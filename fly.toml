@@ -1,0 +1,36 @@
+app = "replace-with-your-xianyu-ai-manager-app"
+primary_region = "hkg"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  API_HOST = "0.0.0.0"
+  PORT = "8080"
+  DB_PATH = "/app/data/xianyu_data.db"
+  TZ = "Asia/Shanghai"
+  PYTHONUNBUFFERED = "1"
+
+[[mounts]]
+  source = "xianyu_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "45s"
+    interval = "30s"
+    method = "GET"
+    timeout = "10s"
+    path = "/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "2048mb"

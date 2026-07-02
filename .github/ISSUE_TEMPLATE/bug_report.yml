@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible defect without including secrets.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not paste Cookie values, passwords, API keys, tokens, databases or personal account identifiers.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Redacted logs or screenshots

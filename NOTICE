@@ -1,0 +1,24 @@
+Xianyu AI Manager
+Copyright (c) 2026 Xianyu AI Manager contributors
+
+This project is a modified work based primarily on:
+  zhinianboke/xianyu-auto-reply
+  https://github.com/zhinianboke/xianyu-auto-reply
+  Licensed under the GNU Affero General Public License v3.0.
+
+Major modifications in this distribution include:
+  - responsive account, settings, product, order and skill-center interfaces;
+  - product-scoped AI knowledge, training rules and conversation testing;
+  - typed and masked settings APIs with atomic section saves;
+  - QR secondary-verification browser session handling;
+  - truthful skill capability reporting and operational diagnostics;
+  - removal of sensitive values from runtime logs and public exports.
+
+The Skill Center is an independent safe rewrite informed by ideas from:
+  - Usagi-org/ai-goofish-monitor (monitoring workflow)
+  - shaxiu/XianyuAutoAgent (expert strategy design)
+  - GuDong2003/xianyu-auto-reply-fix (diagnostic approach)
+
+No claim is made that those projects endorse this distribution. Their names
+and links are provided for attribution and provenance only. See each upstream
+repository for its own license and notices.

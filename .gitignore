@@ -1,0 +1,91 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.local.yml
+*.personal.yml
+*.private.yml
+secrets/
+credentials/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime data
+data/
+backups/
+logs/
+realtime.log
+browser_data/
+playwright-state/
+trajectory_history/
+tmp/
+temp/
+downloads/
+static/uploads/*
+!static/uploads/.gitkeep
+
+# Databases and sessions
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.session
+*.pid
+*.sock
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+static/assets/
+static/index.html
+npm-debug.log*
+
+# Browser and test artifacts
+.playwright/
+.playwright-mcp/
+playwright-report/
+test-results/
+DrissionPage/
+.drission/
+
+# Backups and exports
+frontend_backup/
+*.bak
+*.backup
+*.old
+*.zip
+*.tar.gz
+export_*.json
+export_*.csv
+export_*.xlsx
+keywords_*.xlsx
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local agent metadata
+.claude/
+.spec-workflow/
+AGENTS.md

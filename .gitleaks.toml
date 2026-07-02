@@ -1,0 +1,5 @@
+[allowlist]
+description = "Public Taobao/Xianyu web application identifier, not an authentication secret"
+regexes = [
+  '''444e9908a51d1cb236a27862abc769c9''',
+]

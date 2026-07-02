@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: xianyu-ai-manager
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: TZ
+        value: Asia/Shanghai
+      - key: PYTHONUNBUFFERED
+        value: "1"
