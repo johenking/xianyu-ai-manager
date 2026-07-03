@@ -292,6 +292,10 @@ body {
 
 .modal-header {
   flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
   padding: 2rem 2rem 1.5rem;
   border-bottom: 1px solid #F3F4F6;
   background-color: white;

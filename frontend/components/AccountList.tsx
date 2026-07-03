@@ -1382,7 +1382,7 @@ const AccountList: React.FC = () => {
                 </button>
                 <button
                   onClick={handleSaveAISettings}
-                  className="flex-1 ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2"
+                  className="flex-1 ios-btn-primary px-4 py-3 rounded-xl text-sm font-bold whitespace-nowrap flex items-center justify-center gap-1.5"
                   disabled={saving}
                 >
                   {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
