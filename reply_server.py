@@ -25,6 +25,12 @@ import cookie_manager
 from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
+from ai_provider_service import (
+    PROVIDER_PRESETS,
+    discover_provider_models,
+    provider_test_tokens,
+    test_provider_reply,
+)
 from settings_service import (
     SETTINGS_SECTION_KEYS,
     apply_secret_action,
@@ -4719,6 +4725,7 @@ class BatchDeleteRequest(BaseModel):
 
 class AIReplySettings(BaseModel):
     ai_enabled: bool
+    provider_profile_id: Optional[int] = None
     model_name: str = "deepseek-v4-flash"
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
@@ -4727,6 +4734,32 @@ class AIReplySettings(BaseModel):
     max_bargain_rounds: int = 3
     custom_prompts: str = ""
     api_key_action: str = "keep"
+    provider_test_token: str = ""
+
+
+class AIProviderProfileCreate(BaseModel):
+    name: str
+    provider_type: str = "openai_compatible"
+    preset: str = "custom"
+    base_url: str = ""
+    api_key: str = ""
+    default_model: str = ""
+    is_default: bool = False
+
+
+class AIProviderProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    provider_type: Optional[str] = None
+    preset: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: str = ""
+    api_key_action: str = "keep"
+    default_model: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class AIProviderTestRequest(BaseModel):
+    model_name: str
 
 
 class AIReplyLabRequest(BaseModel):
@@ -4959,6 +4992,125 @@ def _item_knowledge_payload(cookie_id: str, item_id: str, item: Dict[str, Any]) 
     }
 
 
+def _normalize_provider_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    preset = str(data.get('preset') or 'custom').strip().lower()
+    preset_data = PROVIDER_PRESETS.get(preset, PROVIDER_PRESETS['custom'])
+    provider_type = str(data.get('provider_type') or preset_data['provider_type']).strip()
+    if provider_type not in {'openai_compatible', 'gemini'}:
+        raise HTTPException(status_code=400, detail='平台类型仅支持 OpenAI 兼容接口或 Gemini')
+    name = str(data.get('name') or preset_data['label']).strip()
+    base_url = str(data.get('base_url') or preset_data['base_url']).strip().rstrip('/')
+    default_model = str(data.get('default_model') or preset_data['default_model']).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail='平台名称不能为空')
+    if not base_url:
+        raise HTTPException(status_code=400, detail='API 地址不能为空')
+    if not re.match(r'^https?://', base_url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail='API 地址必须以 http:// 或 https:// 开头')
+    return {**data, 'name': name, 'preset': preset, 'provider_type': provider_type,
+            'base_url': base_url, 'default_model': default_model}
+
+
+def _provider_public_payload(profile: Dict[str, Any]) -> Dict[str, Any]:
+    cached_at = profile.get('models_cached_at')
+    return {
+        **profile,
+        'models_cache_fresh': bool(cached_at and time.time() - float(cached_at) < 86400),
+    }
+
+
+@app.get('/api/ai/providers')
+def list_ai_providers(current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    db_manager.ensure_legacy_ai_provider_profiles(user_id)
+    return {
+        'providers': [_provider_public_payload(item) for item in db_manager.list_ai_provider_profiles(user_id)],
+        'presets': PROVIDER_PRESETS,
+    }
+
+
+@app.post('/api/ai/providers')
+def create_ai_provider(payload: AIProviderProfileCreate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    data = _normalize_provider_payload(payload.dict())
+    if not data.get('api_key'):
+        raise HTTPException(status_code=400, detail='新平台必须填写 API Key')
+    if not db_manager.list_ai_provider_profiles(user_id):
+        data['is_default'] = True
+    try:
+        profile_id = db_manager.create_ai_provider_profile(user_id, data)
+    except Exception as e:
+        if 'UNIQUE constraint failed' in str(e):
+            raise HTTPException(status_code=409, detail='平台名称已存在')
+        raise HTTPException(status_code=400, detail='平台配置创建失败')
+    return _provider_public_payload(db_manager.get_ai_provider_profile(profile_id, user_id))
+
+
+@app.put('/api/ai/providers/{profile_id}')
+def update_ai_provider(profile_id: int, payload: AIProviderProfileUpdate,
+                       current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    current = db_manager.get_ai_provider_profile(profile_id, user_id)
+    if not current:
+        raise HTTPException(status_code=404, detail='平台配置不存在')
+    merged = _normalize_provider_payload({**current, **payload.dict(exclude_none=True)})
+    try:
+        return _provider_public_payload(db_manager.update_ai_provider_profile(profile_id, user_id, merged))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.delete('/api/ai/providers/{profile_id}')
+def delete_ai_provider(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        if not db_manager.delete_ai_provider_profile(profile_id, current_user['user_id']):
+            raise HTTPException(status_code=404, detail='平台配置不存在')
+        return {'message': '平台配置已删除'}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@app.post('/api/ai/providers/{profile_id}/models/refresh')
+def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    profile = db_manager.get_ai_provider_profile(profile_id, user_id, include_secret=True)
+    if not profile:
+        raise HTTPException(status_code=404, detail='平台配置不存在')
+    try:
+        models = discover_provider_models(profile)
+        db_manager.update_ai_provider_models(profile_id, user_id, models)
+        return {'models': models, 'cached_at': time.time()}
+    except Exception as e:
+        logger.warning(f'平台模型列表刷新失败 profile={profile_id}: {type(e).__name__}')
+        raise HTTPException(status_code=400, detail='模型列表读取失败，可手动填写模型 ID 后测试')
+
+
+@app.post('/api/ai/providers/{profile_id}/test')
+def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
+                     current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user['user_id']
+    profile = db_manager.get_ai_provider_profile(profile_id, user_id, include_secret=True)
+    if not profile:
+        raise HTTPException(status_code=404, detail='平台配置不存在')
+    model_name = payload.model_name.strip()
+    try:
+        reply = test_provider_reply(profile, model_name)
+        if not reply:
+            raise ValueError('模型返回空内容')
+        db_manager.update_ai_provider_verification(profile_id, user_id, 'verified', '测试回复生成成功')
+        token = provider_test_tokens.issue(user_id, profile_id, model_name)
+        return {
+            'message': '测试回复生成成功，可以应用到账号',
+            'reply': reply,
+            'test_token': token,
+            'model_name': model_name,
+        }
+    except Exception as e:
+        db_manager.update_ai_provider_verification(profile_id, user_id, 'failed', '测试回复生成失败')
+        logger.warning(f'AI平台测试失败 profile={profile_id} model={model_name}: {type(e).__name__}')
+        raise HTTPException(status_code=400, detail='测试回复生成失败，请检查平台、Key、地址和模型 ID')
+
+
 @app.get("/ai-reply-settings/{cookie_id}")
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的AI回复设置"""
@@ -4971,6 +5123,7 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
+        db_manager.ensure_legacy_ai_provider_profiles(user_id)
         settings = db_manager.get_ai_reply_settings(cookie_id)
         account_api_key = ''
         with db_manager.lock:
@@ -4980,18 +5133,25 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
             account_api_key = row[0] if row and row[0] else ''
 
         system_api_key = db_manager.get_system_setting('ai_api_key') or ''
-        effective_key = account_api_key or system_api_key
-        if account_api_key:
+        profile = db_manager.get_ai_provider_profile(settings.get('provider_profile_id'), user_id)
+        effective_key = settings.get('api_key') or account_api_key or system_api_key
+        if profile:
+            api_key_source = 'provider'
+            api_key_masked = profile.get('api_key_masked', '')
+        elif account_api_key:
             api_key_source = 'account'
+            api_key_masked = _mask_secret(effective_key)
         elif system_api_key:
             api_key_source = 'global'
+            api_key_masked = _mask_secret(effective_key)
         else:
             api_key_source = 'missing'
+            api_key_masked = ''
 
         settings.update({
             'api_key': '',
             'api_key_source': api_key_source,
-            'api_key_masked': _mask_secret(effective_key),
+            'api_key_masked': api_key_masked,
             'has_effective_api_key': bool(effective_key),
         })
         return settings
@@ -5018,8 +5178,25 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
         if cookie_manager.manager is None:
             raise HTTPException(status_code=500, detail='CookieManager 未就绪')
 
-        # 明确处理账号专属Key：空值默认保留，只有clear才删除。
+        db_manager.ensure_legacy_ai_provider_profiles(user_id)
+        current_settings = db_manager.get_ai_reply_settings(cookie_id)
+        requested_profile_id = settings.provider_profile_id or current_settings.get('provider_profile_id')
+        if requested_profile_id is not None:
+            profile = db_manager.get_ai_provider_profile(requested_profile_id, user_id)
+            if not profile:
+                raise HTTPException(status_code=404, detail='所选 AI 平台不存在')
+            provider_changed = int(current_settings.get('provider_profile_id') or 0) != int(requested_profile_id)
+            model_changed = str(current_settings.get('model_name') or '') != settings.model_name
+            if provider_changed or model_changed:
+                valid_test = provider_test_tokens.consume(
+                    settings.provider_test_token, user_id, requested_profile_id, settings.model_name
+                )
+                if not valid_test:
+                    raise HTTPException(status_code=409, detail='请先用所选平台和模型生成测试回复，成功后再应用')
+
+        # 明确处理旧版账号专属Key：空值默认保留，只有clear才删除。
         settings_dict = settings.dict()
+        settings_dict['provider_profile_id'] = requested_profile_id
         with db_manager.lock:
             row = db_manager.conn.execute(
                 "SELECT api_key FROM ai_reply_settings WHERE cookie_id = ?", (cookie_id,)
@@ -5032,6 +5209,7 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         settings_dict.pop('api_key_action', None)
+        settings_dict.pop('provider_test_token', None)
         success = db_manager.save_ai_reply_settings(cookie_id, settings_dict)
 
         if success:
@@ -5060,22 +5238,25 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
         user_id = current_user['user_id']
         from db_manager import db_manager
         user_cookies = db_manager.get_all_cookies(user_id)
+        db_manager.ensure_legacy_ai_provider_profiles(user_id)
 
         all_settings = db_manager.get_all_ai_reply_settings()
         # 过滤只属于当前用户的设置
         user_settings = {}
         system_api_key = db_manager.get_system_setting('ai_api_key') or ''
-        for cid, settings in all_settings.items():
+        for cid, raw_settings in all_settings.items():
             if cid not in user_cookies:
                 continue
-            account_api_key = settings.get('api_key') or ''
+            settings = db_manager.get_ai_reply_settings(cid)
+            account_api_key = raw_settings.get('api_key') or ''
             effective_key = account_api_key or system_api_key
+            profile = db_manager.get_ai_provider_profile(settings.get('provider_profile_id'), user_id)
             settings = dict(settings)
             settings.update({
                 'api_key': '',
-                'api_key_source': 'account' if account_api_key else ('global' if system_api_key else 'missing'),
-                'api_key_masked': _mask_secret(effective_key),
-                'has_effective_api_key': bool(effective_key),
+                'api_key_source': 'provider' if profile else ('account' if account_api_key else ('global' if system_api_key else 'missing')),
+                'api_key_masked': profile.get('api_key_masked', '') if profile else _mask_secret(effective_key),
+                'has_effective_api_key': bool(profile.get('api_key_configured')) if profile else bool(effective_key),
             })
             user_settings[cid] = settings
         return user_settings

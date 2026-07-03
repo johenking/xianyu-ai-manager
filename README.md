@@ -11,7 +11,7 @@
 
 - 多账号管理：扫码、账号密码、手动 Cookie，监听与自动确认状态诊断。
 - 商品管理：同步真实商品，为每件商品维护独立知识档案和训练规则。
-- AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复。
+- AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复；不同账号可选择不同平台和模型。
 - AI 训练：在独立对话框中模拟买家咨询，修正规则确认后才写入线上配置。
 - 关键词回复：账号级关键词回复、默认回复与关键词发货规则。
 - 订单与卡密：订单同步、状态管理、卡密库存与自动发货规则。
@@ -42,11 +42,21 @@
 
 因此切换商品后，AI 会使用新商品的标题、价格、详情与知识档案；某件商品的训练规则不会直接套到其他商品。
 
+## AI 平台与模型
+
+“系统与 AI”中的平台配置库支持 DeepSeek、OpenAI、通义千问、OpenRouter、硅基流动、Gemini 和自定义 OpenAI 兼容接口。平台 Key 集中加密保存，账号只选择平台与模型。
+
+- OpenAI 兼容接口读取标准 `/models`；Gemini 读取 `models.list` 并仅保留支持文本生成的模型。
+- 模型列表无法读取时可以手填模型 ID。
+- 平台或模型切换必须先生成测试回复，成功后才会写入账号线上配置。
+- 测试失败不会修改账号当前使用的平台和模型，也不会静默切换到其他收费平台。
+- Anthropic 原生 Messages API 暂未接入；Claude 模型可通过 OpenRouter 等兼容网关使用。
+
 ## 技术栈
 
 - 后端：Python 3.11+、FastAPI、SQLite、Playwright、WebSocket
 - 前端：React 19、TypeScript、Vite、Tailwind CSS
-- AI：OpenAI 兼容接口
+- AI：OpenAI 兼容接口、Google Gemini 原生接口
 
 ## 本地运行
 
@@ -72,6 +82,7 @@ python Start.py
 打开 `http://127.0.0.1:8091`。
 
 默认后台用户名为 `admin`。请在 `.env` 中设置强密码 `ADMIN_PASSWORD` 和随机 `JWT_SECRET_KEY`，不要在公网使用默认值。
+AI 平台密钥使用 Fernet 加密保存。生产环境请另外设置随机的 `AI_PROVIDER_ENCRYPTION_KEY`；未设置时会在 `data/.ai_provider_key` 生成仅本机可读的密钥文件，请与数据库一起备份且不要提交。
 
 ## Docker
 
@@ -86,6 +97,7 @@ docker compose up --build -d
 ## 配置与秘密
 
 - 全局 AI Key 与 SMTP 密码不会通过设置 API 明文返回。
+- 平台 API Key 使用 Fernet 加密保存，平台接口只返回配置状态和掩码。
 - 账号专属 AI Key 使用 `keep / set / clear` 操作，空输入不会误删旧 Key。
 - 不要提交 `data/`、数据库、Cookie、日志、浏览器状态、上传文件或 `.env`。
 - SMTP 是可选能力，未配置不代表系统故障；连接检测只做连接与认证，不发送邮件。

@@ -95,7 +95,9 @@ class AIReplyEngine:
         return is_custom_model and is_dashscope_url
 
     def _is_gemini_api(self, settings: dict) -> bool:
-        """判断是否为Gemini API (通过模型名称)"""
+        """判断是否为 Gemini，优先使用平台类型并兼容旧模型名判断。"""
+        if settings.get('provider_type'):
+            return settings.get('provider_type') == 'gemini'
         model_name = settings.get('model_name', '').lower()
         return 'gemini' in model_name
 

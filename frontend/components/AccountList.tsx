@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, AIReplySettings, AutoReplyDiagnostics } from '../types';
+import { AccountDetail, AIProviderProfile, AIReplySettings, AutoReplyDiagnostics } from '../types';
 import AITrainingLab from './AITrainingLab';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import {
@@ -21,7 +21,10 @@ import {
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
-  getAutoReplyDiagnostics
+  getAutoReplyDiagnostics,
+  getAIProviders,
+  refreshAIProviderModels,
+  testAIProvider
 } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
@@ -95,6 +98,9 @@ const AccountList: React.FC = () => {
     custom_prompts: '',
   });
   const [saving, setSaving] = useState(false);
+  const [aiProviders, setAiProviders] = useState<AIProviderProfile[]>([]);
+  const [testingProvider, setTestingProvider] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [aiSaveNotice, setAiSaveNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
 
@@ -233,9 +239,17 @@ const AccountList: React.FC = () => {
     setAiSaveNotice(null);
     setSaving(true);
     try {
-      const settings = await getAccountAISettings(account.id);
+      const [settings, providerResult] = await Promise.all([
+        getAccountAISettings(account.id),
+        getAIProviders(),
+      ]);
+      setAiProviders(providerResult.providers);
       setAiSettings({
         ai_enabled: settings.ai_enabled ?? false,
+        provider_profile_id: settings.provider_profile_id ?? providerResult.providers.find((item) => item.is_default)?.id ?? providerResult.providers[0]?.id ?? null,
+        provider_name: settings.provider_name,
+        provider_type: settings.provider_type,
+        provider_status: settings.provider_status,
         model_name: settings.model_name || 'deepseek-v4-flash',
         api_key: '',
         base_url: settings.base_url || 'https://api.deepseek.com',
@@ -247,6 +261,7 @@ const AccountList: React.FC = () => {
         max_bargain_rounds: settings.max_bargain_rounds ?? 3,
         custom_prompts: settings.custom_prompts ?? '',
         api_key_action: 'keep',
+        provider_test_token: '',
       });
     } catch (e) {
       console.error('Failed to load AI settings:', e);
@@ -322,16 +337,28 @@ const AccountList: React.FC = () => {
 
   const handleSaveAISettings = async () => {
     if (!editingAccount) return;
+    if (!aiSettings.provider_profile_id) {
+      setAiSaveNotice({ tone: 'error', text: '请先在“系统与 AI”中添加平台配置' });
+      return;
+    }
     setSaving(true);
-    setAiSaveNotice({ tone: 'info', text: '正在保存并复读确认 AI 配置' });
+    setTestingProvider(true);
+    setAiSaveNotice({ tone: 'info', text: '正在用所选模型生成测试回复，成功后才会应用' });
 
     try {
-      const apiKeyAction = aiSettings.api_key.trim() ? 'set' : (aiSettings.api_key_action || 'keep');
-      await updateAccountAISettings(editingAccount.id, { ...aiSettings, api_key_action: apiKeyAction });
+      const testResult = await testAIProvider(aiSettings.provider_profile_id, aiSettings.model_name);
+      setTestingProvider(false);
+      setAiSaveNotice({ tone: 'info', text: `测试回复：${testResult.reply}。正在保存并复读确认。` });
+      await updateAccountAISettings(editingAccount.id, {
+        ...aiSettings,
+        api_key_action: 'keep',
+        provider_test_token: testResult.test_token,
+      });
       const saved = await getAccountAISettings(editingAccount.id);
       const confirmed = saved.ai_enabled === aiSettings.ai_enabled
+        && saved.provider_profile_id === aiSettings.provider_profile_id
         && saved.model_name === aiSettings.model_name
-        && saved.base_url === aiSettings.base_url;
+        && Boolean(saved.has_effective_api_key);
       if (!confirmed) {
         throw new Error('服务器返回的配置与刚保存的值不一致，请重试');
       }
@@ -342,7 +369,24 @@ const AccountList: React.FC = () => {
       console.error('更新AI设置失败:', error);
       setAiSaveNotice({ tone: 'error', text: error instanceof Error ? error.message : '更新失败，请重试' });
     } finally {
+      setTestingProvider(false);
       setSaving(false);
+    }
+  };
+
+  const handleRefreshProviderModels = async () => {
+    if (!aiSettings.provider_profile_id) return;
+    setRefreshingModels(true);
+    setAiSaveNotice(null);
+    try {
+      const result = await refreshAIProviderModels(aiSettings.provider_profile_id);
+      const providers = await getAIProviders();
+      setAiProviders(providers.providers);
+      setAiSaveNotice({ tone: 'success', text: `已读取 ${result.models.length} 个模型，也可以继续手填模型 ID。` });
+    } catch (error) {
+      setAiSaveNotice({ tone: 'error', text: error instanceof Error ? error.message : '模型列表刷新失败，可直接手填模型 ID' });
+    } finally {
+      setRefreshingModels(false);
     }
   };
 
@@ -1209,41 +1253,51 @@ const AccountList: React.FC = () => {
                 <h3 className="text-lg font-bold text-gray-900 mb-4">实际 AI 服务</h3>
                 <div className="space-y-4">
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">API 地址</label>
-                    <input
-                      type="text"
-                      value={aiSettings.base_url}
-                      onChange={(e) => setAiSettings({ ...aiSettings, base_url: e.target.value })}
-                      className="w-full ios-input px-4 py-3 rounded-xl"
-                      placeholder="https://api.deepseek.com"
-                    />
+                    <label className="block text-sm font-bold text-gray-700 mb-2">AI 平台</label>
+                    <select
+                      value={aiSettings.provider_profile_id || ''}
+                      onChange={(e) => {
+                        const provider = aiProviders.find((item) => item.id === Number(e.target.value));
+                        if (!provider) return;
+                        setAiSettings({
+                          ...aiSettings,
+                          provider_profile_id: provider.id,
+                          provider_name: provider.name,
+                          provider_type: provider.provider_type,
+                          provider_status: provider.verification_status,
+                          base_url: provider.base_url,
+                          model_name: provider.default_model || provider.models[0] || '',
+                          api_key_source: 'provider',
+                          api_key_masked: provider.api_key_masked,
+                          has_effective_api_key: provider.api_key_configured,
+                          provider_test_token: '',
+                        });
+                      }}
+                      className="w-full ios-input px-4 py-3 rounded-xl bg-white"
+                    >
+                      {aiProviders.length === 0 && <option value="">请先到“系统与 AI”添加平台</option>}
+                      {aiProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}{provider.is_default ? '（默认）' : ''}</option>)}
+                    </select>
                   </div>
                   <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">模型</label>
+                    <div className="mb-2 flex items-center justify-between gap-3"><label htmlFor="account-ai-model" className="block text-sm font-bold text-gray-700">模型</label><button type="button" onClick={() => void handleRefreshProviderModels()} disabled={refreshingModels || !aiSettings.provider_profile_id} className="inline-flex items-center gap-1.5 text-xs font-bold text-gray-600 hover:text-black disabled:opacity-50">{refreshingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新模型</button></div>
                     <input
-                      type="text"
+                      id="account-ai-model"
+                      list="account-ai-model-options"
+                      type="search"
                       value={aiSettings.model_name}
-                      onChange={(e) => setAiSettings({ ...aiSettings, model_name: e.target.value })}
+                      onChange={(e) => setAiSettings({ ...aiSettings, model_name: e.target.value, provider_test_token: '' })}
                       className="w-full ios-input px-4 py-3 rounded-xl"
-                      placeholder="deepseek-v4-flash"
+                      placeholder="选择或手填模型 ID"
                     />
-                    <p className="text-xs text-gray-500 mt-1">DeepSeek 推荐使用 deepseek-v4-flash 或 deepseek-v4-pro</p>
+                    <datalist id="account-ai-model-options">
+                      {(aiProviders.find((item) => item.id === aiSettings.provider_profile_id)?.models || []).map((model) => <option key={model} value={model} />)}
+                    </datalist>
+                    <p className="text-xs text-gray-500 mt-1">模型列表读取失败时可手填 ID，但仍需生成测试回复才能应用。</p>
                   </div>
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">API Key</label>
-                    <input
-                      type="password"
-                      value={aiSettings.api_key}
-                      onChange={(e) => setAiSettings({ ...aiSettings, api_key: e.target.value, api_key_action: e.target.value ? 'set' : 'keep' })}
-                      className="w-full ios-input px-4 py-3 rounded-xl"
-                      placeholder="为空时使用系统设置中的 Key"
-                    />
-                    <div className="mt-2 rounded-xl bg-gray-50 px-3 py-2 text-xs font-bold text-gray-600">
-                      当前 Key 来源：
-                      {aiSettings.api_key_source === 'account' ? '账号专属' : aiSettings.api_key_source === 'global' ? '系统全局' : '未配置'}
-                      {aiSettings.api_key_masked ? `（${aiSettings.api_key_masked}）` : ''}
-                    </div>
-                    <p className="text-xs text-gray-500 mt-1">留空会保留现有账号专属 Key；填写新值才会替换。系统全局 Key 仅在账号未配置专属 Key 时使用。</p>
+                  <div className="grid grid-cols-1 gap-2 rounded-xl bg-gray-50 px-3 py-3 text-xs text-gray-600 sm:grid-cols-2">
+                    <div><span className="font-bold text-gray-800">Key 来源：</span>{aiSettings.api_key_source === 'provider' ? '平台配置库' : aiSettings.api_key_source === 'account' ? '旧版账号专属' : aiSettings.api_key_source === 'global' ? '旧版系统全局' : '未配置'} {aiSettings.api_key_masked || ''}</div>
+                    <div><span className="font-bold text-gray-800">连接状态：</span>{aiProviders.find((item) => item.id === aiSettings.provider_profile_id)?.verification_status === 'verified' ? '已验证' : '待测试'}</div>
                   </div>
                 </div>
               </div>
@@ -1331,8 +1385,8 @@ const AccountList: React.FC = () => {
                   className="flex-1 ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2"
                   disabled={saving}
                 >
-                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                  {saving ? '保存中...' : '保存'}
+                  {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                  {testingProvider ? '测试中...' : saving ? '应用中...' : '测试并应用'}
                 </button>
               </div>
             </div>

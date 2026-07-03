@@ -167,6 +167,7 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS ai_reply_settings (
                 cookie_id TEXT PRIMARY KEY,
                 ai_enabled BOOLEAN DEFAULT FALSE,
+                provider_profile_id INTEGER,
                 model_name TEXT DEFAULT 'qwen-plus',
                 api_key TEXT,
                 base_url TEXT DEFAULT 'https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -179,6 +180,37 @@ class DBManager:
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_provider_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL CHECK(provider_type IN ('openai_compatible', 'gemini')),
+                preset TEXT NOT NULL DEFAULT 'custom',
+                base_url TEXT NOT NULL,
+                api_key_encrypted TEXT NOT NULL DEFAULT '',
+                default_model TEXT NOT NULL DEFAULT '',
+                models_cache TEXT NOT NULL DEFAULT '[]',
+                models_cached_at REAL,
+                verification_status TEXT NOT NULL DEFAULT 'unverified',
+                verification_message TEXT NOT NULL DEFAULT '',
+                last_verified_at REAL,
+                is_default BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE(user_id, name)
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_ai_provider_profiles_user
+            ON ai_provider_profiles(user_id, is_default)
+            ''')
+            cursor.execute("PRAGMA table_info(ai_reply_settings)")
+            ai_settings_columns = {row[1] for row in cursor.fetchall()}
+            if 'provider_profile_id' not in ai_settings_columns:
+                cursor.execute("ALTER TABLE ai_reply_settings ADD COLUMN provider_profile_id INTEGER")
 
             # 创建AI对话历史表
             cursor.execute('''
@@ -2125,15 +2157,22 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                existing = cursor.execute(
+                    "SELECT provider_profile_id FROM ai_reply_settings WHERE cookie_id = ?", (cookie_id,)
+                ).fetchone()
+                provider_profile_id = settings.get(
+                    'provider_profile_id', existing[0] if existing else None
+                )
                 cursor.execute('''
                 INSERT OR REPLACE INTO ai_reply_settings
-                (cookie_id, ai_enabled, model_name, api_key, base_url,
+                (cookie_id, ai_enabled, provider_profile_id, model_name, api_key, base_url,
                  max_discount_percent, max_discount_amount, max_bargain_rounds,
                  custom_prompts, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
                     cookie_id,
                     settings.get('ai_enabled', False),
+                    provider_profile_id,
                     settings.get('model_name', 'deepseek-v4-flash'),
                     settings.get('api_key', ''),
                     settings.get('base_url', 'https://api.deepseek.com'),
@@ -2169,7 +2208,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT ai_enabled, model_name, api_key, base_url,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, provider_profile_id
                 FROM ai_reply_settings WHERE cookie_id = ?
                 ''', (cookie_id,))
 
@@ -2181,6 +2220,27 @@ class DBManager:
                 system_model = self.get_system_setting('ai_model') or DEFAULT_MODEL
 
                 if result:
+                    provider_profile_id = result[8]
+                    if provider_profile_id:
+                        account = self.get_cookie_details(cookie_id) or {}
+                        profile = self.get_ai_provider_profile(
+                            provider_profile_id, account.get('user_id'), include_secret=True
+                        )
+                        if profile:
+                            return {
+                                'ai_enabled': bool(result[0]),
+                                'provider_profile_id': provider_profile_id,
+                                'provider_name': profile['name'],
+                                'provider_type': profile['provider_type'],
+                                'provider_status': profile['verification_status'],
+                                'model_name': result[1] or profile['default_model'],
+                                'api_key': profile['api_key'],
+                                'base_url': profile['base_url'],
+                                'max_discount_percent': result[4],
+                                'max_discount_amount': result[5],
+                                'max_bargain_rounds': result[6],
+                                'custom_prompts': result[7]
+                            }
                     # 账号有设置，但如果api_key/base_url/model_name为空或等于默认值，使用系统设置
                     account_model = result[1]
                     account_api_key = result[2]
@@ -2193,6 +2253,8 @@ class DBManager:
 
                     return {
                         'ai_enabled': bool(result[0]),
+                        'provider_profile_id': None,
+                        'provider_type': 'gemini' if 'gemini' in use_model.lower() else 'openai_compatible',
                         'model_name': use_model,
                         'api_key': use_api_key,
                         'base_url': use_base_url,
@@ -2205,6 +2267,8 @@ class DBManager:
                     # 账号没有设置，使用系统设置作为默认值
                     return {
                         'ai_enabled': False,
+                        'provider_profile_id': None,
+                        'provider_type': 'gemini' if 'gemini' in system_model.lower() else 'openai_compatible',
                         'model_name': system_model,
                         'api_key': system_api_key,
                         'base_url': system_base_url,
@@ -2217,6 +2281,8 @@ class DBManager:
                 logger.error(f"获取AI回复设置失败: {e}")
                 return {
                     'ai_enabled': False,
+                    'provider_profile_id': None,
+                    'provider_type': 'openai_compatible',
                     'model_name': 'deepseek-v4-flash',
                     'api_key': '',
                     'base_url': 'https://api.deepseek.com',
@@ -2234,7 +2300,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT cookie_id, ai_enabled, model_name, api_key, base_url,
                        max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts
+                       custom_prompts, provider_profile_id
                 FROM ai_reply_settings
                 ''')
 
@@ -2243,6 +2309,7 @@ class DBManager:
                     cookie_id = row[0]
                     result[cookie_id] = {
                         'ai_enabled': bool(row[1]),
+                        'provider_profile_id': row[9],
                         'model_name': row[2],
                         'api_key': row[3],
                         'base_url': row[4],
@@ -2256,6 +2323,224 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取所有AI回复设置失败: {e}")
                 return {}
+
+    # -------------------- AI平台配置 --------------------
+    def _serialize_ai_provider_profile(self, row, include_secret: bool = False) -> dict:
+        from ai_provider_service import decrypt_provider_key, mask_provider_key
+
+        api_key = decrypt_provider_key(row[6]) if row[6] else ''
+        profile = {
+            'id': row[0],
+            'user_id': row[1],
+            'name': row[2],
+            'provider_type': row[3],
+            'preset': row[4],
+            'base_url': row[5],
+            'default_model': row[7],
+            'models': json.loads(row[8] or '[]'),
+            'models_cached_at': row[9],
+            'verification_status': row[10],
+            'verification_message': row[11] or '',
+            'last_verified_at': row[12],
+            'is_default': bool(row[13]),
+            'api_key_configured': bool(api_key),
+            'api_key_masked': mask_provider_key(api_key),
+            'created_at': row[14],
+            'updated_at': row[15],
+        }
+        if include_secret:
+            profile['api_key'] = api_key
+        return profile
+
+    def create_ai_provider_profile(self, user_id: int, data: dict) -> int:
+        from ai_provider_service import encrypt_provider_key
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                if data.get('is_default'):
+                    cursor.execute("UPDATE ai_provider_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
+                cursor.execute('''
+                INSERT INTO ai_provider_profiles
+                (user_id, name, provider_type, preset, base_url, api_key_encrypted,
+                 default_model, verification_status, verification_message, last_verified_at, is_default)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    str(data.get('name') or '').strip(),
+                    data.get('provider_type', 'openai_compatible'),
+                    data.get('preset', 'custom'),
+                    str(data.get('base_url') or '').rstrip('/'),
+                    encrypt_provider_key(data.get('api_key', '')),
+                    str(data.get('default_model') or '').strip(),
+                    data.get('verification_status', 'unverified'),
+                    data.get('verification_message', ''),
+                    data.get('last_verified_at'),
+                    int(bool(data.get('is_default'))),
+                ))
+                self.conn.commit()
+                return int(cursor.lastrowid)
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def list_ai_provider_profiles(self, user_id: int) -> List[dict]:
+        with self.lock:
+            rows = self.conn.execute('''
+                SELECT id, user_id, name, provider_type, preset, base_url, api_key_encrypted,
+                       default_model, models_cache, models_cached_at, verification_status,
+                       verification_message, last_verified_at, is_default, created_at, updated_at
+                FROM ai_provider_profiles WHERE user_id = ?
+                ORDER BY is_default DESC, name COLLATE NOCASE
+            ''', (user_id,)).fetchall()
+            return [self._serialize_ai_provider_profile(row) for row in rows]
+
+    def get_ai_provider_profile(self, profile_id: int, user_id: Optional[int], include_secret: bool = False) -> Optional[dict]:
+        if not profile_id or user_id is None:
+            return None
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT id, user_id, name, provider_type, preset, base_url, api_key_encrypted,
+                       default_model, models_cache, models_cached_at, verification_status,
+                       verification_message, last_verified_at, is_default, created_at, updated_at
+                FROM ai_provider_profiles WHERE id = ? AND user_id = ?
+            ''', (profile_id, user_id)).fetchone()
+            return self._serialize_ai_provider_profile(row, include_secret) if row else None
+
+    def count_ai_provider_references(self, profile_id: int) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM ai_reply_settings WHERE provider_profile_id = ?", (profile_id,)
+            ).fetchone()
+            return int(row[0] if row else 0)
+
+    def update_ai_provider_profile(self, profile_id: int, user_id: int, data: dict) -> dict:
+        from ai_provider_service import encrypt_provider_key
+        from settings_service import apply_secret_action
+
+        with self.lock:
+            current = self.get_ai_provider_profile(profile_id, user_id, include_secret=True)
+            if not current:
+                raise ValueError('平台配置不存在')
+            key_action = data.get('api_key_action', 'keep')
+            api_key = apply_secret_action(current.get('api_key', ''), key_action, data.get('api_key', ''))
+            provider_type = data.get('provider_type', current['provider_type'])
+            base_url = str(data.get('base_url', current['base_url'])).rstrip('/')
+            preset = data.get('preset', current['preset'])
+            sensitive_changed = any([
+                provider_type != current['provider_type'],
+                base_url != current['base_url'],
+                preset != current['preset'],
+                api_key != current.get('api_key', ''),
+            ])
+            if sensitive_changed and self.count_ai_provider_references(profile_id):
+                raise ValueError('该平台正在被账号使用，请先让账号切换到其他平台再修改连接信息')
+            if data.get('is_default'):
+                self.conn.execute("UPDATE ai_provider_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
+            self.conn.execute('''
+                UPDATE ai_provider_profiles SET
+                    name = ?, provider_type = ?, preset = ?, base_url = ?, api_key_encrypted = ?,
+                    default_model = ?, verification_status = ?, verification_message = ?,
+                    last_verified_at = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (
+                str(data.get('name', current['name'])).strip(), provider_type, preset, base_url,
+                encrypt_provider_key(api_key), str(data.get('default_model', current['default_model'])).strip(),
+                'unverified' if sensitive_changed else current['verification_status'],
+                '' if sensitive_changed else current['verification_message'],
+                None if sensitive_changed else current['last_verified_at'],
+                int(bool(data.get('is_default', current['is_default']))), profile_id, user_id,
+            ))
+            self.conn.commit()
+            return self.get_ai_provider_profile(profile_id, user_id)
+
+    def update_ai_provider_verification(self, profile_id: int, user_id: int, status: str, message: str) -> None:
+        with self.lock:
+            self.conn.execute('''
+                UPDATE ai_provider_profiles SET verification_status = ?, verification_message = ?,
+                    last_verified_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (status, str(message or '')[:500], time.time() if status == 'verified' else None, profile_id, user_id))
+            self.conn.commit()
+
+    def update_ai_provider_models(self, profile_id: int, user_id: int, models: List[str]) -> None:
+        with self.lock:
+            self.conn.execute('''
+                UPDATE ai_provider_profiles SET models_cache = ?, models_cached_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (json.dumps(models, ensure_ascii=False), time.time(), profile_id, user_id))
+            self.conn.commit()
+
+    def delete_ai_provider_profile(self, profile_id: int, user_id: int) -> bool:
+        with self.lock:
+            profile = self.get_ai_provider_profile(profile_id, user_id)
+            if not profile:
+                return False
+            if self.count_ai_provider_references(profile_id):
+                raise ValueError('该平台正在被账号使用，不能删除')
+            self.conn.execute("DELETE FROM ai_provider_profiles WHERE id = ? AND user_id = ?", (profile_id, user_id))
+            self.conn.commit()
+            return True
+
+    def ensure_legacy_ai_provider_profiles(self, user_id: int) -> int:
+        """Idempotently bind existing account AI settings to encrypted provider profiles."""
+        with self.lock:
+            cookie_ids = list(self.get_all_cookies(user_id).keys())
+            if not cookie_ids:
+                return 0
+            existing_profiles = self.list_ai_provider_profiles(user_id)
+            profile_by_config = {}
+            for profile in existing_profiles:
+                private = self.get_ai_provider_profile(profile['id'], user_id, include_secret=True)
+                profile_by_config[(private['provider_type'], private['base_url'], private.get('api_key', ''))] = private['id']
+
+            migrated = 0
+            for cookie_id in cookie_ids:
+                row = self.conn.execute(
+                    "SELECT provider_profile_id FROM ai_reply_settings WHERE cookie_id = ?", (cookie_id,)
+                ).fetchone()
+                if row and row[0]:
+                    continue
+                effective = self.get_ai_reply_settings(cookie_id)
+                provider_type = effective.get('provider_type') or ('gemini' if 'gemini' in effective.get('model_name', '').lower() else 'openai_compatible')
+                config_key = (provider_type, effective.get('base_url', ''), effective.get('api_key', ''))
+                profile_id = profile_by_config.get(config_key)
+                if not profile_id:
+                    base_name = '现有 AI 配置'
+                    suffix = len(existing_profiles) + 1
+                    name = base_name if suffix == 1 else f'{base_name} {suffix}'
+                    model = effective.get('model_name', '')
+                    url = effective.get('base_url', '')
+                    preset = 'gemini' if provider_type == 'gemini' else 'deepseek' if 'deepseek' in url.lower() else 'qwen' if 'dashscope' in url.lower() else 'custom'
+                    profile_id = self.create_ai_provider_profile(user_id, {
+                        'name': name,
+                        'provider_type': provider_type,
+                        'preset': preset,
+                        'base_url': url,
+                        'api_key': effective.get('api_key', ''),
+                        'default_model': model,
+                        'verification_status': 'verified' if effective.get('api_key') else 'unverified',
+                        'verification_message': '从现有账号配置安全迁移',
+                        'last_verified_at': time.time() if effective.get('api_key') else None,
+                        'is_default': not existing_profiles,
+                    })
+                    existing_profiles.append({'id': profile_id})
+                    profile_by_config[config_key] = profile_id
+
+                if row:
+                    self.conn.execute(
+                        "UPDATE ai_reply_settings SET provider_profile_id = ? WHERE cookie_id = ?",
+                        (profile_id, cookie_id),
+                    )
+                else:
+                    self.conn.execute('''
+                        INSERT INTO ai_reply_settings
+                        (cookie_id, ai_enabled, provider_profile_id, model_name, api_key, base_url)
+                        VALUES (?, 0, ?, ?, '', ?)
+                    ''', (cookie_id, profile_id, effective.get('model_name', ''), effective.get('base_url', '')))
+                migrated += 1
+            self.conn.commit()
+            return migrated
 
     def save_ai_training_rules(self, cookie_id: str, item_id: str, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """新增或恢复启用训练规则，商品规则严格绑定当前商品。"""

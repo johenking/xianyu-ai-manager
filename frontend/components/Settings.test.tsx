@@ -2,12 +2,18 @@
 import React from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
+import { getAIProviders, getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
 import { SettingsSummary } from '../types';
 import Settings from './Settings';
 
 vi.mock('../services/api', () => ({
   getSettingsSummary: vi.fn(),
+  getAIProviders: vi.fn(),
+  createAIProvider: vi.fn(),
+  updateAIProvider: vi.fn(),
+  deleteAIProvider: vi.fn(),
+  refreshAIProviderModels: vi.fn(),
+  testAIProvider: vi.fn(),
   saveSettingsSection: vi.fn(),
   verifySettingsSection: vi.fn(),
 }));
@@ -40,6 +46,7 @@ const summary: SettingsSummary = {
 describe('Settings configuration sections', () => {
   beforeEach(() => {
     vi.mocked(getSettingsSummary).mockResolvedValue(summary);
+    vi.mocked(getAIProviders).mockResolvedValue({ providers: [], presets: {} });
     vi.mocked(saveSettingsSection).mockReset();
     vi.mocked(verifySettingsSection).mockReset();
   });

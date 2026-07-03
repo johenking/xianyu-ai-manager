@@ -5,7 +5,8 @@ import {
   Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
   SkillMonitorTask, SkillMonitorResult, SkillAgentPrompt,
   SkillOpsHealth, SkillBrowserStatus, SkillDeliveryDiagnostics,
-  AutoReplyDiagnostics, SettingsSectionKey, SettingsSummary, SkillCapability
+  AutoReplyDiagnostics, SettingsSectionKey, SettingsSummary, SkillCapability,
+  AIProviderListResponse, AIProviderProfile
 } from '../types';
 
 // Auth
@@ -504,6 +505,7 @@ export const getAccountAISettings = async (cookieId: string): Promise<AIReplySet
 export const updateAccountAISettings = async (cookieId: string, settings: Partial<AIReplySettings>): Promise<ApiResponse> => {
   const payload = {
     ai_enabled: settings.ai_enabled ?? false,
+    provider_profile_id: settings.provider_profile_id ?? null,
     model_name: settings.model_name ?? 'deepseek-v4-flash',
     api_key: settings.api_key ?? '',
     base_url: settings.base_url ?? 'https://api.deepseek.com',
@@ -512,9 +514,46 @@ export const updateAccountAISettings = async (cookieId: string, settings: Partia
     max_bargain_rounds: settings.max_bargain_rounds ?? 3,
     custom_prompts: encodeCustomPromptsForBackend(settings.custom_prompts),
     api_key_action: settings.api_key_action ?? 'keep',
+    provider_test_token: settings.provider_test_token ?? '',
   };
   return put(`/ai-reply-settings/${cookieId}`, payload);
 }
+
+export const getAIProviders = async (): Promise<AIProviderListResponse> => get('/api/ai/providers');
+
+export const createAIProvider = async (data: {
+  name: string;
+  provider_type: 'openai_compatible' | 'gemini';
+  preset: string;
+  base_url: string;
+  api_key: string;
+  default_model: string;
+  is_default?: boolean;
+}): Promise<AIProviderProfile> => post('/api/ai/providers', data);
+
+export const updateAIProvider = async (id: number, data: Partial<{
+  name: string;
+  provider_type: 'openai_compatible' | 'gemini';
+  preset: string;
+  base_url: string;
+  api_key: string;
+  api_key_action: 'keep' | 'set' | 'clear';
+  default_model: string;
+  is_default: boolean;
+}>): Promise<AIProviderProfile> => put(`/api/ai/providers/${id}`, data);
+
+export const deleteAIProvider = async (id: number): Promise<ApiResponse> => del(`/api/ai/providers/${id}`);
+
+export const refreshAIProviderModels = async (id: number): Promise<{ models: string[]; cached_at: number }> => (
+  post(`/api/ai/providers/${id}/models/refresh`, {})
+);
+
+export const testAIProvider = async (id: number, modelName: string): Promise<{
+  message: string;
+  reply: string;
+  test_token: string;
+  model_name: string;
+}> => post(`/api/ai/providers/${id}/test`, { model_name: modelName });
 
 export const testAIConnection = async (cookieId: string, data?: {
   message?: string;

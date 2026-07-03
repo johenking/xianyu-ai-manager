@@ -4,6 +4,7 @@ import { getSettingsSummary, saveSettingsSection, verifySettingsSection } from '
 import { SettingsSectionKey, SettingsSummary, SystemSettings } from '../types';
 import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import AIProviderManager from './AIProviderManager';
 
 const sectionFields: Record<SettingsSectionKey, string[]> = {
   basic: ['registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages'],
@@ -142,6 +143,8 @@ const Settings: React.FC = () => {
         </div>}
 
         {openSection === 'ai' && <div className="space-y-4">
+          <AIProviderManager />
+          <InlineNotice>下面是旧版全局配置，仅用于尚未绑定平台库的兼容账号。新账号请使用上方平台配置库。</InlineNotice>
           <Field label="API 地址" value={draft.ai_api_url || ''} onChange={(v) => update('ai_api_url', v)} placeholder="https://api.deepseek.com" />
           <Field label="模型" value={draft.ai_model || ''} onChange={(v) => update('ai_model', v)} placeholder="deepseek-chat" />
           <SecretField label="API Key" name="ai_api_key" configured={Boolean(saved.ai_api_key_configured)} masked={saved.ai_api_key_masked || ''} value={draft.ai_api_key || ''} show={Boolean(showSecret.ai_api_key)} onToggle={() => setShowSecret((s) => ({ ...s, ai_api_key: !s.ai_api_key }))} onChange={(v) => { update('ai_api_key', v); setSecretActions((s) => ({ ...s, ai_api_key: v ? 'set' : 'keep' })); }} onClear={() => { update('ai_api_key', ''); setSecretActions((s) => ({ ...s, ai_api_key: 'clear' })); }} />

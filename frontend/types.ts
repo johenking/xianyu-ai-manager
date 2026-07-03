@@ -215,10 +215,14 @@ export interface SettingsSummary {
 
 export interface AIReplySettings {
   ai_enabled: boolean;
+  provider_profile_id?: number | null;
+  provider_name?: string;
+  provider_type?: 'openai_compatible' | 'gemini';
+  provider_status?: 'unverified' | 'verified' | 'failed';
   model_name: string;
   api_key: string;
   base_url: string;
-  api_key_source?: 'account' | 'global' | 'missing';
+  api_key_source?: 'provider' | 'account' | 'global' | 'missing';
   api_key_masked?: string;
   has_effective_api_key?: boolean;
   max_discount_percent: number;
@@ -226,6 +230,37 @@ export interface AIReplySettings {
   max_bargain_rounds: number;
   custom_prompts: string;
   api_key_action?: 'keep' | 'set' | 'clear';
+  provider_test_token?: string;
+}
+
+export interface AIProviderPreset {
+  label: string;
+  provider_type: 'openai_compatible' | 'gemini';
+  base_url: string;
+  default_model: string;
+}
+
+export interface AIProviderProfile {
+  id: number;
+  name: string;
+  provider_type: 'openai_compatible' | 'gemini';
+  preset: string;
+  base_url: string;
+  default_model: string;
+  models: string[];
+  models_cached_at?: number | null;
+  models_cache_fresh?: boolean;
+  verification_status: 'unverified' | 'verified' | 'failed';
+  verification_message?: string;
+  last_verified_at?: number | null;
+  is_default: boolean;
+  api_key_configured: boolean;
+  api_key_masked: string;
+}
+
+export interface AIProviderListResponse {
+  providers: AIProviderProfile[];
+  presets: Record<string, AIProviderPreset>;
 }
 
 // Default Reply

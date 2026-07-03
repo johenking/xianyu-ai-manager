@@ -2,6 +2,18 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+
+- Add user-scoped AI provider profiles for DeepSeek, OpenAI, Qwen, OpenRouter, SiliconFlow, Gemini and custom compatible endpoints.
+- Discover provider models with a manual model ID fallback.
+- Require a successful generated test reply before applying a provider or model change to an account.
+
+### Security
+
+- Encrypt provider API keys at rest and return only configuration state and masks through the API.
+
 ## [1.0.1] - 2026-07-03
 
 ### Fixed
