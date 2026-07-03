@@ -2,6 +2,15 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.0.1] - 2026-07-03
+
+### Fixed
+
+- Show live `checking`, `available` and `unavailable` states on configuration capsules.
+- Keep failed settings saves expanded and cover the behavior with component tests.
+- Report real account-listener, AI readiness and Playwright launch status in operations diagnostics.
+- Replace remaining blocking browser alerts with non-blocking status notices.
+
 ## [1.0.0] - 2026-07-03
 
 ### Added
