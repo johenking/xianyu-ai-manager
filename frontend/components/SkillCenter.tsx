@@ -565,7 +565,8 @@ const SkillCenter: React.FC = () => {
           <Metric label="浏览器启动" value={browserStatus?.playwright_launchable ? '验证成功' : '不可用'} />
           <Metric label="账号数" value={String(browserStatus?.account_count ?? '-')} />
           <Metric label="运行任务" value={String(browserStatus?.active_cookie_tasks ?? '-')} />
-          <Metric label="浏览器路径" value={browserStatus?.browser_path || '使用默认路径'} compact />
+          <Metric label="浏览器内核" value={browserStatus?.browser_path || '未识别'} compact />
+          {browserStatus?.playwright_error && <Metric label="启动原因" value={browserStatus.playwright_error} compact />}
         </div>
       </section>
 

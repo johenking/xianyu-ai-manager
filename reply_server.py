@@ -6072,7 +6072,7 @@ def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_
     browser_info = {
         "playwright_importable": False,
         "playwright_launchable": False,
-        "browser_path": os.getenv('PLAYWRIGHT_BROWSERS_PATH', ''),
+        "browser_path": "",
         "active_cookie_tasks": 0,
         "account_count": len(db_manager.get_all_cookies(current_user['user_id'])),
     }
@@ -6081,12 +6081,13 @@ def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_
         browser_info["playwright_importable"] = True
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright_runtime:
-            browser_info["browser_path"] = playwright_runtime.chromium.executable_path
+            browser_info["browser_path"] = Path(playwright_runtime.chromium.executable_path).name
             browser = playwright_runtime.chromium.launch(headless=True)
             browser.close()
             browser_info["playwright_launchable"] = True
     except Exception as e:
-        browser_info["playwright_error"] = str(e)
+        first_line = str(e).splitlines()[0].strip() if str(e) else type(e).__name__
+        browser_info["playwright_error"] = first_line[:180]
 
     if cookie_manager.manager is not None:
         browser_info["active_cookie_tasks"] = len(cookie_manager.manager.tasks)
