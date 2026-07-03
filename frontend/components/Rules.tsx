@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ShippingRule, ReplyRule, AccountDetail } from '../types';
 import { getShippingRules, getReplyRules, updateShippingRule, deleteShippingRule, updateReplyRule, deleteReplyRule, getAccountDetails } from '../services/api';
 import { Zap, MessageCircle, Plus, Trash2, Edit, Save, X, AlertCircle, RefreshCw, Package } from 'lucide-react';
+import { InlineNotice } from './ui/StatusControls';
 
 const Rules: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'shipping' | 'reply'>('shipping');
@@ -11,6 +12,7 @@ const Rules: React.FC = () => {
   const [cards, setCards] = useState<any[]>([]); // 需要从卡密API获取
   const [loading, setLoading] = useState(false);
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // 弹窗状态
   const [showShippingModal, setShowShippingModal] = useState(false);
@@ -34,6 +36,8 @@ const Rules: React.FC = () => {
               const data = await getReplyRules(selectedAccountId);
               setReplyRules(data);
           }
+      } catch (error) {
+          setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '规则加载失败' });
       } finally {
           setLoading(false);
       }
@@ -55,26 +59,52 @@ const Rules: React.FC = () => {
 
   // Handlers
   const handleToggleShipping = async (rule: ShippingRule) => {
-      await updateShippingRule({ ...rule, enabled: !rule.enabled });
-      refresh();
+      try {
+        await updateShippingRule({ ...rule, enabled: !rule.enabled });
+        await refresh();
+        setPageNotice({ tone: 'success', text: `发货规则已${rule.enabled ? '停用' : '启用'}` });
+      } catch (error) {
+        setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '状态更新失败' });
+      }
   };
   const handleDeleteShipping = async (id: string) => {
       if(confirm('确定删除该发货规则吗？')) {
-          await deleteShippingRule(id);
-          refresh();
+          try {
+            await deleteShippingRule(id);
+            await refresh();
+            setPageNotice({ tone: 'success', text: '发货规则已删除' });
+          } catch (error) {
+            setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '删除失败' });
+          }
       }
   };
 
   const handleToggleReply = async (rule: ReplyRule) => {
-      if (!selectedAccountId) return alert('请先选择账号');
-      await updateReplyRule({ ...rule, enabled: !rule.enabled }, selectedAccountId);
-      refresh();
+      if (!selectedAccountId) {
+        setPageNotice({ tone: 'error', text: '请先选择账号' });
+        return;
+      }
+      try {
+        await updateReplyRule({ ...rule, enabled: !rule.enabled }, selectedAccountId);
+        await refresh();
+        setPageNotice({ tone: 'success', text: `回复规则已${rule.enabled ? '停用' : '启用'}` });
+      } catch (error) {
+        setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '状态更新失败' });
+      }
   };
   const handleDeleteReply = async (id: string) => {
-       if (!selectedAccountId) return alert('请先选择账号');
+       if (!selectedAccountId) {
+         setPageNotice({ tone: 'error', text: '请先选择账号' });
+         return;
+       }
        if(confirm('确定删除该回复规则吗？')) {
-          await deleteReplyRule(id, selectedAccountId);
-          refresh();
+          try {
+            await deleteReplyRule(id, selectedAccountId);
+            await refresh();
+            setPageNotice({ tone: 'success', text: '回复规则已删除' });
+          } catch (error) {
+            setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '删除失败' });
+          }
       }
   };
 
@@ -101,16 +131,20 @@ const Rules: React.FC = () => {
     try {
       await updateShippingRule(editingShippingRule);
       setShowShippingModal(false);
-      refresh();
+      await refresh();
+      setPageNotice({ tone: 'success', text: '发货规则已保存' });
     } catch (error) {
       console.error('保存发货规则失败:', error);
-      alert('保存失败，请重试');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '保存失败，请重试' });
     }
   };
 
   // 关键词回复增删改
   const handleAddReplyRule = () => {
-    if (!selectedAccountId) return alert('请先选择账号');
+    if (!selectedAccountId) {
+      setPageNotice({ tone: 'error', text: '请先选择账号' });
+      return;
+    }
     setEditingReplyRule({
       keyword: '',
       reply_content: '',
@@ -130,15 +164,17 @@ const Rules: React.FC = () => {
     try {
       await updateReplyRule(editingReplyRule, selectedAccountId);
       setShowReplyModal(false);
-      refresh();
+      await refresh();
+      setPageNotice({ tone: 'success', text: '回复规则已保存' });
     } catch (error) {
       console.error('保存回复规则失败:', error);
-      alert('保存失败，请重试');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '保存失败，请重试' });
     }
   };
 
   return (
     <div className="space-y-6 animate-fade-in pb-20">
+      {pageNotice && <div className="fixed right-4 top-4 z-[120] w-[calc(100%-2rem)] max-w-sm"><InlineNotice tone={pageNotice.tone}>{pageNotice.text}</InlineNotice></div>}
       <div className="flex justify-between items-center">
         <div>
           <h2 className="text-3xl font-extrabold text-gray-900">智能策略</h2>

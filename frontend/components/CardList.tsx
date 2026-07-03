@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { Card } from '../types';
 import { getCards, createCard, updateCard, deleteCard } from '../services/api';
 import { Plus, CreditCard, Clock, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Eye, EyeOff, Package } from 'lucide-react';
-import { ToggleControl } from './ui/StatusControls';
+import { InlineNotice, ToggleControl } from './ui/StatusControls';
 
 const CardList: React.FC = () => {
   const [cards, setCards] = useState<Card[]>([]);
@@ -19,6 +19,7 @@ const CardList: React.FC = () => {
     enabled: true,
     delay_seconds: 0
   });
+  const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   useEffect(() => {
     getCards().then(setCards);
@@ -68,11 +69,11 @@ const CardList: React.FC = () => {
 
     // 验证必填字段
     if (!editForm.name?.trim()) {
-      alert('请输入卡密名称');
+      setPageNotice({ tone: 'error', text: '请输入卡密名称' });
       return;
     }
     if (!editForm.type) {
-      alert('请选择卡密类型');
+      setPageNotice({ tone: 'error', text: '请选择卡密类型' });
       return;
     }
 
@@ -107,10 +108,11 @@ const CardList: React.FC = () => {
 
       await updateCard(selectedCard.id, updateData);
       setShowEditModal(false);
-      getCards().then(setCards);
+      setCards(await getCards());
+      setPageNotice({ tone: 'success', text: '卡密修改已保存' });
     } catch (error) {
       console.error('更新卡密失败:', error);
-      alert('更新失败，请重试');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '更新失败，请重试' });
     }
   };
 
@@ -118,10 +120,11 @@ const CardList: React.FC = () => {
     if (confirm('确认删除该卡密吗？')) {
       try {
         await deleteCard(id);
-        getCards().then(setCards);
+        setCards(await getCards());
+        setPageNotice({ tone: 'success', text: '卡密已删除' });
       } catch (error) {
         console.error('删除卡密失败:', error);
-        alert('删除失败，请重试');
+        setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '删除失败，请重试' });
       }
     }
   };
@@ -138,24 +141,28 @@ const CardList: React.FC = () => {
         enabled: true,
         delay_seconds: 0
       });
-      getCards().then(setCards);
+      setCards(await getCards());
+      setPageNotice({ tone: 'success', text: '卡密已添加' });
     } catch (error) {
       console.error('添加卡密失败:', error);
-      alert('添加失败，请重试');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '添加失败，请重试' });
     }
   };
 
   const toggleCardStatus = async (card: Card) => {
     try {
       await updateCard(card.id, { ...card, enabled: !card.enabled });
-      getCards().then(setCards);
+      setCards(await getCards());
+      setPageNotice({ tone: 'success', text: `卡密已${card.enabled ? '停用' : '启用'}` });
     } catch (error) {
       console.error('切换状态失败:', error);
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '状态更新失败' });
     }
   };
 
   return (
     <div className="space-y-6 animate-fade-in">
+      {pageNotice && <div className="fixed right-4 top-4 z-[120] w-[calc(100%-2rem)] max-w-sm"><InlineNotice tone={pageNotice.tone}>{pageNotice.text}</InlineNotice></div>}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h2 className="text-2xl sm:text-3xl font-bold text-gray-900">卡密库存</h2>

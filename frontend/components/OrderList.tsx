@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item } from '../types';
 import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems } from '../services/api';
 import { Search, MoreHorizontal, Truck, RefreshCw, Copy, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, Phone, MapPin, Upload, ExternalLink, Trash2 } from 'lucide-react';
+import { InlineNotice } from './ui/StatusControls';
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   const styles = {
@@ -65,6 +66,7 @@ const OrderList: React.FC = () => {
   });
   const [syncingOrderId, setSyncingOrderId] = useState<string | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
+  const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   // 搜索过滤订单
   const filterOrders = (ordersToFilter: Order[]): Order[] => {
@@ -113,6 +115,7 @@ const OrderList: React.FC = () => {
           }
       } catch (e) {
           console.error('加载订单失败:', e);
+          setPageNotice({ tone: 'error', text: e instanceof Error ? e.message : '订单加载失败' });
       } finally {
           setLoading(false);
       }
@@ -179,8 +182,16 @@ const OrderList: React.FC = () => {
 
   const handleSync = async () => {
       setLoading(true);
-      await syncOrders();
-      loadOrders();
+      setPageNotice({ tone: 'info', text: '正在同步订单' });
+      try {
+        await syncOrders();
+        await loadOrders();
+        setPageNotice({ tone: 'success', text: '订单同步完成' });
+      } catch (error) {
+        setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '订单同步失败' });
+      } finally {
+        setLoading(false);
+      }
   };
 
   const handleShip = (id: string) => {
@@ -252,10 +263,11 @@ const OrderList: React.FC = () => {
       await updateOrder(editingOrder.order_id, updateData);
       setShowEditModal(false);
       setEditingOrder(null);
-      loadOrders();
+      await loadOrders();
+      setPageNotice({ tone: 'success', text: '订单修改已保存' });
     } catch (error) {
       console.error('更新订单失败:', error);
-      alert('更新失败，请重试');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '更新失败，请重试' });
     }
   };
 
@@ -265,10 +277,10 @@ const OrderList: React.FC = () => {
       await importOrders(Array.isArray(orders) ? orders : [orders]);
       setShowImportModal(false);
       setImportText('');
-      loadOrders();
-      alert('订单导入成功');
+      await loadOrders();
+      setPageNotice({ tone: 'success', text: '订单导入成功' });
     } catch (error) {
-      alert('导入失败，请检查JSON格式');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? `导入失败：${error.message}` : '导入失败，请检查 JSON 格式' });
     }
   };
 
@@ -278,12 +290,13 @@ const OrderList: React.FC = () => {
       const result = await syncSingleOrder(orderId);
       if (result.success) {
         await loadOrders();
+        setPageNotice({ tone: 'success', text: result.message || '订单同步完成' });
       } else {
-        alert(result.message || '同步失败');
+        setPageNotice({ tone: 'error', text: result.message || '同步失败' });
       }
     } catch (error: any) {
       console.error('同步订单失败:', error);
-      alert(error?.message || '同步失败，请重试');
+      setPageNotice({ tone: 'error', text: error?.message || '同步失败，请重试' });
     } finally {
       setSyncingOrderId(null);
     }
@@ -295,9 +308,10 @@ const OrderList: React.FC = () => {
     try {
       await deleteOrder(orderId);
       setAllOrders(prev => prev.filter(o => o.order_id !== orderId));
+      setPageNotice({ tone: 'success', text: '订单已删除' });
     } catch (error: any) {
       console.error('删除订单失败:', error);
-      alert(error?.message || '删除失败，请重试');
+      setPageNotice({ tone: 'error', text: error?.message || '删除失败，请重试' });
       await loadOrders();
     } finally {
       setDeletingOrderId(null);
@@ -306,6 +320,7 @@ const OrderList: React.FC = () => {
 
   return (
     <div className="space-y-6 animate-fade-in">
+      {pageNotice && <div className="fixed right-4 top-4 z-[120] w-[calc(100%-2rem)] max-w-sm"><InlineNotice tone={pageNotice.tone}>{pageNotice.text}</InlineNotice></div>}
       <div className="flex flex-col md:flex-row justify-between md:items-end gap-4">
         <div>
           <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">订单中心</h2>

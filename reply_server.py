@@ -6017,6 +6017,24 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
     """获取技能中心运维健康信息"""
     db_path = Path(db_manager.db_path)
     logs = db_manager.list_skill_logs(current_user['user_id'], limit=10)
+    user_cookie_ids = set(db_manager.get_all_cookies(current_user['user_id']).keys())
+    manager_tasks = getattr(cookie_manager.manager, 'tasks', {}) or {}
+    listening_ids = {
+        str(cookie_id) for cookie_id, task in manager_tasks.items()
+        if str(cookie_id) in user_cookie_ids and not getattr(task, 'done', lambda: False)()
+    }
+    account_ai_settings = [db_manager.get_ai_reply_settings(cookie_id) for cookie_id in user_cookie_ids]
+    ai_enabled_count = sum(1 for settings in account_ai_settings if settings.get('ai_enabled'))
+    ai_ready_count = sum(
+        1 for settings in account_ai_settings
+        if settings.get('ai_enabled') and settings.get('api_key') and settings.get('base_url') and settings.get('model_name')
+    )
+    raw_system_settings = db_manager.get_all_system_settings()
+    global_ai_configured = bool(
+        raw_system_settings.get('ai_api_url')
+        and raw_system_settings.get('ai_model')
+        and raw_system_settings.get('ai_api_key')
+    )
     return {
         "success": True,
         "data": {
@@ -6026,7 +6044,18 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
                 "exists": db_path.exists(),
                 "writable": os.access(db_path.parent if db_path.parent else Path('.'), os.W_OK),
             },
-            "cookie_manager": "ok" if cookie_manager.manager is not None else "not_ready",
+            "cookie_manager": "ready" if cookie_manager.manager is not None else "not_ready",
+            "accounts": {
+                "total": len(user_cookie_ids),
+                "listening": len(listening_ids),
+                "listener_state": "running" if listening_ids else "stopped",
+            },
+            "ai": {
+                "global_configured": global_ai_configured,
+                "enabled_accounts": ai_enabled_count,
+                "ready_accounts": ai_ready_count,
+                "model": raw_system_settings.get('ai_model') or '',
+            },
             "skills": {
                 "monitor_tasks": len(db_manager.list_skill_monitor_tasks(current_user['user_id'])),
                 "monitor_results": len(db_manager.list_skill_monitor_results(current_user['user_id'], limit=500)),
@@ -6042,6 +6071,7 @@ def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_
     """获取Playwright/浏览器运行状态"""
     browser_info = {
         "playwright_importable": False,
+        "playwright_launchable": False,
         "browser_path": os.getenv('PLAYWRIGHT_BROWSERS_PATH', ''),
         "active_cookie_tasks": 0,
         "account_count": len(db_manager.get_all_cookies(current_user['user_id'])),
@@ -6049,6 +6079,12 @@ def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_
     try:
         import playwright  # noqa: F401
         browser_info["playwright_importable"] = True
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright_runtime:
+            browser_info["browser_path"] = playwright_runtime.chromium.executable_path
+            browser = playwright_runtime.chromium.launch(headless=True)
+            browser.close()
+            browser_info["playwright_launchable"] = True
     except Exception as e:
         browser_info["playwright_error"] = str(e)
 

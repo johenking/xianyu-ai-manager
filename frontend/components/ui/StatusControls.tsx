@@ -23,6 +23,8 @@ export const ToggleControl: React.FC<{
 export const StatusBadge: React.FC<{ state: string; label: string }> = ({ state, label }) => {
   const style = state === 'ready' || state === 'saved'
     ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+    : state === 'checking'
+      ? 'bg-blue-50 text-blue-700 border-blue-200'
     : state === 'dirty' || state === 'warning'
       ? 'bg-amber-50 text-amber-700 border-amber-200'
       : state === 'error' || state === 'missing'

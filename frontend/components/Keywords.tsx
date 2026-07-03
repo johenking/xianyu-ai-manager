@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom';
 import { AccountDetail, ShippingRule, ReplyRule, DefaultReply } from '../types';
 import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
-import { ToggleControl } from './ui/StatusControls';
+import { InlineNotice, ToggleControl } from './ui/StatusControls';
 
 type TabType = 'reply' | 'delivery' | 'default';
 
@@ -69,6 +69,7 @@ const Keywords: React.FC = () => {
   });
 
   const [loading, setLoading] = useState(false);
+  const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
 
   useEffect(() => {
     getAccountDetails().then((data) => {
@@ -196,11 +197,11 @@ const Keywords: React.FC = () => {
 
   const handleSave = async () => {
     if (!selectedAccount) {
-      alert('请先选择账号');
+      setPageNotice({ tone: 'error', text: '请先选择账号' });
       return;
     }
     if (!replyForm.keyword.trim() || !replyForm.reply_content.trim()) {
-      alert('请填写关键词和回复内容');
+      setPageNotice({ tone: 'error', text: '请填写关键词和回复内容' });
       return;
     }
 
@@ -216,20 +217,20 @@ const Keywords: React.FC = () => {
         selectedAccount
       );
       setShowReplyModal(false);
-      loadKeywords();
-      alert('保存成功！');
+      await loadKeywords();
+      setPageNotice({ tone: 'success', text: '关键词回复已保存' });
     } catch (e) {
-      alert('保存失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `保存失败：${(e as Error).message}` });
     }
   };
 
   const handleSaveDelivery = async () => {
     if (!deliveryForm.keyword.trim()) {
-      alert('请填写触发关键词');
+      setPageNotice({ tone: 'error', text: '请填写触发关键词' });
       return;
     }
     if (!deliveryForm.card_id) {
-      alert('请选择卡券');
+      setPageNotice({ tone: 'error', text: '请选择卡券' });
       return;
     }
 
@@ -243,10 +244,10 @@ const Keywords: React.FC = () => {
         enabled: deliveryForm.enabled
       });
       setShowDeliveryModal(false);
-      loadShippingRules();
-      alert('保存成功！');
+      await loadShippingRules();
+      setPageNotice({ tone: 'success', text: '关键词发货规则已保存' });
     } catch (e) {
-      alert('保存失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `保存失败：${(e as Error).message}` });
     }
   };
 
@@ -254,10 +255,10 @@ const Keywords: React.FC = () => {
     if (!selectedAccount || !confirm('确认删除该关键词吗？')) return;
     try {
       await deleteReplyRule(id, selectedAccount);
-      loadKeywords();
-      alert('删除成功！');
+      await loadKeywords();
+      setPageNotice({ tone: 'success', text: '关键词回复已删除' });
     } catch (e) {
-      alert('删除失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `删除失败：${(e as Error).message}` });
     }
   };
 
@@ -265,10 +266,10 @@ const Keywords: React.FC = () => {
     if (!confirm('确认删除该发货规则吗？')) return;
     try {
       await deleteShippingRule(id);
-      loadShippingRules();
-      alert('删除成功！');
+      await loadShippingRules();
+      setPageNotice({ tone: 'success', text: '关键词发货规则已删除' });
     } catch (e) {
-      alert('删除失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `删除失败：${(e as Error).message}` });
     }
   };
 
@@ -282,15 +283,16 @@ const Keywords: React.FC = () => {
         priority: rule.priority,
         enabled: !rule.enabled
       });
-      loadShippingRules();
+      await loadShippingRules();
+      setPageNotice({ tone: 'success', text: `规则已${rule.enabled ? '停用' : '启用'}` });
     } catch (e) {
-      alert('操作失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `操作失败：${(e as Error).message}` });
     }
   };
 
   const handleSaveDefault = async () => {
     if (!defaultForm.cookie_id) {
-      alert('请先选择账号');
+      setPageNotice({ tone: 'error', text: '请先选择账号' });
       return;
     }
 
@@ -302,10 +304,10 @@ const Keywords: React.FC = () => {
         reply_image_url: defaultForm.reply_image_url
       });
       setShowDefaultModal(false);
-      loadDefaultReplies();
-      alert('保存成功！');
+      await loadDefaultReplies();
+      setPageNotice({ tone: 'success', text: '账号默认回复已保存' });
     } catch (e) {
-      alert('保存失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `保存失败：${(e as Error).message}` });
     }
   };
 
@@ -313,10 +315,10 @@ const Keywords: React.FC = () => {
     if (!confirm('确认删除该默认回复吗？')) return;
     try {
       await deleteDefaultReply(cookieId);
-      loadDefaultReplies();
-      alert('删除成功！');
+      await loadDefaultReplies();
+      setPageNotice({ tone: 'success', text: '账号默认回复已删除' });
     } catch (e) {
-      alert('删除失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `删除失败：${(e as Error).message}` });
     }
   };
 
@@ -324,14 +326,15 @@ const Keywords: React.FC = () => {
     if (!confirm('确认清空该账号的回复记录吗？清空后可以重新对所有对话使用默认回复。')) return;
     try {
       await clearDefaultReplyRecords(cookieId);
-      alert('清空成功！');
+      setPageNotice({ tone: 'success', text: '默认回复记录已清空' });
     } catch (e) {
-      alert('清空失败：' + (e as Error).message);
+      setPageNotice({ tone: 'error', text: `清空失败：${(e as Error).message}` });
     }
   };
 
   return (
     <div className="space-y-8 animate-fade-in">
+      {pageNotice && <div className="fixed right-4 top-4 z-[120] w-[calc(100%-2rem)] max-w-sm"><InlineNotice tone={pageNotice.tone}>{pageNotice.text}</InlineNotice></div>}
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div>

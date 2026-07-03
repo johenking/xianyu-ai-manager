@@ -351,6 +351,17 @@ export interface SkillOpsHealth {
     writable: boolean;
   };
   cookie_manager: string;
+  accounts: {
+    total: number;
+    listening: number;
+    listener_state: 'running' | 'stopped';
+  };
+  ai: {
+    global_configured: boolean;
+    enabled_accounts: number;
+    ready_accounts: number;
+    model: string;
+  };
   skills: {
     monitor_tasks: number;
     monitor_results: number;
@@ -367,6 +378,7 @@ export interface SkillOpsHealth {
 
 export interface SkillBrowserStatus {
   playwright_importable: boolean;
+  playwright_launchable: boolean;
   browser_path?: string;
   active_cookie_tasks: number;
   account_count: number;

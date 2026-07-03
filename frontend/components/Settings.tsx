@@ -30,6 +30,7 @@ const Settings: React.FC = () => {
   const [secretActions, setSecretActions] = useState<Record<string, 'keep' | 'set' | 'clear'>>({});
   const [saving, setSaving] = useState<SettingsSectionKey | null>(null);
   const [verifying, setVerifying] = useState<SettingsSectionKey | null>(null);
+  const [verificationState, setVerificationState] = useState<Partial<Record<SettingsSectionKey, { state: string; label: string }>>>({});
   const [notice, setNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [showSecret, setShowSecret] = useState<Record<string, boolean>>({});
 
@@ -41,6 +42,7 @@ const Settings: React.FC = () => {
       setSaved(next.settings);
       setDraft({ ...next.settings, ai_api_key: '', smtp_password: '' });
       setSecretActions({ ai_api_key: 'keep', smtp_password: 'keep' });
+      setVerificationState({});
       setOpenSection(getInitialOpenSection(next.sections));
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '配置加载失败' });
@@ -55,7 +57,11 @@ const Settings: React.FC = () => {
     smtp: isSectionDirty(pickSection(saved, 'smtp'), pickSection(draft, 'smtp'), { smtp_password: secretActions.smtp_password || 'keep' }),
   }), [saved, draft, secretActions]);
 
-  const update = (key: string, value: unknown) => setDraft((current) => ({ ...current, [key]: value }));
+  const update = (key: string, value: unknown) => {
+    setDraft((current) => ({ ...current, [key]: value }));
+    const section = (Object.keys(sectionFields) as SettingsSectionKey[]).find((candidate) => sectionFields[candidate].includes(key));
+    if (section) setVerificationState((current) => ({ ...current, [section]: undefined }));
+  };
 
   const save = async (section: SettingsSectionKey) => {
     setSaving(section);
@@ -69,6 +75,7 @@ const Settings: React.FC = () => {
       setSaved(result.settings);
       setDraft({ ...result.settings, ai_api_key: '', smtp_password: '' });
       setSecretActions({ ai_api_key: 'keep', smtp_password: 'keep' });
+      setVerificationState((current) => ({ ...current, [section]: undefined }));
       setNotice({ tone: 'success', text: `${sectionMeta[section].title}已保存并确认（${result.saved_at.replace('T', ' ')}）` });
       setOpenSection(null);
     } catch (error) {
@@ -80,12 +87,15 @@ const Settings: React.FC = () => {
 
   const verify = async (section: 'ai' | 'smtp') => {
     setVerifying(section);
+    setVerificationState((current) => ({ ...current, [section]: { state: 'checking', label: '验证中' } }));
     setNotice(null);
     try {
       const actions = section === 'ai' ? { ai_api_key: secretActions.ai_api_key || 'keep' } : { smtp_password: secretActions.smtp_password || 'keep' };
       const result = await verifySettingsSection(section, pickSection(draft, section) as Partial<SystemSettings>, actions);
+      setVerificationState((current) => ({ ...current, [section]: { state: 'ready', label: '可用' } }));
       setNotice({ tone: 'success', text: result.message });
     } catch (error) {
+      setVerificationState((current) => ({ ...current, [section]: { state: 'error', label: '不可用' } }));
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '验证失败' });
     } finally {
       setVerifying(null);
@@ -107,7 +117,9 @@ const Settings: React.FC = () => {
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
         {(Object.keys(sectionMeta) as SettingsSectionKey[]).map((section) => {
           const meta = sectionMeta[section]; const Icon = meta.icon; const isOpen = openSection === section;
-          const state = dirty[section] ? { state: 'dirty', label: '未保存' } : summary.sections[section];
+          const state = dirty[section]
+            ? { state: 'dirty', label: '未保存' }
+            : verificationState[section] || summary.sections[section];
           return <button key={section} aria-expanded={isOpen} onClick={() => setOpenSection(isOpen ? null : section)} className={`flex min-h-20 items-center gap-3 rounded-full border px-4 py-3 text-left transition ${isOpen ? 'border-yellow-400 bg-yellow-50 shadow-sm' : 'border-gray-200 bg-white hover:border-gray-300'}`}>
             <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gray-900 text-[#FFE815]"><Icon className="h-5 w-5" /></span>
             <span className="min-w-0 flex-1"><span className="block font-extrabold text-gray-900">{meta.title}</span><span className="block truncate text-xs text-gray-500">{meta.detail}</span></span>
@@ -119,7 +131,7 @@ const Settings: React.FC = () => {
       {notice && <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice>}
 
       {openSection && <section className="rounded-lg bg-white p-5 shadow-sm ring-1 ring-gray-200 sm:p-7">
-        <div className="mb-6 flex items-center justify-between"><div><h3 className="text-lg font-extrabold text-gray-900">{sectionMeta[openSection].title}</h3><p className="mt-1 text-sm text-gray-500">{dirty[openSection] ? '有尚未保存的修改' : '当前内容与数据库一致'}</p></div><StatusBadge state={dirty[openSection] ? 'dirty' : summary.sections[openSection].state} label={dirty[openSection] ? '未保存' : summary.sections[openSection].label} /></div>
+        <div className="mb-6 flex items-center justify-between"><div><h3 className="text-lg font-extrabold text-gray-900">{sectionMeta[openSection].title}</h3><p className="mt-1 text-sm text-gray-500">{dirty[openSection] ? '有尚未保存的修改' : '当前内容与数据库一致'}</p></div><StatusBadge state={dirty[openSection] ? 'dirty' : (verificationState[openSection]?.state || summary.sections[openSection].state)} label={dirty[openSection] ? '未保存' : (verificationState[openSection]?.label || summary.sections[openSection].label)} /></div>
 
         {openSection === 'basic' && <div className="space-y-4">
           <ToggleRow label="允许用户注册" detail="允许新用户创建后台账号" checked={Boolean(draft.registration_enabled)} onChange={(v) => update('registration_enabled', v)} />

@@ -548,6 +548,10 @@ const SkillCenter: React.FC = () => {
           <Metric label="数据库" value={opsHealth?.database.exists ? '已连接' : '不可用'} />
           <Metric label="数据库写入" value={opsHealth?.database.writable ? '可用' : '不可用'} />
           <Metric label="账号监听管理器" value={opsHealth?.cookie_manager === 'ready' ? '已就绪' : opsHealth?.cookie_manager || '未知'} />
+          <Metric label="账号监听" value={opsHealth ? `${opsHealth.accounts.listening}/${opsHealth.accounts.total} 运行中` : '未知'} />
+          <Metric label="AI 全局配置" value={opsHealth?.ai.global_configured ? '已配置' : '未配置'} />
+          <Metric label="AI 可用账号" value={opsHealth ? `${opsHealth.ai.ready_accounts}/${opsHealth.accounts.total}` : '未知'} />
+          <Metric label="AI 模型" value={opsHealth?.ai.model || '未配置'} compact />
         </div>
       </section>
 
@@ -557,7 +561,8 @@ const SkillCenter: React.FC = () => {
           <h3 className="text-lg font-extrabold text-gray-900">浏览器状态</h3>
         </div>
         <div className="space-y-3 text-sm">
-          <Metric label="Playwright" value={browserStatus?.playwright_importable ? '可启动' : '不可用'} />
+          <Metric label="Playwright 驱动" value={browserStatus?.playwright_importable ? '已安装' : '不可用'} />
+          <Metric label="浏览器启动" value={browserStatus?.playwright_launchable ? '验证成功' : '不可用'} />
           <Metric label="账号数" value={String(browserStatus?.account_count ?? '-')} />
           <Metric label="运行任务" value={String(browserStatus?.active_cookie_tasks ?? '-')} />
           <Metric label="浏览器路径" value={browserStatus?.browser_path || '使用默认路径'} compact />
