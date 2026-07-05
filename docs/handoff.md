@@ -2,7 +2,7 @@
 
 ## Current State On 2026-07-05
 
-The application runs locally at `http://127.0.0.1:8091`. The public source repository is `johenking/xianyu-ai-manager`. Passwords, Cookies, API keys, deployment tokens, and live database contents are intentionally absent from documentation and source control.
+When started locally, the application serves at `http://127.0.0.1:8091`. The public source repository is `johenking/xianyu-ai-manager`. Passwords, Cookies, API keys, deployment tokens, and live database contents are intentionally absent from documentation and source control.
 
 ## Working Capabilities
 

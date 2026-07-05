@@ -1,4 +1,4 @@
-# xianyu-super-butler Deployment Notes
+# Xianyu AI Manager Deployment Notes
 
 ## Local Login
 
@@ -81,14 +81,14 @@ When deploying with `huggingface_hub`, upload source and built assets only. Excl
 The Docker image is prepared, but the current machine needs more free disk space before building. Use this after disk space is available:
 
 ```bash
-docker build -t xianyu-super-butler .
+docker build -t xianyu-ai-manager .
 docker run --rm -p 8091:8080 \
   -e PORT=8080 \
   -e API_HOST=0.0.0.0 \
   -e ADMIN_PASSWORD='change-me' \
   -v "$PWD/data:/app/data" \
   -v "$PWD/logs:/app/logs" \
-  xianyu-super-butler
+  xianyu-ai-manager
 ```
 
 Then open `http://localhost:8091`.

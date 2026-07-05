@@ -1,4 +1,4 @@
-# xianyu-super-butler frontend
+# Xianyu AI Manager frontend
 
 React/Vite frontend for the FastAPI backend in the repository root.
 
