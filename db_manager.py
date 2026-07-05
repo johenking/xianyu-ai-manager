@@ -9,6 +9,7 @@ import string
 import aiohttp
 import io
 import base64
+from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
@@ -126,6 +127,7 @@ class DBManager:
                 id TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
+                xianyu_unb TEXT,
                 auto_confirm INTEGER DEFAULT 1,
                 remark TEXT DEFAULT '',
                 pause_duration INTEGER DEFAULT 10,
@@ -407,6 +409,43 @@ class DBManager:
             )
             ''')
 
+            cursor.execute("PRAGMA table_info(orders)")
+            order_columns = {row[1] for row in cursor.fetchall()}
+            order_sync_columns = {
+                'platform_status_code': "TEXT DEFAULT ''",
+                'platform_status_text': "TEXT DEFAULT ''",
+                'status_source': "TEXT DEFAULT ''",
+                'status_synced_at': "TIMESTAMP",
+                'last_sync_error': "TEXT DEFAULT ''",
+            }
+            for column_name, column_sql in order_sync_columns.items():
+                if column_name not in order_columns:
+                    cursor.execute(f"ALTER TABLE orders ADD COLUMN {column_name} {column_sql}")
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS order_status_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                order_id TEXT DEFAULT '',
+                item_id TEXT DEFAULT '',
+                buyer_id TEXT DEFAULT '',
+                chat_id TEXT DEFAULT '',
+                normalized_status TEXT NOT NULL,
+                raw_status TEXT DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'system_message',
+                occurred_at REAL NOT NULL,
+                match_state TEXT NOT NULL DEFAULT 'pending',
+                matched_order_id TEXT DEFAULT '',
+                matched_at REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_order_status_events_pending
+            ON order_status_events(cookie_id, match_state, occurred_at)
+            ''')
+
             # 检查并添加 is_bargain 列（用于标记小刀订单）
             try:
                 self._execute_sql(cursor, "SELECT is_bargain FROM orders LIMIT 1")
@@ -649,6 +688,23 @@ class DBManager:
             )
             ''')
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_session_refresh_status (
+                cookie_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'idle',
+                trigger TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                verification_image_path TEXT NOT NULL DEFAULT '',
+                started_at REAL,
+                last_attempt_at REAL,
+                last_success_at REAL,
+                expires_at REAL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
@@ -676,6 +732,7 @@ class DBManager:
             self._migrate_database(cursor)
 
             self.conn.commit()
+            self.backfill_cookie_identities()
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
@@ -711,6 +768,17 @@ class DBManager:
                 logger.info("添加cookies表的pause_duration列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN pause_duration INTEGER DEFAULT 10")
                 logger.info("数据库迁移完成：添加pause_duration列")
+
+            if 'xianyu_unb' not in cookie_columns:
+                logger.info("添加cookies表的xianyu_unb列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN xianyu_unb TEXT")
+                logger.info("数据库迁移完成：添加xianyu_unb列")
+
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_user_unb
+                ON cookies(user_id, xianyu_unb)
+                WHERE xianyu_unb IS NOT NULL AND xianyu_unb <> ''
+            ''')
 
             # 确保商品同步配置存在
             cursor.execute("SELECT key FROM system_settings WHERE key IN ('item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages')")
@@ -1541,6 +1609,66 @@ class DBManager:
                 return False
 
     # -------------------- Cookie操作 --------------------
+    @staticmethod
+    def _extract_cookie_unb(cookie_value: str) -> str:
+        if not cookie_value:
+            return ''
+        try:
+            parsed = SimpleCookie()
+            parsed.load(cookie_value)
+            if 'unb' in parsed:
+                return parsed['unb'].value.strip()
+        except Exception:
+            pass
+        for part in cookie_value.split(';'):
+            key, separator, value = part.strip().partition('=')
+            if separator and key == 'unb':
+                return value.strip()
+        return ''
+
+    def backfill_cookie_identities(self) -> int:
+        updated = 0
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(cursor, "SELECT id, value, user_id FROM cookies WHERE xianyu_unb IS NULL OR xianyu_unb = ''")
+            for cookie_id, cookie_value, user_id in cursor.fetchall():
+                unb = self._extract_cookie_unb(cookie_value)
+                if not unb:
+                    continue
+                self._execute_sql(
+                    cursor,
+                    "SELECT id FROM cookies WHERE user_id = ? AND xianyu_unb = ? AND id <> ?",
+                    (user_id, unb, cookie_id),
+                )
+                if cursor.fetchone():
+                    continue
+                self._execute_sql(cursor, "UPDATE cookies SET xianyu_unb = ? WHERE id = ?", (unb, cookie_id))
+                updated += cursor.rowcount
+            self.conn.commit()
+        return updated
+
+    def find_cookie_id_by_unb(self, user_id: int, unb: str) -> Optional[str]:
+        if not unb:
+            return None
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(
+                cursor,
+                "SELECT id FROM cookies WHERE user_id = ? AND xianyu_unb = ? LIMIT 1",
+                (user_id, unb),
+            )
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+
+            self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
+            for cookie_id, cookie_value in cursor.fetchall():
+                if self._extract_cookie_unb(cookie_value) == unb:
+                    self._execute_sql(cursor, "UPDATE cookies SET xianyu_unb = ? WHERE id = ?", (unb, cookie_id))
+                    self.conn.commit()
+                    return cookie_id
+        return None
+
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
         """保存Cookie到数据库，如存在则更新"""
         with self.lock:
@@ -1559,10 +1687,14 @@ class DBManager:
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
 
-                self._execute_sql(cursor,
-                    "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                    (cookie_id, cookie_value, user_id)
-                )
+                xianyu_unb = self._extract_cookie_unb(cookie_value)
+                self._execute_sql(cursor, '''
+                    INSERT INTO cookies (id, value, user_id, xianyu_unb)
+                    VALUES (?, ?, ?, NULLIF(?, ''))
+                    ON CONFLICT(id) DO UPDATE SET
+                        value = excluded.value,
+                        xianyu_unb = COALESCE(NULLIF(excluded.xianyu_unb, ''), cookies.xianyu_unb)
+                ''', (cookie_id, cookie_value, user_id, xianyu_unb))
 
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
@@ -1657,7 +1789,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at, xianyu_unb FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
                     return {
@@ -1670,12 +1802,93 @@ class DBManager:
                         'username': result[6] or '',
                         'password': result[7] or '',
                         'show_browser': bool(result[8]) if result[8] is not None else False,
-                        'created_at': result[9]
+                        'created_at': result[9],
+                        'xianyu_unb': result[10] or '',
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    def update_account_session_refresh(
+        self,
+        cookie_id: str,
+        *,
+        state: str,
+        trigger: str = '',
+        message: str = '',
+        error_code: str = '',
+        verification_image_path: str = '',
+        expires_at: float = None,
+    ) -> bool:
+        allowed_states = {'idle', 'refreshing', 'verification_required', 'success', 'failed', 'timeout', 'cancelled'}
+        if state not in allowed_states:
+            raise ValueError(f"不支持的刷新状态: {state}")
+        now = time.time()
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT last_success_at, started_at FROM account_session_refresh_status WHERE cookie_id = ?", (cookie_id,))
+                existing = cursor.fetchone()
+                last_success_at = now if state == 'success' else (existing[0] if existing else None)
+                started_at = now if state == 'refreshing' else (existing[1] if existing else now)
+                image_path = verification_image_path if state == 'verification_required' else ''
+                self._execute_sql(cursor, '''
+                    INSERT INTO account_session_refresh_status (
+                        cookie_id, state, trigger, message, error_code,
+                        verification_image_path, started_at, last_attempt_at,
+                        last_success_at, expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cookie_id) DO UPDATE SET
+                        state = excluded.state,
+                        trigger = excluded.trigger,
+                        message = excluded.message,
+                        error_code = excluded.error_code,
+                        verification_image_path = excluded.verification_image_path,
+                        started_at = excluded.started_at,
+                        last_attempt_at = excluded.last_attempt_at,
+                        last_success_at = excluded.last_success_at,
+                        expires_at = excluded.expires_at,
+                        updated_at = excluded.updated_at
+                ''', (
+                    cookie_id, state, trigger, message[:240], error_code[:80], image_path,
+                    started_at, now, last_success_at, expires_at, now,
+                ))
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_account_session_refresh(self, cookie_id: str) -> Dict[str, Any]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            self._execute_sql(cursor, '''
+                SELECT state, trigger, message, error_code, verification_image_path,
+                       started_at, last_attempt_at, last_success_at, expires_at, updated_at
+                FROM account_session_refresh_status WHERE cookie_id = ?
+            ''', (cookie_id,))
+            row = cursor.fetchone()
+        if not row:
+            return {
+                'state': 'idle', 'trigger': '', 'message': '', 'error_code': '',
+                'verification_image_url': '', 'started_at': None, 'last_attempt_at': None,
+                'last_success_at': None, 'expires_at': None, 'updated_at': None,
+            }
+        image_path = (row[4] or '').replace('\\', '/')
+        image_url = f"/{image_path}" if image_path.startswith('static/uploads/images/') else ''
+        return {
+            'state': row[0],
+            'trigger': row[1],
+            'message': row[2],
+            'error_code': row[3],
+            'verification_image_url': image_url,
+            'started_at': row[5],
+            'last_attempt_at': row[6],
+            'last_success_at': row[7],
+            'expires_at': row[8],
+            'updated_at': row[9],
+        }
 
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
         """更新Cookie的自动确认发货设置"""
@@ -1768,6 +1981,12 @@ class DBManager:
                     insert_values = [cookie_id, cookie_value, user_id]
                     insert_placeholders = ['?', '?', '?']
 
+                    xianyu_unb = self._extract_cookie_unb(cookie_value)
+                    if xianyu_unb:
+                        insert_fields.append('xianyu_unb')
+                        insert_values.append(xianyu_unb)
+                        insert_placeholders.append('?')
+
                     if username is not None:
                         insert_fields.append('username')
                         insert_values.append(username)
@@ -1797,6 +2016,10 @@ class DBManager:
                     if cookie_value is not None:
                         update_fields.append("value = ?")
                         params.append(cookie_value)
+                        xianyu_unb = self._extract_cookie_unb(cookie_value)
+                        if xianyu_unb:
+                            update_fields.append("xianyu_unb = ?")
+                            params.append(xianyu_unb)
 
                     if username is not None:
                         update_fields.append("username = ?")
@@ -2601,6 +2824,49 @@ class DBManager:
                 result['global_rules' if row[2] == 'global' else 'item_rules'].append(value)
             return result
 
+    def get_ai_training_rule_context(self, cookie_id: str, item_id: str = '') -> Dict[str, Any]:
+        """返回规则装载清单，明确区分适用、其他商品和已停用规则。"""
+        normalized_item_id = str(item_id or '').strip()
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, item_id, scope, rule_text, enabled, created_at, updated_at
+            FROM ai_training_rules
+            WHERE cookie_id = ?
+            ORDER BY CASE scope WHEN 'global' THEN 0 ELSE 1 END, id ASC
+            ''', (cookie_id,))
+            applied_rules = []
+            excluded_rules = []
+            disabled_rules = []
+            for row in cursor.fetchall():
+                rule = {
+                    'id': row[0],
+                    'item_id': row[1],
+                    'scope': row[2],
+                    'text': row[3],
+                    'enabled': bool(row[4]),
+                    'created_at': row[5],
+                    'updated_at': row[6],
+                }
+                if not rule['enabled']:
+                    rule['reason'] = 'disabled'
+                    disabled_rules.append(rule)
+                elif rule['scope'] == 'global' or rule['item_id'] == normalized_item_id:
+                    rule['reason'] = 'applied'
+                    applied_rules.append(rule)
+                else:
+                    rule['reason'] = 'other_item'
+                    excluded_rules.append(rule)
+            return {
+                'applied_rules': applied_rules,
+                'excluded_rules': excluded_rules,
+                'disabled_rules': disabled_rules,
+                'applied_count': len(applied_rules),
+                'excluded_count': len(excluded_rules),
+                'disabled_count': len(disabled_rules),
+                'total_count': len(applied_rules) + len(excluded_rules) + len(disabled_rules),
+            }
+
     def delete_ai_training_rule(self, cookie_id: str, rule_id: int) -> bool:
         with self.lock:
             cursor = self.conn.cursor()
@@ -2683,6 +2949,71 @@ class DBManager:
             ''', (cookie_id, item_id, json.dumps(draft, ensure_ascii=False), source_detail_hash or ''))
             self.conn.commit()
         return self.get_ai_item_knowledge_profile(cookie_id, item_id)
+
+    def copy_ai_item_knowledge_draft(self, cookie_id: str, source_item_id: str,
+                                     target_item_ids: List[str], overwrite: bool = False) -> Dict[str, List[str]]:
+        """复制源商品当前档案到目标草稿，不自动发布。"""
+        normalized_targets = []
+        for value in target_item_ids or []:
+            target_id = str(value or '').strip()
+            if target_id and target_id != source_item_id and target_id not in normalized_targets:
+                normalized_targets.append(target_id)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT draft_json, published_json
+            FROM ai_item_knowledge_profiles
+            WHERE cookie_id = ? AND item_id = ?
+            ''', (cookie_id, source_item_id))
+            source_row = cursor.fetchone()
+            if not source_row:
+                raise ValueError('源商品还没有知识档案')
+            source_draft = json.loads(source_row[0] or '{}')
+            source_published = json.loads(source_row[1] or '{}')
+            source_profile = source_draft or source_published
+            if not source_profile:
+                raise ValueError('源商品知识档案为空')
+            profile_json = json.dumps(source_profile, ensure_ascii=False)
+
+            copied = []
+            skipped = []
+            missing = []
+            for target_id in normalized_targets:
+                cursor.execute(
+                    'SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ?',
+                    (cookie_id, target_id),
+                )
+                if not cursor.fetchone():
+                    missing.append(target_id)
+                    continue
+                cursor.execute('''
+                SELECT draft_json, published_json
+                FROM ai_item_knowledge_profiles
+                WHERE cookie_id = ? AND item_id = ?
+                ''', (cookie_id, target_id))
+                target_row = cursor.fetchone()
+                if target_row and not overwrite:
+                    target_draft = json.loads(target_row[0] or '{}')
+                    target_published = json.loads(target_row[1] or '{}')
+                    if target_draft or target_published:
+                        skipped.append(target_id)
+                        continue
+                cursor.execute('''
+                INSERT INTO ai_item_knowledge_profiles
+                (cookie_id, item_id, draft_json, source_detail_hash, draft_updated_at)
+                VALUES (?, ?, ?, '', CURRENT_TIMESTAMP)
+                ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                    draft_json = excluded.draft_json,
+                    source_detail_hash = '',
+                    draft_updated_at = CURRENT_TIMESTAMP
+                ''', (cookie_id, target_id, profile_json))
+                copied.append(target_id)
+            self.conn.commit()
+            return {
+                'copied_item_ids': copied,
+                'skipped_item_ids': skipped,
+                'missing_item_ids': missing,
+            }
 
     def publish_ai_item_knowledge(self, cookie_id: str, item_id: str) -> Dict[str, Any]:
         with self.lock:
@@ -5495,6 +5826,74 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def apply_order_sync_update(self, order_id: str, cookie_id: str,
+                                incoming_status: str, platform_status_code: str = '',
+                                platform_status_text: str = '', status_source: str = '',
+                                sync_error: str = '', **details) -> Dict[str, Any]:
+        """Apply one verified sync result without downgrading a known status to unknown."""
+        from order_sync_service import choose_order_status, normalize_order_status
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            row = cursor.execute(
+                "SELECT order_status FROM orders WHERE order_id = ? AND cookie_id = ?",
+                (order_id, cookie_id),
+            ).fetchone()
+            if not row:
+                return {'updated': False, 'status_changed': False, 'details_changed': False}
+
+            current_status = normalize_order_status(row[0])
+            next_status = choose_order_status(current_status, incoming_status)
+            status_changed = next_status != current_status
+            allowed_details = {
+                'item_id', 'buyer_id', 'spec_name', 'spec_value', 'quantity', 'amount',
+                'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
+                'created_at', 'chat_id',
+            }
+            update_fields = [
+                'order_status = ?',
+                'platform_status_code = ?',
+                'platform_status_text = ?',
+                'status_source = ?',
+                'status_synced_at = CURRENT_TIMESTAMP',
+                'last_sync_error = ?',
+                'updated_at = CURRENT_TIMESTAMP',
+                'version = version + 1',
+            ]
+            update_values = [
+                next_status,
+                str(platform_status_code or ''),
+                str(platform_status_text or ''),
+                str(status_source or ''),
+                str(sync_error or ''),
+            ]
+            details_changed = False
+            for field in allowed_details:
+                value = details.get(field)
+                if value in (None, ''):
+                    continue
+                existing = cursor.execute(
+                    f"SELECT {field} FROM orders WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+                if existing and str(existing[0] or '') != str(value):
+                    details_changed = True
+                update_fields.append(f"{field} = ?")
+                update_values.append(value)
+            update_values.extend([order_id, cookie_id])
+            cursor.execute(
+                f"UPDATE orders SET {', '.join(update_fields)} WHERE order_id = ? AND cookie_id = ?",
+                update_values,
+            )
+            self.conn.commit()
+            return {
+                'updated': cursor.rowcount > 0,
+                'status_changed': status_changed,
+                'details_changed': details_changed,
+                'old_status': current_status,
+                'new_status': next_status,
+            }
+
     def get_order_by_id(self, order_id: str):
         """根据订单ID获取订单信息"""
         with self.lock:
@@ -5503,7 +5902,8 @@ class DBManager:
                 # 先尝试查询包含version的订单
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id
+                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id,
+                       platform_status_code, platform_status_text, status_source, status_synced_at, last_sync_error
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -5525,7 +5925,12 @@ class DBManager:
                         'created_at': row[10],
                         'updated_at': row[11],
                         'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else ''
+                        'chat_id': row[13] if len(row) > 13 else '',
+                        'platform_status_code': row[14] if len(row) > 14 else '',
+                        'platform_status_text': row[15] if len(row) > 15 else '',
+                        'status_source': row[16] if len(row) > 16 else '',
+                        'status_synced_at': row[17] if len(row) > 17 else None,
+                        'last_sync_error': row[18] if len(row) > 18 else '',
                     }
                 return None
 
@@ -5548,6 +5953,100 @@ class DBManager:
                 logger.error(f"删除订单失败: {order_id} - {e}")
                 self.conn.rollback()
                 return False
+
+    def record_order_status_event(self, cookie_id: str, normalized_status: str,
+                                  raw_status: str = '', order_id: str = '',
+                                  item_id: str = '', buyer_id: str = '',
+                                  chat_id: str = '', source: str = 'system_message',
+                                  occurred_at: float = None) -> int:
+        """Persist a status event until it can be matched deterministically."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            INSERT INTO order_status_events (
+                cookie_id, order_id, item_id, buyer_id, chat_id,
+                normalized_status, raw_status, source, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                cookie_id,
+                str(order_id or ''),
+                str(item_id or ''),
+                str(buyer_id or ''),
+                str(chat_id or ''),
+                str(normalized_status or 'unknown'),
+                str(raw_status or ''),
+                str(source or 'system_message'),
+                float(occurred_at if occurred_at is not None else time.time()),
+            ))
+            event_id = int(cursor.lastrowid)
+            self.conn.commit()
+            return event_id
+
+    def reconcile_order_status_events(self, cookie_id: str, order_id: str,
+                                      item_id: str = '', buyer_id: str = '',
+                                      chat_id: str = '') -> List[Dict[str, Any]]:
+        """Match pending events by identity fields only; never consume them FIFO."""
+        from order_sync_service import choose_order_status
+
+        normalized_order_id = str(order_id or '')
+        normalized_item_id = str(item_id or '')
+        normalized_buyer_id = str(buyer_id or '')
+        normalized_chat_id = str(chat_id or '')
+        if not normalized_order_id:
+            return []
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+            SELECT id, order_id, item_id, buyer_id, chat_id,
+                   normalized_status, raw_status, source, occurred_at
+            FROM order_status_events
+            WHERE cookie_id = ? AND match_state = 'pending'
+            ORDER BY occurred_at ASC, id ASC
+            ''', (cookie_id,))
+            matched = []
+            for row in cursor.fetchall():
+                event_order_id = str(row[1] or '')
+                event_item_id = str(row[2] or '')
+                event_buyer_id = str(row[3] or '')
+                event_chat_id = str(row[4] or '')
+                exact_order_match = bool(event_order_id and event_order_id == normalized_order_id)
+                item_buyer_match = bool(
+                    event_item_id and event_buyer_id
+                    and event_item_id == normalized_item_id
+                    and event_buyer_id == normalized_buyer_id
+                )
+                chat_match = bool(event_chat_id and event_chat_id == normalized_chat_id)
+                if not (exact_order_match or item_buyer_match or chat_match):
+                    continue
+
+                order_row = cursor.execute(
+                    "SELECT order_status FROM orders WHERE order_id = ? AND cookie_id = ?",
+                    (normalized_order_id, cookie_id),
+                ).fetchone()
+                if not order_row:
+                    continue
+                next_status = choose_order_status(order_row[0], row[5])
+                cursor.execute('''
+                UPDATE orders
+                SET order_status = ?, platform_status_text = ?, status_source = ?,
+                    status_synced_at = CURRENT_TIMESTAMP, last_sync_error = '',
+                    updated_at = CURRENT_TIMESTAMP, version = version + 1
+                WHERE order_id = ? AND cookie_id = ?
+                ''', (next_status, row[6] or '', row[7] or 'system_message', normalized_order_id, cookie_id))
+                cursor.execute('''
+                UPDATE order_status_events
+                SET match_state = 'matched', matched_order_id = ?, matched_at = ?
+                WHERE id = ?
+                ''', (normalized_order_id, time.time(), row[0]))
+                matched.append({
+                    'id': row[0],
+                    'normalized_status': row[5],
+                    'raw_status': row[6] or '',
+                    'source': row[7] or 'system_message',
+                })
+            self.conn.commit()
+            return matched
 
     def get_recent_order_by_item_and_buyer(self, item_id: str, buyer_id: str):
         """根据商品ID和买家ID获取最近的订单
@@ -5602,7 +6101,9 @@ class DBManager:
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
                        quantity, amount, order_status, is_bargain, created_at, updated_at,
-                       receiver_name, receiver_phone, receiver_address
+                       receiver_name, receiver_phone, receiver_address, receiver_city,
+                       platform_status_code, platform_status_text, status_source,
+                       status_synced_at, last_sync_error
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -5624,7 +6125,13 @@ class DBManager:
                         'updated_at': row[10],
                         'receiver_name': row[11],
                         'receiver_phone': row[12],
-                        'receiver_address': row[13]
+                        'receiver_address': row[13],
+                        'receiver_city': row[14],
+                        'platform_status_code': row[15],
+                        'platform_status_text': row[16],
+                        'status_source': row[17],
+                        'status_synced_at': row[18],
+                        'last_sync_error': row[19],
                     })
 
                 return orders

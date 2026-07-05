@@ -6,7 +6,8 @@ import {
   SkillMonitorTask, SkillMonitorResult, SkillAgentPrompt,
   SkillOpsHealth, SkillBrowserStatus, SkillDeliveryDiagnostics,
   AutoReplyDiagnostics, SettingsSectionKey, SettingsSummary, SkillCapability,
-  AIProviderListResponse, AIProviderProfile
+  AIProviderListResponse, AIProviderProfile, AccountSessionRefreshStatus
+  , OrderSyncResponse
 } from '../types';
 
 // Auth
@@ -41,6 +42,8 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     pause_duration: item.pause_duration,
     username: item.username,
     login_password: item.login_password,
+    has_login_password: item.has_login_password,
+    login_credentials_valid: item.login_credentials_valid,
     show_browser: item.show_browser,
     nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
     avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
@@ -157,6 +160,19 @@ export const getAutoReplyDiagnostics = async (cookieId: string): Promise<AutoRep
   return res.data;
 };
 
+export const getAccountSessionStatus = async (cookieId: string): Promise<AccountSessionRefreshStatus> => {
+  const res = await get<{ success: boolean; data: AccountSessionRefreshStatus }>(`/api/accounts/${cookieId}/session-status`);
+  return res.data;
+};
+
+export const refreshAccountSession = async (cookieId: string): Promise<{ success: boolean; message: string; data: AccountSessionRefreshStatus }> => {
+  return post(`/api/accounts/${cookieId}/session-refresh`, {});
+};
+
+export const cancelAccountSessionRefresh = async (cookieId: string): Promise<ApiResponse> => {
+  return post(`/api/accounts/${cookieId}/session-refresh/cancel`, {});
+};
+
 // Orders
 export const getOrders = async (
   cookieId?: string,
@@ -198,21 +214,22 @@ export const deleteOrder = async (orderId: string): Promise<ApiResponse> => {
   return del(`/api/orders/${orderId}`);
 };
 
-export const syncOrders = async (cookieId?: string, status?: string): Promise<any> => {
-  const formData = new FormData();
-  if (cookieId) formData.append('cookie_id', cookieId);
-  if (status) formData.append('status', status);
-
-  // 使用 fetch 来发送 FormData
+export const syncOrders = async (cookieId?: string, days: number = 90): Promise<OrderSyncResponse> => {
   const token = localStorage.getItem('auth_token');
-  const response = await fetch('/api/orders/refresh', {
+  const response = await fetch('/api/orders/sync', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${token}`
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
     },
-    body: formData
+    body: JSON.stringify({ cookie_id: cookieId || null, days }),
   });
-  return response.json();
+  const result = await response.json();
+  if (!response.ok && response.status !== 409) {
+    throw new Error(result?.message || result?.detail || `订单同步失败 (${response.status})`);
+  }
+  return result as OrderSyncResponse;
 };
 
 export const syncSingleOrder = async (orderId: string): Promise<any> => {
@@ -583,6 +600,11 @@ export interface AIReplyLabResponse {
   reply: string;
   warnings: string[];
   history?: AIReplyLabMessage[];
+  rule_context?: AITrainingRuleContext;
+  rule_audit?: AIRuleAudit;
+  regenerated?: boolean;
+  knowledge_source?: 'draft' | 'published' | 'none';
+  knowledge_version?: number;
 }
 
 export interface AITrainingRule {
@@ -598,6 +620,31 @@ export interface AITrainingRule {
 export interface AITrainingRulesResponse {
   global_rules: AITrainingRule[];
   item_rules: AITrainingRule[];
+  context?: AITrainingRuleContext;
+}
+
+export interface AITrainingRuleContext {
+  applied_rules: AITrainingRule[];
+  excluded_rules: (AITrainingRule & { reason?: string })[];
+  disabled_rules: (AITrainingRule & { reason?: string })[];
+  applied_count: number;
+  excluded_count: number;
+  disabled_count: number;
+  total_count: number;
+}
+
+export interface AIRuleAuditEntry {
+  rule_id?: number | string;
+  text: string;
+  status: 'followed' | 'violated' | 'not_relevant' | 'unknown';
+  reason?: string;
+}
+
+export interface AIRuleAudit {
+  results: AIRuleAuditEntry[];
+  violation_count: number;
+  unknown_count: number;
+  conflicts: string[];
 }
 
 export type AIKnowledgeStatus = 'confirmed' | 'pending';
@@ -689,9 +736,28 @@ export const getAIItemKnowledge = async (cookieId: string, itemId: string): Prom
   return get(`/ai-item-knowledge/${cookieId}/${itemId}`);
 }
 
-export const generateAIItemKnowledge = async (cookieId: string, itemId: string): Promise<{ message: string; draft: AIItemKnowledge; source_detail_hash: string }> => {
-  return post(`/ai-item-knowledge/${cookieId}/${itemId}/generate`, {});
+export const generateAIItemKnowledge = async (
+  cookieId: string,
+  itemId: string,
+  data: { overview: string; profile: AIItemKnowledge }
+): Promise<{ message: string; draft: AIItemKnowledge; source_detail_hash: string }> => {
+  return post(`/ai-item-knowledge/${cookieId}/${itemId}/generate`, data);
 }
+
+export const copyAIItemKnowledge = async (
+  cookieId: string,
+  sourceItemId: string,
+  targetItemIds: string[],
+  overwrite = false
+): Promise<{
+  message: string;
+  copied_item_ids: string[];
+  skipped_item_ids: string[];
+  missing_item_ids: string[];
+}> => post(`/ai-item-knowledge/${cookieId}/${sourceItemId}/copy`, {
+  target_item_ids: targetItemIds,
+  overwrite,
+});
 
 export const saveAIItemKnowledgeDraft = async (cookieId: string, itemId: string, profile: AIItemKnowledge): Promise<ApiResponse & AIItemKnowledgeProfile> => {
   return put(`/ai-item-knowledge/${cookieId}/${itemId}/draft`, { profile });

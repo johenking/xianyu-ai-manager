@@ -6,15 +6,17 @@ import {
   AIItemKnowledgeProfile,
   AIItemKnowledgeVersion,
   AIKnowledgeEntry,
+  copyAIItemKnowledge,
   generateAIItemKnowledge,
   getAIItemKnowledge,
   getAIItemKnowledgeVersions,
+  getItemsByCookie,
   publishAIItemKnowledge,
   rollbackAIItemKnowledge,
   saveAIItemKnowledgeDraft,
 } from '../services/api';
 import {
-  AlertTriangle, Bot, Check, ChevronDown, ChevronUp, Clock3,
+  AlertTriangle, Bot, Check, ChevronDown, ChevronUp, Copy,
   History, Loader2, Plus, RotateCcw, Save, Send, Trash2, X,
 } from 'lucide-react';
 import {
@@ -48,6 +50,11 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [availableItems, setAvailableItems] = useState<Item[]>([]);
+  const [copyTargetIds, setCopyTargetIds] = useState<string[]>([]);
+  const [overwriteTargets, setOverwriteTargets] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -70,6 +77,14 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   };
 
   useEffect(() => { void loadProfile(); }, [item.cookie_id, item.item_id]);
+
+  useEffect(() => {
+    let mounted = true;
+    getItemsByCookie(item.cookie_id)
+      .then((items) => { if (mounted) setAvailableItems(items); })
+      .catch(() => { if (mounted) setAvailableItems([]); });
+    return () => { mounted = false; };
+  }, [item.cookie_id]);
 
   const updateKnowledge = (updater: (current: AIItemKnowledge) => AIItemKnowledge) => {
     setKnowledge((current) => updater(current));
@@ -126,19 +141,62 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   });
 
   const generateDraft = async () => {
-    if (hasKnowledgeContent(knowledge) && !window.confirm('AI生成会替换当前未发布草稿，继续吗？')) return;
+    const overview = knowledge.overview?.text?.trim() || '';
+    if (!overview) {
+      setError('请先填写商品概览，再生成结构化草稿');
+      return;
+    }
+    const hasDetailedContent = knowledge.pricing.length + knowledge.process.length + knowledge.after_sales.length +
+      knowledge.forbidden.length + knowledge.faqs.length + knowledge.notes.length > 0;
+    if (hasDetailedContent && !window.confirm('AI会保留人工和已确认内容，并替换未确认的AI内容。继续吗？')) return;
     setGenerating(true);
     setError('');
     setMessage('');
     try {
-      const result = await generateAIItemKnowledge(item.cookie_id, item.item_id);
+      const result = await generateAIItemKnowledge(item.cookie_id, item.item_id, {
+        overview,
+        profile: knowledge,
+      });
       setKnowledge(normalizeItemKnowledge(result.draft));
-      setDirty(true);
-      setMessage('AI草稿已生成，黄色内容需要确认');
+      setProfile((current) => current ? {
+        ...current,
+        draft: result.draft,
+        source_detail_hash: result.source_detail_hash,
+      } : current);
+      setDirty(false);
+      setMessage(result.message || '概览已保存，AI草稿已生成，黄色内容需要确认');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'AI草稿生成失败');
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const toggleCopyTarget = (targetId: string) => {
+    setCopyTargetIds((current) => current.includes(targetId)
+      ? current.filter((value) => value !== targetId)
+      : [...current, targetId]);
+  };
+
+  const copyKnowledge = async () => {
+    if (copyTargetIds.length === 0) return;
+    setCopying(true);
+    setError('');
+    setMessage('');
+    try {
+      const result = await copyAIItemKnowledge(
+        item.cookie_id, item.item_id, copyTargetIds, overwriteTargets
+      );
+      const skipped = result.skipped_item_ids.length > 0
+        ? `，跳过 ${result.skipped_item_ids.length} 个已有档案的商品`
+        : '';
+      setMessage(`${result.message}${skipped}`);
+      setCopyTargetIds([]);
+      setCopyOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '复制知识档案失败');
+    } finally {
+      setCopying(false);
     }
   };
 
@@ -265,10 +323,43 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
                   </div>
                 </div>
                 {profile?.source_changed && <div className="border border-orange-200 bg-orange-50 rounded-lg px-3 py-3 text-xs text-orange-800 flex gap-2"><AlertTriangle className="w-4 h-4 shrink-0" />商品详情同步后发生变化，建议复核知识档案。</div>}
-                <button onClick={generateDraft} disabled={generating} className="w-full px-4 py-3 rounded-lg bg-black text-white font-bold flex items-center justify-center gap-2 disabled:opacity-60">
-                  {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}AI 生成结构化草稿
+                <button
+                  onClick={() => setCopyOpen((current) => !current)}
+                  disabled={dirty || !hasKnowledgeContent(knowledge)}
+                  className="w-full px-4 py-3 rounded-lg bg-gray-100 text-gray-700 font-bold flex items-center justify-between disabled:opacity-50"
+                >
+                  <span className="flex items-center gap-2"><Copy className="w-4 h-4" />复制到其他商品</span>
+                  {copyOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                 </button>
-                <div className="text-xs text-gray-500 leading-5">AI 生成的内容全部标为待确认，不会自动发布。</div>
+                {copyOpen && (
+                  <div className="border-l-4 border-yellow-400 pl-3 space-y-3">
+                    <div className="text-xs text-gray-600 leading-5">只复制为目标商品草稿，不会自动发布。</div>
+                    <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
+                      {availableItems.filter((candidate) => candidate.item_id !== item.item_id).map((candidate) => (
+                        <label key={candidate.item_id} className="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={copyTargetIds.includes(candidate.item_id)}
+                            onChange={() => toggleCopyTarget(candidate.item_id)}
+                            aria-label={`${candidate.item_title || candidate.item_id} ${candidate.item_price || ''} ${candidate.item_id.slice(-6)}`}
+                            className="mt-0.5"
+                          />
+                          <span className="min-w-0">
+                            <b className="block truncate">{candidate.item_title || candidate.item_id}</b>
+                            <span className="text-gray-400">{candidate.item_price || '-'} · …{candidate.item_id.slice(-6)}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <label className="flex items-center gap-2 text-xs text-orange-700">
+                      <input type="checkbox" checked={overwriteTargets} onChange={(event) => setOverwriteTargets(event.target.checked)} />
+                      覆盖目标商品已有草稿
+                    </label>
+                    <button onClick={() => void copyKnowledge()} disabled={copying || copyTargetIds.length === 0} className="w-full px-3 py-2 rounded-lg bg-black text-white text-xs font-bold disabled:opacity-50">
+                      {copying ? '复制中...' : '复制到所选草稿'}
+                    </button>
+                  </div>
+                )}
                 <button onClick={() => void toggleVersions()} className="w-full px-4 py-3 rounded-lg bg-gray-100 text-gray-700 font-bold flex items-center justify-between">
                   <span className="flex items-center gap-2"><History className="w-4 h-4" />版本记录</span>{showVersions ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                 </button>
@@ -282,8 +373,12 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
                 </div>
 
                 <section>
-                  <div className="flex items-center justify-between mb-2"><label className="text-sm font-bold text-gray-800">商品概况</label>{knowledge.overview?.status === 'pending' && <button onClick={() => updateKnowledge((current) => ({ ...current, overview: { ...current.overview, status: 'confirmed' } }))} className="text-xs font-bold text-yellow-700">确认AI概况</button>}</div>
+                  <div className="flex items-center justify-between mb-2"><label className="text-sm font-bold text-gray-800">第 1 步 · 商品概览</label>{knowledge.overview?.status === 'pending' && <button onClick={() => updateKnowledge((current) => ({ ...current, overview: { ...current.overview, status: 'confirmed' } }))} className="text-xs font-bold text-yellow-700">确认AI概况</button>}</div>
                   <textarea value={knowledge.overview?.text || ''} onChange={(event) => updateOverview(event.target.value)} className={`ios-input w-full px-4 py-3 rounded-lg resize-none h-24 ${knowledge.overview?.status === 'pending' ? 'border-yellow-400 bg-yellow-50' : ''}`} placeholder="用自己的话描述这个商品大体是什么、适合谁、核心价值是什么..." />
+                  <button onClick={generateDraft} disabled={generating || !knowledge.overview?.text?.trim()} className="mt-3 w-full px-4 py-3 rounded-lg bg-black text-white font-bold flex items-center justify-center gap-2 disabled:opacity-40">
+                    {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}第 2 步 · AI 生成结构化草稿
+                  </button>
+                  <div className="text-xs text-gray-500 leading-5 mt-2">人工概览会先保存并作为最高优先级事实；AI只展开详细字段，生成内容仍需确认。</div>
                 </section>
 
                 {(Object.keys(SECTION_LABELS) as ListSection[]).map((section) => (

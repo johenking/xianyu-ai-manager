@@ -2693,12 +2693,12 @@ class XianyuSliderStealth:
                             logger.info(f"【{self.pure_user_id}】✅ 检测到 alibaba-login-box iframe（人脸验证/短信验证）")
                             frame = iframe.content_frame()
                             if frame:
-                                logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame.url if hasattr(frame, 'url') else '未知'}")
+                                logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame已加载（地址已隐藏）")
 
                                 # 尝试自动点击"其他验证方式"，然后找到"通过拍摄脸部"的验证按钮
                                 face_verify_url = self._get_face_verification_url(frame)
                                 if face_verify_url:
-                                    logger.info(f"【{self.pure_user_id}】✅ 获取到人脸验证链接: {face_verify_url}")
+                                    logger.info(f"【{self.pure_user_id}】✅ 已获取人脸验证链接（内容已隐藏）")
 
                                     # 截图并保存
                                     screenshot_path = None
@@ -2779,7 +2779,7 @@ class XianyuSliderStealth:
             for idx, frame in enumerate(page.frames):
                 try:
                     frame_url = frame.url
-                    logger.debug(f"【{self.pure_user_id}】检查Frame {idx} 是否有二维码: {frame_url}")
+                    logger.debug(f"【{self.pure_user_id}】检查Frame {idx} 是否有二维码（地址已隐藏）")
 
                     # 检查frame URL是否包含 mini_login（人脸验证或短信验证页面）
                     if 'mini_login' in frame_url:
@@ -2796,7 +2796,7 @@ class XianyuSliderStealth:
 
                         if not is_slider:
                             logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 mini_login 页面（人脸验证/短信验证）")
-                            logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame_url}")
+                            logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame已加载（地址已隐藏）")
                             return True, frame
 
                     # 检查frame的父iframe是否是alibaba-login-box
@@ -2807,7 +2807,7 @@ class XianyuSliderStealth:
                             parent_iframe_id = frame_element.get_attribute('id')
                             if parent_iframe_id == 'alibaba-login-box':
                                 logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到 alibaba-login-box（人脸验证/短信验证）")
-                                logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame URL: {frame_url}")
+                                logger.info(f"【{self.pure_user_id}】人脸验证/短信验证Frame已加载（地址已隐藏）")
                                 return True, frame
                     except:
                         pass
@@ -2857,7 +2857,7 @@ class XianyuSliderStealth:
 
                                 if not has_slider_in_frame:
                                     logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到二维码验证: {selector}")
-                                    logger.info(f"【{self.pure_user_id}】二维码Frame URL: {frame_url}")
+                                    logger.info(f"【{self.pure_user_id}】二维码验证Frame已加载（地址已隐藏）")
                                     return True, frame
                         except:
                             continue
@@ -2880,7 +2880,7 @@ class XianyuSliderStealth:
 
                             if not has_slider_keyword:
                                 logger.info(f"【{self.pure_user_id}】✅ 在Frame {idx} 检测到人脸验证")
-                                logger.info(f"【{self.pure_user_id}】人脸验证Frame URL: {frame_url}")
+                                logger.info(f"【{self.pure_user_id}】人脸验证Frame已加载（地址已隐藏）")
                                 return True, frame
                     except:
                         pass
@@ -3628,7 +3628,7 @@ class XianyuSliderStealth:
                                     # 检查是否有验证链接（从VerificationFrame对象）
                                     if hasattr(qr_frame, 'verify_url') and qr_frame.verify_url:
                                         frame_url = qr_frame.verify_url
-                                        logger.info(f"【{self.pure_user_id}】使用获取到的人脸验证链接: {frame_url}")
+                                        logger.info(f"【{self.pure_user_id}】使用已获取的人脸验证链接（内容已隐藏）")
                                     else:
                                         frame_url = qr_frame.url if hasattr(qr_frame, 'url') else None
 
@@ -3649,8 +3649,7 @@ class XianyuSliderStealth:
                                 logger.warning(f"【{self.pure_user_id}】" + "=" * 60)
                             elif frame_url:
                                 logger.warning(f"【{self.pure_user_id}】" + "=" * 60)
-                                logger.warning(f"【{self.pure_user_id}】二维码/人脸验证链接:")
-                                logger.warning(f"【{self.pure_user_id}】{frame_url}")
+                                logger.warning(f"【{self.pure_user_id}】已检测到二维码/人脸验证链接（内容已隐藏）")
                                 logger.warning(f"【{self.pure_user_id}】" + "=" * 60)
                             else:
                                 logger.warning(f"【{self.pure_user_id}】" + "=" * 60)
@@ -3679,11 +3678,11 @@ class XianyuSliderStealth:
                                                 f"⚠️ 账号密码登录需要人脸验证\n\n"
                                                 f"账号: {self.pure_user_id}\n"
                                                 f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                                                f"请点击验证链接完成验证:\n{frame_url}\n\n"
+                                                f"请在账号管理页或可见浏览器中完成验证。\n\n"
                                                 f"在验证期间，闲鱼自动回复暂时无法使用。"
                                             )
 
-                                        logger.info(f"【{self.pure_user_id}】准备发送人脸验证通知，截图路径: {screenshot_path}, URL: {frame_url}")
+                                        logger.info(f"【{self.pure_user_id}】准备发送人脸验证通知，截图状态: {bool(screenshot_path)}，链接已隐藏")
 
                                         # 如果回调是异步函数，使用 asyncio.run 在新的事件循环中运行
                                         import asyncio

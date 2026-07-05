@@ -1,27 +1,33 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Order, OrderStatus, Item } from '../types';
+import { Order, OrderStatus, Item, OrderSyncResponse } from '../types';
 import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems } from '../services/api';
 import { Search, MoreHorizontal, Truck, RefreshCw, Copy, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, Phone, MapPin, Upload, ExternalLink, Trash2 } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   const styles = {
+    unknown: 'bg-amber-50 text-amber-700 border border-amber-200',
     processing: 'bg-yellow-100 text-yellow-800',
     pending_ship: 'bg-[#FFE815] text-black',
     shipped: 'bg-blue-100 text-blue-700',
     completed: 'bg-green-100 text-green-700',
     cancelled: 'bg-gray-100 text-gray-500',
     refunding: 'bg-red-100 text-red-600',
+    refunded: 'bg-red-100 text-red-700',
+    refund_cancelled: 'bg-gray-100 text-gray-600',
   };
 
   const labels = {
+    unknown: '待核对',
     processing: '处理中',
     pending_ship: '待发货',
     shipped: '已发货',
     completed: '已完成',
     cancelled: '已取消',
     refunding: '退款中',
+    refunded: '已退款',
+    refund_cancelled: '退款已关闭',
   };
 
   return (
@@ -67,6 +73,7 @@ const OrderList: React.FC = () => {
   const [syncingOrderId, setSyncingOrderId] = useState<string | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [syncResult, setSyncResult] = useState<OrderSyncResponse | null>(null);
 
   // 搜索过滤订单
   const filterOrders = (ordersToFilter: Order[]): Order[] => {
@@ -182,11 +189,16 @@ const OrderList: React.FC = () => {
 
   const handleSync = async () => {
       setLoading(true);
-      setPageNotice({ tone: 'info', text: '正在同步订单' });
+      setSyncResult(null);
+      setPageNotice({ tone: 'info', text: '正在发现并核对近 90 天订单' });
       try {
-        await syncOrders();
+        const result = await syncOrders(undefined, 90);
+        setSyncResult(result);
         await loadOrders();
-        setPageNotice({ tone: 'success', text: '订单同步完成' });
+        setPageNotice({
+          tone: result.requires_login.length > 0 || !result.success ? 'error' : 'success',
+          text: result.message || '订单同步完成',
+        });
       } catch (error) {
         setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '订单同步失败' });
       } finally {
@@ -337,12 +349,34 @@ const OrderList: React.FC = () => {
               <Plus className="w-4 h-4" />
               插入订单
             </button>
-            <button onClick={handleSync} className="ios-btn-primary px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 text-sm flex items-center gap-2">
+            <button
+              onClick={handleSync}
+              disabled={loading}
+              className="ios-btn-primary px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 text-sm flex items-center gap-2 disabled:opacity-60"
+            >
                 <Truck className="w-5 h-5" />
-                一键同步订单
+                同步近90天订单
             </button>
         </div>
       </div>
+
+      {syncResult && (
+        <div className={`border px-4 py-3 rounded-xl text-sm ${syncResult.requires_login.length ? 'bg-red-50 border-red-200 text-red-800' : 'bg-white border-gray-200 text-gray-700'}`}>
+          <div className="font-bold">{syncResult.message}</div>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+            <span>发现 {syncResult.summary.discovered}</span>
+            <span>状态更新 {syncResult.summary.status_updated}</span>
+            <span>详情更新 {syncResult.summary.details_updated}</span>
+            <span>无变化 {syncResult.summary.unchanged}</span>
+            <span>失败 {syncResult.summary.failed}</span>
+          </div>
+          {syncResult.requires_login.length > 0 && (
+            <div className="mt-2 font-medium">
+              需要更新登录状态的账号：{syncResult.requires_login.join('、')}。请前往账号管理恢复登录后再同步。
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="ios-card rounded-[2rem] overflow-hidden shadow-lg border-0 bg-white">
         {/* Toolbar */}
@@ -350,10 +384,13 @@ const OrderList: React.FC = () => {
           <div className="flex gap-1 p-1 bg-gray-200/50 rounded-xl overflow-x-auto max-w-full">
              {[
                  {k:'all', v:'全部'},
-                 {k:'shipped', v:'已发货'},
                  {k:'pending_ship', v:'待发货'},
-                 {k:'cancelled', v:'已取消'},
-                 {k:'refunding', v:'其他'}
+                 {k:'shipped', v:'已发货'},
+                 {k:'completed', v:'已完成'},
+                 {k:'refunding', v:'退款中'},
+                 {k:'refunded', v:'已退款'},
+                 {k:'cancelled', v:'已关闭'},
+                 {k:'unknown', v:'待核对'}
              ].map(opt => (
                  <button
                     key={opt.k}
@@ -376,8 +413,63 @@ const OrderList: React.FC = () => {
           </div>
         </div>
 
-        {/* Table */}
-        <div className="overflow-x-auto min-h-[400px]">
+        {/* Mobile order list */}
+        <div className="md:hidden divide-y divide-gray-100 min-h-[320px]">
+          {orders.map((order) => (
+            <div key={`mobile-${order.id}`} className="p-4 space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-bold text-gray-900 text-sm line-clamp-2">
+                    {getItemNameById(order.item_id, order.item_title)}
+                  </div>
+                  <div className="mt-1 text-xs text-gray-500 break-all">订单号：{order.order_id}</div>
+                </div>
+                <StatusBadge status={order.status} />
+              </div>
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <div className="text-gray-400">买家</div>
+                  <div className="mt-1 font-semibold text-gray-700 break-all">{order.buyer_id || '待补充'}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-gray-400">实付金额</div>
+                  <div className="mt-1 text-base font-extrabold text-gray-900">¥{order.amount || '0'}</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 text-xs text-gray-400">
+                <span>数量 {order.quantity || 1}</span>
+                <span>{order.created_at || '时间待补充'}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {order.status === 'pending_ship' && (
+                  <button onClick={() => handleShip(order.order_id)} className="px-3 py-2 rounded-lg bg-black text-white text-xs font-bold">
+                    立即发货
+                  </button>
+                )}
+                <button onClick={() => handleViewDetail(order)} className="px-3 py-2 rounded-lg bg-blue-50 text-blue-700 text-xs font-bold">详情</button>
+                <button onClick={() => handleEdit(order)} className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-xs font-bold">编辑</button>
+                <button
+                  onClick={() => handleSyncSingle(order.order_id)}
+                  disabled={syncingOrderId === order.order_id}
+                  className="px-3 py-2 rounded-lg bg-green-50 text-green-700 text-xs font-bold disabled:opacity-50"
+                >
+                  核对状态
+                </button>
+                <a
+                  href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-2 rounded-lg bg-amber-50 text-amber-700 text-xs font-bold"
+                >
+                  闲鱼详情
+                </a>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Desktop table */}
+        <div className="hidden md:block overflow-x-auto min-h-[400px]">
           <table className="w-full min-w-[900px] text-left border-collapse table-fixed">
             <thead>
               <tr className="bg-white text-gray-400 text-xs font-bold uppercase tracking-wider border-b border-gray-50">
@@ -556,6 +648,28 @@ const OrderList: React.FC = () => {
                   <div className="col-span-2">
                     <div className="text-xs text-gray-500 mb-1">创建时间</div>
                     <div className="text-sm font-medium text-gray-700">{selectedOrder.created_at}</div>
+                  </div>
+                  <div className="col-span-2 border-t border-gray-200 pt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">平台原始状态</div>
+                      <div className="text-sm font-medium text-gray-700">
+                        {selectedOrder.platform_status_text || selectedOrder.platform_status_code || '尚未取得'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">同步来源</div>
+                      <div className="text-sm font-medium text-gray-700">{selectedOrder.status_source || '历史记录'}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">最近同步</div>
+                      <div className="text-sm font-medium text-gray-700">{selectedOrder.status_synced_at || '尚未同步'}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-gray-500 mb-1">最后同步结果</div>
+                      <div className={`text-sm font-medium ${selectedOrder.last_sync_error ? 'text-red-600' : 'text-green-700'}`}>
+                        {selectedOrder.last_sync_error || '无错误'}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>

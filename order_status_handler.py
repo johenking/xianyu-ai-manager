@@ -12,6 +12,32 @@ import asyncio
 from loguru import logger
 from typing import Optional, Dict, Any
 
+
+def extract_order_event_identity(message: dict) -> Dict[str, str]:
+    """Extract deterministic identifiers without guessing an order by queue order."""
+    try:
+        serialized = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        serialized = str(message)
+
+    def first_match(patterns):
+        for pattern in patterns:
+            match = re.search(pattern, serialized, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ""
+
+    return {
+        "order_id": first_match([
+            r'orderId[=\\":]+(\d{8,})',
+            r'bizOrderId[=\\":]+(\d{8,})',
+            r'order_detail\?id=(\d{8,})',
+        ]),
+        "item_id": first_match([r'itemId[=\\":]+(\d{5,})']),
+        "buyer_id": first_match([r'peerUserId[=\\":]+(\d{5,})', r'buyerId[=\\":]+(\d{5,})']),
+        "chat_id": first_match([r'chatId[=\\":]+([\w-]{5,})', r'conversationId[=\\":]+([\w-]{5,})']),
+    }
+
 # ==================== 订单状态处理器配置 ====================
 # 订单状态处理器配置
 ORDER_STATUS_HANDLER_CONFIG = {
@@ -37,8 +63,9 @@ class OrderStatusHandler:
         'processing': ['pending_ship', 'shipped', 'completed', 'cancelled'],
         'pending_ship': ['shipped', 'completed', 'cancelled', 'refunding'],  # 已付款，可以退款
         'shipped': ['completed', 'cancelled', 'refunding'],  # 已发货，可以退款
-        'completed': ['cancelled', 'refunding'],  # 已完成，可以退款
-        'refunding': ['completed', 'cancelled', 'refund_cancelled'],  # 退款中，可以完成（取消退款）、关闭（退款完成）或撤销
+        'completed': ['cancelled', 'refunding', 'refunded'],  # 已完成后仍可能退款
+        'refunding': ['completed', 'refunded', 'refund_cancelled'],
+        'refunded': [],
         'refund_cancelled': [],  # 退款撤销（临时状态，会立即回退到上一次状态）
         'cancelled': []  # 已关闭，不能转换到其他状态
     }
@@ -54,6 +81,7 @@ class OrderStatusHandler:
             'shipped': '已发货',        # 发货确认后
             'completed': '已完成',      # 交易完成
             'refunding': '退款中',      # 退款中/退货中
+            'refunded': '已退款',       # 退款成功
             'refund_cancelled': '退款撤销',  # 退款撤销（临时状态，会回退）
             'cancelled': '已关闭',      # 交易关闭
         }
@@ -704,7 +732,7 @@ class OrderStatusHandler:
                 '[买家已付款]': 'pending_ship',  # 买家已付款
                 '[付款完成]': 'pending_ship',  # 付款完成
                 '[已付款，待发货]': 'pending_ship',  # 已付款，待发货
-                '[退款成功，钱款已原路退返]': 'cancelled',  # 退款成功，设置为已关闭
+                '[退款成功，钱款已原路退返]': 'refunded',
                 '[你关闭了订单，钱款已原路退返]': 'cancelled',  # 卖家关闭订单，设置为已关闭
             }
 
@@ -719,44 +747,43 @@ class OrderStatusHandler:
 
             # 提取订单ID
             order_id = self.extract_order_id(message)
+            identity = extract_order_event_identity(message)
+            order_id = order_id or identity["order_id"]
             if not order_id:
-                # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
-                if self.config.get('use_pending_queue', True):
-                    logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，暂时无法提取订单ID，添加到待处理队列')
-                else:
-                    logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，无法提取订单ID且未启用待处理队列，跳过处理')
-                return False
-
-                # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
-                temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-
-                # 获取对应的状态
-                new_status = message_status_mapping[send_message]
-
-                # 添加到待处理队列，使用特殊标记
-                self._add_to_pending_updates(
-                    order_id=temp_order_id,
-                    new_status=new_status,
+                from db_manager import db_manager
+                db_manager.record_order_status_event(
                     cookie_id=cookie_id,
-                    context=f"{send_message} - {msg_time} - 等待订单ID提取"
+                    normalized_status=new_status,
+                    raw_status=send_message,
+                    item_id=identity["item_id"],
+                    buyer_id=identity["buyer_id"],
+                    chat_id=identity["chat_id"],
+                    source="system_message",
+                    occurred_at=time.time(),
                 )
-
-                # 添加到待处理的系统消息队列
-                if cookie_id not in self._pending_system_messages:
-                    self._pending_system_messages[cookie_id] = []
-
-                self._pending_system_messages[cookie_id].append({
-                    'message': message,
-                    'send_message': send_message,
-                    'cookie_id': cookie_id,
-                    'msg_time': msg_time,
-                    'new_status': new_status,
-                    'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
-                    'timestamp': time.time()  # 添加时间戳用于清理
-                })
-
+                logger.info(f'[{msg_time}] 【{cookie_id}】订单状态事件已持久化，等待精确关联')
                 return True
+
+            from db_manager import db_manager
+            db_manager.record_order_status_event(
+                cookie_id=cookie_id,
+                normalized_status=new_status,
+                raw_status=send_message,
+                order_id=order_id,
+                item_id=identity["item_id"],
+                buyer_id=identity["buyer_id"],
+                chat_id=identity["chat_id"],
+                source="system_message",
+                occurred_at=time.time(),
+            )
+            db_manager.reconcile_order_status_events(
+                cookie_id=cookie_id,
+                order_id=order_id,
+                item_id=identity["item_id"],
+                buyer_id=identity["buyer_id"],
+                chat_id=identity["chat_id"],
+            )
+            return True
 
             # 获取对应的状态（new_status已经在上面通过_check_refund_message或message_status_mapping确定了）
 
@@ -1005,6 +1032,19 @@ class OrderStatusHandler:
             message: 原始消息（可选，用于匹配）
         """
         logger.info(f"🔄 订单状态处理器.on_order_id_extracted开始: order_id={order_id}, cookie_id={cookie_id}")
+
+        identity = extract_order_event_identity(message or {})
+        from db_manager import db_manager
+        matched = db_manager.reconcile_order_status_events(
+            cookie_id=cookie_id,
+            order_id=order_id,
+            item_id=identity["item_id"],
+            buyer_id=identity["buyer_id"],
+            chat_id=identity["chat_id"],
+        )
+        if matched:
+            logger.info(f"订单 {order_id} 已关联 {len(matched)} 条持久化状态事件")
+        return
 
         with self._lock:
             # 检查是否启用待处理队列

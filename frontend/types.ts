@@ -39,6 +39,8 @@ export interface AccountDetail {
   // 登录信息
   username?: string;
   login_password?: string;
+  has_login_password?: boolean;
+  login_credentials_valid?: boolean;
   show_browser?: boolean;
   // Frontend helpers
   nickname?: string;
@@ -53,12 +55,15 @@ export interface AccountDetail {
 
 // Orders
 export type OrderStatus =
+  | 'unknown'
   | 'processing'
   | 'pending_ship'
   | 'shipped'
   | 'completed'
   | 'cancelled'
-  | 'refunding';
+  | 'refunding'
+  | 'refunded'
+  | 'refund_cancelled';
 
 export interface Order {
   id: string;
@@ -75,8 +80,33 @@ export interface Order {
   receiver_name?: string;
   receiver_phone?: string;
   receiver_address?: string;
+  receiver_city?: string;
+  platform_status_code?: string;
+  platform_status_text?: string;
+  status_source?: string;
+  status_synced_at?: string;
+  last_sync_error?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface OrderSyncSummary {
+  total_seen: number;
+  discovered: number;
+  status_updated: number;
+  details_updated: number;
+  unchanged: number;
+  failed: number;
+}
+
+export interface OrderSyncResponse {
+  success: boolean;
+  partial?: boolean;
+  message: string;
+  days: number;
+  summary: OrderSyncSummary;
+  requires_login: string[];
+  accounts: Array<{ cookie_id: string; success: boolean; message?: string }>;
 }
 
 // Cards
@@ -325,11 +355,13 @@ export interface AutoReplyDiagnostics {
   cookie_id: string;
   ready: boolean;
   issues: string[];
+  diagnosed_at?: number;
   account: {
     enabled: boolean;
     cookie_length: number;
     has_login_username: boolean;
     has_login_password: boolean;
+    login_credentials_valid?: boolean;
     show_browser: boolean;
   };
   runtime: {
@@ -357,6 +389,7 @@ export interface AutoReplyDiagnostics {
       updated_at?: string;
     } | null;
   };
+  session: AccountSessionRefreshStatus;
   reply: {
     keyword_count: number;
     default_reply_count: number;
@@ -368,6 +401,28 @@ export interface AutoReplyDiagnostics {
     conversation_count: number;
     recent_conversations: Array<{ role: string; content: string; created_at: string }>;
   };
+}
+
+export type AccountSessionRefreshState =
+  | 'idle'
+  | 'refreshing'
+  | 'verification_required'
+  | 'success'
+  | 'failed'
+  | 'timeout'
+  | 'cancelled';
+
+export interface AccountSessionRefreshStatus {
+  state: AccountSessionRefreshState;
+  trigger: string;
+  message: string;
+  error_code: string;
+  verification_image_url: string;
+  started_at?: number | null;
+  last_attempt_at?: number | null;
+  last_success_at?: number | null;
+  expires_at?: number | null;
+  updated_at?: number | null;
 }
 
 export interface SkillAgentPrompt {
