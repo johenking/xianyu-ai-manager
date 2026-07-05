@@ -47,6 +47,19 @@ from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from order_sync_service import OrderSyncCoordinator, XianyuOrderListClient, normalize_order_status
+from api_routers import (
+    accounts_router,
+    admin_router,
+    ai_router,
+    auth_router,
+    content_router,
+    frontend_router,
+    include_domain_routers,
+    orders_router,
+    settings_router,
+    skills_router,
+    system_router,
+)
 
 from loguru import logger
 
@@ -426,6 +439,7 @@ app.mount('/static', StaticFiles(directory=static_dir), name='static')
 # 挂载 /assets 路径，指向 static/assets 目录
 # 这样访问 /assets/xxx.js 时会正确映射到 static_dir/assets/xxx.js
 assets_dir = os.path.join(static_dir, 'assets')
+os.makedirs(assets_dir, exist_ok=True)
 app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
 
 # 确保图片上传目录存在
@@ -435,7 +449,7 @@ if not os.path.exists(uploads_dir):
     logger.info(f"创建图片上传目录: {uploads_dir}")
 
 # 健康检查端点
-@app.get('/health')
+@system_router.get('/health')
 async def health_check():
     """健康检查端点，用于Docker健康检查和负载均衡器"""
     try:
@@ -492,23 +506,23 @@ async def serve_frontend():
     else:
         return HTMLResponse('<h3>Frontend not found. Please build the frontend first.</h3>')
 
-@app.get('/', response_class=HTMLResponse)
+@frontend_router.get('/', response_class=HTMLResponse)
 async def root():
     return await serve_frontend()
 
 
 # 登录页面路由 - 重定向到 React 前端
-@app.get('/login.html', response_class=HTMLResponse)
+@frontend_router.get('/login.html', response_class=HTMLResponse)
 async def login_page():
     return await serve_frontend()
 
-@app.get('/login', response_class=HTMLResponse)
+@frontend_router.get('/login', response_class=HTMLResponse)
 async def login_route():
     return await serve_frontend()
 
 
 # 注册页面路由
-@app.get('/register.html', response_class=HTMLResponse)
+@frontend_router.get('/register.html', response_class=HTMLResponse)
 async def register_page():
     # 检查注册是否开启
     from db_manager import db_manager
@@ -539,7 +553,7 @@ async def register_page():
 
     return await serve_frontend()
 
-@app.get('/register', response_class=HTMLResponse)
+@frontend_router.get('/register', response_class=HTMLResponse)
 async def register_route():
     return await serve_frontend()
 
@@ -552,7 +566,7 @@ async def register_route():
 
 
 # 登录接口
-@app.post('/login')
+@auth_router.post('/login')
 async def login(request: LoginRequest):
     from db_manager import db_manager
 
@@ -656,7 +670,7 @@ async def login(request: LoginRequest):
 
 
 # 验证token接口
-@app.get('/verify')
+@auth_router.get('/verify')
 async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
     if user_info:
         return {
@@ -669,7 +683,7 @@ async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
 
 
 # 登出接口
-@app.post('/logout')
+@auth_router.post('/logout')
 async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if credentials:
         SESSION_TOKENS.pop(credentials.credentials, None)
@@ -678,7 +692,7 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
 
 
 # 修改管理员密码接口
-@app.post('/change-admin-password')
+@auth_router.post('/change-admin-password')
 async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
     from db_manager import db_manager
 
@@ -702,7 +716,7 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
 
 
 # 普通用户修改密码接口
-@app.post('/change-password')
+@auth_router.post('/change-password')
 async def change_user_password(request: ChangePasswordRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     from db_manager import db_manager
 
@@ -732,7 +746,7 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
 
 
 # 检查是否使用默认密码
-@app.get('/api/check-default-password')
+@auth_router.get('/api/check-default-password')
 async def check_default_password(current_user: Dict[str, Any] = Depends(get_current_user)):
     from db_manager import db_manager
 
@@ -759,7 +773,7 @@ async def check_default_password(current_user: Dict[str, Any] = Depends(get_curr
 
 
 # 生成图形验证码接口
-@app.post('/generate-captcha')
+@auth_router.post('/generate-captcha')
 async def generate_captcha(request: CaptchaRequest):
     from db_manager import db_manager
 
@@ -802,7 +816,7 @@ async def generate_captcha(request: CaptchaRequest):
 
 
 # 验证图形验证码接口
-@app.post('/verify-captcha')
+@auth_router.post('/verify-captcha')
 async def verify_captcha(request: VerifyCaptchaRequest):
     from db_manager import db_manager
 
@@ -882,7 +896,7 @@ class GeetestValidateResponse(BaseModel):
     message: str = ""
 
 
-@app.get('/geetest/register', response_model=GeetestRegisterResponse)
+@auth_router.get('/geetest/register', response_model=GeetestRegisterResponse)
 async def geetest_register():
     """
     获取极验验证码初始化参数
@@ -939,7 +953,7 @@ async def geetest_register():
             )
 
 
-@app.post('/geetest/validate', response_model=GeetestValidateResponse)
+@auth_router.post('/geetest/validate', response_model=GeetestValidateResponse)
 async def geetest_validate(request: GeetestValidateRequest):
     """
     极验二次验证
@@ -1002,7 +1016,7 @@ async def geetest_validate(request: GeetestValidateRequest):
 
 
 # 发送验证码接口（需要先验证图形验证码）
-@app.post('/send-verification-code')
+@auth_router.post('/send-verification-code')
 async def send_verification_code(request: SendCodeRequest):
     from db_manager import db_manager
 
@@ -1070,7 +1084,7 @@ async def send_verification_code(request: SendCodeRequest):
 
 
 # 用户注册接口
-@app.post('/register')
+@auth_router.post('/register')
 async def register(request: RegisterRequest):
     from db_manager import db_manager
 
@@ -1170,7 +1184,7 @@ def verify_api_key(api_key: str) -> bool:
         return api_key == API_SECRET_KEY
 
 
-@app.post('/send-message', response_model=SendMessageResponse)
+@system_router.post('/send-message', response_model=SendMessageResponse)
 async def send_message_api(request: SendMessageRequest):
     """发送消息API接口（使用秘钥验证）"""
     try:
@@ -1273,7 +1287,7 @@ async def send_message_api(request: SendMessageRequest):
         )
 
 
-@app.post("/xianyu/reply", response_model=ResponseModel)
+@system_router.post("/xianyu/reply", response_model=ResponseModel)
 async def xianyu_reply(req: RequestModel):
     msg_template = match_reply(req.cookie_id, req.send_message)
     is_default_reply = False
@@ -1377,7 +1391,7 @@ class SystemSettingCreateIn(BaseModel):
 
 
 
-@app.get("/cookies")
+@accounts_router.get("/cookies")
 def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         return []
@@ -1389,7 +1403,7 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
     return list(user_cookies.keys())
 
 
-@app.get("/cookies/details")
+@accounts_router.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有Cookie的详细信息（包括值和状态）"""
     if cookie_manager.manager is None:
@@ -1427,7 +1441,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     return result
 
 
-@app.post("/cookies")
+@accounts_router.post("/cookies")
 def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail="CookieManager 未就绪")
@@ -1476,7 +1490,7 @@ class AccountLoginInfoUpdate(BaseModel):
     show_browser: Optional[bool] = None
 
 
-@app.put("/cookies/{cid}/login-info")
+@accounts_router.put("/cookies/{cid}/login-info")
 def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号登录信息（用户名、密码、是否显示浏览器）"""
     try:
@@ -1510,7 +1524,7 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
 
 # ============ 通用的 /cookies/{cid} 路由 ============
 
-@app.put('/cookies/{cid}')
+@accounts_router.put('/cookies/{cid}')
 def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail='CookieManager 未就绪')
@@ -1555,7 +1569,7 @@ class CookieAccountInfo(BaseModel):
     show_browser: Optional[bool] = None
 
 
-@app.post("/cookie/{cid}/account-info")
+@accounts_router.post("/cookie/{cid}/account-info")
 def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号信息（Cookie、用户名、密码、显示浏览器设置）"""
     if cookie_manager.manager is None:
@@ -1600,7 +1614,7 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/cookie/{cid}/details")
+@accounts_router.get("/cookie/{cid}/details")
 def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号详细信息（包括用户名、密码、显示浏览器设置）"""
     try:
@@ -1981,7 +1995,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         logger.error(traceback.format_exc())
 
 
-@app.post("/password-login")
+@accounts_router.post("/password-login")
 async def password_login(
     request: Dict[str, Any],
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2040,7 +2054,7 @@ async def password_login(
         return {'success': False, 'message': f'登录失败: {str(e)}'}
 
 
-@app.get("/password-login/check/{session_id}")
+@accounts_router.get("/password-login/check/{session_id}")
 async def check_password_login_status(
     session_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2140,7 +2154,7 @@ async def check_password_login_status(
 
 # ========================= 人脸验证截图相关接口 =========================
 
-@app.get("/face-verification/screenshot/{account_id}")
+@accounts_router.get("/face-verification/screenshot/{account_id}")
 async def get_account_face_verification_screenshot(
     account_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2217,7 +2231,7 @@ async def get_account_face_verification_screenshot(
         }
 
 
-@app.delete("/face-verification/screenshot/{account_id}")
+@accounts_router.delete("/face-verification/screenshot/{account_id}")
 async def delete_account_face_verification_screenshot(
     account_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2266,7 +2280,7 @@ async def delete_account_face_verification_screenshot(
 
 # ========================= 扫码登录相关接口 =========================
 
-@app.post("/qr-login/generate")
+@accounts_router.post("/qr-login/generate")
 async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_user)):
     """生成扫码登录二维码"""
     try:
@@ -2286,7 +2300,7 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
         return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
 
 
-@app.get("/qr-login/check/{session_id}")
+@accounts_router.get("/qr-login/check/{session_id}")
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
     try:
@@ -2364,7 +2378,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         return {'status': 'error', 'message': str(e)}
 
 
-@app.post("/qr-login/continue/{session_id}")
+@accounts_router.post("/qr-login/continue/{session_id}")
 async def continue_qr_code_after_verification(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """用户完成安全验证后，恢复扫码登录状态检查"""
     try:
@@ -2506,7 +2520,7 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
         raise fallback_e
 
 
-@app.post("/qr-login/refresh-cookies")
+@accounts_router.post("/qr-login/refresh-cookies")
 async def refresh_cookies_from_qr_login(
     request: Dict[str, Any],
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2567,7 +2581,7 @@ async def refresh_cookies_from_qr_login(
         return {'success': False, 'message': f'刷新cookie失败: {str(e)}'}
 
 
-@app.post("/qr-login/reset-cooldown/{cookie_id}")
+@accounts_router.post("/qr-login/reset-cooldown/{cookie_id}")
 async def reset_qr_cookie_refresh_cooldown(
     cookie_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2609,7 +2623,7 @@ async def reset_qr_cookie_refresh_cooldown(
         return {'success': False, 'message': f'重置冷却时间失败: {str(e)}'}
 
 
-@app.get("/qr-login/cooldown-status/{cookie_id}")
+@accounts_router.get("/qr-login/cooldown-status/{cookie_id}")
 async def get_qr_cookie_refresh_cooldown_status(
     cookie_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -2654,7 +2668,7 @@ async def get_qr_cookie_refresh_cooldown_status(
         return {'success': False, 'message': f'获取冷却状态失败: {str(e)}'}
 
 
-@app.put('/cookies/{cid}/status')
+@accounts_router.put('/cookies/{cid}/status')
 def update_cookie_status(cid: str, status_data: CookieStatusIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号的启用/禁用状态"""
     if cookie_manager.manager is None:
@@ -2678,7 +2692,7 @@ def update_cookie_status(cid: str, status_data: CookieStatusIn, current_user: Di
 
 # ------------------------- 默认回复管理接口 -------------------------
 
-@app.get('/default-replies/{cid}')
+@content_router.get('/default-replies/{cid}')
 def get_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的默认回复设置"""
     from db_manager import db_manager
@@ -2701,7 +2715,7 @@ def get_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put('/default-replies/{cid}')
+@content_router.put('/default-replies/{cid}')
 def update_default_reply(cid: str, reply_data: DefaultReplyIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新指定账号的默认回复设置"""
     from db_manager import db_manager
@@ -2721,7 +2735,7 @@ def update_default_reply(cid: str, reply_data: DefaultReplyIn, current_user: Dic
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get('/default-replies')
+@content_router.get('/default-replies')
 def get_all_default_replies(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户所有账号的默认回复设置"""
     from db_manager import db_manager
@@ -2738,7 +2752,7 @@ def get_all_default_replies(current_user: Dict[str, Any] = Depends(get_current_u
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete('/default-replies/{cid}')
+@content_router.delete('/default-replies/{cid}')
 def delete_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除指定账号的默认回复设置"""
     from db_manager import db_manager
@@ -2761,7 +2775,7 @@ def delete_default_reply(cid: str, current_user: Dict[str, Any] = Depends(get_cu
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/default-replies/{cid}/clear-records')
+@content_router.post('/default-replies/{cid}/clear-records')
 def clear_default_reply_records(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """清空指定账号的默认回复记录"""
     from db_manager import db_manager
@@ -2784,25 +2798,25 @@ def clear_default_reply_records(cid: str, current_user: Dict[str, Any] = Depends
 # ------------------------- 默认回复管理接口（单数形式兼容路由） -------------------------
 # 兼容前端使用 /api/default-reply/ 的请求
 
-@app.get('/api/default-reply/{cid}')
+@content_router.get('/api/default-reply/{cid}', deprecated=True)
 def get_default_reply_compat(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的默认回复设置（兼容路由）"""
     return get_default_reply(cid, current_user)
 
 
-@app.put('/api/default-reply/{cid}')
+@content_router.put('/api/default-reply/{cid}', deprecated=True)
 def update_default_reply_compat(cid: str, reply_data: DefaultReplyIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新指定账号的默认回复设置（兼容路由）"""
     return update_default_reply(cid, reply_data, current_user)
 
 
-@app.delete('/api/default-reply/{cid}')
+@content_router.delete('/api/default-reply/{cid}', deprecated=True)
 def delete_default_reply_compat(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除指定账号的默认回复设置（兼容路由）"""
     return delete_default_reply(cid, current_user)
 
 
-@app.post('/api/default-reply/{cid}/clear-records')
+@content_router.post('/api/default-reply/{cid}/clear-records', deprecated=True)
 def clear_default_reply_records_compat(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """清空指定账号的默认回复记录（兼容路由）"""
     return clear_default_reply_records(cid, current_user)
@@ -2810,7 +2824,7 @@ def clear_default_reply_records_compat(cid: str, current_user: Dict[str, Any] = 
 
 # ------------------------- 通知渠道管理接口 -------------------------
 
-@app.get('/notification-channels')
+@content_router.get('/notification-channels')
 def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有通知渠道"""
     from db_manager import db_manager
@@ -2821,7 +2835,7 @@ def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/notification-channels')
+@content_router.post('/notification-channels')
 def create_notification_channel(channel_data: NotificationChannelIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建通知渠道"""
     from db_manager import db_manager
@@ -2838,7 +2852,7 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get('/notification-channels/{channel_id}')
+@content_router.get('/notification-channels/{channel_id}')
 def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
     """获取指定通知渠道"""
     from db_manager import db_manager
@@ -2853,7 +2867,7 @@ def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put('/notification-channels/{channel_id}')
+@content_router.put('/notification-channels/{channel_id}')
 def update_notification_channel(channel_id: int, channel_data: NotificationChannelUpdate, _: None = Depends(require_auth)):
     """更新通知渠道"""
     from db_manager import db_manager
@@ -2874,7 +2888,7 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.delete('/notification-channels/{channel_id}')
+@content_router.delete('/notification-channels/{channel_id}')
 def delete_notification_channel(channel_id: int, _: None = Depends(require_auth)):
     """删除通知渠道"""
     from db_manager import db_manager
@@ -2892,7 +2906,7 @@ def delete_notification_channel(channel_id: int, _: None = Depends(require_auth)
 
 # ------------------------- 消息通知配置接口 -------------------------
 
-@app.get('/message-notifications')
+@content_router.get('/message-notifications')
 def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户所有账号的消息通知配置"""
     from db_manager import db_manager
@@ -2909,7 +2923,7 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get('/message-notifications/{cid}')
+@content_router.get('/message-notifications/{cid}')
 def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的消息通知配置"""
     from db_manager import db_manager
@@ -2928,7 +2942,7 @@ def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post('/message-notifications/{cid}')
+@content_router.post('/message-notifications/{cid}')
 def set_message_notification(cid: str, notification_data: MessageNotificationIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """设置账号的消息通知"""
     from db_manager import db_manager
@@ -2956,7 +2970,7 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete('/message-notifications/account/{cid}')
+@content_router.delete('/message-notifications/account/{cid}')
 def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
     """删除账号的所有消息通知配置"""
     from db_manager import db_manager
@@ -2972,7 +2986,7 @@ def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete('/message-notifications/{notification_id}')
+@content_router.delete('/message-notifications/{notification_id}')
 def delete_message_notification(notification_id: int, _: None = Depends(require_auth)):
     """删除消息通知配置"""
     from db_manager import db_manager
@@ -2990,7 +3004,7 @@ def delete_message_notification(notification_id: int, _: None = Depends(require_
 
 # ------------------------- 系统设置接口 -------------------------
 
-@app.get('/system-settings/public')
+@settings_router.get('/system-settings/public')
 def get_public_system_settings():
     """获取公开的系统设置（无需认证）"""
     from db_manager import db_manager
@@ -3009,7 +3023,7 @@ def get_public_system_settings():
         }
 
 
-@app.get('/system-settings')
+@settings_router.get('/system-settings')
 def get_system_settings(_: None = Depends(require_auth)):
     """获取类型化系统设置，不返回明文密钥。"""
     from db_manager import db_manager
@@ -3090,12 +3104,12 @@ def _settings_summary() -> Dict[str, Any]:
     }
 
 
-@app.get('/api/settings/summary')
+@settings_router.get('/api/settings/summary')
 def get_settings_summary(_: Dict[str, Any] = Depends(require_admin)):
     return {'success': True, **_settings_summary()}
 
 
-@app.put('/api/settings/sections/{section}')
+@settings_router.put('/api/settings/sections/{section}')
 def save_settings_section(section: str, request: SystemSettingsSectionIn,
                           _: Dict[str, Any] = Depends(require_admin)):
     values = _prepare_settings_section(section, request)
@@ -3109,7 +3123,7 @@ def save_settings_section(section: str, request: SystemSettingsSectionIn,
     }
 
 
-@app.post('/api/settings/verify/{section}')
+@settings_router.post('/api/settings/verify/{section}')
 def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
                             _: Dict[str, Any] = Depends(require_admin)):
     if section not in {'ai', 'smtp'}:
@@ -3159,7 +3173,7 @@ def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
         raise HTTPException(status_code=400, detail=f"验证失败: {str(e)}")
 
 
-@app.put('/system-settings/{key}')
+@settings_router.put('/system-settings/{key}')
 def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Depends(require_auth)):
     """更新系统设置"""
     from db_manager import db_manager
@@ -3181,7 +3195,7 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Dep
 
 # ------------------------- 注册设置接口 -------------------------
 
-@app.get('/registration-status')
+@settings_router.get('/registration-status')
 def get_registration_status():
     """获取注册开关状态（公开接口，无需认证）"""
     from db_manager import db_manager
@@ -3208,7 +3222,7 @@ def get_registration_status():
         return {'enabled': True, 'message': '注册功能已开启'}  # 出错时默认开启
 
 
-@app.get('/login-info-status')
+@auth_router.get('/login-info-status')
 def get_login_info_status():
     """获取默认登录信息显示状态（公开接口，无需认证）"""
     from db_manager import db_manager
@@ -3237,7 +3251,7 @@ class LoginInfoSettingUpdate(BaseModel):
     enabled: bool
 
 
-@app.put('/registration-settings')
+@settings_router.put('/registration-settings')
 def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):
     """更新注册开关设置（仅管理员）"""
     from db_manager import db_manager
@@ -3263,7 +3277,7 @@ def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_
         logger.error(f"更新注册设置失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put('/login-info-settings')
+@auth_router.put('/login-info-settings')
 def update_login_info_settings(setting_data: LoginInfoSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):
     """更新默认登录信息显示设置（仅管理员）"""
     from db_manager import db_manager
@@ -3292,7 +3306,7 @@ def update_login_info_settings(setting_data: LoginInfoSettingUpdate, admin_user:
 
 
 
-@app.delete("/cookies/{cid}")
+@accounts_router.delete("/cookies/{cid}")
 def remove_cookie(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail="CookieManager 未就绪")
@@ -3325,7 +3339,7 @@ class PauseDurationUpdate(BaseModel):
     pause_duration: int
 
 
-@app.put("/cookies/{cid}/auto-confirm")
+@accounts_router.put("/cookies/{cid}/auto-confirm")
 def update_auto_confirm(cid: str, update_data: AutoConfirmUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号的自动确认发货设置"""
     if cookie_manager.manager is None:
@@ -3359,7 +3373,7 @@ def update_auto_confirm(cid: str, update_data: AutoConfirmUpdate, current_user: 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/cookies/{cid}/auto-confirm")
+@accounts_router.get("/cookies/{cid}/auto-confirm")
 def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号的自动确认发货设置"""
     if cookie_manager.manager is None:
@@ -3385,7 +3399,7 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/cookies/{cid}/remark")
+@accounts_router.put("/cookies/{cid}/remark")
 def update_cookie_remark(cid: str, update_data: RemarkUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号备注"""
     if cookie_manager.manager is None:
@@ -3415,7 +3429,7 @@ def update_cookie_remark(cid: str, update_data: RemarkUpdate, current_user: Dict
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/cookies/{cid}/remark")
+@accounts_router.get("/cookies/{cid}/remark")
 def get_cookie_remark(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号备注"""
     if cookie_manager.manager is None:
@@ -3444,7 +3458,7 @@ def get_cookie_remark(cid: str, current_user: Dict[str, Any] = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/cookies/{cid}/pause-duration")
+@accounts_router.put("/cookies/{cid}/pause-duration")
 def update_cookie_pause_duration(cid: str, update_data: PauseDurationUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号自动回复暂停时间"""
     if cookie_manager.manager is None:
@@ -3478,7 +3492,7 @@ def update_cookie_pause_duration(cid: str, update_data: PauseDurationUpdate, cur
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/cookies/{cid}/pause-duration")
+@accounts_router.get("/cookies/{cid}/pause-duration")
 def get_cookie_pause_duration(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号自动回复暂停时间"""
     if cookie_manager.manager is None:
@@ -3511,7 +3525,7 @@ class KeywordWithItemIdIn(BaseModel):
     keywords: List[Dict[str, Any]]  # [{"keyword": str, "reply": str, "item_id": str}]
 
 
-@app.get("/keywords/{cid}")
+@content_router.get("/keywords/{cid}")
 def get_keywords(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail="CookieManager 未就绪")
@@ -3540,7 +3554,7 @@ def get_keywords(cid: str, current_user: Dict[str, Any] = Depends(get_current_us
     return all_keywords
 
 
-@app.get("/keywords-with-item-id/{cid}")
+@content_router.get("/keywords-with-item-id/{cid}")
 def get_keywords_with_item_id(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取包含商品ID的关键词列表"""
     if cookie_manager.manager is None:
@@ -3571,7 +3585,7 @@ def get_keywords_with_item_id(cid: str, current_user: Dict[str, Any] = Depends(g
     return result
 
 
-@app.post("/keywords/{cid}")
+@content_router.post("/keywords/{cid}")
 def update_keywords(cid: str, body: KeywordIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail="CookieManager 未就绪")
@@ -3593,7 +3607,7 @@ def update_keywords(cid: str, body: KeywordIn, current_user: Dict[str, Any] = De
     return {"msg": "updated", "count": len(kw_list)}
 
 
-@app.post("/keywords-with-item-id/{cid}")
+@content_router.post("/keywords-with-item-id/{cid}")
 def update_keywords_with_item_id(cid: str, body: KeywordWithItemIdIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新包含商品ID的关键词列表"""
     if cookie_manager.manager is None:
@@ -3678,7 +3692,7 @@ def update_keywords_with_item_id(cid: str, body: KeywordWithItemIdIn, current_us
     return {"msg": "updated", "count": len(keywords_to_save)}
 
 
-@app.get("/items/{cid}")
+@content_router.get("/items/{cid}")
 def get_items_list(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的商品列表"""
     if cookie_manager.manager is None:
@@ -3719,7 +3733,7 @@ def get_items_list(cid: str, current_user: Dict[str, Any] = Depends(get_current_
         raise HTTPException(status_code=500, detail="获取商品列表失败")
 
 
-@app.get("/keywords-export/{cid}")
+@content_router.get("/keywords-export/{cid}")
 def export_keywords(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """导出指定账号的关键词为Excel文件"""
     if cookie_manager.manager is None:
@@ -3806,7 +3820,7 @@ def export_keywords(cid: str, current_user: Dict[str, Any] = Depends(get_current
         raise HTTPException(status_code=500, detail=f"导出关键词失败: {str(e)}")
 
 
-@app.post("/keywords-import/{cid}")
+@content_router.post("/keywords-import/{cid}")
 async def import_keywords(cid: str, file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入Excel文件中的关键词到指定账号"""
     if cookie_manager.manager is None:
@@ -3906,7 +3920,7 @@ async def import_keywords(cid: str, file: UploadFile = File(...), current_user: 
         raise HTTPException(status_code=500, detail=f"导入关键词失败: {str(e)}")
 
 
-@app.post("/keywords/{cid}/image")
+@content_router.post("/keywords/{cid}/image")
 async def add_image_keyword(
     cid: str,
     keyword: str = Form(...),
@@ -3986,7 +4000,7 @@ async def add_image_keyword(
         raise HTTPException(status_code=500, detail=f"添加图片关键词失败: {str(e)}")
 
 
-@app.post("/upload-image")
+@content_router.post("/upload-image")
 async def upload_image(
     image: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -4024,7 +4038,7 @@ async def upload_image(
         raise HTTPException(status_code=500, detail=f"图片上传失败: {str(e)}")
 
 
-@app.get("/keywords-with-type/{cid}")
+@content_router.get("/keywords-with-type/{cid}")
 def get_keywords_with_type(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取包含类型信息的关键词列表"""
     if cookie_manager.manager is None:
@@ -4043,7 +4057,7 @@ def get_keywords_with_type(cid: str, current_user: Dict[str, Any] = Depends(get_
         raise HTTPException(status_code=500, detail=f"获取关键词列表失败: {str(e)}")
 
 
-@app.delete("/keywords/{cid}/{index}")
+@content_router.delete("/keywords/{cid}/{index}")
 def delete_keyword_by_index(cid: str, index: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """根据索引删除关键词"""
     if cookie_manager.manager is None:
@@ -4082,7 +4096,7 @@ def delete_keyword_by_index(cid: str, index: int, current_user: Dict[str, Any] =
         raise HTTPException(status_code=500, detail=f"删除关键词失败: {str(e)}")
 
 
-@app.get("/debug/keywords-table-info")
+@content_router.get("/debug/keywords-table-info")
 def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current_user)):
     """调试：检查keywords表结构"""
     try:
@@ -4111,7 +4125,7 @@ def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current
 
 
 # 卡券管理API
-@app.get("/cards")
+@content_router.get("/cards")
 def get_cards(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的卡券列表"""
     try:
@@ -4123,7 +4137,7 @@ def get_cards(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/cards")
+@content_router.post("/cards")
 def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建新卡券"""
     try:
@@ -4162,7 +4176,7 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/cards/{card_id}")
+@content_router.get("/cards/{card_id}")
 def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取单个卡券详情"""
     try:
@@ -4177,7 +4191,7 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/cards/{card_id}")
+@content_router.put("/cards/{card_id}")
 def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
     """更新卡券"""
     try:
@@ -4211,7 +4225,7 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/cards/{card_id}/image")
+@content_router.put("/cards/{card_id}/image")
 async def update_card_with_image(
     card_id: int,
     image: UploadFile = File(...),
@@ -4282,7 +4296,7 @@ async def update_card_with_image(
 
 
 # 自动发货规则API
-@app.get("/delivery-rules")
+@content_router.get("/delivery-rules")
 def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取发货规则列表"""
     try:
@@ -4294,7 +4308,7 @@ def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/delivery-rules")
+@content_router.post("/delivery-rules")
 def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建新发货规则"""
     try:
@@ -4313,7 +4327,7 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/delivery-rules/{rule_id}")
+@content_router.get("/delivery-rules/{rule_id}")
 def get_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取单个发货规则详情"""
     try:
@@ -4328,7 +4342,7 @@ def get_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(get_c
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/delivery-rules/{rule_id}")
+@content_router.put("/delivery-rules/{rule_id}")
 def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新发货规则"""
     try:
@@ -4351,7 +4365,7 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/cards/{card_id}")
+@content_router.delete("/cards/{card_id}")
 def delete_card(card_id: int, _: None = Depends(require_auth)):
     """删除卡券"""
     try:
@@ -4365,7 +4379,7 @@ def delete_card(card_id: int, _: None = Depends(require_auth)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/delivery-rules/{rule_id}")
+@content_router.delete("/delivery-rules/{rule_id}")
 def delete_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除发货规则"""
     try:
@@ -4382,7 +4396,7 @@ def delete_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(ge
 
 # ==================== 备份和恢复 API ====================
 
-@app.get("/backup/export")
+@admin_router.get("/backup/export")
 def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
     """导出用户备份"""
     try:
@@ -4408,7 +4422,7 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=f"导出备份失败: {str(e)}")
 
 
-@app.post("/backup/import")
+@admin_router.post("/backup/import")
 def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入用户备份"""
     try:
@@ -4445,7 +4459,7 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
         raise HTTPException(status_code=500, detail=f"导入备份失败: {str(e)}")
 
 
-@app.post("/system/reload-cache")
+@admin_router.post("/system/reload-cache")
 def reload_cache(_: None = Depends(require_auth)):
     """重新加载系统缓存（用于手动刷新数据）"""
     try:
@@ -4464,7 +4478,7 @@ def reload_cache(_: None = Depends(require_auth)):
 
 # ==================== 商品管理 API ====================
 
-@app.get("/items")
+@content_router.get("/items")
 def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的所有商品信息"""
     try:
@@ -4494,7 +4508,7 @@ class ItemSearchMultipleRequest(BaseModel):
     keyword: str
     total_pages: int = 1
 
-@app.post("/items/search")
+@content_router.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
@@ -4544,7 +4558,7 @@ async def search_items(
         raise HTTPException(status_code=500, detail=f"商品搜索失败: {error_msg}")
 
 
-@app.get("/cookies/check")
+@accounts_router.get("/cookies/check")
 async def check_valid_cookies(
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
 ):
@@ -4593,7 +4607,7 @@ async def check_valid_cookies(
             "error": str(e)
         }
 
-@app.post("/items/search_multiple")
+@content_router.post("/items/search_multiple")
 async def search_multiple_pages(
     search_request: ItemSearchMultipleRequest,
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
@@ -4643,7 +4657,7 @@ async def search_multiple_pages(
 
 
 
-@app.get("/items/cookie/{cookie_id}")
+@content_router.get("/items/cookie/{cookie_id}")
 def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定Cookie的商品信息"""
     try:
@@ -4663,7 +4677,7 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
         raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
 
 
-@app.get("/items/{cookie_id}/{item_id}")
+@content_router.get("/items/{cookie_id}/{item_id}")
 def get_item_detail(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取商品详情"""
     try:
@@ -4689,7 +4703,7 @@ class ItemDetailUpdate(BaseModel):
     item_detail: str
 
 
-@app.put("/items/{cookie_id}/{item_id}")
+@content_router.put("/items/{cookie_id}/{item_id}")
 def update_item_detail(
     cookie_id: str,
     item_id: str,
@@ -4717,7 +4731,7 @@ def update_item_detail(
         raise HTTPException(status_code=500, detail=f"更新商品详情失败: {str(e)}")
 
 
-@app.delete("/items/{cookie_id}/{item_id}")
+@content_router.delete("/items/{cookie_id}/{item_id}")
 def delete_item_info(
     cookie_id: str,
     item_id: str,
@@ -4857,7 +4871,7 @@ def _mask_secret(value: str) -> str:
     return f"{value[:3]}***{value[-4:]}"
 
 
-@app.delete("/items/batch")
+@content_router.delete("/items/batch")
 def batch_delete_items(
     request: BatchDeleteRequest,
     _: None = Depends(require_auth)
@@ -5055,7 +5069,7 @@ def _provider_public_payload(profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@app.get('/api/ai/providers')
+@ai_router.get('/api/ai/providers')
 def list_ai_providers(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
     db_manager.ensure_legacy_ai_provider_profiles(user_id)
@@ -5065,7 +5079,7 @@ def list_ai_providers(current_user: Dict[str, Any] = Depends(get_current_user)):
     }
 
 
-@app.post('/api/ai/providers')
+@ai_router.post('/api/ai/providers')
 def create_ai_provider(payload: AIProviderProfileCreate, current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
     data = _normalize_provider_payload(payload.dict())
@@ -5082,7 +5096,7 @@ def create_ai_provider(payload: AIProviderProfileCreate, current_user: Dict[str,
     return _provider_public_payload(db_manager.get_ai_provider_profile(profile_id, user_id))
 
 
-@app.put('/api/ai/providers/{profile_id}')
+@ai_router.put('/api/ai/providers/{profile_id}')
 def update_ai_provider(profile_id: int, payload: AIProviderProfileUpdate,
                        current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
@@ -5096,7 +5110,7 @@ def update_ai_provider(profile_id: int, payload: AIProviderProfileUpdate,
         raise HTTPException(status_code=409, detail=str(e))
 
 
-@app.delete('/api/ai/providers/{profile_id}')
+@ai_router.delete('/api/ai/providers/{profile_id}')
 def delete_ai_provider(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     try:
         if not db_manager.delete_ai_provider_profile(profile_id, current_user['user_id']):
@@ -5106,7 +5120,7 @@ def delete_ai_provider(profile_id: int, current_user: Dict[str, Any] = Depends(g
         raise HTTPException(status_code=409, detail=str(e))
 
 
-@app.post('/api/ai/providers/{profile_id}/models/refresh')
+@ai_router.post('/api/ai/providers/{profile_id}/models/refresh')
 def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
     profile = db_manager.get_ai_provider_profile(profile_id, user_id, include_secret=True)
@@ -5121,7 +5135,7 @@ def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = D
         raise HTTPException(status_code=400, detail='模型列表读取失败，可手动填写模型 ID 后测试')
 
 
-@app.post('/api/ai/providers/{profile_id}/test')
+@ai_router.post('/api/ai/providers/{profile_id}/test')
 def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
                      current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
@@ -5147,7 +5161,7 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
         raise HTTPException(status_code=400, detail='测试回复生成失败，请检查平台、Key、地址和模型 ID')
 
 
-@app.get("/ai-reply-settings/{cookie_id}")
+@ai_router.get("/ai-reply-settings/{cookie_id}")
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的AI回复设置"""
     try:
@@ -5198,7 +5212,7 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.put("/ai-reply-settings/{cookie_id}")
+@ai_router.put("/ai-reply-settings/{cookie_id}")
 def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新指定账号的AI回复设置"""
     try:
@@ -5266,7 +5280,7 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.get("/ai-reply-settings")
+@ai_router.get("/ai-reply-settings")
 def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户所有账号的AI回复设置"""
     try:
@@ -5301,7 +5315,7 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.post("/ai-reply-test/{cookie_id}")
+@ai_router.post("/ai-reply-test/{cookie_id}")
 def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_auth)):
     """测试AI回复功能"""
     try:
@@ -5356,7 +5370,7 @@ def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_aut
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.post("/ai-reply-lab/reply/{cookie_id}")
+@ai_router.post("/ai-reply-lab/reply/{cookie_id}")
 def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """AI训练实验室回复，不污染正式对话记录和线上提示词。"""
     try:
@@ -5455,7 +5469,7 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.post("/ai-reply-lab/save/{cookie_id}")
+@ai_router.post("/ai-reply-lab/save/{cookie_id}")
 def save_ai_reply_lab_rules(cookie_id: str, request: AIReplyLabSaveRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """兼容旧前端：训练规则写入分层规则表，不再污染账号提示词。"""
     try:
@@ -5477,14 +5491,14 @@ def save_ai_reply_lab_rules(cookie_id: str, request: AIReplyLabSaveRequest, curr
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.get("/ai-training-rules/{cookie_id}")
+@ai_router.get("/ai-training-rules/{cookie_id}")
 def get_ai_training_rules(cookie_id: str, item_id: str = Query(default=''), current_user: Dict[str, Any] = Depends(get_current_user)):
     _ensure_ai_cookie_access(cookie_id, current_user)
     rules = db_manager.get_ai_training_rules(cookie_id, item_id, include_disabled=True)
     return {**rules, 'context': db_manager.get_ai_training_rule_context(cookie_id, item_id)}
 
 
-@app.post("/ai-training-rules/{cookie_id}")
+@ai_router.post("/ai-training-rules/{cookie_id}")
 def save_ai_training_rules(cookie_id: str, request: AIReplyLabSaveRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     _ensure_ai_cookie_access(cookie_id, current_user)
     rules = _normalize_scoped_rules(request.training_rules)
@@ -5494,7 +5508,7 @@ def save_ai_training_rules(cookie_id: str, request: AIReplyLabSaveRequest, curre
     return {"message": "训练规则已保存", "rules": saved}
 
 
-@app.delete("/ai-training-rules/{cookie_id}/{rule_id}")
+@ai_router.delete("/ai-training-rules/{cookie_id}/{rule_id}")
 def delete_ai_training_rule(cookie_id: str, rule_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     _ensure_ai_cookie_access(cookie_id, current_user)
     if not db_manager.delete_ai_training_rule(cookie_id, rule_id):
@@ -5502,7 +5516,7 @@ def delete_ai_training_rule(cookie_id: str, rule_id: int, current_user: Dict[str
     return {"message": "训练规则已删除"}
 
 
-@app.patch("/ai-training-rules/{cookie_id}/{rule_id}")
+@ai_router.patch("/ai-training-rules/{cookie_id}/{rule_id}")
 def set_ai_training_rule_status(cookie_id: str, rule_id: int, request: AITrainingRuleStatusRequest,
                                 current_user: Dict[str, Any] = Depends(get_current_user)):
     _ensure_ai_cookie_access(cookie_id, current_user)
@@ -5511,13 +5525,13 @@ def set_ai_training_rule_status(cookie_id: str, rule_id: int, request: AITrainin
     return {"message": "训练规则状态已更新"}
 
 
-@app.get("/ai-item-knowledge/{cookie_id}/{item_id}")
+@ai_router.get("/ai-item-knowledge/{cookie_id}/{item_id}")
 def get_ai_item_knowledge(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
     return _item_knowledge_payload(cookie_id, item_id, item)
 
 
-@app.post("/ai-item-knowledge/{cookie_id}/{item_id}/generate")
+@ai_router.post("/ai-item-knowledge/{cookie_id}/{item_id}/generate")
 def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeGenerateRequest,
                                current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
@@ -5556,7 +5570,7 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
         raise HTTPException(status_code=500, detail='AI草稿生成失败，请检查AI配置')
 
 
-@app.post("/ai-item-knowledge/{cookie_id}/{item_id}/copy")
+@ai_router.post("/ai-item-knowledge/{cookie_id}/{item_id}/copy")
 def copy_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeCopyRequest,
                            current_user: Dict[str, Any] = Depends(get_current_user)):
     _get_ai_knowledge_item(cookie_id, item_id, current_user)
@@ -5574,7 +5588,7 @@ def copy_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledg
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.put("/ai-item-knowledge/{cookie_id}/{item_id}/draft")
+@ai_router.put("/ai-item-knowledge/{cookie_id}/{item_id}/draft")
 def save_ai_item_knowledge_draft(cookie_id: str, item_id: str, request: AIItemKnowledgeDraftRequest,
                                  current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
@@ -5593,7 +5607,7 @@ def save_ai_item_knowledge_draft(cookie_id: str, item_id: str, request: AIItemKn
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/ai-item-knowledge/{cookie_id}/{item_id}/publish")
+@ai_router.post("/ai-item-knowledge/{cookie_id}/{item_id}/publish")
 def publish_ai_item_knowledge(cookie_id: str, item_id: str,
                               current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
@@ -5607,14 +5621,14 @@ def publish_ai_item_knowledge(cookie_id: str, item_id: str,
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/ai-item-knowledge/{cookie_id}/{item_id}/versions")
+@ai_router.get("/ai-item-knowledge/{cookie_id}/{item_id}/versions")
 def get_ai_item_knowledge_versions(cookie_id: str, item_id: str,
                                    current_user: Dict[str, Any] = Depends(get_current_user)):
     _get_ai_knowledge_item(cookie_id, item_id, current_user)
     return {'versions': db_manager.get_ai_item_knowledge_versions(cookie_id, item_id)}
 
 
-@app.post("/ai-item-knowledge/{cookie_id}/{item_id}/rollback/{version}")
+@ai_router.post("/ai-item-knowledge/{cookie_id}/{item_id}/rollback/{version}")
 def rollback_ai_item_knowledge(cookie_id: str, item_id: str, version: int,
                                current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
@@ -5653,13 +5667,13 @@ def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
     return refresh_status
 
 
-@app.get("/api/accounts/{cookie_id}/session-status")
+@accounts_router.get("/api/accounts/{cookie_id}/session-status")
 def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
     return {'success': True, 'data': _current_session_refresh_status(cookie_id)}
 
 
-@app.post("/api/accounts/{cookie_id}/session-refresh")
+@accounts_router.post("/api/accounts/{cookie_id}/session-refresh")
 async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
     current_status = _current_session_refresh_status(cookie_id)
@@ -5694,7 +5708,7 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
     }
 
 
-@app.post("/api/accounts/{cookie_id}/session-refresh/cancel")
+@accounts_router.post("/api/accounts/{cookie_id}/session-refresh/cancel")
 def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
     status_info = _current_session_refresh_status(cookie_id)
@@ -5708,7 +5722,7 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
     return {'success': True, 'message': '刷新已取消' if cancelled else '没有正在运行的刷新任务'}
 
 
-@app.get("/api/diagnostics/auto-reply/{cookie_id}")
+@accounts_router.get("/api/diagnostics/auto-reply/{cookie_id}")
 def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """诊断指定账号的自动回复链路"""
     try:
@@ -5882,7 +5896,7 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
 
 # ==================== 技能中心API ====================
 
-@app.get('/api/skills/capabilities')
+@skills_router.get('/api/skills/capabilities')
 def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_user)):
     account_count = len(db_manager.get_all_cookies(current_user['user_id']))
     return {
@@ -6141,7 +6155,7 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int) -> Tuple[L
     return created_ids, len(raw_items), search_result
 
 
-@app.get("/api/skills/monitor/tasks")
+@skills_router.get("/api/skills/monitor/tasks")
 def list_skill_monitor_tasks(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的技能监控任务"""
     return {
@@ -6150,7 +6164,7 @@ def list_skill_monitor_tasks(current_user: Dict[str, Any] = Depends(get_current_
     }
 
 
-@app.post("/api/skills/monitor/tasks")
+@skills_router.post("/api/skills/monitor/tasks")
 def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建技能监控任务"""
     try:
@@ -6187,7 +6201,7 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.post("/api/skills/monitor/tasks/{task_id}/run")
+@skills_router.post("/api/skills/monitor/tasks/{task_id}/run")
 async def run_skill_monitor_task(task_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """运行技能监控任务，调用真实闲鱼搜索并写入真实结果"""
     try:
@@ -6224,7 +6238,7 @@ async def run_skill_monitor_task(task_id: int, current_user: Dict[str, Any] = De
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.get("/api/skills/monitor/results")
+@skills_router.get("/api/skills/monitor/results")
 def list_skill_monitor_results(
     task_id: Optional[int] = Query(None),
     limit: int = Query(100, ge=1, le=500),
@@ -6237,7 +6251,7 @@ def list_skill_monitor_results(
     }
 
 
-@app.get("/api/skills/agent/prompts")
+@skills_router.get("/api/skills/agent/prompts")
 def get_skill_agent_prompts(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取AI专家客服提示词"""
     prompts = _ensure_skill_agent_prompts(current_user['user_id'])
@@ -6247,7 +6261,7 @@ def get_skill_agent_prompts(current_user: Dict[str, Any] = Depends(get_current_u
     }
 
 
-@app.put("/api/skills/agent/prompts/{prompt_type}")
+@skills_router.put("/api/skills/agent/prompts/{prompt_type}")
 def update_skill_agent_prompt(
     prompt_type: str,
     prompt: SkillAgentPromptIn,
@@ -6278,7 +6292,7 @@ def update_skill_agent_prompt(
     return {"success": True, "message": "提示词保存成功"}
 
 
-@app.post("/api/skills/agent/test-reply")
+@skills_router.post("/api/skills/agent/test-reply")
 def test_skill_agent_reply(test_data: SkillAgentTestIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """测试AI专家客服策略，调用真实AI回复引擎"""
     try:
@@ -6350,7 +6364,7 @@ def test_skill_agent_reply(test_data: SkillAgentTestIn, current_user: Dict[str, 
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
-@app.get("/api/skills/ops/health")
+@skills_router.get("/api/skills/ops/health")
 def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取技能中心运维健康信息"""
     db_path = Path(db_manager.db_path)
@@ -6404,7 +6418,7 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
     }
 
 
-@app.get("/api/skills/ops/browser-status")
+@skills_router.get("/api/skills/ops/browser-status")
 def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取Playwright/浏览器运行状态"""
     browser_info = {
@@ -6433,7 +6447,7 @@ def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_
     return {"success": True, "data": browser_info}
 
 
-@app.get("/api/skills/ops/delivery-diagnostics")
+@skills_router.get("/api/skills/ops/delivery-diagnostics")
 def get_skill_delivery_diagnostics(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取发货、卡券和规则诊断"""
     user_id = current_user['user_id']
@@ -6464,7 +6478,7 @@ def get_skill_delivery_diagnostics(current_user: Dict[str, Any] = Depends(get_cu
 
 # ==================== 日志管理API ====================
 
-@app.get("/logs")
+@admin_router.get("/logs")
 async def get_logs(lines: int = 200, level: str = None, source: str = None, _: None = Depends(require_auth)):
     """获取实时系统日志"""
     try:
@@ -6480,7 +6494,7 @@ async def get_logs(lines: int = 200, level: str = None, source: str = None, _: N
         return {"success": False, "message": f"获取日志失败: {str(e)}", "logs": []}
 
 
-@app.get("/risk-control-logs")
+@admin_router.get("/risk-control-logs")
 async def get_risk_control_logs(
     cookie_id: str = None,
     limit: int = 100,
@@ -6515,7 +6529,7 @@ async def get_risk_control_logs(
         }
 
 
-@app.delete("/risk-control-logs/{log_id}")
+@admin_router.delete("/risk-control-logs/{log_id}")
 async def delete_risk_control_log(
     log_id: int,
     admin_user: Dict[str, Any] = Depends(require_admin)
@@ -6538,7 +6552,7 @@ async def delete_risk_control_log(
         return {"success": False, "message": f"删除失败: {str(e)}"}
 
 
-@app.get("/logs/stats")
+@admin_router.get("/logs/stats")
 async def get_log_stats(_: None = Depends(require_auth)):
     """获取日志统计信息"""
     try:
@@ -6551,7 +6565,7 @@ async def get_log_stats(_: None = Depends(require_auth)):
         return {"success": False, "message": f"获取日志统计失败: {str(e)}", "stats": {}}
 
 
-@app.post("/logs/clear")
+@admin_router.post("/logs/clear")
 async def clear_logs(_: None = Depends(require_auth)):
     """清空日志"""
     try:
@@ -6566,7 +6580,7 @@ async def clear_logs(_: None = Depends(require_auth)):
 
 # ==================== 商品管理API ====================
 
-@app.post("/items/get-all-from-account")
+@content_router.post("/items/get-all-from-account")
 async def get_all_items_from_account(request: dict, _: None = Depends(require_auth)):
     """从指定账号获取所有商品信息"""
     try:
@@ -6615,7 +6629,7 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
         return {"success": False, "message": f"获取商品信息异常: {str(e)}"}
 
 
-@app.post("/items/get-by-page")
+@content_router.post("/items/get-by-page")
 async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
     """从指定账号按页获取商品信息"""
     try:
@@ -6681,7 +6695,7 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
 
 # ------------------------- 用户设置接口 -------------------------
 
-@app.get('/user-settings')
+@settings_router.get('/user-settings')
 def get_user_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的设置"""
     from db_manager import db_manager
@@ -6692,7 +6706,7 @@ def get_user_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put('/user-settings/{key}')
+@settings_router.put('/user-settings/{key}')
 def update_user_setting(key: str, setting_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新用户设置"""
     from db_manager import db_manager
@@ -6714,7 +6728,7 @@ def update_user_setting(key: str, setting_data: dict, current_user: Dict[str, An
         log_with_user('error', f"更新用户设置异常: {key} - {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/user-settings/{key}')
+@settings_router.get('/user-settings/{key}')
 def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取用户特定设置"""
     from db_manager import db_manager
@@ -6731,7 +6745,7 @@ def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_curren
 
 # ------------------------- 管理员专用接口 -------------------------
 
-@app.get('/admin/users')
+@admin_router.get('/admin/users')
 def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取所有用户信息（管理员专用）"""
     from db_manager import db_manager
@@ -6762,7 +6776,7 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
         log_with_user('error', f"获取用户信息失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete('/admin/users/{user_id}')
+@admin_router.delete('/admin/users/{user_id}')
 def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
     """删除用户（管理员专用）"""
     from db_manager import db_manager
@@ -6794,7 +6808,7 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
         log_with_user('error', f"删除用户异常: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/admin/risk-control-logs')
+@admin_router.get('/admin/risk-control-logs')
 async def get_admin_risk_control_logs(
     cookie_id: str = None,
     limit: int = 100,
@@ -6824,7 +6838,7 @@ async def get_admin_risk_control_logs(
         return {"success": False, "message": f"查询失败: {str(e)}", "data": [], "total": 0}
 
 
-@app.get('/admin/cookies')
+@admin_router.get('/admin/cookies')
 def get_admin_cookies(admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取所有Cookie信息（管理员专用）"""
     try:
@@ -6873,7 +6887,7 @@ def get_admin_cookies(admin_user: Dict[str, Any] = Depends(require_admin)):
         }
 
 
-@app.get('/admin/logs')
+@admin_router.get('/admin/logs')
 def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
                    lines: int = 100,
                    level: str = None):
@@ -6937,7 +6951,7 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
         log_with_user('error', f"获取系统日志失败: {str(e)}", admin_user)
         return {"logs": [], "message": f"获取系统日志失败: {str(e)}", "success": False}
 
-@app.get('/admin/log-files')
+@admin_router.get('/admin/log-files')
 def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     """列出所有可用的系统日志文件"""
     import os
@@ -6979,7 +6993,7 @@ def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
         log_with_user('error', f"获取日志文件列表失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/admin/logs/export')
+@admin_router.get('/admin/logs/export')
 def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """导出指定的日志文件"""
     import os
@@ -7030,7 +7044,7 @@ def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admi
         log_with_user('error', f"导出日志文件失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/admin/stats')
+@admin_router.get('/admin/stats')
 def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取系统统计信息（管理员专用）"""
     from db_manager import db_manager
@@ -7086,7 +7100,7 @@ def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
 
 # ------------------------- BI报表分析接口 -------------------------
 
-@app.get('/analytics/orders')
+@orders_router.get('/analytics/orders')
 def get_order_analytics(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -7130,7 +7144,7 @@ def get_order_analytics(
         log_with_user('error', f"获取订单分析数据失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/analytics/orders/valid')
+@orders_router.get('/analytics/orders/valid')
 def get_valid_orders(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -7170,7 +7184,7 @@ def get_valid_orders(
 
 # ------------------------- 指定商品回复接口 -------------------------
 
-@app.get("/itemReplays")
+@content_router.get("/itemReplays")
 def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的所有商品回复信息"""
     try:
@@ -7188,7 +7202,7 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品回复信息失败: {str(e)}")
 
-@app.get("/itemReplays/cookie/{cookie_id}")
+@content_router.get("/itemReplays/cookie/{cookie_id}")
 def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定Cookie的商品信息"""
     try:
@@ -7207,7 +7221,7 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取商品信息失败: {str(e)}")
 
-@app.put("/item-reply/{cookie_id}/{item_id}")
+@content_router.put("/item-reply/{cookie_id}/{item_id}")
 def update_item_reply(
     cookie_id: str,
     item_id: str,
@@ -7239,7 +7253,7 @@ def update_item_reply(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新商品回复失败: {str(e)}")
 
-@app.delete("/item-reply/{cookie_id}/{item_id}")
+@content_router.delete("/item-reply/{cookie_id}/{item_id}")
 def delete_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     删除指定账号cookie_id和商品item_id的商品回复
@@ -7268,7 +7282,7 @@ class ItemToDelete(BaseModel):
 class BatchDeleteRequest(BaseModel):
     items: List[ItemToDelete]
 
-@app.delete("/item-reply/batch")
+@content_router.delete("/item-reply/batch")
 async def batch_delete_item_reply(
     req: BatchDeleteRequest,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -7291,7 +7305,7 @@ async def batch_delete_item_reply(
         "failed_count": result["failed_count"]
     }
 
-@app.get("/item-reply/{cookie_id}/{item_id}")
+@content_router.get("/item-reply/{cookie_id}/{item_id}")
 def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     获取指定账号cookie_id和商品item_id的商品回复内容
@@ -7321,7 +7335,7 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
 
 # ------------------------- 数据库备份和恢复接口 -------------------------
 
-@app.get('/admin/backup/download')
+@admin_router.get('/admin/backup/download')
 def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)):
     """下载数据库备份文件（管理员专用）"""
     import os
@@ -7358,7 +7372,7 @@ def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)
         log_with_user('error', f"下载数据库备份失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post('/admin/backup/upload')
+@admin_router.post('/admin/backup/upload')
 async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin),
                                 backup_file: UploadFile = File(...)):
     """上传并恢复数据库备份文件（管理员专用）"""
@@ -7468,7 +7482,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
             os.remove(temp_file_path)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get('/admin/backup/list')
+@admin_router.get('/admin/backup/list')
 def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     """列出服务器上的备份文件（管理员专用）"""
     import os
@@ -7512,7 +7526,7 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
 
 # ------------------------- 系统管理接口 -------------------------
 
-@app.post('/admin/reload-cache')
+@admin_router.post('/admin/reload-cache')
 async def reload_system_cache(admin_user: Dict[str, Any] = Depends(require_admin)):
     """刷新系统缓存（管理员专用）"""
     try:
@@ -7531,7 +7545,7 @@ async def reload_system_cache(admin_user: Dict[str, Any] = Depends(require_admin
 
 # ------------------------- 数据管理接口 -------------------------
 
-@app.get('/admin/data/{table_name}')
+@admin_router.get('/admin/data/{table_name}')
 def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """获取指定表的所有数据（管理员专用）"""
     from db_manager import db_manager
@@ -7570,7 +7584,7 @@ def get_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require
         log_with_user('error', f"查询表数据失败: {table_name} - {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete('/admin/data/{table_name}/{record_id}')
+@admin_router.delete('/admin/data/{table_name}/{record_id}')
 def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """删除指定表的指定记录（管理员专用）"""
     from db_manager import db_manager
@@ -7611,7 +7625,7 @@ def delete_table_record(table_name: str, record_id: str, admin_user: Dict[str, A
         log_with_user('error', f"删除表记录异常: {table_name}.{record_id} - {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete('/admin/data/{table_name}')
+@admin_router.delete('/admin/data/{table_name}')
 def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """清空指定表的所有数据（管理员专用）"""
     from db_manager import db_manager
@@ -7655,7 +7669,7 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
 
 
 # 商品多规格管理API
-@app.put("/items/{cookie_id}/{item_id}/multi-spec")
+@content_router.put("/items/{cookie_id}/{item_id}/multi-spec")
 def update_item_multi_spec(
     cookie_id: str,
     item_id: str,
@@ -7685,7 +7699,7 @@ def update_item_multi_spec(
 
 
 # 商品多数量发货管理API
-@app.put("/items/{cookie_id}/{item_id}/multi-quantity-delivery")
+@content_router.put("/items/{cookie_id}/{item_id}/multi-quantity-delivery")
 def update_item_multi_quantity_delivery(
     cookie_id: str,
     item_id: str,
@@ -7794,7 +7808,7 @@ async def _sync_recent_orders(
     return JSONResponse(status_code=status_code, content=payload)
 
 
-@app.post('/api/orders/sync')
+@orders_router.post('/api/orders/sync')
 async def sync_recent_orders(
     request: OrderSyncRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -7806,7 +7820,7 @@ async def sync_recent_orders(
         days=request.days,
     )
 
-@app.get('/api/orders')
+@orders_router.get('/api/orders')
 def get_user_orders(
     current_user: Dict[str, Any] = Depends(get_current_user),
     page: int = Query(1, ge=1, description="页码"),
@@ -7874,7 +7888,7 @@ def get_user_orders(
         raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
 
 
-@app.get('/api/orders/{order_id}')
+@orders_router.get('/api/orders/{order_id}')
 def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取订单详情"""
     try:
@@ -7903,7 +7917,7 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
         raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
 
 
-@app.delete('/api/orders/{order_id}')
+@orders_router.delete('/api/orders/{order_id}')
 def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除订单"""
     try:
@@ -7938,7 +7952,7 @@ def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_curre
         raise HTTPException(status_code=500, detail=f"删除订单失败: {str(e)}")
 
 
-@app.post('/api/orders/{order_id}/refresh')
+@orders_router.post('/api/orders/{order_id}/refresh')
 async def refresh_single_order(
     order_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -8060,7 +8074,7 @@ def check_order_data_completeness(order: Dict[str, Any]) -> bool:
     return not any(incomplete_conditions)
 
 
-@app.put('/api/orders/{order_id}')
+@orders_router.put('/api/orders/{order_id}')
 async def update_order(
     order_id: str,
     update_data: dict,
@@ -8220,7 +8234,7 @@ async def update_order(
         raise HTTPException(status_code=500, detail=f"更新订单失败: {str(e)}")
 
 
-@app.post('/api/orders/refresh')
+@orders_router.post('/api/orders/refresh', deprecated=True)
 async def refresh_orders_status(
     cookie_id: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
@@ -8610,7 +8624,7 @@ async def refresh_orders_status(
 #     pass
 
 
-@app.post('/api/orders/manual-ship')
+@orders_router.post('/api/orders/manual-ship')
 async def manual_ship_orders(
     order_ids: List[str] = Body(..., description="订单ID列表"),
     ship_mode: str = Body(..., description="发货模式: status_only（仅修改发货状态）或 full_delivery（完整发货流程）"),
@@ -8902,7 +8916,7 @@ async def manual_ship_orders(
         raise HTTPException(status_code=500, detail=f"手动发货失败: {str(e)}")
 
 
-@app.post('/api/orders/import')
+@orders_router.post('/api/orders/import')
 async def import_orders(
     orders: List[Dict[str, Any]] = Body(..., description="订单列表"),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -9041,7 +9055,7 @@ async def import_orders(
 # 定义不需要返回前端页面的路径前缀（API 路径）
 API_PREFIXES = ['/api/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
 
-@app.get('/{path:path}', response_class=HTMLResponse)
+@frontend_router.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):
     """
     Catch-all 路由：处理所有未匹配的 GET 请求
@@ -9055,6 +9069,9 @@ async def catch_all_route(path: str):
 
     # 返回前端页面
     return await serve_frontend()
+
+
+include_domain_routers(app)
 
 
 # 移除自动启动，由Start.py或手动启动

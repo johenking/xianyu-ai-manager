@@ -4,6 +4,20 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-05
+
+### Added
+
+- Add a FastAPI application factory and lifespan-owned single-loop runtime.
+- Group the full compatible API surface into domain `APIRouter` registries.
+- Add authentication repository and service boundaries as the first incremental database extraction.
+
+### Changed
+
+- Reduce `Start.py` to a one-worker Uvicorn entrypoint and stop account listeners and browser contexts during shutdown.
+- Mark retained default-reply and order-refresh compatibility aliases as deprecated in OpenAPI without removing them.
+- Allow a clean source checkout to start before frontend assets have been built.
+
 ## [1.1.1] - 2026-07-05
 
 ### Added

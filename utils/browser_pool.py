@@ -404,3 +404,11 @@ def get_browser_pool(max_size: int = 3, idle_timeout: int = 300) -> BrowserPool:
         _global_browser_pool = BrowserPool(max_size=max_size, idle_timeout=idle_timeout)
 
     return _global_browser_pool
+
+
+async def close_global_browser_pool() -> None:
+    global _global_browser_pool
+    if _global_browser_pool is None:
+        return
+    await _global_browser_pool.close_all()
+    _global_browser_pool = None
