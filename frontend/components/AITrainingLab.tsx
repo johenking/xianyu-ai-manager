@@ -62,6 +62,8 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
   const [ruleContext, setRuleContext] = useState<AITrainingRuleContext | null>(null);
   const [ruleAudit, setRuleAudit] = useState<AIRuleAudit | null>(null);
   const [regenerated, setRegenerated] = useState(false);
+  const [guardedByRule, setGuardedByRule] = useState(false);
+  const [guardReason, setGuardReason] = useState('');
   const [knowledgeSource, setKnowledgeSource] = useState<'draft' | 'published' | 'none'>('none');
   const [knowledgeVersion, setKnowledgeVersion] = useState(0);
   const [ruleDraft, setRuleDraft] = useState('');
@@ -184,6 +186,8 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
       setRuleAudit(result.rule_audit || null);
       setAuditExpanded(false);
       setRegenerated(Boolean(result.regenerated));
+      setGuardedByRule(Boolean(result.guarded_by_rule));
+      setGuardReason(result.guard_reason || '');
       setKnowledgeSource(result.knowledge_source || 'none');
       setKnowledgeVersion(result.knowledge_version || 0);
       setMessages((current) => [...current, { role: 'assistant', content: result.reply }]);
@@ -452,9 +456,11 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
                         <span className="ai-training-audit-count">无关 {auditSummary.notRelevant}</span>
                         {(auditSummary.unknown > 0 || auditSummary.conflicts > 0) && <span className="ai-training-audit-count is-warning">待核对 {auditSummary.unknown + auditSummary.conflicts}</span>}
                         {regenerated && <span className="ai-training-audit-count is-warning">已自动重答</span>}
+                        {guardedByRule && <span className="ai-training-audit-count is-negative">已规则兜底</span>}
                       </div>
                       <div className="mt-1 text-[11px] text-gray-500">
                       {knowledgeSource === 'draft' ? '本次读取：未发布草稿' : knowledgeSource === 'published' ? `本次读取：已发布 v${knowledgeVersion}` : '本次未读取知识档案'}
+                      {guardedByRule && <span className="ml-2 text-red-600 font-bold">{guardReason === 'price_rule_conflict' ? '价格规则冲突，已阻止模型猜价' : '价格规则硬优先，已阻止违规报价'}</span>}
                       </div>
                     </div>
                     <button type="button" onClick={() => setAuditExpanded((value) => !value)} className="ai-training-text-button shrink-0" aria-expanded={auditExpanded}>

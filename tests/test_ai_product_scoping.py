@@ -279,6 +279,9 @@ class AIProductScopingTests(unittest.TestCase):
         target = self.db.get_ai_item_knowledge_profile("account-1", "item-b")
 
         self.assertEqual(result["copied_item_ids"], ["item-b"])
+        self.assertEqual(result["source_kind"], "draft")
+        self.assertEqual(result["copied_count"], 1)
+        self.assertEqual(result["skipped_count"], 0)
         self.assertEqual(target["draft"]["overview"]["text"], "同款Claude代充服务")
         self.assertEqual(target["published"], {})
 
@@ -295,7 +298,27 @@ class AIProductScopingTests(unittest.TestCase):
 
         self.assertEqual(result["copied_item_ids"], [])
         self.assertEqual(result["skipped_item_ids"], ["item-b"])
+        self.assertEqual(result["skipped_count"], 1)
+        self.assertEqual(result["skipped_reasons"]["item-b"], "目标已有草稿或已发布知识档案，未开启覆盖")
         self.assertEqual(target["draft"]["overview"]["text"], "目标原档案")
+
+    def test_copy_knowledge_falls_back_to_published_when_source_has_no_draft(self):
+        self._insert_item("item-a", "源商品")
+        self._insert_item("item-b", "目标商品")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-a", self._knowledge("已发布档案"), "hash-a")
+        self.db.publish_ai_item_knowledge("account-1", "item-a")
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE ai_item_knowledge_profiles SET draft_json = '{}' WHERE cookie_id = ? AND item_id = ?",
+                ("account-1", "item-a"),
+            )
+            self.db.conn.commit()
+
+        result = self.db.copy_ai_item_knowledge_draft("account-1", "item-a", ["item-b"], overwrite=False)
+        target = self.db.get_ai_item_knowledge_profile("account-1", "item-b")
+
+        self.assertEqual(result["source_kind"], "published")
+        self.assertEqual(target["draft"]["overview"]["text"], "已发布档案")
 
     def test_rule_audit_parser_maps_every_rule_and_flags_violations(self):
         rules = [
@@ -344,6 +367,69 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertTrue(result["regenerated"])
         self.assertEqual(result["audit"]["violation_count"], 0)
         self.assertEqual(call.call_count, 4)
+
+    def test_price_rule_violation_is_guarded_after_retry(self):
+        rules = [{"id": 11, "text": "Pro无质保145元，有质保155元"}]
+        messages = [
+            {"role": "system", "content": "当前商品价格是135"},
+            {"role": "user", "content": "Pro多少钱？"},
+        ]
+        with patch.object(self.engine, "_call_configured_model", side_effect=[
+            "Pro是135元。",
+            '{"results":[{"rule_id":11,"status":"violated","reason":"回复价格135不符合145/155"}],"conflicts":[]}',
+            "Pro还是135元。",
+            '{"results":[{"rule_id":11,"status":"violated","reason":"仍然回复135"}],"conflicts":[]}',
+        ]):
+            result = self.engine.generate_rule_checked_reply(
+                settings={"model_name": "test-model"},
+                cookie_id="account-1",
+                messages=messages,
+                buyer_message="Pro多少钱？",
+                rules=rules,
+                knowledge_text="规格与价格：Pro 145元/155元",
+                max_tokens=160,
+                temperature=0.5,
+            )
+
+        self.assertTrue(result["guarded_by_rule"])
+        self.assertEqual(result["guard_reason"], "price_rule_violation")
+        self.assertIn(11, result["guarded_rule_ids"])
+        self.assertIn("Pro无质保145元", result["reply"])
+        self.assertNotEqual(result["reply"], "Pro还是135元。")
+
+    def test_conflicting_price_rules_do_not_call_model(self):
+        rules = [
+            {"id": 11, "text": "Pro价格145元"},
+            {"id": 12, "text": "Pro价格135元"},
+        ]
+        messages = [
+            {"role": "system", "content": "当前商品价格是135"},
+            {"role": "user", "content": "Pro多少钱？"},
+        ]
+        with patch.object(self.engine, "_call_configured_model") as call:
+            result = self.engine.generate_rule_checked_reply(
+                settings={"model_name": "test-model"},
+                cookie_id="account-1",
+                messages=messages,
+                buyer_message="Pro多少钱？",
+                rules=rules,
+                knowledge_text="",
+                max_tokens=160,
+                temperature=0.5,
+            )
+
+        call.assert_not_called()
+        self.assertTrue(result["guarded_by_rule"])
+        self.assertEqual(result["guard_reason"], "price_rule_conflict")
+        self.assertIn("价格规则存在冲突", result["reply"])
+
+    def test_overlapping_price_rules_are_not_treated_as_conflicts(self):
+        rules = [
+            {"id": 11, "text": "Pro无质保145元，有质保155元"},
+            {"id": 12, "text": "Pro无质保145元"},
+        ]
+
+        self.assertEqual(self.engine._detect_price_rule_conflicts(rules), [])
 
 
 if __name__ == "__main__":

@@ -153,6 +153,9 @@ export interface AIReplyLabResponse {
   rule_context?: AITrainingRuleContext;
   rule_audit?: AIRuleAudit;
   regenerated?: boolean;
+  guarded_by_rule?: boolean;
+  guard_reason?: string;
+  guarded_rule_ids?: Array<number | string>;
   knowledge_source?: 'draft' | 'published' | 'none';
   knowledge_version?: number;
 }
@@ -304,6 +307,11 @@ export const copyAIItemKnowledge = async (
   copied_item_ids: string[];
   skipped_item_ids: string[];
   missing_item_ids: string[];
+  source_kind?: 'draft' | 'published';
+  copied_count?: number;
+  skipped_count?: number;
+  missing_count?: number;
+  skipped_reasons?: Record<string, string>;
 }> => post(`/ai-item-knowledge/${cookieId}/${sourceItemId}/copy`, {
   target_item_ids: targetItemIds,
   overwrite,

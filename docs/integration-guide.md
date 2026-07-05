@@ -121,6 +121,8 @@ curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/copy" \
 
 Copy writes target drafts only, never publishes, and skips targets that already contain draft or published knowledge unless `overwrite` is explicitly true. Use `GET .../versions` and `POST .../rollback/{version}` for history.
 
+The copy response keeps `copied_item_ids`, `skipped_item_ids`, and `missing_item_ids`, and may also include `source_kind`, `copied_count`, `skipped_count`, `missing_count`, and `skipped_reasons` so clients can explain whether the source came from the draft or published snapshot and why a target was skipped.
+
 ## Training Rules And Lab
 
 Get all current-item rule states:
@@ -149,6 +151,8 @@ curl -sS -X POST "$BASE_URL/ai-reply-lab/reply/$COOKIE_ID" \
 ```
 
 The result includes the reply, warnings, rule context, rule audit, regeneration state, and knowledge source. Reuse `session_id` for a multi-turn lab conversation. Save rules explicitly through `/ai-reply-lab/save/{cookie_id}` or `/ai-training-rules/{cookie_id}`.
+
+Price, plan, package, and warranty-price rules are hard guarded. If the model still violates a price rule after one regeneration, the lab response returns a safe rule-based reply and may include `guarded_by_rule`, `guard_reason`, and `guarded_rule_ids`. If price rules conflict with each other, the guard blocks model guessing and reports the conflict for manual cleanup.
 
 ## Account Binding And Refresh
 
