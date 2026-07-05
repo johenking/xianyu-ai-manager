@@ -746,10 +746,11 @@ class XianyuLive:
 
         # Cookie刷新定时任务
         self.cookie_refresh_task = None
-        self.cookie_refresh_interval = 1200  # 每20分钟执行一次预防性刷新
+        cookie_refresh_settings = self._load_cookie_refresh_settings()
+        self.cookie_refresh_interval = cookie_refresh_settings['interval_minutes'] * 60
         self.last_cookie_refresh_time = 0
         self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
-        self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能
+        self.cookie_refresh_enabled = cookie_refresh_settings['enabled']  # 是否启用Cookie刷新功能
 
         # 商品同步定时任务
         self.item_sync_task = None
@@ -851,6 +852,44 @@ class XianyuLive:
     def get_instance_count(cls):
         """获取当前活跃实例数量"""
         return len(cls._instances)
+
+    def _load_cookie_refresh_settings(self):
+        """从数据库读取账号级定时Cookie刷新设置，失败时使用保守默认值"""
+        try:
+            settings = db_manager.get_cookie_refresh_settings(self.cookie_id)
+            return {
+                'enabled': bool(settings.get('enabled')),
+                'interval_minutes': int(settings.get('interval_minutes', 1440)),
+            }
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】读取Cookie定时刷新设置失败，默认关闭: {self._safe_str(e)}")
+            return {'enabled': False, 'interval_minutes': 1440}
+
+    def _format_cookie_refresh_interval(self) -> str:
+        minutes = max(1, int(self.cookie_refresh_interval // 60))
+        if minutes % 1440 == 0:
+            return f"{minutes // 1440}天"
+        if minutes % 60 == 0:
+            return f"{minutes // 60}小时"
+        return f"{minutes}分钟"
+
+    def configure_cookie_refresh(self, enabled: bool, interval_minutes: int):
+        """更新运行中的定时Cookie刷新设置"""
+        interval_seconds = max(60, int(interval_minutes) * 60)
+        previous = (self.cookie_refresh_enabled, self.cookie_refresh_interval)
+        self.cookie_refresh_enabled = bool(enabled)
+        self.cookie_refresh_interval = interval_seconds
+        current = (self.cookie_refresh_enabled, self.cookie_refresh_interval)
+        if previous != current:
+            status = "开启" if self.cookie_refresh_enabled else "关闭"
+            logger.info(
+                f"【{self.cookie_id}】Cookie定时刷新设置已更新: {status}, 间隔 {self._format_cookie_refresh_interval()}"
+            )
+
+    def refresh_cookie_refresh_settings_from_db(self):
+        """刷新运行时定时Cookie刷新设置，便于后台循环无需重启生效"""
+        settings = self._load_cookie_refresh_settings()
+        self.configure_cookie_refresh(settings['enabled'], settings['interval_minutes'])
 
     def _create_tracked_task(self, coro):
         """创建并追踪后台任务，确保异常不会被静默忽略"""
@@ -5678,10 +5717,12 @@ class XianyuLive:
 
 
     async def cookie_refresh_loop(self):
-        """Cookie刷新定时任务 - 每20分钟执行一次"""
+        """Cookie刷新定时任务 - 按账号设置执行预防性刷新"""
         try:
             while True:
                 try:
+                    self.refresh_cookie_refresh_settings_from_db()
+
                     # 检查账号是否启用
                     from cookie_manager import manager as cookie_manager
                     if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
@@ -5690,7 +5731,6 @@ class XianyuLive:
 
                     # 检查Cookie刷新功能是否启用
                     if not self.cookie_refresh_enabled:
-                        logger.warning(f"【{self.cookie_id}】Cookie刷新功能已禁用，跳过执行")
                         await self._interruptible_sleep(300)  # 5分钟后再检查
                         continue
 
@@ -5707,7 +5747,7 @@ class XianyuLive:
                         elif self.cookie_refresh_lock.locked():
                             logger.warning(f"【{self.cookie_id}】Cookie刷新任务已在执行中，跳过本次触发")
                         else:
-                            logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
+                            logger.info(f"【{self.cookie_id}】开始执行定时Cookie刷新任务，间隔 {self._format_cookie_refresh_interval()}...")
                             # 在独立的任务中执行Cookie刷新，避免阻塞主循环
                             asyncio.create_task(self._execute_cookie_refresh(current_time))
 
@@ -5744,8 +5784,8 @@ class XianyuLive:
         db_manager.update_account_session_refresh(
             self.cookie_id,
             state='refreshing',
-            trigger='scheduled_20m',
-            message='正在执行每20分钟一次的 Cookie 预防性刷新',
+            trigger='scheduled_cookie_refresh',
+            message=f'正在执行每{self._format_cookie_refresh_interval()}一次的 Cookie 预防性刷新',
         )
 
         # 使用Lock确保原子性，防止重复执行
@@ -5802,7 +5842,7 @@ class XianyuLive:
                         else:
                             logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
                             db_manager.update_account_session_refresh(
-                                self.cookie_id, state='success', trigger='scheduled_20m',
+                                self.cookie_id, state='success', trigger='scheduled_cookie_refresh',
                                 message='Cookie 预防性刷新成功',
                             )
 
@@ -5811,13 +5851,13 @@ class XianyuLive:
                         import traceback
                         logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
                         db_manager.update_account_session_refresh(
-                            self.cookie_id, state='failed', trigger='scheduled_20m',
+                            self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
                             message='Cookie 已刷新，但有效性检查异常', error_code='validation_exception',
                         )
                 else:
                     logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
                     db_manager.update_account_session_refresh(
-                        self.cookie_id, state='failed', trigger='scheduled_20m',
+                        self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
                         message='浏览器未能刷新 Cookie', error_code='browser_refresh_failed',
                     )
                     # 即使失败也要更新时间，避免频繁重试
@@ -5827,7 +5867,7 @@ class XianyuLive:
                 # 超时也要更新时间，避免频繁重试
                 self.last_cookie_refresh_time = current_time
                 db_manager.update_account_session_refresh(
-                    self.cookie_id, state='timeout', trigger='scheduled_20m',
+                    self.cookie_id, state='timeout', trigger='scheduled_cookie_refresh',
                     message='Cookie 刷新超过三分钟', error_code='browser_refresh_timeout',
                 )
             except Exception as e:
@@ -5835,7 +5875,7 @@ class XianyuLive:
                 # 异常也要更新时间，避免频繁重试
                 self.last_cookie_refresh_time = current_time
                 db_manager.update_account_session_refresh(
-                    self.cookie_id, state='failed', trigger='scheduled_20m',
+                    self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
                     message='Cookie 预防性刷新出现异常', error_code='scheduled_refresh_exception',
                 )
             finally:
@@ -5854,9 +5894,8 @@ class XianyuLive:
 
     def enable_cookie_refresh(self, enabled: bool = True):
         """启用或禁用Cookie刷新功能"""
-        self.cookie_refresh_enabled = enabled
-        status = "启用" if enabled else "禁用"
-        logger.info(f"【{self.cookie_id}】Cookie刷新功能已{status}")
+        interval_minutes = max(1, int(self.cookie_refresh_interval // 60))
+        self.configure_cookie_refresh(enabled, interval_minutes)
 
 
     async def refresh_cookies_from_qr_login(self, qr_cookies_str: str, cookie_id: str = None, user_id: int = None):

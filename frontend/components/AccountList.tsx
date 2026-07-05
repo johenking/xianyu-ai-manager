@@ -20,6 +20,7 @@ import {
   updateAccountPauseDuration,
   updateAccountCookie,
   updateAccountLoginInfo,
+  updateAccountCookieRefreshSettings,
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
@@ -40,6 +41,23 @@ import {
 type ModalType = 'edit' | 'ai-settings' | null;
 type AddLoginMethod = 'qr' | 'password' | 'cookie';
 type AddLoginStatus = 'idle' | 'processing' | 'success' | 'failed' | 'verification_required';
+
+const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
+const COOKIE_REFRESH_INTERVAL_OPTIONS = [
+  { value: 60, label: '1 小时' },
+  { value: 360, label: '6 小时' },
+  { value: 720, label: '12 小时' },
+  { value: 1440, label: '24 小时' },
+  { value: 4320, label: '3 天' },
+  { value: 10080, label: '7 天' },
+];
+
+const formatCookieRefreshInterval = (minutes?: number) => {
+  const value = minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES;
+  if (value % 1440 === 0) return `${value / 1440} 天`;
+  if (value % 60 === 0) return `${value / 60} 小时`;
+  return `${value} 分钟`;
+};
 
 const AccountList: React.FC = () => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -88,6 +106,8 @@ const AccountList: React.FC = () => {
     username: '',
     login_password: '',
     show_browser: false,
+    cookie_refresh_enabled: false,
+    cookie_refresh_interval_minutes: DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
     showLoginPassword: false,
   });
 
@@ -257,6 +277,8 @@ const AccountList: React.FC = () => {
       username: account.username || '',
       login_password: account.login_password || '',
       show_browser: account.show_browser || false,
+      cookie_refresh_enabled: account.cookie_refresh_enabled || false,
+      cookie_refresh_interval_minutes: account.cookie_refresh_interval_minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
       showLoginPassword: false,
     });
     setActiveModal('edit');
@@ -390,6 +412,18 @@ const AccountList: React.FC = () => {
           username: editForm.username,
           login_password: editForm.login_password,
           show_browser: editForm.show_browser,
+        }));
+      }
+
+      if (
+        editForm.cookie_refresh_enabled !== (editingAccount.cookie_refresh_enabled || false) ||
+        editForm.cookie_refresh_interval_minutes !== (
+          editingAccount.cookie_refresh_interval_minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES
+        )
+      ) {
+        promises.push(updateAccountCookieRefreshSettings(editingAccount.id, {
+          cookie_refresh_enabled: editForm.cookie_refresh_enabled,
+          cookie_refresh_interval_minutes: editForm.cookie_refresh_interval_minutes,
         }));
       }
 
@@ -747,6 +781,12 @@ const AccountList: React.FC = () => {
                 <div className="flex flex-wrap gap-2">
                    <StatusBadge state={account.auto_confirm ? 'ready' : 'idle'} label={account.auto_confirm ? '自动确认开启' : '自动确认关闭'} />
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
+                   <StatusBadge
+                    state={account.cookie_refresh_enabled ? 'warning' : 'idle'}
+                    label={account.cookie_refresh_enabled
+                      ? `每 ${formatCookieRefreshInterval(account.cookie_refresh_interval_minutes)}刷新 Cookie`
+                      : '定时刷新关闭'}
+                   />
                    {diagnosis && (
                     <span className={`text-xs px-3 py-1.5 rounded-lg font-bold ${diagnosis.ready ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
                       {diagnosis.ready ? '自动回复就绪' : `${diagnosis.issues.length} 个问题`}
@@ -1288,6 +1328,48 @@ const AccountList: React.FC = () => {
                       label="编辑账号时显示登录浏览器"
                     />
                   </div>
+                </div>
+              </div>
+
+              {/* Cookie 刷新 */}
+              <div className="border-t border-gray-200 pt-6">
+                <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
+                  <RefreshCw className="w-5 h-5 text-cyan-500" />
+                  Cookie 刷新
+                </h3>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-4 bg-cyan-50 rounded-xl">
+                    <div>
+                      <div className="font-bold text-gray-900">自动定时 Cookie 刷新</div>
+                      <div className="text-xs text-gray-500">关闭后仍可手动刷新，可降低频繁触发验证的概率。</div>
+                    </div>
+                    <ToggleControl
+                      checked={editForm.cookie_refresh_enabled}
+                      onChange={(checked) => setEditForm({ ...editForm, cookie_refresh_enabled: checked })}
+                      label="自动定时 Cookie 刷新"
+                    />
+                  </div>
+                  {editForm.cookie_refresh_enabled && (
+                    <div>
+                      <label htmlFor="cookie-refresh-interval" className="block text-sm font-bold text-gray-700 mb-2">
+                        刷新间隔
+                      </label>
+                      <select
+                        id="cookie-refresh-interval"
+                        value={editForm.cookie_refresh_interval_minutes}
+                        onChange={(e) => setEditForm({
+                          ...editForm,
+                          cookie_refresh_interval_minutes: parseInt(e.target.value, 10) || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
+                        })}
+                        className="w-full ios-input px-4 py-3 rounded-xl"
+                      >
+                        {COOKIE_REFRESH_INTERVAL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">建议使用 24 小时或更长间隔，减少账号风控压力。</p>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

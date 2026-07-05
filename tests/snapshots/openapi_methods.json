@@ -266,6 +266,9 @@
     "GET",
     "PUT"
   ],
+  "/cookies/{cid}/cookie-refresh-settings": [
+    "PUT"
+  ],
   "/cookies/{cid}/login-info": [
     "PUT"
   ],

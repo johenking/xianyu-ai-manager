@@ -14,6 +14,8 @@ export interface AccountDetail {
   has_login_password?: boolean;
   login_credentials_valid?: boolean;
   show_browser?: boolean;
+  cookie_refresh_enabled?: boolean;
+  cookie_refresh_interval_minutes?: number;
   // Frontend helpers
   nickname?: string;
   avatar_url?: string;

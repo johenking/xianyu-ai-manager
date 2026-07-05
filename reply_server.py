@@ -1488,6 +1488,10 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
                 and is_valid_account_login_username(cookie_details.get('username'))
             ),
             'show_browser': bool(cookie_details.get('show_browser')) if cookie_details else False,
+            'cookie_refresh_enabled': bool(cookie_details.get('cookie_refresh_enabled')) if cookie_details else False,
+            'cookie_refresh_interval_minutes': (
+                cookie_details.get('cookie_refresh_interval_minutes', 1440) if cookie_details else 1440
+            ),
         })
     return result
 
@@ -1541,6 +1545,11 @@ class AccountLoginInfoUpdate(BaseModel):
     show_browser: Optional[bool] = None
 
 
+class CookieRefreshSettingsUpdate(BaseModel):
+    cookie_refresh_enabled: bool
+    cookie_refresh_interval_minutes: int
+
+
 @accounts_router.put("/cookies/{cid}/login-info")
 def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号登录信息（用户名、密码、是否显示浏览器）"""
@@ -1569,6 +1578,49 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
             raise HTTPException(status_code=500, detail="更新登录信息失败")
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@accounts_router.put("/cookies/{cid}/cookie-refresh-settings")
+def update_cookie_refresh_settings(
+    cid: str,
+    update_data: CookieRefreshSettingsUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """更新账号定时Cookie刷新设置"""
+    try:
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        success = db_manager.update_cookie_refresh_settings(
+            cid,
+            enabled=update_data.cookie_refresh_enabled,
+            interval_minutes=update_data.cookie_refresh_interval_minutes,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="更新Cookie定时刷新设置失败")
+
+        try:
+            from XianyuAutoAsync import XianyuLive
+            live_instance = XianyuLive.get_instance(cid)
+            if live_instance:
+                live_instance.configure_cookie_refresh(
+                    update_data.cookie_refresh_enabled,
+                    update_data.cookie_refresh_interval_minutes,
+                )
+        except Exception as sync_error:
+            logger.warning(f"同步运行中Cookie刷新设置失败（数据库已保存）: {cid}, {sync_error}")
+
+        return {"success": True, "message": "Cookie定时刷新设置已更新"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

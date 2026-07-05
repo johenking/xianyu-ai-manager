@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Item, AccountDetail } from '../types';
 import {
   getItems,
+  getItemsByCookie,
   getAccountDetails,
   syncItemsFromAccount,
   deleteItem,
@@ -14,6 +15,7 @@ import AITrainingLab from './AITrainingLab';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
+const ALL_ACCOUNTS_VALUE = '__all__';
 
 const ItemList: React.FC = () => {
   const [items, setItems] = useState<Item[]>([]);
@@ -29,17 +31,46 @@ const ItemList: React.FC = () => {
     loadData();
   }, []);
 
+  const loadItemsForAccount = async (accountId: string) => {
+    if (!accountId) {
+      setItems([]);
+      return;
+    }
+    const itemList = accountId === ALL_ACCOUNTS_VALUE
+      ? await getItems()
+      : await getItemsByCookie(accountId);
+    setItems(itemList);
+  };
+
   const loadData = async () => {
     setLoading(true);
     try {
-      const [accountList, itemList] = await Promise.all([
-        getAccountDetails(),
-        getItems()
-      ]);
+      const accountList = await getAccountDetails();
       setAccounts(accountList);
-      setItems(itemList);
-      if (!selectedAccount && accountList.length > 0) {
-        setSelectedAccount(accountList[0].id);
+      const selectionStillValid =
+        selectedAccount === ALL_ACCOUNTS_VALUE ||
+        accountList.some((account) => account.id === selectedAccount);
+      const nextSelectedAccount = selectionStillValid
+        ? selectedAccount
+        : (accountList[0]?.id || '');
+      setSelectedAccount(nextSelectedAccount);
+      await loadItemsForAccount(nextSelectedAccount);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '加载商品数据失败';
+      setStatusText(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAccountChange = async (accountId: string) => {
+    setSelectedAccount(accountId);
+    setLoading(true);
+    setStatusText('');
+    try {
+      await loadItemsForAccount(accountId);
+      if (accountId === ALL_ACCOUNTS_VALUE) {
+        setStatusText('已显示全部账号商品；同步商品请先选择单个账号。');
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : '加载商品数据失败';
@@ -50,8 +81,8 @@ const ItemList: React.FC = () => {
   };
 
   const handleSync = async () => {
-    if (!selectedAccount) {
-      setStatusText('请先选择账号');
+    if (!selectedAccount || selectedAccount === ALL_ACCOUNTS_VALUE) {
+      setStatusText('请先选择单个账号再同步商品');
       return;
     }
     setLoading(true);
@@ -61,8 +92,7 @@ const ItemList: React.FC = () => {
       if (result?.success === false) {
         throw new Error(result.message || '同步商品失败');
       }
-      const freshItems = await getItems();
-      setItems(freshItems);
+      await loadItemsForAccount(selectedAccount);
       setStatusText(result?.message || '商品同步完成');
     } catch (error) {
       const message = error instanceof Error ? error.message : '同步商品失败';
@@ -133,7 +163,10 @@ const ItemList: React.FC = () => {
     }
   };
 
-  const selectedAccountLabel = accounts.find(account => account.id === selectedAccount);
+  const selectedAccountLabel = selectedAccount === ALL_ACCOUNTS_VALUE
+    ? null
+    : accounts.find(account => account.id === selectedAccount);
+  const canSyncSelectedAccount = Boolean(selectedAccount && selectedAccount !== ALL_ACCOUNTS_VALUE);
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -152,18 +185,20 @@ const ItemList: React.FC = () => {
             <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
           </button>
           <select
+            aria-label="商品账号"
             className="ios-input px-4 py-3 rounded-xl text-sm min-w-0 sm:min-w-[220px]"
             value={selectedAccount}
-            onChange={e => setSelectedAccount(e.target.value)}
+            onChange={e => void handleAccountChange(e.target.value)}
           >
-            <option value="">选择账号以同步</option>
+            {accounts.length === 0 && <option value="">暂无账号</option>}
             {accounts.map(acc => (
               <option key={acc.id} value={acc.id}>{acc.nickname || acc.remark || acc.id}</option>
             ))}
+            {accounts.length > 0 && <option value={ALL_ACCOUNTS_VALUE}>全部账号</option>}
           </select>
           <button
             onClick={handleSync}
-            disabled={loading || !selectedAccount}
+            disabled={loading || !canSyncSelectedAccount}
             className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 disabled:opacity-50"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
@@ -180,7 +215,12 @@ const ItemList: React.FC = () => {
 
       {selectedAccountLabel && (
         <div className="text-xs text-gray-400">
-          当前同步账号：{selectedAccountLabel.nickname || selectedAccountLabel.remark || selectedAccountLabel.id}
+          当前查看账号：{selectedAccountLabel.nickname || selectedAccountLabel.remark || selectedAccountLabel.id}
+        </div>
+      )}
+      {selectedAccount === ALL_ACCOUNTS_VALUE && (
+        <div className="text-xs text-gray-400">
+          当前查看：全部账号商品
         </div>
       )}
 
