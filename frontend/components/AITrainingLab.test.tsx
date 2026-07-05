@@ -75,4 +75,36 @@ describe('AITrainingLab rule audit', () => {
     expect(screen.getByText('规则 R3 · 已遵守')).toBeTruthy();
     expect(screen.getByRole('button', { name: '收起审计' })).toBeTruthy();
   });
+
+  it('shows when a price rule guard blocks the model reply', async () => {
+    vi.mocked(sendAITrainingMessage).mockResolvedValue({
+      session_id: 'session-1',
+      reply: '按当前商品规则：Pro无质保145元，有质保155元。',
+      warnings: [],
+      regenerated: true,
+      guarded_by_rule: true,
+      guard_reason: 'price_rule_violation',
+      guarded_rule_ids: [11],
+      knowledge_source: 'draft',
+      knowledge_version: 2,
+      rule_context: {
+        applied_rules: [{ id: 11, scope: 'item', text: 'Pro无质保145元，有质保155元', enabled: true }],
+        excluded_rules: [], disabled_rules: [], applied_count: 1, excluded_count: 0, disabled_count: 0, total_count: 1,
+      },
+      rule_audit: {
+        results: [{ rule_id: 11, text: 'Pro无质保145元，有质保155元', status: 'violated', reason: '模型回复135元' }],
+        violation_count: 1,
+        unknown_count: 0,
+        conflicts: [],
+      },
+    });
+    render(<AITrainingLab account={{ id: 'account-1', enabled: true, auto_confirm: true }} onClose={() => undefined} />);
+
+    await screen.findByText('已加载 1 / 3');
+    fireEvent.click(screen.getByRole('button', { name: '发送测试' }));
+
+    expect(await screen.findByText('已规则兜底')).toBeTruthy();
+    expect(screen.getByText('价格规则硬优先，已阻止违规报价')).toBeTruthy();
+    expect(screen.getAllByText(/Pro无质保145元/).length).toBeGreaterThan(0);
+  });
 });

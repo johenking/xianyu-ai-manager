@@ -5569,6 +5569,9 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             "rule_context": reply_result.get('rule_context', {}),
             "rule_audit": reply_result.get('audit', {}),
             "regenerated": bool(reply_result.get('regenerated')),
+            "guarded_by_rule": bool(reply_result.get('guarded_by_rule')),
+            "guard_reason": reply_result.get('guard_reason', ''),
+            "guarded_rule_ids": reply_result.get('guarded_rule_ids', []),
             "knowledge_source": reply_result.get('knowledge_source', 'none'),
             "knowledge_version": reply_result.get('knowledge_version', 0),
         }

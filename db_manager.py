@@ -2980,7 +2980,7 @@ class DBManager:
         return self.get_ai_item_knowledge_profile(cookie_id, item_id)
 
     def copy_ai_item_knowledge_draft(self, cookie_id: str, source_item_id: str,
-                                     target_item_ids: List[str], overwrite: bool = False) -> Dict[str, List[str]]:
+                                     target_item_ids: List[str], overwrite: bool = False) -> Dict[str, Any]:
         """复制源商品当前档案到目标草稿，不自动发布。"""
         normalized_targets = []
         for value in target_item_ids or []:
@@ -3000,6 +3000,7 @@ class DBManager:
             source_draft = json.loads(source_row[0] or '{}')
             source_published = json.loads(source_row[1] or '{}')
             source_profile = source_draft or source_published
+            source_kind = 'draft' if source_draft else 'published'
             if not source_profile:
                 raise ValueError('源商品知识档案为空')
             profile_json = json.dumps(source_profile, ensure_ascii=False)
@@ -3007,6 +3008,7 @@ class DBManager:
             copied = []
             skipped = []
             missing = []
+            skipped_reasons = {}
             for target_id in normalized_targets:
                 cursor.execute(
                     'SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ?',
@@ -3014,6 +3016,7 @@ class DBManager:
                 )
                 if not cursor.fetchone():
                     missing.append(target_id)
+                    skipped_reasons[target_id] = '目标商品不存在或不属于当前账号'
                     continue
                 cursor.execute('''
                 SELECT draft_json, published_json
@@ -3026,6 +3029,7 @@ class DBManager:
                     target_published = json.loads(target_row[1] or '{}')
                     if target_draft or target_published:
                         skipped.append(target_id)
+                        skipped_reasons[target_id] = '目标已有草稿或已发布知识档案，未开启覆盖'
                         continue
                 cursor.execute('''
                 INSERT INTO ai_item_knowledge_profiles
@@ -3042,6 +3046,11 @@ class DBManager:
                 'copied_item_ids': copied,
                 'skipped_item_ids': skipped,
                 'missing_item_ids': missing,
+                'source_kind': source_kind,
+                'copied_count': len(copied),
+                'skipped_count': len(skipped),
+                'missing_count': len(missing),
+                'skipped_reasons': skipped_reasons,
             }
 
     def publish_ai_item_knowledge(self, cookie_id: str, item_id: str) -> Dict[str, Any]:

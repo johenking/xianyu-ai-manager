@@ -7,6 +7,7 @@ import {
   generateAIItemKnowledge,
   getAIItemKnowledge,
   getItemsByCookie,
+  saveAIItemKnowledgeDraft,
 } from '../services/api';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 
@@ -62,6 +63,18 @@ describe('ItemKnowledgeModal overview workflow', () => {
       copied_item_ids: ['item-b'],
       skipped_item_ids: [],
       missing_item_ids: [],
+      source_kind: 'draft',
+      copied_count: 1,
+      skipped_count: 0,
+      missing_count: 0,
+      skipped_reasons: {},
+    });
+    vi.mocked(saveAIItemKnowledgeDraft).mockResolvedValue({
+      ...emptyProfile,
+      draft: {
+        overview: { text: '已保存草稿', source: 'user', status: 'confirmed' },
+        pricing: [], process: [], after_sales: [], forbidden: [], faqs: [], notes: [],
+      },
     });
   });
 
@@ -109,6 +122,31 @@ describe('ItemKnowledgeModal overview workflow', () => {
     await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
       'account-1', 'item-a', ['item-b'], false
     ));
-    expect(await screen.findByText('已复制到 1 个商品草稿')).toBeTruthy();
+    expect(await screen.findByText(/已复制到 1 个商品草稿/)).toBeTruthy();
+  });
+
+  it('can select all targets and saves dirty draft before copying', async () => {
+    vi.mocked(getAIItemKnowledge).mockResolvedValue({
+      ...emptyProfile,
+      draft: {
+        overview: { text: '同款Claude代充', source: 'user', status: 'confirmed' },
+        pricing: [], process: [], after_sales: [], forbidden: [], faqs: [], notes: [],
+      },
+    });
+    render(<ItemKnowledgeModal item={sourceItem as any} onClose={() => undefined} />);
+    await screen.findByText('草稿档案');
+
+    fireEvent.change(screen.getByDisplayValue('同款Claude代充'), {
+      target: { value: '同款Claude代充，已编辑' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
+    fireEvent.click(screen.getByRole('button', { name: '全选' }));
+    fireEvent.click(screen.getByLabelText(/覆盖目标商品已有草稿/));
+    fireEvent.click(screen.getByRole('button', { name: '保存当前草稿并复制到所选草稿' }));
+
+    await waitFor(() => expect(saveAIItemKnowledgeDraft).toHaveBeenCalled());
+    await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
+      'account-1', 'item-a', ['item-b'], true
+    ));
   });
 });
