@@ -41,8 +41,8 @@ RUN python -m venv /opt/venv && \
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
-# 复制requirements.txt并安装Python依赖
-COPY requirements.txt .
+# 复制兼容入口和精确锁文件并安装 Python 依赖
+COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 复制项目文件（排除 frontend 目录）
@@ -58,7 +58,7 @@ FROM base AS runtime
 
 # 设置标签信息
 LABEL maintainer="johenking" \
-      version="1.0.0" \
+      version="1.4.0" \
       description="Xianyu AI Manager - product-scoped AI reply and operations" \
       repository="https://github.com/johenking/xianyu-ai-manager" \
       license="AGPL-3.0" \

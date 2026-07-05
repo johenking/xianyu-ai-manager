@@ -3,16 +3,20 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from fastapi.routing import APIRoute
-
 from app_factory import create_app
 
 
 class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
-        routes = [route for route in app.routes if isinstance(route, APIRoute)]
-        self.assertEqual(len(routes), 203)
+        paths = app.openapi()["paths"]
+        signatures = {
+            (method.upper(), path)
+            for path, definition in paths.items()
+            for method in definition
+            if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
+        }
+        self.assertEqual(len(signatures), 197)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -28,7 +32,6 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
                 "system",
             },
         )
-        signatures = {(method, route.path) for route in routes for method in route.methods}
         self.assertIn(("POST", "/login"), signatures)
         self.assertIn(("POST", "/api/orders/sync"), signatures)
         self.assertIn(("POST", "/ai-reply-lab/reply/{cookie_id}"), signatures)

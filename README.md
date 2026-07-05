@@ -106,6 +106,8 @@ python Start.py
 AI 平台密钥使用 Fernet 加密保存。生产环境请另外设置随机的 `AI_PROVIDER_ENCRYPTION_KEY`；未设置时会在 `data/.ai_provider_key` 生成仅本机可读的密钥文件，请与数据库一起备份且不要提交。
 闲鱼账号登录密码使用另一把 Fernet 密钥。生产环境建议设置独立的 `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY`；未设置时会生成权限为 `0600` 的 `data/.account_credential_key`。数据库迁移会在修改前同时备份数据库和本地密钥。
 
+`requirements.txt` 保留旧的安装入口，实际引用 Python 3.11 生成的精确 `requirements.lock`。更新依赖时修改 `requirements.in` 并重新生成锁文件；测试、Ruff 和构建工具使用 `requirements-dev.lock`。
+
 ## Docker
 
 ```bash
@@ -130,14 +132,18 @@ docker compose up --build -d
 ## 测试
 
 ```bash
-.venv/bin/python -m py_compile settings_service.py db_manager.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
+.venv/bin/pip install -r requirements-dev.lock
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
 .venv/bin/python -m unittest discover -s tests -v
+ruff check .
 
 cd frontend
 npm audit --audit-level=high
-npm exec tsc -- --noEmit
+npm run typecheck
 npm test
 npm run build
+npm run build
+npm run verify:build
 ```
 
 ## 来源与许可

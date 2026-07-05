@@ -378,7 +378,7 @@ class ResponseModel(BaseModel):
 
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.0.0",
+    version="1.4.0",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -8560,6 +8560,9 @@ async def refresh_orders_status(
         # 由于我们已经处理完所有订单，跳过原来的循环
         # 下面的代码需要删除，所以我们需要找到循环结束的位置
         if False:  # 这个if永远不会执行，只是为了保持代码结构
+            from order_status_query_playwright import OrderStatusQueryPlaywright
+            from utils.order_detail_fetcher import fetch_order_detail_simple
+
             for order_info in orders_to_refresh:
                 order_id = order_info['order_id']
                 cookie_id = order_info['cookie_id']

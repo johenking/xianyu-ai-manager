@@ -31,16 +31,20 @@ Back up `data/.ai_provider_key` with the database when `AI_PROVIDER_ENCRYPTION_K
 
 ```bash
 source .venv/bin/activate
-python -m py_compile settings_service.py db_manager.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
+pip install -r requirements-dev.lock
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
 python -m unittest discover -s tests -v
+ruff check .
 
 cd frontend
-npm exec tsc -- --noEmit
+npm run typecheck
 npm test
 npm run build
+npm run build
+npm run verify:build
 ```
 
-The frontend build writes to `static/`. A production build alone does not restart the backend.
+The frontend build writes to `static/`. It keeps the current and previous successful asset generations and disables source maps unless `VITE_BUILD_SOURCEMAP=true`. A production build alone does not restart the backend.
 
 Basic smoke tests:
 
@@ -69,6 +73,7 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `ADMIN_PASSWORD` | Initial admin password, used only when creating a new database. |
 | `JWT_SECRET_KEY` | Signs backend session tokens; use an independent random value. |
 | `AI_PROVIDER_ENCRYPTION_KEY` | Encrypts provider API keys. If absent, a local key file is generated under `data/`. |
+| `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY` | Encrypts stored Xianyu login passwords with an independent key. |
 | `PORT` | Cloud web port override. |
 | `API_PORT` | Alternative web port used by `entrypoint.sh` and `Start.py`. |
 | `API_HOST` | Bind host, usually `0.0.0.0` in containers. |
@@ -76,6 +81,7 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `TZ` | Runtime timezone, usually `Asia/Shanghai`. |
 | `PLAYWRIGHT_BROWSERS_PATH` | Playwright browser cache path. |
 | `DOCKER_ENV` | Enables Linux/container Playwright handling. |
+| `VITE_BUILD_SOURCEMAP` | Set to `true` only when a production source map is explicitly required. |
 
 Do not commit secrets. Put deployment tokens, model keys, SMTP credentials, and Xianyu Cookies in platform secret stores or the Web UI.
 

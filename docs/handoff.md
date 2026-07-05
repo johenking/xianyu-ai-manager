@@ -34,18 +34,24 @@ Run the following before release or handoff:
 
 ```bash
 source .venv/bin/activate
-python -m py_compile settings_service.py db_manager.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
+pip install -r requirements-dev.lock
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
 python -m unittest discover -s tests -v
+ruff check .
 
 cd frontend
-npm exec tsc -- --noEmit
+npm run typecheck
 npm test
 npm run build
+npm run build
+npm run verify:build
 ```
 
 Also exercise one desktop and one mobile viewport for account management, AI training, product knowledge, provider selection, and settings. Record the actual pass counts at release time rather than treating an old count as permanent evidence.
 
-Verified on 2026-07-05: Python compilation and 53 backend unit tests passed; TypeScript, 9 frontend test files with 17 tests, the Vite production build, and `npm audit` with 0 vulnerabilities passed. Account editing and the affected mobile surfaces were checked at `1440x900`, `1280x720`, `768x1024`, and `390x844` with no horizontal overflow or console errors.
+Verified on 2026-07-05: Python compilation, Ruff, 68 backend unit tests, and the 197-method OpenAPI contract passed. TypeScript, 9 frontend test files with 17 tests, two consecutive Vite production builds, static-retention verification, and `npm audit` with 0 vulnerabilities passed. The entry chunk measured 215,727 bytes versus the v1.1.0 baseline of 865,910 bytes, a 75.1% reduction. Gitleaks reported no secrets.
+
+Manual `pip-audit` still reports four advisories against `protobuf==3.10.0`, which is an exact transitive requirement of `blackboxprotobuf==1.0.1`. Do not force-upgrade protobuf without first replacing or compatibility-testing the Xianyu protocol decoder.
 
 ## Next Useful Work
 

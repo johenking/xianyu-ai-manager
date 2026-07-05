@@ -1,6 +1,7 @@
 import path from 'path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { staticRetentionPlugin } from './build/staticRetention';
 
 export default defineConfig({
   base: '/static/',
@@ -128,7 +129,7 @@ export default defineConfig({
       },
     },
   },
-  plugins: [react()],
+  plugins: [react(), staticRetentionPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, '.'),
@@ -136,7 +137,7 @@ export default defineConfig({
   },
   build: {
     outDir: '../static',
-    sourcemap: true,
+    sourcemap: process.env.VITE_BUILD_SOURCEMAP === 'true',
     rollupOptions: {
       output: {
         manualChunks: undefined,

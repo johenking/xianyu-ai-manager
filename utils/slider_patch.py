@@ -72,6 +72,7 @@ def send_notification(user_id: str, title: str, message: str, notification_type:
                     email_password = config_data.get('email_password', '')
                     recipient_email = config_data.get('recipient_email', '')
                     smtp_from = config_data.get('smtp_from', email_user)  # 发件人显示名称，默认使用邮箱地址
+                    smtp_port = int(config_data.get('smtp_port', 587) or 587)
                     smtp_use_ssl = config_data.get('smtp_use_ssl', smtp_port == 465)  # 端口465默认使用SSL
                     smtp_use_tls = config_data.get('smtp_use_tls', smtp_port == 587)  # 端口587默认使用TLS
 

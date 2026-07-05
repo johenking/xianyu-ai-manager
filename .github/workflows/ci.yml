@@ -9,16 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
           cache: pip
-      - run: pip install -r requirements.txt
-      - run: python -m py_compile settings_service.py db_manager.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
+          cache-dependency-path: requirements-dev.lock
+      - run: pip install -r requirements-dev.lock
+      - run: ruff check .
+      - run: python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
       - run: python -m unittest discover -s tests -v
       - uses: actions/setup-node@v4
         with:
@@ -30,8 +40,12 @@ jobs:
       - working-directory: frontend
         run: npm audit --audit-level=high
       - working-directory: frontend
-        run: npm exec tsc -- --noEmit
+        run: npm run typecheck
       - working-directory: frontend
         run: npm test
       - working-directory: frontend
         run: npm run build
+      - working-directory: frontend
+        run: npm run build
+      - working-directory: frontend
+        run: npm run verify:build

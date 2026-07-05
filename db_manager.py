@@ -73,7 +73,8 @@ class DBManager:
         if os.getenv('SQL_LOG_LEVEL'):
             self.sql_log_level = os.getenv('SQL_LOG_LEVEL', 'DEBUG').upper()
 
-        logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
+        sql_log_state = '已启用' if self.sql_log_enabled else '已禁用'
+        logger.info(f"SQL日志{sql_log_state}，日志级别: {self.sql_log_level}")
 
         self.init_db()
 

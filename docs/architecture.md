@@ -12,7 +12,7 @@ Main runtime path:
 4. `db_manager.py` retains the compatibility persistence facade. New domain SQL starts in `repositories/`, while domain decisions live in `services/`; authentication is the first extracted boundary.
 5. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account and exposes an awaited shutdown path.
 6. `ai_reply_engine.py` assembles product-scoped context, calls the selected provider, audits rules, and optionally regenerates once.
-7. `frontend/` builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
+7. `frontend/` lazy-loads business pages, exposes domain API/type modules through compatibility barrels, and builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
 
 The deployment model is intentionally one process, one Uvicorn worker, one asyncio event loop, and SQLite. It does not claim horizontal multi-worker support.
 
@@ -107,5 +107,9 @@ The local workspace uses port `8091`; containers commonly expose `8080` through 
 `/health/live` proves the process can answer HTTP. `/health/ready` additionally checks SQLite and CookieManager readiness and reports the schema migration version plus a runtime-session summary. Responses carry `X-Request-ID`; HTTP error JSON keeps `detail` and adds `request_id`.
 
 Set `WEB_CONCURRENCY=1`. Startup rejects values other than one because SQLite state and in-memory browser sessions are not shared between workers. SQL details default to DEBUG.
+
+Production source maps are disabled unless `VITE_BUILD_SOURCEMAP=true`. The Vite retention plugin records successful asset generations and keeps only the current and previous generation. CI verifies that the entry chunk remains at least 30% smaller than the v1.1.0 baseline and that no unowned bundle remains after two builds.
+
+Python runtime requirements are declared in `requirements.in` and locked in `requirements.lock`; development and build tools are declared separately in `requirements-dev.in` and `requirements-dev.lock`. `requirements.txt` remains a compatibility include for existing deployment commands.
 
 Xianyu login remains environment-sensitive. Datacenter or overseas IPs and headless browser fingerprints can trigger Alibaba risk controls. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.
