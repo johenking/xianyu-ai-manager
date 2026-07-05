@@ -2,91 +2,97 @@
 
 ## System Shape
 
-`xianyu-super-butler` is a FastAPI + SQLite + React/Vite application for Xianyu account operations, auto-reply, order handling, card delivery, and the added Skill Center.
+Xianyu AI Manager is a FastAPI + SQLite + React/Vite application for Xianyu account operations, auto-reply, order handling, card delivery, product knowledge, and the Skill Center.
 
 Main runtime path:
 
-1. `Start.py` checks database files, Playwright Chromium, frontend build output, and starts the API server.
-2. `reply_server.py` owns FastAPI routes, authentication, admin APIs, Xianyu account APIs, order APIs, and Skill Center APIs.
+1. `Start.py` checks the database, Playwright Chromium, frontend build output, and starts the API server.
+2. `reply_server.py` owns authentication and the public API surface.
 3. `db_manager.py` owns SQLite schema creation, migrations, and persistence helpers.
-4. `cookie_manager.py` starts per-account Xianyu message tasks through `XianyuAutoAsync.XianyuLive`.
-5. `frontend/` builds React assets into `static/`; the backend serves the SPA and `/static/*`.
+4. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account.
+5. `ai_reply_engine.py` assembles product-scoped context, calls the selected provider, audits rules, and optionally regenerates once.
+6. `frontend/` builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
 
-## Authentication
+## Authentication And Account Identity
 
-Backend login uses the `users` table. The initial admin user is `admin`; its initial password is read from `ADMIN_PASSWORD` during first database creation, and falls back to `admin123` if the environment variable is absent.
+Backend users live in `users`. The initial `admin` password is read from `ADMIN_PASSWORD` only when a new database creates the user. Login sessions are stored in `auth_sessions`, expire after 30 days, and are removed by `/logout`.
 
-Successful login creates a bearer token in memory and persists it in `auth_sessions`. Tokens expire after 30 days. Frontend stores the token in `localStorage` as `auth_token` and verifies it with `/verify` on load. `/logout` removes both the in-memory and SQLite session.
+Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
+
+Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Token failure can trigger an immediate refresh; enabled accounts also perform preventive refresh attempts. When Alibaba requires human verification, the account page reads the persisted status and verification image instead of pretending refresh succeeded.
+
+## AI Context Flow
+
+Each reply is built in this order:
+
+1. Safety restrictions.
+2. Current product title, price, details, and product knowledge.
+3. Enabled global rules plus enabled rules for the current product.
+4. Local intent routing to bargain, technical, or default expert strategy.
+5. Account-wide response style.
+
+Production replies read only `published_json` from the current product knowledge profile. The training lab reads `draft_json` first, then falls back to the published version. Rules belonging to other products and disabled rules are reported but not injected.
+
+After generation, the engine audits every applied rule. If any rule is marked violated, it asks the same configured provider to regenerate once with the violations made explicit, then audits again. The response metadata includes applied, excluded, and disabled rules, audit results, conflicts, and whether regeneration occurred. Contradictory rules still require human correction.
+
+## Product Knowledge Lifecycle
+
+Knowledge is scoped by `(cookie_id, item_id)`:
+
+1. The seller writes a required plain-language overview.
+2. AI combines that overview with the synchronized product title, price, and detail text to produce a structured draft.
+3. Generated fields remain pending until the seller confirms or edits them.
+4. Publishing stores an immutable version and copies the draft into the production snapshot.
+5. Rollback restores a historical version.
+
+Copying knowledge chooses the source draft, or the published snapshot when no draft exists, and writes it only to target drafts. The default is no overwrite. Copy never publishes target products.
+
+## Order Synchronization
+
+`order_sync_service.py` discovers seller orders from the recent paginated platform feed and reconciles them with stored details. The default window is 90 days. Status text takes precedence over numeric codes, so signed orders become `completed`, active refunds become `refunding`, successful refunds become `refunded`, and closed refund requests become `refund_cancelled`.
+
+Unknown or failed responses never overwrite a reliable stored status. Shipped, completed, refunding, and legacy closed orders remain eligible for detail checks because completion can later move to refund. Session expiry stops that account's sync with `requires_login` instead of counting the attempt as success. Unmatched status events are persisted in `order_status_events` and reconciled when the corresponding order is later discovered.
+
+## AI Providers And Settings
+
+`ai_provider_profiles` stores user-scoped provider profiles, encrypted API keys, the default model, cached model lists, and verification state. OpenAI-compatible providers use Chat Completions and `/models`; Gemini uses its native models list and `generateContent`. Accounts bind to a profile and select their own model. A provider/model change must generate a successful test reply before it can replace the active account configuration.
+
+System settings are split into basic, AI, and SMTP sections. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification authenticates without sending mail.
 
 ## Data Model
 
 Core tables:
 
-- `users`: backend users and admin account.
-- `auth_sessions`: persistent backend login sessions.
-- `cookies`, `cookie_status`: Xianyu account cookies and enabled state.
-- `keywords`, `default_replies`, `item_replay`: keyword/default/item-specific reply rules.
-- `ai_reply_settings`, `ai_conversations`, `ai_item_cache`: AI reply configuration and conversation context.
-- `cards`, `delivery_rules`, `orders`, `item_info`: inventory, delivery rules, order data, item data.
-- `notification_channels`, `message_notifications`: notification destinations and per-account bindings.
-- `risk_control_logs`: slider/captcha/verification events.
-
-Skill Center tables:
-
-- `skill_monitor_tasks`: monitor task definitions.
-- `skill_monitor_results`: monitor output rows.
-- `skill_agent_prompts`: per-user Prompt presets for AI expert replies.
-- `skill_run_logs`: module run logs.
-
-## Skill Center Design
-
-The Skill Center is a safe rewrite of behavior inspired by three external projects, without directly copying their GPL/AGPL code:
-
-- `Usagi-org/ai-goofish-monitor`: monitor task and result workflow.
-- `shaxiu/XianyuAutoAgent`: multi-expert reply strategy and Prompt management.
-- `GuDong2003/xianyu-auto-reply-fix`: deployment, browser, delivery, and stability diagnostics.
-
-The implementation keeps the original app surface intact and adds a sidebar entry for `SkillCenter.tsx`. Existing account, order, keyword, card, and delivery APIs remain the source of truth.
+- `users`, `auth_sessions`: backend identities and persistent login sessions.
+- `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, and Cookie refresh state.
+- `keywords`, `default_replies`, `item_replay`: deterministic reply rules.
+- `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.
+- `ai_training_rules`: global and product-scoped rules with enabled state.
+- `ai_item_knowledge_profiles`, `ai_item_knowledge_versions`: knowledge draft, published snapshot, and version history.
+- `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory, delivery, synchronized orders and deferred status events, and products.
+- `notification_channels`, `message_notifications`, `risk_control_logs`: notification and risk-control records.
+- `skill_monitor_tasks`, `skill_monitor_results`, `skill_agent_prompts`, `skill_run_logs`: Skill Center state.
 
 ## Route Groups
 
-Auth and app shell:
+- Auth: `/login`, `/logout`, `/verify`, `/change-password`, `/change-admin-password`.
+- Account binding: `/qr-login/*`, `/password-login/*`, `/cookies*`.
+- Session refresh: `/api/accounts/{cookie_id}/session-status`, `/session-refresh`, `/session-refresh/cancel`.
+- Diagnostics: `/api/diagnostics/auto-reply/{cookie_id}` and `/api/skills/ops/*`.
+- Settings: `/api/settings/summary`, `/api/settings/sections/{section}`, `/api/settings/verify/{section}`.
+- AI providers: `/api/ai/providers*`, including model refresh and generated-reply tests.
+- AI training: `/ai-reply-lab/*`, `/ai-training-rules/*`.
+- Product knowledge: `/ai-item-knowledge/{cookie_id}/{item_id}/*`.
+- Replies and inventory: `/keywords*`, `/default-replies*`, `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`.
+- Orders and analytics: `POST /api/orders/sync`, `/api/orders*`, `/analytics/orders*`.
+- Skill Center: `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*`.
 
-- `GET /`, `/login`, `/register`, `/{path:path}`
-- `POST /login`, `POST /logout`, `GET /verify`
-- `POST /change-password`, `POST /change-admin-password`
+## Skill Center Boundary
 
-Xianyu account login and cookies:
-
-- `POST /qr-login/generate`, `GET /qr-login/check/{session_id}`
-- `POST /password-login`, `GET /password-login/check/{session_id}`
-- `GET /cookies/details`, `POST /cookies`, `PUT /cookies/{cid}`, `DELETE /cookies/{cid}`
-
-Reply and inventory:
-
-- `/keywords*`, `/default-replies*`, `/api/default-reply*`
-- `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`
-- `/ai-reply-settings*`, `/ai-reply-test/{cookie_id}`
-
-Orders and analytics:
-
-- `/api/orders*`
-- `/analytics/orders`, `/analytics/orders/valid`
-
-Skill Center:
-
-- `GET/POST /api/skills/monitor/tasks`
-- `POST /api/skills/monitor/tasks/{task_id}/run`
-- `GET /api/skills/monitor/results`
-- `GET /api/skills/agent/prompts`
-- `PUT /api/skills/agent/prompts/{prompt_type}`
-- `POST /api/skills/agent/test-reply`
-- `GET /api/skills/ops/health`
-- `GET /api/skills/ops/browser-status`
-- `GET /api/skills/ops/delivery-diagnostics`
+The Skill Center is an independent safe rewrite informed by monitor workflow, expert-strategy, and diagnostics ideas from the projects named in `NOTICE`. Manual product searches, expert prompts, and diagnostics are functional. Scheduled monitoring, AI monitor filtering, and notification delivery are explicitly unavailable and must not be represented as queued or successful.
 
 ## Deployment Notes
 
-Local default port comes from `global_config.yml` and is set to `8091` in this workspace. Cloud platforms override with `PORT` or `API_PORT`; Hugging Face Spaces Docker expects `app_port: 8080` in `README.md` frontmatter.
+The local workspace uses port `8091`; containers commonly expose `8080` through `PORT` or `API_PORT`. A Hugging Face Spaces export needs Docker frontmatter with `app_port: 8080`, but the GitHub README does not require that frontmatter.
 
-Xianyu login is environment-sensitive. Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk controls. Account binding is more reliable on a local machine or trusted domestic host; Cookie-based binding is often more stable than cloud QR login.
+Xianyu login remains environment-sensitive. Datacenter or overseas IPs and headless browser fingerprints can trigger Alibaba risk controls. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.

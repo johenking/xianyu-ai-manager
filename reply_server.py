@@ -37,9 +37,16 @@ from settings_service import (
     normalize_system_settings,
     validate_skill_monitor_features,
 )
+from account_session_refresh import (
+    active_refresh_registry,
+    is_runtime_event_active,
+    is_valid_account_login_username,
+    remove_verification_image,
+)
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from order_sync_service import OrderSyncCoordinator, XianyuOrderListClient, normalize_order_status
 
 from loguru import logger
 
@@ -145,6 +152,11 @@ class LoginResponse(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
+
+
+class OrderSyncRequest(BaseModel):
+    cookie_id: Optional[str] = None
+    days: int = Field(90, ge=1, le=365)
 
 
 class RegisterRequest(BaseModel):
@@ -1402,7 +1414,15 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'remark': remark,
-            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+            'username': cookie_details.get('username', '') if cookie_details else '',
+            'has_login_password': bool(cookie_details.get('password')) if cookie_details else False,
+            'login_credentials_valid': bool(
+                cookie_details
+                and cookie_details.get('password')
+                and is_valid_account_login_username(cookie_details.get('username'))
+            ),
+            'show_browser': bool(cookie_details.get('show_browser')) if cookie_details else False,
         })
     return result
 
@@ -1416,24 +1436,31 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
         user_id = current_user['user_id']
         from db_manager import db_manager
 
-        log_with_user('info', f"尝试添加Cookie: {item.id}, 当前用户ID: {user_id}, 用户名: {current_user.get('username', 'unknown')}", current_user)
+        cookie_unb = db_manager._extract_cookie_unb(item.value)
+        canonical_id = db_manager.find_cookie_id_by_unb(user_id, cookie_unb) if cookie_unb else None
+        target_id = canonical_id or item.id
+
+        log_with_user('info', f"尝试添加Cookie: {target_id}, 当前用户ID: {user_id}, 用户名: {current_user.get('username', 'unknown')}", current_user)
 
         # 检查cookie是否已存在且属于其他用户
         existing_cookies = db_manager.get_all_cookies()
-        if item.id in existing_cookies:
+        if target_id in existing_cookies:
             # 检查是否属于当前用户
             user_cookies = db_manager.get_all_cookies(user_id)
-            if item.id not in user_cookies:
-                log_with_user('warning', f"Cookie ID冲突: {item.id} 已被其他用户使用", current_user)
+            if target_id not in user_cookies:
+                log_with_user('warning', f"Cookie ID冲突: {target_id} 已被其他用户使用", current_user)
                 raise HTTPException(status_code=400, detail="该Cookie ID已被其他用户使用")
 
         # 保存到数据库时指定用户ID
-        db_manager.save_cookie(item.id, item.value, user_id)
+        db_manager.save_cookie(target_id, item.value, user_id)
 
         # 添加到CookieManager，同时指定用户ID
-        cookie_manager.manager.add_cookie(item.id, item.value, user_id=user_id)
-        log_with_user('info', f"Cookie添加成功: {item.id}", current_user)
-        return {"msg": "success"}
+        if target_id in cookie_manager.manager.cookies:
+            cookie_manager.manager.update_cookie(target_id, item.value, save_to_db=False)
+        else:
+            cookie_manager.manager.add_cookie(target_id, item.value, user_id=user_id)
+        log_with_user('info', f"Cookie添加成功: {target_id}", current_user)
+        return {"msg": "success", "account_id": target_id, "matched_existing": bool(canonical_id)}
     except HTTPException:
         raise
     except Exception as e:
@@ -1460,12 +1487,14 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
 
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if update_data.username is not None and update_data.username and not is_valid_account_login_username(update_data.username):
+            raise HTTPException(status_code=400, detail="闲鱼登录账号不能填写 API 地址，请填写手机号、邮箱或闲鱼登录名")
 
         # 使用现有的update_cookie_account_info方法更新登录信息
         success = db_manager.update_cookie_account_info(
             cid,
             username=update_data.username,
-            password=update_data.login_password,
+            password=update_data.login_password if update_data.login_password else None,
             show_browser=update_data.show_browser
         )
 
@@ -1725,7 +1754,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                                         live_instance.send_token_refresh_notification(
                                             error_message=message,
                                             notification_type="face_verification",
-                                            verification_url=verification_url
+                                            verification_url=None
                                         )
                                     )
                                     log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
@@ -1782,6 +1811,14 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
 
                 # 将cookie字典转换为字符串格式
                 cookies_str = '; '.join([f"{k}={v}" for k, v in cookies_dict.items()])
+
+                actual_unb = str(cookies_dict.get('unb') or '').strip()
+                canonical_account_id = db_manager.find_cookie_id_by_unb(user_id, actual_unb) if actual_unb else None
+                if canonical_account_id:
+                    account_id = canonical_account_id
+                elif actual_unb:
+                    account_id = actual_unb
+                password_login_sessions[session_id]['account_id'] = account_id
 
                 log_with_user('info', f"账号密码登录成功，获取到 {len(cookies_dict)} 个Cookie字段: {account_id}", current_user)
 
@@ -2037,10 +2074,9 @@ async def check_password_login_status(
             verification_url = session.get('verification_url')
             return {
                 'status': 'verification_required',
-                'verification_url': verification_url,
                 'screenshot_path': screenshot_path,
                 'qr_code_url': session.get('qr_code_url'),  # 保留兼容性
-                'message': '需要人脸验证，请查看验证截图' if screenshot_path else '需要人脸验证，请点击验证链接'
+                'message': '需要身份验证，请查看验证截图' if screenshot_path else '需要身份验证，请在可见浏览器中完成'
             }
         elif status == 'success':
             # 登录成功
@@ -2347,17 +2383,7 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
         # 检查是否已存在相同unb的账号
         existing_cookies = db_manager.get_all_cookies(user_id)
-        existing_account_id = None
-
-        for account_id, cookie_value in existing_cookies.items():
-            try:
-                # 解析现有Cookie中的unb
-                existing_cookie_dict = trans_cookies(cookie_value)
-                if existing_cookie_dict.get('unb') == unb:
-                    existing_account_id = account_id
-                    break
-            except:
-                continue
+        existing_account_id = db_manager.find_cookie_id_by_unb(user_id, unb)
 
         # 确定账号ID
         if existing_account_id:
@@ -4786,6 +4812,16 @@ class AIItemKnowledgeDraftRequest(BaseModel):
     profile: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AIItemKnowledgeGenerateRequest(BaseModel):
+    overview: str = ""
+    profile: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AIItemKnowledgeCopyRequest(BaseModel):
+    target_item_ids: List[str] = Field(default_factory=list)
+    overwrite: bool = False
+
+
 class SkillMonitorTaskIn(BaseModel):
     name: str = ""
     keyword: str
@@ -5374,7 +5410,7 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             ai_reply_lab_sessions[session_id] = session
 
         history = session.get('history', [])
-        reply = ai_reply_engine.generate_lab_reply(
+        reply_result = ai_reply_engine.generate_lab_reply(
             message=message,
             item_info={
                 'title': item_title,
@@ -5386,10 +5422,12 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             training_rules=_normalize_scoped_rules(request.training_rules),
             item_id=normalized_item_id,
             prompt_override=request.prompt_override,
+            return_metadata=True,
         )
 
-        if not reply:
+        if not reply_result or not reply_result.get('reply'):
             raise HTTPException(status_code=400, detail="AI回复生成失败，请检查API Key、API地址或训练规则")
+        reply = reply_result['reply']
 
         history.extend([
             {'role': 'user', 'content': message},
@@ -5403,6 +5441,11 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             "reply": reply,
             "warnings": _detect_ai_reply_warnings(reply),
             "history": session['history'],
+            "rule_context": reply_result.get('rule_context', {}),
+            "rule_audit": reply_result.get('audit', {}),
+            "regenerated": bool(reply_result.get('regenerated')),
+            "knowledge_source": reply_result.get('knowledge_source', 'none'),
+            "knowledge_version": reply_result.get('knowledge_version', 0),
         }
 
     except HTTPException:
@@ -5437,7 +5480,8 @@ def save_ai_reply_lab_rules(cookie_id: str, request: AIReplyLabSaveRequest, curr
 @app.get("/ai-training-rules/{cookie_id}")
 def get_ai_training_rules(cookie_id: str, item_id: str = Query(default=''), current_user: Dict[str, Any] = Depends(get_current_user)):
     _ensure_ai_cookie_access(cookie_id, current_user)
-    return db_manager.get_ai_training_rules(cookie_id, item_id, include_disabled=True)
+    rules = db_manager.get_ai_training_rules(cookie_id, item_id, include_disabled=True)
+    return {**rules, 'context': db_manager.get_ai_training_rule_context(cookie_id, item_id)}
 
 
 @app.post("/ai-training-rules/{cookie_id}")
@@ -5474,24 +5518,60 @@ def get_ai_item_knowledge(cookie_id: str, item_id: str, current_user: Dict[str, 
 
 
 @app.post("/ai-item-knowledge/{cookie_id}/{item_id}/generate")
-def generate_ai_item_knowledge(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeGenerateRequest,
+                               current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
+    overview = str(request.overview or '').strip()
+    seed = dict(request.profile) if isinstance(request.profile, dict) else {}
+    if not overview:
+        seed_overview = seed.get('overview') if isinstance(seed.get('overview'), dict) else {}
+        overview = str(seed_overview.get('text') or '').strip()
+    if not overview:
+        raise HTTPException(status_code=400, detail='请先填写商品概览，再生成结构化草稿')
+    seed['overview'] = {
+        **(seed.get('overview') if isinstance(seed.get('overview'), dict) else {}),
+        'text': overview,
+        'source': 'user',
+        'status': 'confirmed',
+    }
+    source_hash = _item_knowledge_source_hash(item)
+    db_manager.save_ai_item_knowledge_draft(cookie_id, item_id, seed, source_hash)
     try:
-        draft = ai_reply_engine.generate_item_knowledge_draft({
+        generated = ai_reply_engine.generate_item_knowledge_draft({
             'title': item.get('item_title') or '',
             'price': item.get('item_price') or '',
             'desc': item.get('item_detail') or item.get('item_description') or '',
-        }, cookie_id)
+        }, cookie_id, seller_overview=overview)
+        draft = ai_reply_engine.merge_generated_knowledge_with_seed(seed, generated)
+        db_manager.save_ai_item_knowledge_draft(cookie_id, item_id, draft, source_hash)
         return {
-            'message': 'AI草稿已生成，请确认后保存',
+            'message': '概览已保存，AI结构化草稿已生成',
             'draft': draft,
-            'source_detail_hash': _item_knowledge_source_hash(item),
+            'source_detail_hash': source_hash,
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"生成商品知识草稿失败 {cookie_id}/{item_id}: {e}")
         raise HTTPException(status_code=500, detail='AI草稿生成失败，请检查AI配置')
+
+
+@app.post("/ai-item-knowledge/{cookie_id}/{item_id}/copy")
+def copy_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeCopyRequest,
+                           current_user: Dict[str, Any] = Depends(get_current_user)):
+    _get_ai_knowledge_item(cookie_id, item_id, current_user)
+    if not request.target_item_ids:
+        raise HTTPException(status_code=400, detail='请选择至少一个目标商品')
+    try:
+        result = db_manager.copy_ai_item_knowledge_draft(
+            cookie_id, item_id, request.target_item_ids, request.overwrite
+        )
+        return {
+            **result,
+            'message': f"已复制到 {len(result['copied_item_ids'])} 个商品草稿",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.put("/ai-item-knowledge/{cookie_id}/{item_id}/draft")
@@ -5548,20 +5628,100 @@ def rollback_ai_item_knowledge(cookie_id: str, item_id: str, version: int,
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _require_owned_cookie(cookie_id: str, user_id: int) -> None:
+    if cookie_id not in db_manager.get_all_cookies(user_id):
+        raise HTTPException(status_code=403, detail="无权限访问该闲鱼账号")
+
+
+def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
+    refresh_status = db_manager.get_account_session_refresh(cookie_id)
+    if (
+        refresh_status.get('state') in {'refreshing', 'verification_required'}
+        and refresh_status.get('expires_at')
+        and time.time() > float(refresh_status['expires_at'])
+    ):
+        image_path = (refresh_status.get('verification_image_url') or '').lstrip('/')
+        remove_verification_image(image_path)
+        db_manager.update_account_session_refresh(
+            cookie_id,
+            state='timeout',
+            trigger=refresh_status.get('trigger') or 'automatic',
+            message='身份验证已超时，请重新发起刷新',
+            error_code='verification_timeout',
+        )
+        refresh_status = db_manager.get_account_session_refresh(cookie_id)
+    return refresh_status
+
+
+@app.get("/api/accounts/{cookie_id}/session-status")
+def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    _require_owned_cookie(cookie_id, current_user['user_id'])
+    return {'success': True, 'data': _current_session_refresh_status(cookie_id)}
+
+
+@app.post("/api/accounts/{cookie_id}/session-refresh")
+async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    _require_owned_cookie(cookie_id, current_user['user_id'])
+    current_status = _current_session_refresh_status(cookie_id)
+    if active_refresh_registry.is_active(cookie_id):
+        return {'success': True, 'message': 'Cookie 刷新已经在进行中', 'data': current_status}
+
+    if current_status.get('state') in {'refreshing', 'verification_required'}:
+        db_manager.update_account_session_refresh(
+            cookie_id, state='failed', trigger='manual',
+            message='上一次刷新会话已中断，正在重新发起', error_code='interrupted',
+        )
+
+    from XianyuAutoAsync import XianyuLive
+    live_instance = XianyuLive.get_instance(cookie_id)
+    if live_instance is None:
+        raise HTTPException(status_code=409, detail="账号监听实例未运行，请先开启账号监听")
+
+    manager_loop = getattr(cookie_manager.manager, 'loop', None) if cookie_manager.manager else None
+    running_loop = asyncio.get_running_loop()
+    if manager_loop and manager_loop is not running_loop and manager_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            live_instance._try_password_login_refresh("手动立即刷新"),
+            manager_loop,
+        )
+    else:
+        asyncio.create_task(live_instance._try_password_login_refresh("手动立即刷新"))
+    await asyncio.sleep(0)
+    return {
+        'success': True,
+        'message': '已开始刷新 Cookie',
+        'data': db_manager.get_account_session_refresh(cookie_id),
+    }
+
+
+@app.post("/api/accounts/{cookie_id}/session-refresh/cancel")
+def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    _require_owned_cookie(cookie_id, current_user['user_id'])
+    status_info = _current_session_refresh_status(cookie_id)
+    image_path = (status_info.get('verification_image_url') or '').lstrip('/')
+    cancelled = active_refresh_registry.cancel(cookie_id)
+    remove_verification_image(image_path)
+    db_manager.update_account_session_refresh(
+        cookie_id, state='cancelled', trigger=status_info.get('trigger') or 'manual',
+        message='Cookie 刷新已取消', error_code='cancelled',
+    )
+    return {'success': True, 'message': '刷新已取消' if cancelled else '没有正在运行的刷新任务'}
+
+
 @app.get("/api/diagnostics/auto-reply/{cookie_id}")
 def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """诊断指定账号的自动回复链路"""
     try:
         user_id = current_user['user_id']
         user_cookies = db_manager.get_all_cookies(user_id)
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该闲鱼账号")
+        _require_owned_cookie(cookie_id, user_id)
 
         cookie_info = db_manager.get_cookie_details(cookie_id) or {}
         cookie_value = user_cookies.get(cookie_id, '')
         ai_settings = db_manager.get_ai_reply_settings(cookie_id)
         default_reply = db_manager.get_default_reply(cookie_id) or {}
         status_enabled = db_manager.get_cookie_status(cookie_id)
+        refresh_status = _current_session_refresh_status(cookie_id)
 
         manager_ready = cookie_manager.manager is not None
         manager_has_cookie = False
@@ -5573,7 +5733,6 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
         if manager_ready:
             manager_has_cookie = cookie_id in getattr(cookie_manager.manager, 'cookies', {})
             task_status = getattr(cookie_manager.manager, 'task_status', {}).get(cookie_id, {}) or {}
-            recent_runtime_error = task_status.get('last_error') or ''
             task = getattr(cookie_manager.manager, 'tasks', {}).get(cookie_id)
             if task:
                 task_done = task.done()
@@ -5584,21 +5743,8 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                         task_error = str(exc) if exc else ''
                     except Exception as exc_check_error:
                         task_error = str(exc_check_error)
-            if not recent_runtime_error:
-                try:
-                    log_files = sorted(Path('logs').glob('xianyu_*.log'), key=lambda path: path.stat().st_mtime, reverse=True)
-                    runtime_error_keywords = ['Token获取失败', 'Token刷新异常', 'Cannot connect to host h5api.m.goofish.com', 'WebSocket连接异常']
-                    for log_file in log_files[:2]:
-                        text = log_file.read_text(encoding='utf-8', errors='ignore')[-80000:]
-                        lines = text.splitlines()
-                        for line in reversed(lines):
-                            if cookie_id in line and any(keyword in line for keyword in runtime_error_keywords):
-                                recent_runtime_error = line.split(' - ', 1)[-1].strip()
-                                break
-                        if recent_runtime_error:
-                            break
-                except Exception as log_error:
-                    logger.debug(f"读取闲鱼运行日志失败: {log_error}")
+            if not task_running:
+                recent_runtime_error = task_status.get('last_error') or task_error or ''
 
         with db_manager.lock:
             cursor = db_manager.conn.cursor()
@@ -5635,7 +5781,7 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                 'error_message': risk_row[4],
                 'created_at': risk_row[5],
                 'updated_at': risk_row[6],
-            } if risk_row else None
+            } if risk_row and refresh_status.get('state') in {'refreshing', 'verification_required'} else None
 
         issues = []
         if not status_enabled:
@@ -5659,22 +5805,27 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
         if keyword_count == 0 and not ai_settings.get('ai_enabled') and not default_reply.get('enabled'):
             issues.append("关键词、AI、默认回复都未配置，无法自动回复")
 
-        risk_status = (latest_risk_control or {}).get('processing_status')
-        risk_text = " ".join([
-            str((latest_risk_control or {}).get('event_description') or ''),
-            str((latest_risk_control or {}).get('processing_result') or ''),
-            str((latest_risk_control or {}).get('error_message') or ''),
-        ])
-        if risk_status in {'processing', 'failed'} or '滑块' in risk_text or '人机' in risk_text:
-            if risk_status == 'success' and recent_runtime_error and 'Token获取失败' in recent_runtime_error:
-                issues.append("滑块验证已尝试通过，但闲鱼 Session 仍过期，需要重新登录闲鱼账号")
-            elif risk_status != 'success':
-                issues.append("闲鱼要求人机验证，请重新扫码登录或在可见浏览器里完成滑块")
+        refresh_state = refresh_status.get('state')
+        if refresh_state == 'verification_required':
+            issues.append("Cookie 刷新正在等待身份验证，请在账号卡片中完成验证")
+        elif refresh_state == 'refreshing':
+            issues.append("Cookie 正在自动刷新，请稍候")
+        elif refresh_state in {'failed', 'timeout'}:
+            updated_at = refresh_status.get('updated_at')
+            if is_runtime_event_active(
+                updated_at,
+                refresh_status.get('last_success_at'),
+                max_age_seconds=600,
+            ):
+                issues.append(refresh_status.get('message') or "最近一次 Cookie 刷新失败")
         if not cookie_info.get('username') or not cookie_info.get('password'):
             issues.append("未保存闲鱼账号密码，Cookie 过期后无法自动刷新")
             if recent_runtime_error and 'Token获取失败' in recent_runtime_error:
                 issues.append("当前 Cookie 已无法换取消息 Token，请重新扫码添加账号或保存闲鱼账号密码后再自动刷新")
+        elif not is_valid_account_login_username(cookie_info.get('username')):
+            issues.append("已保存的闲鱼登录账号格式异常，请重新填写")
 
+        issues = list(dict.fromkeys(issues))
         blocking_issues = [
             issue for issue in issues
             if issue != "未保存闲鱼账号密码，Cookie 过期后无法自动刷新"
@@ -5686,11 +5837,16 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                 "cookie_id": cookie_id,
                 "ready": len(blocking_issues) == 0,
                 "issues": issues,
+                "diagnosed_at": time.time(),
                 "account": {
                     "enabled": bool(status_enabled),
                     "cookie_length": len(cookie_value),
                     "has_login_username": bool(cookie_info.get('username')),
                     "has_login_password": bool(cookie_info.get('password')),
+                    "login_credentials_valid": bool(
+                        cookie_info.get('password')
+                        and is_valid_account_login_username(cookie_info.get('username'))
+                    ),
                     "show_browser": bool(cookie_info.get('show_browser')),
                 },
                 "runtime": {
@@ -5703,6 +5859,7 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                     "recent_runtime_error": recent_runtime_error,
                     "latest_risk_control": latest_risk_control,
                 },
+                "session": refresh_status,
                 "reply": {
                     "keyword_count": keyword_count,
                     "default_reply_count": default_reply_count,
@@ -7560,6 +7717,93 @@ def update_item_multi_quantity_delivery(
 
 # ==================== 订单管理接口 ====================
 
+async def _fetch_order_details_for_sync(**kwargs):
+    from utils.order_fetcher_optimized import process_orders_batch
+
+    return await process_orders_batch(
+        order_ids=kwargs["order_ids"],
+        cookie_id=kwargs["cookie_id"],
+        cookie_string=kwargs["cookie_string"],
+        max_concurrent=3,
+        timeout=30,
+        headless=True,
+        use_pool=True,
+        force_refresh=True,
+    )
+
+
+async def _sync_recent_orders(
+    current_user: Dict[str, Any],
+    cookie_id: Optional[str] = None,
+    days: int = 90,
+) -> JSONResponse:
+    user_cookies = db_manager.get_all_cookies(current_user["user_id"])
+    if cookie_id:
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=404, detail="账号不存在或无权访问")
+        user_cookies = {cookie_id: user_cookies[cookie_id]}
+    if not user_cookies:
+        raise HTTPException(status_code=400, detail="当前没有可同步的闲鱼账号")
+
+    client = XianyuOrderListClient()
+    coordinator = OrderSyncCoordinator(
+        db_manager,
+        discoverer=client.discover,
+        detail_fetcher=_fetch_order_details_for_sync,
+    )
+    account_results = []
+    total_summary = {
+        "total_seen": 0,
+        "discovered": 0,
+        "status_updated": 0,
+        "details_updated": 0,
+        "unchanged": 0,
+        "failed": 0,
+    }
+    for account_id, cookie_string in user_cookies.items():
+        result = await coordinator.sync_account(
+            cookie_id=account_id,
+            cookie_string=cookie_string,
+            days=days,
+        )
+        account_results.append({"cookie_id": account_id, **result})
+        for key in total_summary:
+            total_summary[key] += int((result.get("summary") or {}).get(key) or 0)
+
+    requires_login = [row["cookie_id"] for row in account_results if row.get("requires_login")]
+    successful = sum(1 for row in account_results if row.get("success"))
+    partial = any(row.get("partial") for row in account_results) or (successful > 0 and successful < len(account_results))
+    payload = {
+        "success": successful == len(account_results),
+        "partial": partial,
+        "message": (
+            "订单同步完成"
+            if successful == len(account_results)
+            else "登录状态已过期，请先在账号管理更新登录状态"
+            if requires_login and successful == 0
+            else "订单同步部分完成"
+        ),
+        "days": days,
+        "summary": total_summary,
+        "requires_login": requires_login,
+        "accounts": account_results,
+    }
+    status_code = 409 if requires_login and successful == 0 else 200
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.post('/api/orders/sync')
+async def sync_recent_orders(
+    request: OrderSyncRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Discover and reconcile recent seller orders with truthful partial failures."""
+    return await _sync_recent_orders(
+        current_user=current_user,
+        cookie_id=request.cookie_id,
+        days=request.days,
+    )
+
 @app.get('/api/orders')
 def get_user_orders(
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -7738,41 +7982,39 @@ async def refresh_single_order(
 
         result = batch_results[0]
         if result.get('error'):
-            raise HTTPException(status_code=500, detail=f"刷新失败: {result.get('error')}")
+            status_code = 409 if result.get('requires_login') or result.get('error_code') == 'session_expired' else 502
+            raise HTTPException(
+                status_code=status_code,
+                detail={
+                    "code": result.get('error_code') or 'order_refresh_failed',
+                    "message": result.get('error'),
+                    "requires_login": status_code == 409,
+                },
+            )
 
-        # 状态码映射
-        order_status = result.get('order_status', 'unknown')
-        if order_status and str(order_status).isdigit():
-            status_mapping = {
-                '1': 'processing',
-                '2': 'pending_ship',
-                '3': 'shipped',
-                '4': 'completed',
-                '5': 'refunding',
-                '6': 'cancelled',
-                '7': 'refunding',
-                '8': 'cancelled',
-                '9': 'refunding',
-                '10': 'cancelled',
-                '11': 'completed',
-                '12': 'cancelled',
-            }
-            order_status = status_mapping.get(str(order_status), order_status)
-
-        # 更新数据库
-        db_manager.insert_or_update_order(
+        order_status = normalize_order_status(
+            result.get('order_status', 'unknown'),
+            result.get('status_text', ''),
+        )
+        update_result = db_manager.apply_order_sync_update(
             order_id=order_id,
+            cookie_id=cookie_id,
+            incoming_status=order_status,
+            platform_status_code=str(result.get('api_status') or result.get('order_status') or ''),
+            platform_status_text=str(result.get('status_text') or ''),
+            status_source='order_detail',
+            sync_error='' if order_status != 'unknown' else '无法确认平台订单状态',
             item_id=result.get('item_id') or None,
             buyer_id=result.get('buyer_id') or None,
             spec_name=result.get('spec_name') or None,
             spec_value=result.get('spec_value') or None,
             quantity=result.get('quantity') or None,
             amount=result.get('amount') or None,
-            order_status=order_status,
-            cookie_id=cookie_id,
+            created_at=result.get('order_time') or None,
             receiver_name=result.get('receiver_name') or None,
             receiver_phone=result.get('receiver_phone') or None,
             receiver_address=result.get('receiver_address') or None,
+            receiver_city=result.get('receiver_city') or None,
         )
 
         log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
@@ -7781,7 +8023,9 @@ async def refresh_single_order(
             "message": "订单刷新成功",
             "data": {
                 "order_id": order_id,
-                "order_status": order_status,
+                "order_status": update_result.get('new_status', order_status),
+                "status_changed": bool(update_result.get('status_changed')),
+                "details_changed": bool(update_result.get('details_changed')),
             }
         })
 
@@ -7986,6 +8230,9 @@ async def refresh_orders_status(
     2. 对非'已发货'状态的订单，使用Playwright查询最新状态
     3. 更新数据库中有变化的订单
     """
+    # 兼容旧前端；状态筛选不再缩小核对范围，避免漏掉签收或退款变化。
+    return await _sync_recent_orders(current_user=current_user, cookie_id=cookie_id, days=90)
+
     try:
         from db_manager import db_manager
         from utils.order_fetcher_optimized import process_orders_batch

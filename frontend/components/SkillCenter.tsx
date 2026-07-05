@@ -641,11 +641,11 @@ const SkillCenter: React.FC = () => {
             <button
               key={item.id}
               onClick={() => setActiveSkill(item.id as SkillTab)}
-              className={`px-5 py-3 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors ${
+              className={`flex-none whitespace-nowrap px-3 sm:px-5 py-3 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors ${
                 selected ? 'bg-[#FFE815] text-black' : 'text-gray-500 hover:text-gray-900'
               }`}
             >
-              <Icon className="w-4 h-4" />
+              <Icon className="w-4 h-4 shrink-0" />
               {item.label}
             </button>
           );

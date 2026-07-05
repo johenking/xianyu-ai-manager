@@ -12,6 +12,7 @@ from loguru import logger
 from collections import defaultdict
 
 from utils.browser_pool import get_browser_pool
+from order_sync_service import normalize_order_status, parse_order_api_payload
 
 
 class OrderFetcherOptimized:
@@ -165,8 +166,10 @@ class OrderFetcherOptimized:
                             logger.info(f"[拦截] API响应已保存")
                         except Exception as e:
                             logger.error(f"解析API响应失败: {e}")
+                        await route.fulfill(response=response)
+                        return
 
-                    # 继续所有请求
+                    # 继续非订单详情请求
                     await route.continue_()
 
                 # 设置路由拦截
@@ -201,12 +204,19 @@ class OrderFetcherOptimized:
                     logger.info(f"拦截到 {len(self.api_responses)} 个API响应")
                     api_result = self.api_responses[0]
 
-                    if api_result.get('ret') and api_result['ret'][0].startswith('SUCCESS'):
-                        order_data = api_result.get('data', {})
+                    parsed_api = parse_order_api_payload(api_result)
+                    if parsed_api.get('success'):
+                        order_data = parsed_api.get('data', {})
                         api_data = self._parse_api_response(order_data)
                         logger.info(f"API数据解析成功: {api_data.keys()}")
                     else:
-                        logger.warning(f"API响应失败: {api_result.get('ret', ['未知错误'])[0]}")
+                        logger.warning(f"API响应失败: {parsed_api.get('error_code')}")
+                        return {
+                            'order_id': order_id,
+                            'error': parsed_api.get('error') or '订单接口请求失败',
+                            'error_code': parsed_api.get('error_code') or 'platform_error',
+                            'requires_login': bool(parsed_api.get('requires_login')),
+                        }
                 else:
                     logger.warning("未拦截到API响应，仅使用DOM解析数据")
 
@@ -287,35 +297,11 @@ class OrderFetcherOptimized:
         result = {}
 
         try:
-            # 定义状态码映射（与 reply_server.py 保持一致）
-            STATUS_CODE_MAP = {
-                '1': 'processing',
-                '2': 'pending_ship',
-                '3': 'shipped',
-                '4': 'completed',
-                '7': 'refunding',
-                '8': 'cancelled',
-                '9': 'refunding',
-                '10': 'cancelled',
-                '11': 'completed',  # 交易完成
-                '12': 'cancelled',  # 交易关闭
-            }
-
             # 提取订单状态
             status_code = order_data.get('status', 'unknown')
-            # 如果是字符串状态，直接使用；如果是数字，映射到字符串
-            if isinstance(status_code, str):
-                if status_code in ['processing', 'pending_ship', 'shipped', 'completed', 'cancelled', 'refunding', 'unknown']:
-                    result['order_status'] = status_code
-                elif status_code.isdigit():
-                    result['order_status'] = STATUS_CODE_MAP.get(status_code, 'unknown')
-                else:
-                    result['order_status'] = status_code
-            else:
-                # 是数字，需要映射
-                result['order_status'] = STATUS_CODE_MAP.get(str(status_code), 'unknown')
-
             result['status_text'] = order_data.get('utArgs', {}).get('orderStatusName', '')
+            result['order_status'] = normalize_order_status(status_code, result['status_text'])
+            result['platform_status_code'] = str(status_code or '')
 
             # 提取商品信息
             components = order_data.get('components', [])
@@ -544,9 +530,15 @@ class OrderFetcherOptimized:
                     {text: '等待卖家发货', status: 'pending_ship', priority: 45},
                     // 已完成
                     {text: '交易成功', status: 'completed', priority: 40},
+                    {text: '买家已签收', status: 'completed', priority: 40},
+                    {text: '买家确认收货', status: 'completed', priority: 40},
                     {text: '订单完成', status: 'completed', priority: 35},
                     {text: '交易完成', status: 'completed', priority: 30},
                     // 退款
+                    {text: '退款成功', status: 'refunded', priority: 45},
+                    {text: '钱款已原路退返', status: 'refunded', priority: 45},
+                    {text: '退款撤销', status: 'refund_cancelled', priority: 30},
+                    {text: '退款关闭', status: 'refund_cancelled', priority: 30},
                     {text: '退款中', status: 'refunding', priority: 25},
                     {text: '申请退款', status: 'refunding', priority: 20},
                     // 处理中

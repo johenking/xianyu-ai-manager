@@ -5,10 +5,15 @@
 import asyncio
 import time
 import os
+import hashlib
 from typing import Dict, Optional, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 from loguru import logger
 from collections import defaultdict
+
+
+def cookie_fingerprint(cookie_string: str) -> str:
+    return hashlib.sha256(str(cookie_string or '').encode('utf-8')).hexdigest()
 
 
 class BrowserPool:
@@ -35,6 +40,7 @@ class BrowserPool:
 
         # 存储浏览器实例：{cookie_id: (playwright, browser, context, page, last_used_time)}
         self.pool: Dict[str, Tuple[Playwright, Browser, BrowserContext, Page, float]] = {}
+        self._cookie_fingerprints: Dict[str, str] = {}
 
         # 锁：确保同一cookie_id的浏览器不会被并发初始化
         self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -68,9 +74,14 @@ class BrowserPool:
             async with self._pool_lock:
                 if cookie_id in self.pool:
                     playwright, browser, context, page, _ = self.pool[cookie_id]
+                    incoming_fingerprint = cookie_fingerprint(cookie_string)
+                    if self._cookie_fingerprints.get(cookie_id) != incoming_fingerprint:
+                        logger.info(f"Cookie已更新，重建订单浏览器上下文: {cookie_id}")
+                        await self._close_browser_unsafe(cookie_id)
+                        browser = None
 
                     # 检查浏览器是否仍然连接
-                    if browser.is_connected():
+                    if browser and browser.is_connected():
                         try:
                             # 验证上下文是否可用
                             pages = context.pages
@@ -107,6 +118,7 @@ class BrowserPool:
 
                 async with self._pool_lock:
                     self.pool[cookie_id] = (playwright, browser, context, page, time.time())
+                    self._cookie_fingerprints[cookie_id] = cookie_fingerprint(cookie_string)
 
                 logger.info(f"浏览器实例创建成功: {cookie_id}")
                 return browser, context, page
@@ -308,6 +320,7 @@ class BrowserPool:
         finally:
             # 从池中移除
             del self.pool[cookie_id]
+            self._cookie_fingerprints.pop(cookie_id, None)
 
     async def close_browser(self, cookie_id: str):
         """

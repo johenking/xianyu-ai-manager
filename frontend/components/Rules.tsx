@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { ShippingRule, ReplyRule, AccountDetail } from '../types';
 import { getShippingRules, getReplyRules, updateShippingRule, deleteShippingRule, updateReplyRule, deleteReplyRule, getAccountDetails } from '../services/api';
 import { Zap, MessageCircle, Plus, Trash2, Edit, Save, X, AlertCircle, RefreshCw, Package } from 'lucide-react';
-import { InlineNotice } from './ui/StatusControls';
+import { InlineNotice, ToggleControl } from './ui/StatusControls';
 
 const Rules: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'shipping' | 'reply'>('shipping');
@@ -390,19 +390,11 @@ const Rules: React.FC = () => {
 
               <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
                 <span className="font-bold text-gray-900">启用状态</span>
-                <button
-                  type="button"
-                  onClick={() => setEditingShippingRule({ ...editingShippingRule, enabled: !editingShippingRule?.enabled })}
-                  className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
-                    editingShippingRule?.enabled ? 'bg-[#FFE815]' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 block ${
-                      editingShippingRule?.enabled ? 'translate-x-7' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={Boolean(editingShippingRule?.enabled)}
+                  onChange={(checked) => setEditingShippingRule({ ...editingShippingRule, enabled: checked })}
+                  label="启用发货规则"
+                />
               </div>
 
               <div className="flex gap-3 pt-4">
@@ -491,19 +483,11 @@ const Rules: React.FC = () => {
 
               <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
                 <span className="font-bold text-gray-900">启用状态</span>
-                <button
-                  type="button"
-                  onClick={() => setEditingReplyRule({ ...editingReplyRule, enabled: !editingReplyRule?.enabled })}
-                  className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
-                    editingReplyRule?.enabled ? 'bg-[#FFE815]' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 block ${
-                      editingReplyRule?.enabled ? 'translate-x-7' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={Boolean(editingReplyRule?.enabled)}
+                  onChange={(checked) => setEditingReplyRule({ ...editingReplyRule, enabled: checked })}
+                  label="启用回复规则"
+                />
               </div>
 
               <div className="flex gap-3 pt-4">

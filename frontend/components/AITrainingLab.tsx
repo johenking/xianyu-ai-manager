@@ -3,7 +3,9 @@ import { createPortal } from 'react-dom';
 import { AccountDetail, Item } from '../types';
 import {
   AIReplyLabMessage,
+  AIRuleAudit,
   AITrainingRule,
+  AITrainingRuleContext,
   deleteAITrainingRule,
   getAIItemKnowledge,
   getAITrainingRules,
@@ -14,8 +16,8 @@ import {
   setAITrainingRuleEnabled,
 } from '../services/api';
 import {
-  AlertTriangle, Bot, Globe2, Loader2, Package, RefreshCw,
-  Save, Send, Trash2, X,
+  AlertTriangle, Bot, CheckCircle2, ChevronDown, ChevronUp, Globe2,
+  Loader2, MessageSquare, Package, RefreshCw, Save, Send, Trash2, X,
 } from 'lucide-react';
 import { newKnowledgeEntry, normalizeItemKnowledge } from '../utils/itemKnowledge';
 
@@ -57,6 +59,11 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
   const [sessionId, setSessionId] = useState('');
   const [buyerMessage, setBuyerMessage] = useState('这个商品怎么操作？');
   const [trainingRules, setTrainingRules] = useState<AITrainingRule[]>([]);
+  const [ruleContext, setRuleContext] = useState<AITrainingRuleContext | null>(null);
+  const [ruleAudit, setRuleAudit] = useState<AIRuleAudit | null>(null);
+  const [regenerated, setRegenerated] = useState(false);
+  const [knowledgeSource, setKnowledgeSource] = useState<'draft' | 'published' | 'none'>('none');
+  const [knowledgeVersion, setKnowledgeVersion] = useState(0);
   const [ruleDraft, setRuleDraft] = useState('');
   const [ruleScope, setRuleScope] = useState<'item' | 'global'>('item');
   const [knowledgeSection, setKnowledgeSection] = useState<'pricing' | 'process' | 'after_sales' | 'forbidden' | 'notes'>('notes');
@@ -67,12 +74,26 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [savedMessage, setSavedMessage] = useState('');
+  const [itemDetailExpanded, setItemDetailExpanded] = useState(false);
+  const [auditExpanded, setAuditExpanded] = useState(false);
+  const [expandedRuleKeys, setExpandedRuleKeys] = useState<Set<string>>(new Set());
+  const [mobilePanel, setMobilePanel] = useState<'chat' | 'rules'>('chat');
 
   const selectedItem = useMemo(
     () => items.find((item) => item.item_id === selectedItemId),
     [items, selectedItemId]
   );
   const pendingRules = trainingRules.filter((rule) => !rule.id);
+  const auditSummary = useMemo(() => {
+    const results = ruleAudit?.results || [];
+    return {
+      followed: results.filter((entry) => entry.status === 'followed').length,
+      violated: results.filter((entry) => entry.status === 'violated').length,
+      notRelevant: results.filter((entry) => entry.status === 'not_relevant').length,
+      unknown: results.filter((entry) => entry.status !== 'followed' && entry.status !== 'violated' && entry.status !== 'not_relevant').length,
+      conflicts: ruleAudit?.conflicts.length || 0,
+    };
+  }, [ruleAudit]);
 
   useEffect(() => {
     let mounted = true;
@@ -92,12 +113,14 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
   const loadRules = async (itemId: string) => {
     if (!itemId) {
       setTrainingRules([]);
+      setRuleContext(null);
       return;
     }
     setLoadingRules(true);
     try {
       const result = await getAITrainingRules(account.id, itemId);
       setTrainingRules([...result.global_rules, ...result.item_rules]);
+      setRuleContext(result.context || null);
     } catch (err) {
       setError(err instanceof Error ? err.message : '训练规则加载失败');
     } finally {
@@ -109,8 +132,15 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
     setMessages([]);
     setSessionId('');
     setWarnings([]);
+    setRuleAudit(null);
+    setRegenerated(false);
+    setKnowledgeSource('none');
+    setKnowledgeVersion(0);
     setSavedMessage('');
     setError('');
+    setItemDetailExpanded(false);
+    setAuditExpanded(false);
+    setExpandedRuleKeys(new Set());
     void loadRules(selectedItemId);
   }, [selectedItemId]);
 
@@ -150,6 +180,12 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
       });
       setSessionId(result.session_id);
       setWarnings(result.warnings || []);
+      setRuleContext(result.rule_context || ruleContext);
+      setRuleAudit(result.rule_audit || null);
+      setAuditExpanded(false);
+      setRegenerated(Boolean(result.regenerated));
+      setKnowledgeSource(result.knowledge_source || 'none');
+      setKnowledgeVersion(result.knowledge_version || 0);
       setMessages((current) => [...current, { role: 'assistant', content: result.reply }]);
       setBuyerMessage('');
     } catch (err) {
@@ -231,10 +267,33 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
     }
   };
 
+  const ruleKey = (rule: AITrainingRule, index: number) => String(rule.id || `${rule.scope}-${index}-${rule.text}`);
+
+  const toggleRuleText = (key: string) => {
+    setExpandedRuleKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const renderAuditEntry = (entry: AIRuleAudit['results'][number]) => {
+    const label = entry.status === 'followed' ? '已遵守' : entry.status === 'violated' ? '仍违反' : entry.status === 'not_relevant' ? '本问无关' : '未能确认';
+    const tone = entry.status === 'followed' ? 'text-green-700' : entry.status === 'violated' ? 'text-red-700' : 'text-gray-600';
+    return (
+      <div key={String(entry.rule_id)} className="ai-training-audit-entry">
+        <div className={`font-bold ${tone}`}>规则 R{entry.rule_id} · {label}</div>
+        <div className="text-gray-600">{entry.text}</div>
+        {entry.reason && <div className="text-gray-400">{entry.reason}</div>}
+      </div>
+    );
+  };
+
   return createPortal(
     <div className="modal-overlay-centered">
-      <div className="modal-container" style={{ maxWidth: '1080px', width: '96vw', maxHeight: '92vh' }}>
-        <div className="modal-header flex items-center justify-between w-full">
+      <div className="modal-container ai-training-modal">
+        <div className="modal-header ai-training-header">
           <div>
             <h3 className="text-xl font-extrabold text-gray-900 flex items-center gap-2">
               <Bot className="w-6 h-6 text-yellow-500" />
@@ -242,20 +301,30 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
             </h3>
             <p className="text-sm text-gray-500 mt-1">{account.nickname || account.remark || account.id}</p>
           </div>
-          <button onClick={onClose} className="p-2 rounded-lg hover:bg-gray-100" title="关闭">
+          <button type="button" onClick={onClose} className="ai-training-icon-button" title="关闭" aria-label="关闭 AI 训练">
             <X className="w-5 h-5 text-gray-500" />
           </button>
         </div>
 
-        <div className="modal-body">
-          <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-6">
-            <aside className="space-y-5">
-              <section>
-                <label className="block text-sm font-bold text-gray-700 mb-2">当前商品</label>
+        <div className="ai-training-body">
+          <div className="ai-training-mobile-tabs" role="tablist" aria-label="AI 训练视图">
+            <button type="button" role="tab" aria-selected={mobilePanel === 'chat'} onClick={() => setMobilePanel('chat')} className={mobilePanel === 'chat' ? 'is-active' : ''}>
+              <MessageSquare className="w-4 h-4" />对话训练
+            </button>
+            <button type="button" role="tab" aria-selected={mobilePanel === 'rules'} onClick={() => setMobilePanel('rules')} className={mobilePanel === 'rules' ? 'is-active' : ''}>
+              <Package className="w-4 h-4" />商品与规则
+            </button>
+          </div>
+
+          <div className="ai-training-workbench">
+            <aside className={`ai-training-sidebar ${mobilePanel === 'rules' ? 'is-mobile-active' : ''}`}>
+              <section className="ai-training-product-section">
+                <label className="block text-sm font-bold text-gray-800 mb-2" htmlFor="ai-training-item">当前商品</label>
                 <select
+                  id="ai-training-item"
                   value={selectedItemId}
                   onChange={(event) => changeItem(event.target.value)}
-                  className="w-full ios-input px-3 py-3 rounded-lg"
+                  className="w-full ios-input px-3 py-3 rounded-lg text-sm font-semibold"
                   disabled={loadingItems}
                 >
                   {items.length === 0 && <option value="">暂无商品</option>}
@@ -263,121 +332,201 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
                     <option key={item.item_id} value={item.item_id}>{item.item_title || item.item_id}</option>
                   ))}
                 </select>
-                <div className="mt-3 border-l-4 border-yellow-400 pl-3 text-xs text-gray-600 leading-relaxed">
-                  <div className="font-bold text-gray-900">{selectedItem?.item_title || '未选择商品'}</div>
-                  <div className="mt-1">价格：{selectedItem?.item_price || '-'}</div>
-                  <div className="mt-2 text-gray-500">{itemDetailPreview(selectedItem)}</div>
+                <div className="ai-training-product-summary">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="font-bold text-gray-900 min-w-0 break-words">{selectedItem?.item_title || '未选择商品'}</div>
+                    <span className="shrink-0 text-gray-500">¥{selectedItem?.item_price || '-'}</span>
+                  </div>
+                  <div className={`ai-training-product-description ${itemDetailExpanded ? 'is-expanded' : ''}`}>{itemDetailPreview(selectedItem)}</div>
+                  {itemDetailPreview(selectedItem).length > 72 && (
+                    <button type="button" onClick={() => setItemDetailExpanded((value) => !value)} className="ai-training-text-button" aria-expanded={itemDetailExpanded}>
+                      {itemDetailExpanded ? '收起详情' : '展开详情'}
+                      {itemDetailExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    </button>
+                  )}
                 </div>
               </section>
 
-              <section>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="text-sm font-bold text-gray-700">生效规则</div>
+              <section className="ai-training-rules-section">
+                <div className="flex items-center justify-between mb-2 shrink-0">
+                  <div className="text-sm font-bold text-gray-800">生效规则</div>
                   {loadingRules && <Loader2 className="w-4 h-4 animate-spin text-gray-400" />}
                 </div>
-                <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
-                  {trainingRules.map((rule, index) => (
-                    <div key={rule.id || `${rule.scope}-${index}`} className={`border px-3 py-2 rounded-lg ${rule.enabled === false ? 'bg-gray-50 opacity-55' : 'bg-white'}`}>
+                {ruleContext && (
+                  <div className="ai-training-rule-stats">
+                    <span className="is-positive">已加载 {ruleContext.applied_count} / {ruleContext.total_count}</span>
+                    <span>其他商品 {ruleContext.excluded_count}</span>
+                    <span>已停用 {ruleContext.disabled_count}</span>
+                  </div>
+                )}
+                <div className="ai-training-rule-list">
+                  {trainingRules.map((rule, index) => {
+                    const key = ruleKey(rule, index);
+                    const isExpanded = expandedRuleKeys.has(key);
+                    return (
+                    <div key={key} className={`ai-training-rule-row ${rule.enabled === false ? 'is-disabled' : ''}`}>
                       <div className="flex items-start gap-2">
                         <button
                           type="button"
                           onClick={() => void toggleRule(rule)}
-                          className={`mt-1 h-4 w-7 rounded-full p-0.5 transition-colors ${rule.enabled === false ? 'bg-gray-300' : 'bg-green-500'}`}
+                          className={`ai-training-toggle ${rule.enabled === false ? '' : 'is-enabled'}`}
                           title={rule.enabled === false ? '启用规则' : '停用规则'}
+                          aria-pressed={rule.enabled !== false}
                         >
-                          <span className={`block h-3 w-3 rounded-full bg-white transition-transform ${rule.enabled === false ? '' : 'translate-x-3'}`} />
+                          <span />
                         </button>
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1 text-[11px] font-bold text-gray-500 mb-1">
+                          <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-bold text-gray-500 mb-1">
                             {rule.scope === 'global' ? <Globe2 className="w-3 h-3" /> : <Package className="w-3 h-3" />}
                             {rule.scope === 'global' ? '全店通用' : '当前商品'}
-                            {!rule.id && <span className="text-orange-600">未保存</span>}
+                            {!rule.id && <span className="ai-training-unsaved-badge">待保存</span>}
                           </div>
-                          <div className="text-xs text-gray-700 leading-relaxed">{rule.text}</div>
+                          <div className={`ai-training-rule-copy ${isExpanded ? 'is-expanded' : ''}`}>{rule.text}</div>
+                          {rule.text.length > 72 && (
+                            <button type="button" className="ai-training-text-button mt-1" onClick={() => toggleRuleText(key)} aria-expanded={isExpanded}>
+                              {isExpanded ? '收起' : '展开'}
+                            </button>
+                          )}
                         </div>
-                        <button onClick={() => void removeRule(rule)} className="text-gray-400 hover:text-red-500" title="删除规则">
+                        <button type="button" onClick={() => void removeRule(rule)} className="ai-training-row-action" title="删除规则" aria-label="删除规则">
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
                     </div>
-                  ))}
+                  );})}
                   {!loadingRules && trainingRules.length === 0 && (
-                    <div className="border border-dashed border-gray-200 rounded-lg px-3 py-4 text-xs text-gray-400">暂无规则</div>
+                    <div className="ai-training-empty-state">暂无规则</div>
                   )}
                 </div>
               </section>
             </aside>
 
-            <main className="space-y-4 min-w-0">
-              <div className="flex flex-wrap gap-2">
+            <main className={`ai-training-workspace ${mobilePanel === 'chat' ? 'is-mobile-active' : ''}`}>
+              <div className="ai-training-presets" aria-label="快捷测试问题">
                 {PRESET_MESSAGES.map((preset) => (
-                  <button key={preset} type="button" onClick={() => setBuyerMessage(preset)} className="text-xs font-bold px-3 py-2 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200">
+                  <button key={preset} type="button" onClick={() => setBuyerMessage(preset)}>
                     {preset}
                   </button>
                 ))}
               </div>
 
-              <div className="h-[390px] overflow-y-auto rounded-lg border border-gray-200 bg-[#F7F8FA] p-4 space-y-3">
-                {messages.length === 0 && <div className="h-full flex items-center justify-center text-sm font-bold text-gray-400">以买家身份发送咨询</div>}
+              <div className="ai-training-chat" aria-live="polite">
+                {messages.length === 0 && (
+                  <div className="ai-training-chat-empty">
+                    <MessageSquare className="w-5 h-5" />
+                    <span>以买家身份发送咨询</span>
+                  </div>
+                )}
                 {messages.map((message, index) => (
-                  <div key={`${message.role}-${index}`} className={`flex ${message.role === 'user' ? 'justify-start' : 'justify-end'}`}>
-                    <div className={`max-w-[80%] rounded-lg px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap ${message.role === 'user' ? 'bg-white border border-gray-200' : 'bg-[#FFE815]'}`}>
-                      {message.content}
+                  <div key={`${message.role}-${index}`} className={`ai-training-message ${message.role === 'user' ? 'is-buyer' : 'is-ai'}`}>
+                    <div className="ai-training-message-wrap">
+                      <span className="ai-training-message-label">{message.role === 'user' ? '买家' : 'AI 客服'}</span>
+                      <div className="ai-training-message-bubble">{message.content}</div>
                     </div>
                   </div>
                 ))}
-                {sending && <div className="flex justify-end"><div className="rounded-lg bg-[#FFE815] px-4 py-3 text-sm font-bold flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />生成中</div></div>}
+                {sending && (
+                  <div className="ai-training-message is-ai">
+                    <div className="ai-training-message-wrap">
+                      <span className="ai-training-message-label">AI 客服</span>
+                      <div className="ai-training-message-bubble flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" />生成中</div>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {warnings.length > 0 && (
-                <div className="border border-orange-200 bg-orange-50 rounded-lg px-4 py-3 flex items-start gap-2 text-sm text-orange-900">
+                <div className="ai-training-alert is-warning">
                   <AlertTriangle className="w-4 h-4 mt-0.5" />
                   <div><strong>命中风险词：</strong>{warnings.join('、')}</div>
                 </div>
               )}
-              {error && <div className="border border-red-200 bg-red-50 rounded-lg px-4 py-3 text-sm font-bold text-red-800">{error}</div>}
-              {savedMessage && <div className="border border-green-200 bg-green-50 rounded-lg px-4 py-3 text-sm font-bold text-green-800">{savedMessage}</div>}
+              {ruleAudit && (
+                <section className={`ai-training-audit ${auditSummary.violated > 0 || auditSummary.conflicts > 0 ? 'has-issues' : ''} ${auditExpanded ? 'is-expanded' : ''}`}>
+                  <div className="ai-training-audit-header">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+                        <span className="text-gray-900">规则审计</span>
+                        <span className="ai-training-audit-count is-positive">遵守 {auditSummary.followed}</span>
+                        <span className={`ai-training-audit-count ${auditSummary.violated > 0 ? 'is-negative' : ''}`}>违反 {auditSummary.violated}</span>
+                        <span className="ai-training-audit-count">无关 {auditSummary.notRelevant}</span>
+                        {(auditSummary.unknown > 0 || auditSummary.conflicts > 0) && <span className="ai-training-audit-count is-warning">待核对 {auditSummary.unknown + auditSummary.conflicts}</span>}
+                        {regenerated && <span className="ai-training-audit-count is-warning">已自动重答</span>}
+                      </div>
+                      <div className="mt-1 text-[11px] text-gray-500">
+                      {knowledgeSource === 'draft' ? '本次读取：未发布草稿' : knowledgeSource === 'published' ? `本次读取：已发布 v${knowledgeVersion}` : '本次未读取知识档案'}
+                      </div>
+                    </div>
+                    <button type="button" onClick={() => setAuditExpanded((value) => !value)} className="ai-training-text-button shrink-0" aria-expanded={auditExpanded}>
+                      {auditExpanded ? '收起审计' : '查看完整审计'}
+                      {auditExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  {(auditExpanded || auditSummary.violated > 0 || ruleAudit.conflicts.length > 0) && (
+                    <div className="ai-training-audit-body">
+                      {(auditExpanded ? ruleAudit.results : ruleAudit.results.filter((entry) => entry.status === 'violated')).map(renderAuditEntry)}
+                      {ruleAudit.conflicts.length > 0 && (
+                        <div className="ai-training-audit-conflicts">
+                          <div className="font-bold">发现事实或规则冲突</div>
+                          {ruleAudit.conflicts.map((conflict) => <div key={conflict}>{conflict}</div>)}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+              )}
+              {error && <div className="ai-training-alert is-error">{error}</div>}
+              {savedMessage && <div className="ai-training-alert is-success"><CheckCircle2 className="w-4 h-4" />{savedMessage}</div>}
 
-              <div className="grid grid-cols-[1fr_auto] gap-3">
-                <textarea value={buyerMessage} onChange={(event) => setBuyerMessage(event.target.value)} className="w-full ios-input px-4 py-3 rounded-lg h-20 resize-none" placeholder="输入买家问题..." />
-                <button type="button" onClick={() => void sendMessage()} disabled={sending || !buyerMessage.trim() || !selectedItem} className="ios-btn-primary px-5 py-3 rounded-lg font-bold flex items-center justify-center gap-2 disabled:opacity-60">
+              <div className="ai-training-composer">
+                <textarea value={buyerMessage} onChange={(event) => setBuyerMessage(event.target.value)} className="ios-input" placeholder="输入买家问题..." aria-label="买家问题" />
+                <button type="button" onClick={() => void sendMessage()} disabled={sending || !buyerMessage.trim() || !selectedItem} className="ios-btn-primary" title={!buyerMessage.trim() ? '请先输入买家问题' : '发送测试'}>
                   {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}发送测试
                 </button>
               </div>
 
-              <div className="border-t border-gray-200 pt-4">
-                <div className="flex gap-2 mb-3" role="group" aria-label="规则范围">
-                  <button type="button" onClick={() => setRuleScope('item')} className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1 ${ruleScope === 'item' ? 'bg-black text-white' : 'bg-gray-100 text-gray-600'}`}><Package className="w-3.5 h-3.5" />当前商品</button>
-                  <button type="button" onClick={() => setRuleScope('global')} className={`px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1 ${ruleScope === 'global' ? 'bg-black text-white' : 'bg-gray-100 text-gray-600'}`}><Globe2 className="w-3.5 h-3.5" />全店通用</button>
+              <section className="ai-training-correction">
+                <div className="ai-training-correction-header">
+                  <div>
+                    <div className="text-sm font-bold text-gray-900">修正这次回复</div>
+                    <div className="text-[11px] text-gray-500 mt-0.5">先加入待保存规则，再复测确认效果</div>
+                  </div>
+                  <div className="ai-training-segmented" role="group" aria-label="规则范围">
+                    <button type="button" onClick={() => setRuleScope('item')} aria-pressed={ruleScope === 'item'} className={ruleScope === 'item' ? 'is-active' : ''}><Package className="w-3.5 h-3.5" />当前商品</button>
+                    <button type="button" onClick={() => setRuleScope('global')} aria-pressed={ruleScope === 'global'} className={ruleScope === 'global' ? 'is-active' : ''}><Globe2 className="w-3.5 h-3.5" />全店通用</button>
+                  </div>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_auto] gap-3">
-                  <textarea value={ruleDraft} onChange={(event) => setRuleDraft(event.target.value)} className="w-full ios-input px-4 py-3 rounded-lg h-20 resize-none" placeholder="指出回复哪里有问题..." />
-                  <button type="button" onClick={addRule} disabled={!ruleDraft.trim()} className="px-5 py-3 rounded-lg font-bold bg-black text-white disabled:opacity-60">记住修正</button>
-                  <button type="button" onClick={retestLastBuyerMessage} disabled={sending || !messages.some((message) => message.role === 'user')} className="px-4 py-3 rounded-lg font-bold bg-gray-100 text-gray-700 flex items-center gap-2 disabled:opacity-60"><RefreshCw className="w-4 h-4" />再测</button>
+                <div className="ai-training-correction-row">
+                  <textarea value={ruleDraft} onChange={(event) => setRuleDraft(event.target.value)} className="ios-input" placeholder="指出回复哪里有问题..." aria-label="回复修正内容" />
+                  <button type="button" onClick={addRule} disabled={!ruleDraft.trim()} className="ai-training-dark-button" title={!ruleDraft.trim() ? '请先填写修正内容' : '加入待保存规则'}>加入待保存</button>
+                  <button type="button" onClick={retestLastBuyerMessage} disabled={sending || !messages.some((message) => message.role === 'user')} className="ai-training-secondary-button"><RefreshCw className="w-4 h-4" />再测</button>
                 </div>
-                <div className="flex flex-wrap items-center gap-2 mt-3">
-                  <select value={knowledgeSection} onChange={(event) => setKnowledgeSection(event.target.value as typeof knowledgeSection)} className="ios-input px-3 py-2 rounded-lg text-xs">
+                <div className="ai-training-knowledge-row">
+                  <select value={knowledgeSection} onChange={(event) => setKnowledgeSection(event.target.value as typeof knowledgeSection)} className="ios-input" aria-label="商品知识分类">
                     <option value="pricing">规格与价格</option>
                     <option value="process">操作流程</option>
                     <option value="after_sales">售后边界</option>
                     <option value="forbidden">禁止说法</option>
                     <option value="notes">其他补充</option>
                   </select>
-                  <button type="button" onClick={() => void addCorrectionToKnowledge()} disabled={saving || !ruleDraft.trim() || !selectedItem} className="px-4 py-2 rounded-lg bg-yellow-100 text-yellow-900 text-xs font-bold flex items-center gap-2 disabled:opacity-50">
+                  <button type="button" onClick={() => void addCorrectionToKnowledge()} disabled={saving || !ruleDraft.trim() || !selectedItem} className="ai-training-knowledge-button">
                     <Package className="w-4 h-4" />补充到商品知识草稿
                   </button>
                 </div>
-              </div>
+              </section>
             </main>
           </div>
         </div>
 
-        <div className="modal-footer">
-          <div className="flex gap-3 w-full">
-            <button onClick={onClose} className="flex-1 px-6 py-3 rounded-lg font-bold bg-gray-100 text-gray-700">关闭</button>
-            <button onClick={() => void saveRules()} disabled={saving || pendingRules.length === 0} className="flex-1 ios-btn-primary px-6 py-3 rounded-lg font-bold flex items-center justify-center gap-2 disabled:opacity-60">
+        <div className="modal-footer ai-training-footer">
+          <div className="ai-training-save-status" role="status">
+            {saving ? <><Loader2 className="w-4 h-4 animate-spin" />正在保存修正</> : error ? <><AlertTriangle className="w-4 h-4 text-red-500" />操作失败，请查看上方提示</> : pendingRules.length > 0 ? <><span className="ai-training-status-dot is-pending" />有 {pendingRules.length} 条待保存</> : savedMessage ? <><CheckCircle2 className="w-4 h-4 text-green-600" />已保存</> : <><span className="ai-training-status-dot" />暂无修改</>}
+          </div>
+          <div className="ai-training-footer-actions">
+            <button type="button" onClick={onClose} className="ai-training-secondary-button">关闭</button>
+            <button type="button" onClick={() => void saveRules()} disabled={saving || pendingRules.length === 0} className="ios-btn-primary" title={pendingRules.length === 0 ? '当前没有待保存的修正规则' : '保存到真实 AI'}>
               {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-              保存修正{pendingRules.length > 0 ? ` (${pendingRules.length})` : ''}
+              保存到真实 AI{pendingRules.length > 0 ? ` (${pendingRules.length})` : ''}
             </button>
           </div>
         </div>

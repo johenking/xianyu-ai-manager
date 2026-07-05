@@ -1,8 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, AIProviderProfile, AIReplySettings, AutoReplyDiagnostics } from '../types';
+import { AccountDetail, AccountSessionRefreshStatus, AIProviderProfile, AIReplySettings, AutoReplyDiagnostics } from '../types';
 import AITrainingLab from './AITrainingLab';
+import ModelSelector from './ModelSelector';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import { AccountAvatar, CookieEditor } from './ui/AccountVisuals';
 import {
   getAccountDetails,
   updateAccountStatus,
@@ -22,6 +24,9 @@ import {
   getAllAISettings,
   getAccountAISettings,
   getAutoReplyDiagnostics,
+  getAccountSessionStatus,
+  refreshAccountSession,
+  cancelAccountSessionRefresh,
   getAIProviders,
   refreshAIProviderModels,
   testAIProvider
@@ -54,6 +59,8 @@ const AccountList: React.FC = () => {
   const [trainingAccount, setTrainingAccount] = useState<AccountDetail | null>(null);
   const [diagnostics, setDiagnostics] = useState<Record<string, AutoReplyDiagnostics>>({});
   const [diagnosingId, setDiagnosingId] = useState<string>('');
+  const [sessionStatuses, setSessionStatuses] = useState<Record<string, AccountSessionRefreshStatus>>({});
+  const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
   const [passwordForm, setPasswordForm] = useState({
     account_id: '',
     account: '',
@@ -103,6 +110,18 @@ const AccountList: React.FC = () => {
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [aiSaveNotice, setAiSaveNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+
+  const loadSessionStatuses = async (targetAccounts: AccountDetail[] = accounts) => {
+    const results = await Promise.all(targetAccounts.map(async (account) => {
+      try {
+        return [account.id, await getAccountSessionStatus(account.id)] as const;
+      } catch {
+        return null;
+      }
+    }));
+    const next = Object.fromEntries(results.filter((entry): entry is readonly [string, AccountSessionRefreshStatus] => Boolean(entry)));
+    setSessionStatuses(next);
+  };
 
   const clearQRPolling = () => {
     if (qrPollingRef.current) {
@@ -202,6 +221,14 @@ const AccountList: React.FC = () => {
     };
   }, []);
 
+  const accountIds = accounts.map((account) => account.id).join('|');
+  useEffect(() => {
+    if (!accounts.length) return undefined;
+    void loadSessionStatuses(accounts);
+    const timer = window.setInterval(() => void loadSessionStatuses(accounts), 3000);
+    return () => window.clearInterval(timer);
+  }, [accountIds]);
+
   const handleToggle = async (id: string, currentStatus: boolean) => {
     try {
       await updateAccountStatus(id, !currentStatus);
@@ -283,6 +310,29 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const handleRefreshSession = async (account: AccountDetail) => {
+    setRefreshingSessionId(account.id);
+    try {
+      const result = await refreshAccountSession(account.id);
+      setSessionStatuses((current) => ({ ...current, [account.id]: result.data }));
+      setPageNotice({ tone: 'info', text: result.message || '已开始刷新 Cookie' });
+    } catch (error) {
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : 'Cookie 刷新启动失败' });
+    } finally {
+      setRefreshingSessionId('');
+    }
+  };
+
+  const handleCancelSessionRefresh = async (account: AccountDetail) => {
+    try {
+      const result = await cancelAccountSessionRefresh(account.id);
+      await loadSessionStatuses([account]);
+      setPageNotice({ tone: 'info', text: result.message || 'Cookie 刷新已取消' });
+    } catch (error) {
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '取消刷新失败' });
+    }
+  };
+
   const handleSaveEdit = async () => {
     if (!editingAccount) return;
     setSaving(true);
@@ -326,7 +376,10 @@ const AccountList: React.FC = () => {
       await Promise.all(promises);
       setActiveModal(null);
       await loadAccounts();
-      setPageNotice({ tone: 'success', text: '账号设置已保存' });
+      const refreshedDiagnosis = await getAutoReplyDiagnostics(editingAccount.id);
+      setDiagnostics((current) => ({ ...current, [editingAccount.id]: refreshedDiagnosis }));
+      await loadSessionStatuses([editingAccount]);
+      setPageNotice({ tone: 'success', text: '账号设置已保存，诊断状态已更新' });
     } catch (error) {
       console.error('更新账号失败:', error);
       setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '更新失败，请重试' });
@@ -643,14 +696,15 @@ const AccountList: React.FC = () => {
       <div className="grid grid-cols-1 gap-6">
         {accounts.map((account) => {
           const diagnosis = diagnostics[account.id];
+          const sessionStatus = sessionStatuses[account.id];
           return (
           <div key={account.id} className="ios-card p-4 sm:p-6 rounded-2xl group hover:border-[#FFE815] transition-all duration-300">
           <div className="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-5">
             <div className="flex min-w-0 items-start sm:items-center gap-4 sm:gap-6">
               <div className="relative">
-                <img
+                <AccountAvatar
                   src={account.avatar_url}
-                  alt="avatar"
+                  label={account.nickname || account.remark || `账号 ${account.id}`}
                   className="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl object-cover shadow-md ring-4 ring-white"
                 />
                 <div className={`absolute -bottom-1 -right-1 w-6 h-6 rounded-full border-4 border-white flex items-center justify-center ${account.enabled ? 'bg-green-500' : 'bg-gray-300'}`}>
@@ -678,6 +732,11 @@ const AccountList: React.FC = () => {
                       {diagnosis.ready ? '自动回复就绪' : `${diagnosis.issues.length} 个问题`}
                     </span>
                    )}
+                   {sessionStatus?.state === 'refreshing' && <StatusBadge state="checking" label="Cookie 刷新中" />}
+                   {sessionStatus?.state === 'verification_required' && <StatusBadge state="warning" label="等待身份验证" />}
+                   {sessionStatus?.state === 'success' && <StatusBadge state="ready" label="Cookie 已刷新" />}
+                   {(sessionStatus?.state === 'failed' || sessionStatus?.state === 'timeout') && <StatusBadge state="error" label="Cookie 刷新失败" />}
+                   {account.has_login_password && account.login_credentials_valid === false && <StatusBadge state="error" label="登录信息异常" />}
                 </div>
               </div>
             </div>
@@ -688,6 +747,14 @@ const AccountList: React.FC = () => {
                     title="自动回复诊断"
                 >
                     {diagnosingId === account.id ? <Loader2 className="w-5 h-5 animate-spin" /> : <MessageCircle className="w-5 h-5" />}
+                </button>
+                <button
+                    onClick={() => void handleRefreshSession(account)}
+                    disabled={refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' || sessionStatus?.state === 'verification_required'}
+                    className="p-3 rounded-xl hover:bg-cyan-100 transition-colors text-cyan-700 disabled:cursor-not-allowed disabled:opacity-40"
+                    title="立即刷新 Cookie"
+                >
+                    <RefreshCw className={`w-5 h-5 ${refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' ? 'animate-spin' : ''}`} />
                 </button>
                 <button
                     onClick={() => openEditModal(account)}
@@ -737,6 +804,33 @@ const AccountList: React.FC = () => {
                   {diagnosis.issues.map((issue) => (
                     <div key={issue} className="text-xs text-red-600 font-bold">- {issue}</div>
                   ))}
+                </div>
+              )}
+              {diagnosis.diagnosed_at && <div className="mt-3 text-[11px] font-medium text-gray-400">诊断更新于 {new Date(diagnosis.diagnosed_at * 1000).toLocaleTimeString()}</div>}
+            </div>
+          )}
+          {sessionStatus && ['refreshing', 'verification_required', 'failed', 'timeout'].includes(sessionStatus.state) && (
+            <div className={`mt-5 rounded-2xl border p-4 ${sessionStatus.state === 'verification_required' ? 'border-amber-200 bg-amber-50' : sessionStatus.state === 'refreshing' ? 'border-blue-200 bg-blue-50' : 'border-red-200 bg-red-50'}`}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <div className="font-bold text-gray-900">
+                    {sessionStatus.state === 'verification_required' ? '需要完成闲鱼身份验证' : sessionStatus.state === 'refreshing' ? '正在刷新 Cookie' : 'Cookie 刷新未完成'}
+                  </div>
+                  <div className="mt-1 text-sm text-gray-700">{sessionStatus.message}</div>
+                  {sessionStatus.updated_at && <div className="mt-1 text-xs text-gray-500">更新于 {new Date(sessionStatus.updated_at * 1000).toLocaleTimeString()}</div>}
+                </div>
+                <div className="flex shrink-0 gap-2">
+                  {(sessionStatus.state === 'refreshing' || sessionStatus.state === 'verification_required') && (
+                    <button type="button" onClick={() => void handleCancelSessionRefresh(account)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700">取消</button>
+                  )}
+                  {(sessionStatus.state === 'failed' || sessionStatus.state === 'timeout') && (
+                    <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-black px-3 py-2 text-xs font-bold text-white">重新刷新</button>
+                  )}
+                </div>
+              </div>
+              {sessionStatus.state === 'verification_required' && sessionStatus.verification_image_url && (
+                <div className="mt-4 overflow-hidden rounded-xl border border-amber-200 bg-white p-2">
+                  <img src={`${sessionStatus.verification_image_url}?t=${sessionStatus.updated_at || Date.now()}`} alt="闲鱼身份验证" className="mx-auto max-h-[520px] w-auto max-w-full object-contain" />
                 </div>
               )}
             </div>
@@ -931,19 +1025,11 @@ const AccountList: React.FC = () => {
                             <div className="font-bold text-gray-900">登录时显示浏览器</div>
                             <div className="text-xs text-gray-500">需要安全验证时，打开浏览器更容易完成操作。</div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => setPasswordForm({ ...passwordForm, show_browser: !passwordForm.show_browser })}
-                            className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
-                              passwordForm.show_browser ? 'bg-[#FFE815]' : 'bg-gray-300'
-                            }`}
-                          >
-                            <span
-                              className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 ${
-                                passwordForm.show_browser ? 'translate-x-7' : 'translate-x-1'
-                              }`}
-                            />
-                          </button>
+                          <ToggleControl
+                            checked={passwordForm.show_browser}
+                            onChange={(checked) => setPasswordForm({ ...passwordForm, show_browser: checked })}
+                            label="登录时显示浏览器"
+                          />
                         </div>
                         {passwordMessage && (
                           <div className={`text-sm font-bold rounded-2xl px-4 py-3 ${
@@ -1078,13 +1164,10 @@ const AccountList: React.FC = () => {
               {/* Cookie */}
               <div>
                 <label className="block text-sm font-bold text-gray-700 mb-2">Cookie</label>
-                <textarea
+                <CookieEditor
                   value={editForm.cookie}
-                  onChange={(e) => setEditForm({ ...editForm, cookie: e.target.value })}
-                  placeholder="更新账号Cookie"
-                  className="w-full ios-input px-4 py-3 rounded-xl h-32 resize-none font-mono text-xs"
+                  onChange={(cookie) => setEditForm({ ...editForm, cookie })}
                 />
-                <p className="text-xs text-gray-500 mt-1">当前Cookie长度: {editForm.cookie.length} 字符</p>
               </div>
 
               {/* 自动确认收货 */}
@@ -1096,19 +1179,11 @@ const AccountList: React.FC = () => {
                   </div>
                   <div className="text-xs text-gray-500">自动点击确认收货按钮</div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setEditForm({ ...editForm, auto_confirm: !editForm.auto_confirm })}
-                  className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
-                    editForm.auto_confirm ? 'bg-[#FFE815]' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 ${
-                      editForm.auto_confirm ? 'translate-x-7' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={editForm.auto_confirm}
+                  onChange={(checked) => setEditForm({ ...editForm, auto_confirm: checked })}
+                  label="自动确认收货"
+                />
               </div>
 
               {/* 暂停时长 */}
@@ -1153,7 +1228,7 @@ const AccountList: React.FC = () => {
                         type={editForm.showLoginPassword ? 'text' : 'password'}
                         value={editForm.login_password}
                         onChange={(e) => setEditForm({ ...editForm, login_password: e.target.value })}
-                        placeholder="用于自动登录"
+                        placeholder={editingAccount.has_login_password ? '密码已保存，留空表示不修改' : '用于自动登录'}
                         className="w-full ios-input px-4 py-3 rounded-xl pr-12"
                       />
                       <button
@@ -1164,25 +1239,24 @@ const AccountList: React.FC = () => {
                         {editForm.showLoginPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                       </button>
                     </div>
+                    <p className={`mt-1 text-xs font-medium ${editingAccount.login_credentials_valid ? 'text-emerald-600' : 'text-amber-600'}`}>
+                      {editingAccount.login_credentials_valid
+                        ? '登录信息已保存，系统不会把密码回传到页面。'
+                        : editingAccount.has_login_password
+                          ? '已保存的信息格式异常，请重新填写正确的闲鱼登录账号和密码。'
+                          : '尚未保存登录密码，Cookie 失效后无法自动登录刷新。'}
+                    </p>
                   </div>
                   <div className="flex items-center justify-between">
                     <div>
                       <div className="font-bold text-gray-900">登录时显示浏览器</div>
                       <div className="text-xs text-gray-500">调试时可开启查看登录过程</div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => setEditForm({ ...editForm, show_browser: !editForm.show_browser })}
-                      className={`w-14 h-8 rounded-full transition-colors duration-300 relative ${
-                        editForm.show_browser ? 'bg-[#FFE815]' : 'bg-gray-300'
-                      }`}
-                    >
-                      <span
-                        className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow-md transition-transform duration-300 ${
-                          editForm.show_browser ? 'translate-x-7' : 'translate-x-1'
-                        }`}
-                      />
-                    </button>
+                    <ToggleControl
+                      checked={editForm.show_browser}
+                      onChange={(checked) => setEditForm({ ...editForm, show_browser: checked })}
+                      label="编辑账号时显示登录浏览器"
+                    />
                   </div>
                 </div>
               </div>
@@ -1281,19 +1355,13 @@ const AccountList: React.FC = () => {
                   </div>
                   <div>
                     <div className="mb-2 flex items-center justify-between gap-3"><label htmlFor="account-ai-model" className="block text-sm font-bold text-gray-700">模型</label><button type="button" onClick={() => void handleRefreshProviderModels()} disabled={refreshingModels || !aiSettings.provider_profile_id} className="inline-flex items-center gap-1.5 text-xs font-bold text-gray-600 hover:text-black disabled:opacity-50">{refreshingModels ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新模型</button></div>
-                    <input
-                      id="account-ai-model"
-                      list="account-ai-model-options"
-                      type="search"
+                    <ModelSelector
+                      models={aiProviders.find((item) => item.id === aiSettings.provider_profile_id)?.models || []}
                       value={aiSettings.model_name}
-                      onChange={(e) => setAiSettings({ ...aiSettings, model_name: e.target.value, provider_test_token: '' })}
-                      className="w-full ios-input px-4 py-3 rounded-xl"
-                      placeholder="选择或手填模型 ID"
+                      onChange={(modelName) => setAiSettings({ ...aiSettings, model_name: modelName, provider_test_token: '' })}
+                      disabled={!aiSettings.provider_profile_id}
                     />
-                    <datalist id="account-ai-model-options">
-                      {(aiProviders.find((item) => item.id === aiSettings.provider_profile_id)?.models || []).map((model) => <option key={model} value={model} />)}
-                    </datalist>
-                    <p className="text-xs text-gray-500 mt-1">模型列表读取失败时可手填 ID，但仍需生成测试回复才能应用。</p>
+                    <p className="text-xs text-gray-500 mt-1">选择后必须点击“测试并应用”；测试失败不会改变当前生效模型。</p>
                   </div>
                   <div className="grid grid-cols-1 gap-2 rounded-xl bg-gray-50 px-3 py-3 text-xs text-gray-600 sm:grid-cols-2">
                     <div><span className="font-bold text-gray-800">Key 来源：</span>{aiSettings.api_key_source === 'provider' ? '平台配置库' : aiSettings.api_key_source === 'account' ? '旧版账号专属' : aiSettings.api_key_source === 'global' ? '旧版系统全局' : '未配置'} {aiSettings.api_key_masked || ''}</div>

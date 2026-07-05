@@ -1,63 +1,55 @@
 # Handoff
 
-## Status On 2026-06-09
+## Current State On 2026-07-05
 
-The project is installed, built, running locally, and deployed to Hugging Face Spaces.
+The application runs locally at `http://127.0.0.1:8091`. The public source repository is `johenking/xianyu-ai-manager`. Passwords, Cookies, API keys, deployment tokens, and live database contents are intentionally absent from documentation and source control.
 
-Known URLs:
+## Working Capabilities
 
-- Local: `http://127.0.0.1:8091`
-- 服务地址：使用您自己的部署域名，或本地 `http://127.0.0.1:8091`
+- Multi-account QR and manual-Cookie binding with listener and auto-reply diagnostics; password login remains a page-sensitive compatibility path.
+- Stable Xianyu identity matching through `xianyu_unb`, so same-user re-login updates the existing account record.
+- Structured Cookie refresh state, immediate refresh after Token failure, and account-page secondary verification.
+- Product-scoped knowledge with seller overview, AI draft generation, confirmation, publishing, versions, rollback, and draft-only copy to similar products.
+- Product-scoped and global training rules, with applied/excluded/disabled reporting and one audit-driven regeneration attempt.
+- Buyer-style multi-turn training dialog that does not affect production until rules are explicitly saved.
+- User-scoped AI provider profiles, encrypted keys, model discovery, custom model IDs, and test-before-apply account switching.
+- Typed basic, AI, and optional SMTP settings sections with secret masks and connection verification.
+- Skill Center manual monitoring, expert prompts, and real operational diagnostics.
+- Responsive account, product, order, card, keyword, Skill Center, and settings pages.
+- Recent-order discovery and reconciliation with completed, refunding, refunded, refund-cancelled, and login-required states.
 
-The backend admin username is `admin`. Passwords are intentionally not stored in repository files; use the deployed platform secret `ADMIN_PASSWORD` or update the password through the Web UI.
+## Important Boundaries
 
-## Completed Work
+- Training uses the current product draft; real buyer replies use only the published knowledge snapshot.
+- Copying knowledge writes target drafts only, defaults to no overwrite, and never publishes automatically.
+- A rule being stored does not guarantee compliance if it is disabled, scoped to another product, or contradicted by another rule. Use the lab's rule context and audit result.
+- Deleting an account removes account-linked data. Re-login or update the Cookie instead of deleting when the goal is session recovery.
+- Alibaba secondary verification cannot be bypassed. Cloud or overseas IPs can increase verification frequency.
+- Scheduled monitoring, AI monitor filtering, and notification delivery remain explicitly unavailable.
+- QR remains the recommended login path. Password login may fail after Xianyu page or risk-control changes and must not be documented as guaranteed.
 
-- Installed Python, Playwright, and frontend dependencies.
-- Built React/Vite assets into `static/`.
-- Changed local service configuration from port `8080` to `8091` to avoid a port conflict.
-- Added Docker deployment support through `Dockerfile`, `entrypoint.sh`, `render.yaml`, and `fly.toml`.
-- Deployed the app to Hugging Face Spaces Docker.
-- Added persistent backend login sessions through the `auth_sessions` table.
-- Fixed frontend auth verification so `authenticated: false` does not count as a logged-in state.
-- Added a sidebar `技能中心` entry.
-- Added safe-rewrite Skill Center modules:
-  - Monitor tasks and results.
-  - AI expert Prompt management and test reply.
-  - Ops health, browser status, and delivery diagnostics.
+## Verification Baseline
 
-## Verification Evidence
-
-Commands verified on 2026-06-09:
+Run the following before release or handoff:
 
 ```bash
 source .venv/bin/activate
-python -m py_compile db_manager.py reply_server.py
+python -m py_compile settings_service.py db_manager.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py reply_server.py XianyuAutoAsync.py
+python -m unittest discover -s tests -v
 
 cd frontend
+npm exec tsc -- --noEmit
+npm test
 npm run build
-
-curl -sS http://127.0.0.1:8091/health
 ```
 
-Remote checks verified:
+Also exercise one desktop and one mobile viewport for account management, AI training, product knowledge, provider selection, and settings. Record the actual pass counts at release time rather than treating an old count as permanent evidence.
 
-```bash
-curl -sS http://127.0.0.1:8091/health
-```
-
-Remote login and `/verify` succeeded after the deployment returned to `RUNNING`.
-
-## Important Caveats
-
-- Hugging Face or other overseas cloud environments are poor fits for initial Xianyu account binding. Use local binding or a trusted domestic server when possible.
-- Runtime databases, cookies, logs, API keys, and deployment tokens must not be committed or uploaded.
-- The Skill Center integration is a first usable loop, not a full clone of the referenced repositories.
-- Directly copying GPL/AGPL source from external Xianyu projects should be avoided unless the repository owner accepts the licensing consequences.
+Verified on 2026-07-05: Python compilation and 53 backend unit tests passed; TypeScript, 9 frontend test files with 17 tests, the Vite production build, and `npm audit` with 0 vulnerabilities passed. Account editing and the affected mobile surfaces were checked at `1440x900`, `1280x720`, `768x1024`, and `390x844` with no horizontal overflow or console errors.
 
 ## Next Useful Work
 
-- Add a first-class "manual Cookie add" flow for brand-new accounts instead of requiring QR login first.
-- Surface QR/password login failure messages in the frontend modal.
-- Add a Skill Center log table view backed by `skill_run_logs`.
-- Add tests around `auth_sessions` expiry and Skill Center API authorization.
+- Add a rule-conflict editor that identifies contradictory facts before a reply reaches the model.
+- Add integration tests for knowledge generation, copy, publish, rollback, and account session refresh routes.
+- Measure rule-audit latency and provider cost so operators can decide whether production auditing should be configurable.
+- Implement scheduling and notification delivery only with truthful execution state and retry semantics.

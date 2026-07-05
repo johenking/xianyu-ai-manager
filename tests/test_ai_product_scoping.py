@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import ai_reply_engine as ai_module
 from ai_reply_engine import AIReplyEngine
@@ -43,6 +44,52 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertEqual([rule["text"] for rule in item_a["item_rules"]], ["这个商品使用邀请邮箱"])
         self.assertEqual([rule["text"] for rule in item_b["item_rules"]], ["这个商品是官方直充"])
         self.assertNotIn("邀请邮箱", " ".join(rule["text"] for rule in item_b["item_rules"]))
+
+    def test_rule_context_reports_every_applicable_excluded_and_disabled_rule(self):
+        self.db.save_ai_training_rules(
+            "account-1",
+            "item-a",
+            [
+                {"scope": "global", "text": "回复保持简短"},
+                {"scope": "item", "text": "当前商品使用组织ID"},
+            ],
+        )
+        self.db.save_ai_training_rules(
+            "account-1",
+            "item-b",
+            [{"scope": "item", "text": "其他商品使用邀请邮箱"}],
+        )
+        other_rule = self.db.get_ai_training_rules("account-1", "item-b")["item_rules"][0]
+        self.db.set_ai_training_rule_enabled("account-1", other_rule["id"], False)
+
+        context = self.db.get_ai_training_rule_context("account-1", "item-a")
+
+        self.assertEqual(
+            [rule["text"] for rule in context["applied_rules"]],
+            ["回复保持简短", "当前商品使用组织ID"],
+        )
+        self.assertEqual(context["applied_count"], 2)
+        self.assertEqual(context["disabled_count"], 1)
+        self.assertEqual(context["excluded_count"], 0)
+        self.assertEqual(context["total_count"], 3)
+
+    def test_rule_context_excludes_enabled_rules_bound_to_other_items(self):
+        self.db.save_ai_training_rules(
+            "account-1",
+            "item-a",
+            [{"scope": "item", "text": "A商品规则"}],
+        )
+        self.db.save_ai_training_rules(
+            "account-1",
+            "item-b",
+            [{"scope": "item", "text": "B商品规则"}],
+        )
+
+        context = self.db.get_ai_training_rule_context("account-1", "item-a")
+
+        self.assertEqual([rule["text"] for rule in context["applied_rules"]], ["A商品规则"])
+        self.assertEqual([rule["text"] for rule in context["excluded_rules"]], ["B商品规则"])
+        self.assertEqual(context["excluded_rules"][0]["reason"], "other_item")
 
     def test_system_prompt_marks_current_item_as_authoritative(self):
         prompt = self.engine.build_product_system_prompt(
@@ -167,6 +214,136 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertEqual(draft["process"][0]["status"], "pending")
         self.assertEqual(draft["faqs"][0]["status"], "pending")
         self.assertEqual(draft["after_sales"], [])
+
+    def test_seed_overview_is_authoritative_and_manual_entries_survive_generation(self):
+        seed = self._knowledge("这是卖家亲自填写的商品概览")
+        seed["process"] = [{
+            "id": "manual-process",
+            "text": "人工确认的交付流程",
+            "source": "user",
+            "status": "confirmed",
+        }]
+        seed["notes"] = [{
+            "id": "old-ai-note",
+            "text": "旧的未确认AI内容",
+            "source": "ai",
+            "status": "pending",
+        }]
+        generated = self._knowledge("模型擅自改写的概览", status="pending")
+        generated["pricing"] = [{
+            "id": "new-price",
+            "label": "Pro",
+            "amount": "145元",
+            "source": "ai",
+            "status": "pending",
+        }]
+
+        merged = self.engine.merge_generated_knowledge_with_seed(seed, generated)
+
+        self.assertEqual(merged["overview"]["text"], "这是卖家亲自填写的商品概览")
+        self.assertEqual(merged["overview"]["source"], "user")
+        self.assertEqual(merged["overview"]["status"], "confirmed")
+        self.assertEqual(merged["process"][0]["text"], "人工确认的交付流程")
+        self.assertEqual(merged["pricing"][0]["text"] if "text" in merged["pricing"][0] else merged["pricing"][0]["label"], "Pro")
+        self.assertEqual(merged["notes"], [])
+
+    def test_generation_prompt_contains_seller_overview(self):
+        self._insert_item()
+        with patch.object(self.engine, "is_ai_enabled", return_value=True), \
+             patch.object(self.db, "get_ai_reply_settings", return_value={
+                 "api_key": "test-key",
+                 "base_url": "https://api.example.com/v1",
+                 "model_name": "test-model",
+             }), \
+             patch.object(self.engine, "_create_openai_client", return_value=object()), \
+             patch.object(self.engine, "_call_openai_api", return_value='{"overview":{"text":"AI概览"}}') as call:
+            self.engine.generate_item_knowledge_draft(
+                {"title": "Claude代充", "price": "135", "desc": "商品详情"},
+                "account-1",
+                seller_overview="卖家说明：这是官网代充，不是礼品卡",
+            )
+
+        messages = call.call_args.args[2]
+        self.assertIn("卖家说明：这是官网代充，不是礼品卡", messages[1]["content"])
+
+    def test_copy_knowledge_creates_target_draft_without_publishing_it(self):
+        self._insert_item("item-a", "Claude商品A")
+        self._insert_item("item-b", "Claude商品B")
+        source = self._knowledge("同款Claude代充服务")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-a", source, "source-hash")
+        self.db.publish_ai_item_knowledge("account-1", "item-a")
+
+        result = self.db.copy_ai_item_knowledge_draft(
+            "account-1", "item-a", ["item-b"], overwrite=False
+        )
+        target = self.db.get_ai_item_knowledge_profile("account-1", "item-b")
+
+        self.assertEqual(result["copied_item_ids"], ["item-b"])
+        self.assertEqual(target["draft"]["overview"]["text"], "同款Claude代充服务")
+        self.assertEqual(target["published"], {})
+
+    def test_copy_knowledge_does_not_overwrite_existing_target_without_confirmation(self):
+        self._insert_item("item-a", "源商品")
+        self._insert_item("item-b", "目标商品")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-a", self._knowledge("源档案"), "hash-a")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-b", self._knowledge("目标原档案"), "hash-b")
+
+        result = self.db.copy_ai_item_knowledge_draft(
+            "account-1", "item-a", ["item-b"], overwrite=False
+        )
+        target = self.db.get_ai_item_knowledge_profile("account-1", "item-b")
+
+        self.assertEqual(result["copied_item_ids"], [])
+        self.assertEqual(result["skipped_item_ids"], ["item-b"])
+        self.assertEqual(target["draft"]["overview"]["text"], "目标原档案")
+
+    def test_rule_audit_parser_maps_every_rule_and_flags_violations(self):
+        rules = [
+            {"id": 3, "text": "不要说这是礼品卡"},
+            {"id": 8, "text": "只回答当前问题"},
+        ]
+        raw = '''{
+          "results": [
+            {"rule_id": 3, "status": "violated", "reason": "回复说成了礼品卡"},
+            {"rule_id": 8, "status": "followed", "reason": "回复简短"}
+          ],
+          "conflicts": ["规则与商品概览冲突"]
+        }'''
+
+        audit = self.engine.parse_rule_audit(raw, rules)
+
+        self.assertEqual(audit["results"][0]["status"], "violated")
+        self.assertEqual(audit["results"][1]["status"], "followed")
+        self.assertEqual(audit["violation_count"], 1)
+        self.assertEqual(audit["conflicts"], ["规则与商品概览冲突"])
+
+    def test_rule_checked_reply_regenerates_once_after_a_violation(self):
+        rules = [{"id": 3, "text": "不要说这是礼品卡"}]
+        messages = [
+            {"role": "system", "content": "当前商品是官网代充"},
+            {"role": "user", "content": "这是礼品卡吗？"},
+        ]
+        with patch.object(self.engine, "_call_configured_model", side_effect=[
+            "这是礼品卡。",
+            '{"results":[{"rule_id":3,"status":"violated","reason":"错误说成礼品卡"}],"conflicts":[]}',
+            "不是礼品卡，这是官网代充服务。",
+            '{"results":[{"rule_id":3,"status":"followed","reason":"已否认礼品卡"}],"conflicts":[]}',
+        ]) as call:
+            result = self.engine.generate_rule_checked_reply(
+                settings={"model_name": "test-model"},
+                cookie_id="account-1",
+                messages=messages,
+                buyer_message="这是礼品卡吗？",
+                rules=rules,
+                knowledge_text="商品概览：官网代充服务",
+                max_tokens=160,
+                temperature=0.5,
+            )
+
+        self.assertEqual(result["reply"], "不是礼品卡，这是官网代充服务。")
+        self.assertTrue(result["regenerated"])
+        self.assertEqual(result["audit"]["violation_count"], 0)
+        self.assertEqual(call.call_count, 4)
 
 
 if __name__ == "__main__":
