@@ -11,12 +11,13 @@ export const ToggleControl: React.FC<{
     type="button"
     role="switch"
     aria-checked={checked}
+    aria-disabled={disabled || undefined}
     aria-label={label}
     disabled={disabled}
     onClick={() => onChange(!checked)}
     className={`relative h-8 w-14 shrink-0 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${checked ? 'bg-[#FFE815]' : 'bg-gray-300'}`}
   >
-    <span className={`absolute left-1 top-1 h-6 w-6 rounded-full bg-white shadow-sm transition-transform ${checked ? 'translate-x-6' : 'translate-x-0'}`} />
+    <span aria-hidden="true" className={`absolute left-1 top-1 h-6 w-6 rounded-full bg-white shadow-sm transition-transform ${checked ? 'translate-x-6' : 'translate-x-0'}`} />
   </button>
 );
 

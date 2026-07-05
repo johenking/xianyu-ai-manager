@@ -197,7 +197,7 @@ const ItemList: React.FC = () => {
                         <Trash2 className={`w-4 h-4 ${actionKey === `delete-${itemKey(item)}` ? 'animate-pulse' : ''}`} />
                       </button>
                   </div>
-                  <div className="aspect-square bg-gray-100 rounded-2xl mb-4 overflow-hidden relative">
+                  <div className="aspect-[16/10] sm:aspect-square bg-gray-100 rounded-2xl mb-4 overflow-hidden relative">
                       {item.item_image ? (
                           <img src={item.item_image} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
                       ) : (
