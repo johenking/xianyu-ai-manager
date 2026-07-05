@@ -4,15 +4,38 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-05
+
 ### Added
 
 - Add user-scoped AI provider profiles for DeepSeek, OpenAI, Qwen, OpenRouter, SiliconFlow, Gemini and custom compatible endpoints.
 - Discover provider models with a manual model ID fallback.
 - Require a successful generated test reply before applying a provider or model change to an account.
+- Add seller-overview-first product knowledge generation with draft confirmation, publishing, version history and rollback.
+- Copy a knowledge profile to other product drafts without automatic publishing or default overwrites.
+- Report applied, excluded and disabled training rules, audit each generated reply, and regenerate once after a detected violation.
+- Persist structured Cookie refresh and secondary-verification state on the account page.
+- Discover and reconcile recent seller orders, including completed, refunding, refunded and refund-cancelled states.
+- Persist raw platform order status, sync source, sync time, errors and unmatched status events for later reconciliation.
+
+### Changed
+
+- Match re-login and Cookie updates by the stable Xianyu `unb` identity so existing account-scoped data is retained.
+- Replace the model `datalist` with an explicit searchable selector plus separate custom-model entry.
+- Make training prefer the current product draft while production replies continue to use only published knowledge.
+- Rework the AI training dialog into a fixed two-column workbench with independent scrolling and a persistent input area.
+- Standardize account and rule switches, mask Cookie content by default, add avatar fallbacks, and tighten mobile keyword, Skill Center and product layouts.
+
+### Fixed
+
+- Stop unknown order responses from overwriting a reliable status and report expired sessions as login-required failures.
+- Continue checking shipped and completed orders so signed and refunded orders can advance to their real platform state.
+- Show refund success as `refunded` instead of collapsing it into a generic cancellation.
 
 ### Security
 
 - Encrypt provider API keys at rest and return only configuration state and masks through the API.
+- Keep account Cookie contents hidden in the edit dialog until the operator explicitly reveals them.
 
 ## [1.0.1] - 2026-07-03
 

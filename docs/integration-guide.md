@@ -1,152 +1,202 @@
 # Integration Guide
 
-## Base URLs
+## Base URL And Authentication
 
-- Local app: `http://127.0.0.1:8091`
-- 服务地址：使用您自己的部署域名，或本地 `http://127.0.0.1:8091`
-
-Use the local URL for account binding when possible. Cloud account binding can fail because Xianyu may reject datacenter IPs or headless browser fingerprints.
-
-## Authentication
-
-Login returns a bearer token:
+Local base URL: `http://127.0.0.1:8091`. Use your own deployment domain outside the local workspace.
 
 ```bash
+export BASE_URL=http://127.0.0.1:8091
+
 curl -sS -X POST "$BASE_URL/login" \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"<password>"}'
 ```
 
-Use the returned token on protected APIs:
+Pass the returned token to protected APIs:
 
 ```bash
 curl -sS "$BASE_URL/verify" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-The frontend saves the token in browser `localStorage`. Backend sessions are persisted in SQLite `auth_sessions` and expire after 30 days.
+Backend sessions are persisted in `auth_sessions` and expire after 30 days. Never put a real token, Cookie, password, or API key in scripts committed to the repository.
 
-## Health
+## API Map
+
+| Capability | Routes |
+|---|---|
+| Health | `GET /health` |
+| Settings | `GET /api/settings/summary`, `PUT /api/settings/sections/{section}`, `POST /api/settings/verify/{section}` |
+| AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
+| AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
+| Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
+| Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel` |
+| Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
+| Orders | `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
+| Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
+
+All routes below require `Authorization: Bearer $TOKEN` unless stated otherwise.
+
+## Settings Sections
+
+Read typed values, secret masks, and section states:
 
 ```bash
-curl -sS "$BASE_URL/health"
+curl -sS "$BASE_URL/api/settings/summary" \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-Expected shape:
+Save only one section at a time. Secret fields use `keep`, `set`, or `clear`; an empty input does not implicitly remove a stored secret.
+
+```bash
+curl -sS -X PUT "$BASE_URL/api/settings/sections/ai" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "settings":{"ai_api_url":"https://api.example.com/v1","ai_model":"model-id"},
+    "secret_actions":{"ai_api_key":"keep"}
+  }'
+```
+
+Use `/api/settings/verify/ai` or `/api/settings/verify/smtp` to test unsaved values. SMTP verification connects and authenticates but does not send mail.
+
+## AI Provider Profiles
+
+Create a user-scoped OpenAI-compatible profile:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/ai/providers" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name":"Example Gateway",
+    "provider_type":"openai_compatible",
+    "preset":"custom",
+    "base_url":"https://api.example.com/v1",
+    "api_key":"<api-key>",
+    "default_model":"model-id",
+    "is_default":false
+  }'
+```
+
+Refresh a provider's model list with `POST /api/ai/providers/{id}/models/refresh`. Test a model with:
 
 ```json
-{
-  "status": "healthy",
-  "services": {
-    "cookie_manager": "ok",
-    "database": "ok"
-  }
-}
+{"model_name":"model-id"}
 ```
 
-## Skill Center APIs
+Provider responses never return the cleartext key. Accounts may only apply a new provider/model after a successful generated-reply test; a failed test leaves the active configuration unchanged.
 
-All Skill Center APIs require `Authorization: Bearer $TOKEN`.
+## Product Knowledge
 
-### Monitor Tasks
-
-Create a mockable monitor task:
+Read the current draft, published snapshot, source product, and version state:
 
 ```bash
-curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks" \
+curl -sS "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Generate a structured draft only after the seller provides an overview:
+
+```bash
+curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/generate" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "name": "iPhone local deals",
-    "keyword": "iPhone",
-    "min_price": 1000,
-    "max_price": 5000,
-    "region": "上海",
-    "published_within_hours": 24,
-    "ai_filter": "优先同城自提",
-    "notify_enabled": false,
-    "account_id": "",
-    "enabled": true
+    "overview":"这是卖家确认的商品用途、规格、限制和交付方式。",
+    "profile":{}
   }'
 ```
 
-List tasks:
+The generation call saves the overview first, then combines it with the synchronized title, price, and detail text. Save edits with `PUT .../draft`. Publishing is a separate `POST .../publish` action and fails while generated fields remain unconfirmed.
+
+Copy the source profile to other products:
 
 ```bash
-curl -sS "$BASE_URL/api/skills/monitor/tasks" \
+curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/copy" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"target_item_ids":["target-item-id"],"overwrite":false}'
+```
+
+Copy writes target drafts only, never publishes, and skips targets that already contain draft or published knowledge unless `overwrite` is explicitly true. Use `GET .../versions` and `POST .../rollback/{version}` for history.
+
+## Training Rules And Lab
+
+Get all current-item rule states:
+
+```bash
+curl -sS "$BASE_URL/ai-training-rules/$COOKIE_ID?item_id=$ITEM_ID" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Run a task:
+The response distinguishes `applied_rules`, `excluded_rules`, and `disabled_rules`. The lab accepts temporary rules without changing production:
 
 ```bash
-curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks/$TASK_ID/run" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-List results:
-
-```bash
-curl -sS "$BASE_URL/api/skills/monitor/results?task_id=$TASK_ID" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-### AI Expert Prompts
-
-List prompts:
-
-```bash
-curl -sS "$BASE_URL/api/skills/agent/prompts" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-Update one prompt:
-
-```bash
-curl -sS -X PUT "$BASE_URL/api/skills/agent/prompts/bargain" \
+curl -sS -X POST "$BASE_URL/ai-reply-lab/reply/$COOKIE_ID" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "prompt_type": "bargain",
-    "title": "议价专家",
-    "content": "在不低于底价的前提下礼貌议价。",
-    "enabled": true
+    "session_id":null,
+    "message":"买家问题",
+    "item_id":"item-id",
+    "item_title":"fallback title",
+    "item_price":100,
+    "item_desc":"fallback detail",
+    "training_rules":[],
+    "prompt_override":""
   }'
 ```
 
-Test a reply:
+The result includes the reply, warnings, rule context, rule audit, regeneration state, and knowledge source. Reuse `session_id` for a multi-turn lab conversation. Save rules explicitly through `/ai-reply-lab/save/{cookie_id}` or `/ai-training-rules/{cookie_id}`.
+
+## Account Binding And Refresh
+
+Supported binding paths:
+
+- QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`.
+- Password compatibility path: `POST /password-login`, then poll `GET /password-login/check/{session_id}`.
+- Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
+
+Re-login uses the Cookie's `unb` to find an existing account within the same backend user. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+
+Read or trigger structured refresh state:
 
 ```bash
-curl -sS -X POST "$BASE_URL/api/skills/agent/test-reply" \
+curl -sS "$BASE_URL/api/accounts/$COOKIE_ID/session-status" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -sS -X POST "$BASE_URL/api/accounts/$COOKIE_ID/session-refresh" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Manual refresh requires the account listener to be running. A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. Cancel with `POST .../session-refresh/cancel`.
+
+QR is the recommended binding path. Password login depends on the current Xianyu web page and risk-control flow, so it may stop working after platform changes. Use QR or update the existing account Cookie when that happens; do not delete the account merely to retry authentication.
+
+## Recent Order Sync
+
+Discover and reconcile the last 90 days by default:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/orders/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{
-    "message": "还能便宜吗？",
-    "item_title": "二手显示器",
-    "price": 599,
-    "context": "买家第一次询价"
-  }'
+  -d '{"days":90,"cookie_id":null}'
 ```
 
-### Ops Diagnostics
+The response reports `discovered`, `status_updated`, `details_updated`, `unchanged`, and `failed` counts. It also returns account IDs in `requires_login`. If every selected account has an expired session, the API returns HTTP 409 and does not overwrite order data. Statuses include `unknown`, `processing`, `pending_ship`, `shipped`, `completed`, `refunding`, `refunded`, `refund_cancelled`, and `cancelled`.
+
+## Skill Center
+
+Manual monitor tasks require a real account. Create/list tasks at `/api/skills/monitor/tasks`, run one with `POST /api/skills/monitor/tasks/{task_id}/run`, and read results from `/api/skills/monitor/results`.
+
+Expert prompts live at `/api/skills/agent/prompts`; test them against a real account and product with `/api/skills/agent/test-reply`. Runtime diagnostics are available at:
 
 ```bash
-curl -sS "$BASE_URL/api/skills/ops/health" \
-  -H "Authorization: Bearer $TOKEN"
-
-curl -sS "$BASE_URL/api/skills/ops/browser-status" \
-  -H "Authorization: Bearer $TOKEN"
-
-curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" \
-  -H "Authorization: Bearer $TOKEN"
+curl -sS "$BASE_URL/api/skills/ops/health" -H "Authorization: Bearer $TOKEN"
+curl -sS "$BASE_URL/api/skills/ops/browser-status" -H "Authorization: Bearer $TOKEN"
+curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" -H "Authorization: Bearer $TOKEN"
 ```
 
-## Xianyu Account Binding
-
-Supported paths:
-
-- QR login: `POST /qr-login/generate` then poll `GET /qr-login/check/{session_id}`.
-- Password login: `POST /password-login` then poll `GET /password-login/check/{session_id}`.
-- Cookie update: `PUT /cookies/{cid}` with a new Cookie value.
-
-Prefer local QR/password login or manual Cookie entry. Overseas cloud QR login may return a QR code but fail during confirmation or real-cookie refresh.
+Scheduled monitoring, AI monitor filtering, and notification delivery are not implemented. The API reports them as unavailable instead of simulating a queue or delivery.

@@ -62,7 +62,7 @@ https://<your-render-service>.onrender.com
 
 ## Hugging Face Spaces
 
-Use Docker SDK and keep the frontmatter `app_port: 8080` in `README.md`.
+Use Docker SDK. Add or preserve `sdk: docker` and `app_port: 8080` frontmatter in the Hugging Face export README; the GitHub README does not require Spaces frontmatter.
 
 Required/recommended Space secrets or variables:
 
