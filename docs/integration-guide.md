@@ -30,7 +30,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
-| Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel` |
+| Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Orders | `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
 | Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
@@ -88,6 +88,8 @@ Refresh a provider's model list with `POST /api/ai/providers/{id}/models/refresh
 Provider responses never return the cleartext key. Accounts may only apply a new provider/model after a successful generated-reply test; a failed test leaves the active configuration unchanged.
 
 ## Product Knowledge
+
+For product management screens, load a single account by default with `GET /items/cookie/{cookie_id}`. Use `GET /items` only for an explicit all-account view. Manual product sync remains account-scoped through `POST /items/get-all-from-account`.
 
 Read the current draft, published snapshot, source product, and version state:
 
@@ -174,7 +176,18 @@ curl -sS -X POST "$BASE_URL/api/accounts/$COOKIE_ID/session-refresh" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Manual refresh requires the account listener to be running. A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. After verification, the account page can recheck the refresh state, but success is only shown after the backend detects the logged-in page and refreshed Cookie. Cancel with `POST .../session-refresh/cancel`.
+Manual refresh requires the account listener to be running. Scheduled preventive refresh is configured per account and defaults to off:
+
+```bash
+curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/cookie-refresh-settings" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"cookie_refresh_enabled":false,"cookie_refresh_interval_minutes":1440}'
+```
+
+When enabled, `cookie_refresh_interval_minutes` must be between 60 and 10080. Turning scheduled refresh off does not disable manual refresh or refreshes triggered by an expired session.
+
+A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. After verification, the account page can recheck the refresh state, but success is only shown after the backend detects the logged-in page and refreshed Cookie. Cancel with `POST .../session-refresh/cancel`.
 
 QR is the recommended binding path. Password login depends on the current Xianyu web page and risk-control flow, so it may stop working after platform changes. Use QR or update the existing account Cookie when that happens; do not delete the account merely to retry authentication.
 

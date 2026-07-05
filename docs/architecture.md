@@ -24,7 +24,7 @@ Backend users live in `users`. The initial `admin` password is read from `ADMIN_
 
 Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
 
-Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Token failure can trigger an immediate refresh; enabled accounts also perform preventive refresh attempts. When Alibaba requires human verification, the account page reads the persisted status and verification image instead of pretending refresh succeeded.
+Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Token failure can trigger an immediate refresh. Preventive scheduled refresh is account-level, opt-in, defaults to off, and uses `cookies.cookie_refresh_enabled` plus `cookies.cookie_refresh_interval_minutes`; manual refresh is unaffected by that setting. When Alibaba requires human verification, the account page reads the persisted status and verification image instead of pretending refresh succeeded.
 
 Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. Passwords, Cookies, Tokens, complete verification URLs, Playwright objects, and AI conversation content remain in memory. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
 
@@ -73,7 +73,7 @@ Core tables:
 - `users`, `auth_sessions`: backend identities and persistent login sessions.
 - `schema_migrations`: ordered, transactional database migration history.
 - `runtime_sessions`: safe ownership, status, TTL, and redacted errors for temporary operations.
-- `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, and Cookie refresh state.
+- `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, account-level scheduled refresh settings, and Cookie refresh state.
 - `keywords`, `default_replies`, `item_replay`: deterministic reply rules.
 - `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.
 - `ai_training_rules`: global and product-scoped rules with enabled state.
@@ -85,7 +85,7 @@ Core tables:
 ## Route Groups
 
 - Auth: `/login`, `/logout`, `/verify`, `/change-password`, `/change-admin-password`.
-- Account binding: `/qr-login/*`, `/password-login/*`, `/cookies*`.
+- Account binding: `/qr-login/*`, `/password-login/*`, `/cookies*`, including `PUT /cookies/{cid}/cookie-refresh-settings`.
 - Session refresh: `/api/accounts/{cookie_id}/session-status`, `/session-refresh`, `/session-refresh/cancel`.
 - Diagnostics: `/api/diagnostics/auto-reply/{cookie_id}` and `/api/skills/ops/*`.
 - Settings: `/api/settings/summary`, `/api/settings/sections/{section}`, `/api/settings/verify/{section}`.

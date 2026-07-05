@@ -124,9 +124,10 @@ Recommended order:
 
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
 2. Keep the account listener running, then trigger `/session-refresh` once.
-3. Complete the account-page verification when required; platform verification cannot be bypassed.
-4. Re-login locally or update the existing Cookie if refresh cannot recover it.
-5. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
+3. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
+4. Complete the account-page verification when required; platform verification cannot be bypassed.
+5. Re-login locally or update the existing Cookie if refresh cannot recover it.
+6. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
@@ -140,7 +141,7 @@ Use `POST /api/orders/sync` with `{"days":90}` to discover missing recent orders
 
 ```bash
 tmux capture-pane -t xianyu-butler -p -S -500
-rg -n "session-refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
+rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
 ```
 
 Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, passwords, provider keys, or verification URLs.
