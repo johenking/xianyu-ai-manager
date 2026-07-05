@@ -4,6 +4,20 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-05
+
+### Added
+
+- Add a unified, owner-scoped Session Registry for QR login, password login, AI training, and Cookie refresh metadata.
+- Add `/health/live` and `/health/ready`, request IDs, and structured HTTP error responses.
+- Persist only safe runtime status, TTL, ownership, and redacted errors in `runtime_sessions`.
+
+### Changed
+
+- Mark nonrecoverable browser sessions as `interrupted` after a service restart.
+- Default SQL statement logging to DEBUG and reject multi-worker configuration explicitly.
+- Include migration and runtime-session summaries in operational health responses.
+
 ## [1.2.0] - 2026-07-05
 
 ### Added

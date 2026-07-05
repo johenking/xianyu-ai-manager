@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 import uvicorn
 
+from app_factory import assert_single_worker_configuration
 from config import AUTO_REPLY
 
 
@@ -23,6 +24,7 @@ def _server_address() -> tuple[str, int]:
 
 
 def main() -> None:
+    assert_single_worker_configuration()
     host, port = _server_address()
     uvicorn.run(
         "app_factory:create_app",

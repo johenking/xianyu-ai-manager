@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -60,6 +60,7 @@ from api_routers import (
     skills_router,
     system_router,
 )
+from session_registry import get_session_registry
 
 from loguru import logger
 
@@ -417,15 +418,38 @@ logger.info("Web服务器启动，文件日志收集器已初始化")
 @app.middleware("http")
 async def log_requests(request, call_next):
     start_time = time.time()
+    supplied_request_id = request.headers.get("X-Request-ID", "")
+    request_id = supplied_request_id if re.fullmatch(r"[A-Za-z0-9._-]{8,80}", supplied_request_id) else secrets.token_hex(8)
+    request.state.request_id = request_id
 
-    logger.info(f"🌐 API请求: {request.method} {request.url.path}")
+    logger.info(f"🌐 API请求: {request.method} {request.url.path} request_id={request_id}")
 
     response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
 
     process_time = time.time() - start_time
     logger.info(f"✅ API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
 
     return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_with_request_id(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": getattr(request.state, "request_id", "")},
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_with_request_id(request: Request, exc: Exception):
+    request_id = getattr(request.state, "request_id", "")
+    logger.exception(f"未处理请求异常 request_id={request_id}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error", "request_id": request_id},
+    )
 
 # 提供前端静态文件
 import os
@@ -480,9 +504,10 @@ async def health_check():
                 "cpu_percent": cpu_percent,
                 "memory_percent": memory_info.percent,
                 "memory_available": memory_info.available
-            }
+            },
+            "migration_version": getattr(db_manager, "schema_version", "legacy"),
+            "runtime_sessions": get_session_registry().summary(),
         }
-
         if status["status"] == "unhealthy":
             raise HTTPException(status_code=503, detail=status)
 
@@ -494,6 +519,32 @@ async def health_check():
             "timestamp": time.time(),
             "error": str(e)
         }
+
+
+@system_router.get('/health/live')
+async def health_live():
+    return {"status": "alive", "timestamp": time.time()}
+
+
+@system_router.get('/health/ready')
+async def health_ready():
+    try:
+        db_manager.conn.execute("SELECT 1").fetchone()
+        database_ready = True
+    except Exception:
+        database_ready = False
+    manager_ready = cookie_manager.manager is not None
+    payload = {
+        "status": "ready" if database_ready and manager_ready else "not_ready",
+        "timestamp": time.time(),
+        "services": {
+            "database": "ok" if database_ready else "error",
+            "cookie_manager": "ok" if manager_ready else "error",
+        },
+        "migration_version": getattr(db_manager, "schema_version", "legacy"),
+        "runtime_sessions": get_session_registry().summary(),
+    }
+    return JSONResponse(status_code=200 if payload["status"] == "ready" else 503, content=payload)
 
 
 # 服务 React 前端 SPA - 所有前端路由都返回 index.html
@@ -2033,6 +2084,15 @@ async def password_login(
             'timestamp': time.time(),
             'user_id': user_id
         }
+        get_session_registry().register(
+            session_id,
+            "password_login",
+            user_id,
+            account_id=account_id,
+            status="processing",
+            ttl_seconds=3600,
+            transient=password_login_sessions[session_id],
+        )
 
         # 启动后台登录任务
         task = asyncio.create_task(_execute_password_login(
@@ -2061,6 +2121,8 @@ async def check_password_login_status(
 ):
     """检查账号密码登录状态"""
     try:
+        registry = get_session_registry()
+        registry.cleanup()
         # 清理过期会话（超过1小时）
         current_time = time.time()
         expired_sessions = [
@@ -2072,6 +2134,11 @@ async def check_password_login_status(
                 del password_login_sessions[sid]
 
         if session_id not in password_login_sessions:
+            persisted = registry.get(session_id)
+            if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+                return {'status': 'forbidden', 'message': '无权限访问该会话'}
+            if persisted and persisted.get('status') == 'interrupted':
+                return {'status': 'interrupted', 'message': persisted.get('error_message') or '服务已重启，请重新发起登录'}
             return {'status': 'not_found', 'message': '会话不存在或已过期'}
 
         session = password_login_sessions[session_id]
@@ -2081,6 +2148,12 @@ async def check_password_login_status(
             return {'status': 'forbidden', 'message': '无权限访问该会话'}
 
         status = session['status']
+        registry.update(
+            session_id,
+            status=status,
+            error_code='login_failed' if status == 'failed' else '',
+            error_message=session.get('error', '') if status == 'failed' else '',
+        )
 
         if status == 'verification_required':
             # 需要人脸认证
@@ -2289,6 +2362,15 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
         result = await qr_login_manager.generate_qr_code()
 
         if result['success']:
+            session_id = result['session_id']
+            get_session_registry().register(
+                session_id,
+                "qr_login",
+                current_user['user_id'],
+                status="processing",
+                ttl_seconds=900,
+                transient=qr_login_manager.sessions.get(session_id),
+            )
             log_with_user('info', f"扫码登录二维码生成成功: {result['session_id']}", current_user)
         else:
             log_with_user('warning', f"扫码登录二维码生成失败: {result.get('message', '未知错误')}", current_user)
@@ -2304,6 +2386,13 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
     try:
+        registry = get_session_registry()
+        registry.cleanup()
+        persisted = registry.get(session_id)
+        if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+        if persisted and persisted.get('status') == 'interrupted':
+            return {'status': 'interrupted', 'message': persisted.get('error_message') or '服务已重启，请重新生成二维码'}
         # 清理过期记录
         cleanup_qr_check_records()
 
@@ -2334,6 +2423,12 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
             # 获取会话状态
             status_info = qr_login_manager.get_session_status(session_id)
+            registry.update(
+                session_id,
+                status=status_info.get('status') or 'processing',
+                error_code='qr_login_error' if status_info.get('status') in {'failed', 'error'} else '',
+                error_message=status_info.get('message', '') if status_info.get('status') in {'failed', 'error'} else '',
+            )
             safe_status_info = {
                 'status': status_info.get('status'),
                 'session_id': status_info.get('session_id'),
@@ -5409,6 +5504,10 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             ai_reply_lab_sessions.pop(sid, None)
 
         session_id = request.session_id or secrets.token_urlsafe(16)
+        registry = get_session_registry()
+        persisted = registry.get(session_id)
+        if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权限访问该训练会话')
         session = ai_reply_lab_sessions.get(session_id)
         normalized_item_id = str(request.item_id or '')
         if (not session or session.get('cookie_id') != cookie_id
@@ -5422,6 +5521,17 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
                 'timestamp': current_time,
             }
             ai_reply_lab_sessions[session_id] = session
+            registry.register(
+                session_id,
+                "ai_training",
+                current_user['user_id'],
+                account_id=cookie_id,
+                status="processing",
+                ttl_seconds=6 * 3600,
+                transient=session,
+            )
+        else:
+            registry.update(session_id, status="processing", ttl_seconds=6 * 3600)
 
         history = session.get('history', [])
         reply_result = ai_reply_engine.generate_lab_reply(
@@ -5449,6 +5559,7 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
         ])
         session['history'] = history[-24:]
         session['timestamp'] = current_time
+        registry.update(session_id, status="success", ttl_seconds=6 * 3600)
 
         return {
             "session_id": session_id,
@@ -5670,7 +5781,17 @@ def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
 @accounts_router.get("/api/accounts/{cookie_id}/session-status")
 def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
-    return {'success': True, 'data': _current_session_refresh_status(cookie_id)}
+    status_data = _current_session_refresh_status(cookie_id)
+    session_id = f"cookie-refresh:{cookie_id}"
+    registry = get_session_registry()
+    if registry.get(session_id):
+        registry.update(
+            session_id,
+            status=status_data.get('state') or 'idle',
+            error_code=status_data.get('error_code') or '',
+            error_message=status_data.get('message') or '',
+        )
+    return {'success': True, 'data': status_data}
 
 
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh")
@@ -5690,6 +5811,16 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
     live_instance = XianyuLive.get_instance(cookie_id)
     if live_instance is None:
         raise HTTPException(status_code=409, detail="账号监听实例未运行，请先开启账号监听")
+
+    get_session_registry().register(
+        f"cookie-refresh:{cookie_id}",
+        "cookie_refresh",
+        current_user['user_id'],
+        account_id=cookie_id,
+        status="refreshing",
+        ttl_seconds=900,
+        transient=live_instance,
+    )
 
     manager_loop = getattr(cookie_manager.manager, 'loop', None) if cookie_manager.manager else None
     running_loop = asyncio.get_running_loop()
@@ -5718,6 +5849,12 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
     db_manager.update_account_session_refresh(
         cookie_id, state='cancelled', trigger=status_info.get('trigger') or 'manual',
         message='Cookie 刷新已取消', error_code='cancelled',
+    )
+    get_session_registry().update(
+        f"cookie-refresh:{cookie_id}",
+        status='cancelled',
+        error_code='cancelled',
+        error_message='Cookie 刷新已取消',
     )
     return {'success': True, 'message': '刷新已取消' if cancelled else '没有正在运行的刷新任务'}
 
@@ -6395,7 +6532,9 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
                 "path": str(db_path),
                 "exists": db_path.exists(),
                 "writable": os.access(db_path.parent if db_path.parent else Path('.'), os.W_OK),
+                "migration_version": getattr(db_manager, "schema_version", "legacy"),
             },
+            "runtime_sessions": get_session_registry().summary(),
             "cookie_manager": "ready" if cookie_manager.manager is not None else "not_ready",
             "accounts": {
                 "total": len(user_cookie_ids),

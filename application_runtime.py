@@ -12,6 +12,7 @@ from loguru import logger
 import cookie_manager as cookie_manager_module
 from config import COOKIES_LIST
 from db_manager import db_manager
+from session_registry import initialize_session_registry
 
 
 def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
@@ -34,6 +35,7 @@ def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
 
 async def start_runtime() -> cookie_manager_module.CookieManager:
     loop = asyncio.get_running_loop()
+    initialize_session_registry(db_manager).cleanup()
     manager = cookie_manager_module.manager
     if manager is None:
         manager = cookie_manager_module.CookieManager(loop)
@@ -85,4 +87,3 @@ async def stop_runtime() -> None:
     except Exception as exc:
         logger.warning(f"关闭浏览器池时出现问题: {exc}")
     logger.info("运行时已停止")
-

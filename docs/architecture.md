@@ -26,6 +26,8 @@ Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu
 
 Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Token failure can trigger an immediate refresh; enabled accounts also perform preventive refresh attempts. When Alibaba requires human verification, the account page reads the persisted status and verification image instead of pretending refresh succeeded.
 
+Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. Passwords, Cookies, Tokens, complete verification URLs, Playwright objects, and AI conversation content remain in memory. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
+
 ## AI Context Flow
 
 Each reply is built in this order:
@@ -70,6 +72,7 @@ Core tables:
 
 - `users`, `auth_sessions`: backend identities and persistent login sessions.
 - `schema_migrations`: ordered, transactional database migration history.
+- `runtime_sessions`: safe ownership, status, TTL, and redacted errors for temporary operations.
 - `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, and Cookie refresh state.
 - `keywords`, `default_replies`, `item_replay`: deterministic reply rules.
 - `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.
@@ -100,5 +103,9 @@ The Skill Center is an independent safe rewrite informed by monitor workflow, ex
 ## Deployment Notes
 
 The local workspace uses port `8091`; containers commonly expose `8080` through `PORT` or `API_PORT`. A Hugging Face Spaces export needs Docker frontmatter with `app_port: 8080`, but the GitHub README does not require that frontmatter.
+
+`/health/live` proves the process can answer HTTP. `/health/ready` additionally checks SQLite and CookieManager readiness and reports the schema migration version plus a runtime-session summary. Responses carry `X-Request-ID`; HTTP error JSON keeps `detail` and adds `request_id`.
+
+Set `WEB_CONCURRENCY=1`. Startup rejects values other than one because SQLite state and in-memory browser sessions are not shared between workers. SQL details default to DEBUG.
 
 Xianyu login remains environment-sensitive. Datacenter or overseas IPs and headless browser fingerprints can trigger Alibaba risk controls. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.

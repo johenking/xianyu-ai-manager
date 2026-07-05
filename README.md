@@ -100,6 +100,8 @@ python Start.py
 
 打开 `http://127.0.0.1:8091`。
 
+存活探针为 `/health/live`，就绪探针为 `/health/ready`，兼容探针 `/health` 继续保留。当前架构只支持单实例、单 Uvicorn worker；请保持 `WEB_CONCURRENCY=1`。
+
 默认后台用户名为 `admin`。请在 `.env` 中设置强密码 `ADMIN_PASSWORD` 和随机 `JWT_SECRET_KEY`，不要在公网使用默认值。
 AI 平台密钥使用 Fernet 加密保存。生产环境请另外设置随机的 `AI_PROVIDER_ENCRYPTION_KEY`；未设置时会在 `data/.ai_provider_key` 生成仅本机可读的密钥文件，请与数据库一起备份且不要提交。
 闲鱼账号登录密码使用另一把 Fernet 密钥。生产环境建议设置独立的 `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY`；未设置时会生成权限为 `0600` 的 `data/.account_credential_key`。数据库迁移会在修改前同时备份数据库和本地密钥。

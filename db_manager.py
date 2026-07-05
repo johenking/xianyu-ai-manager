@@ -65,13 +65,13 @@ class DBManager:
 
         # SQL日志配置 - 默认启用
         self.sql_log_enabled = True  # 默认启用SQL日志
-        self.sql_log_level = 'INFO'  # 默认使用INFO级别
+        self.sql_log_level = 'DEBUG'  # SQL明细默认只在DEBUG级别记录
 
         # 允许通过环境变量覆盖默认设置
         if os.getenv('SQL_LOG_ENABLED'):
             self.sql_log_enabled = os.getenv('SQL_LOG_ENABLED', 'true').lower() == 'true'
         if os.getenv('SQL_LOG_LEVEL'):
-            self.sql_log_level = os.getenv('SQL_LOG_LEVEL', 'INFO').upper()
+            self.sql_log_level = os.getenv('SQL_LOG_LEVEL', 'DEBUG').upper()
 
         logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
 
