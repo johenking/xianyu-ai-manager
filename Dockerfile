@@ -1,5 +1,5 @@
 # 使用Python 3.11作为基础镜像
-FROM python:3.11-slim-bookworm AS base
+FROM python:3.14-slim-bookworm AS base
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
