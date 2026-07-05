@@ -6,16 +6,21 @@ Xianyu AI Manager is a FastAPI + SQLite + React/Vite application for Xianyu acco
 
 Main runtime path:
 
-1. `Start.py` checks the database, Playwright Chromium, frontend build output, and starts the API server.
-2. `reply_server.py` owns authentication and the public API surface.
-3. `db_manager.py` owns SQLite schema creation, migrations, and persistence helpers.
-4. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account.
-5. `ai_reply_engine.py` assembles product-scoped context, calls the selected provider, audits rules, and optionally regenerates once.
-6. `frontend/` builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
+1. `Start.py` starts one Uvicorn worker using the `app_factory:create_app` factory.
+2. `app_factory.py` owns FastAPI lifespan; `application_runtime.py` starts and stops the CookieManager and browser pool on the server event loop.
+3. `reply_server.py` keeps endpoint implementations compatible while `api_routers.py` groups all routes into auth, account, AI, order, skill, settings, content, admin, system, and frontend `APIRouter` domains.
+4. `db_manager.py` retains the compatibility persistence facade. New domain SQL starts in `repositories/`, while domain decisions live in `services/`; authentication is the first extracted boundary.
+5. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account and exposes an awaited shutdown path.
+6. `ai_reply_engine.py` assembles product-scoped context, calls the selected provider, audits rules, and optionally regenerates once.
+7. `frontend/` builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
+
+The deployment model is intentionally one process, one Uvicorn worker, one asyncio event loop, and SQLite. It does not claim horizontal multi-worker support.
 
 ## Authentication And Account Identity
 
-Backend users live in `users`. The initial `admin` password is read from `ADMIN_PASSWORD` only when a new database creates the user. Login sessions are stored in `auth_sessions`, expire after 30 days, and are removed by `/logout`.
+Backend users live in `users`. The initial `admin` password is read from `ADMIN_PASSWORD` only when a new database creates the user. New passwords use bcrypt cost 12; a successful legacy SHA-256 login upgrades the stored hash. New login Sessions store a Token digest, expire after 30 days, and are removed by `/logout`; legacy records remain readable during migration.
+
+`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database and local encryption keys before starting one transaction. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider key.
 
 Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
 
@@ -64,6 +69,7 @@ System settings are split into basic, AI, and SMTP sections. `settings_service.p
 Core tables:
 
 - `users`, `auth_sessions`: backend identities and persistent login sessions.
+- `schema_migrations`: ordered, transactional database migration history.
 - `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, and Cookie refresh state.
 - `keywords`, `default_replies`, `item_replay`: deterministic reply rules.
 - `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.

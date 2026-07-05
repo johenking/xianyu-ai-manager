@@ -30,7 +30,8 @@ try:
     current_runtime = execjs.get()
     logger.info(f"当前JavaScript运行时: {current_runtime.name}")
 
-    xianyu_js = execjs.compile(open(get_js_path(), 'r', encoding='utf-8').read())
+    with open(get_js_path(), 'r', encoding='utf-8') as javascript_file:
+        xianyu_js = execjs.compile(javascript_file.read())
     logger.info("JavaScript文件加载成功")
 except Exception as e:
     error_msg = str(e)

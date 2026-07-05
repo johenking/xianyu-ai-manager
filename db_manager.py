@@ -21,9 +21,9 @@ from security_utils import (
     AccountCredentialCipher,
     hash_user_password,
     token_digest,
-    verify_legacy_sha256,
-    verify_user_password_hash,
 )
+from repositories.auth_repository import AuthSessionRepository, UserRepository
+from services.auth_service import AuthService
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
@@ -754,6 +754,9 @@ class DBManager:
             if applied_migrations:
                 logger.info(f"数据库迁移完成: {', '.join(applied_migrations)}")
             self.backfill_cookie_identities()
+            self.user_repository = UserRepository(self.conn)
+            self.auth_session_repository = AuthSessionRepository(self.conn)
+            self.auth_service = AuthService(self.user_repository)
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
@@ -1557,21 +1560,11 @@ class DBManager:
         with self.lock:
             try:
                 now = time.time()
-                cursor = self.conn.cursor()
                 digest = token_digest(token)
                 storage_id = f"digest:{digest}"
-                self._execute_sql(cursor, '''
-                INSERT INTO auth_sessions
-                (token, token_digest, user_id, username, is_admin, created_at, expires_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(token) DO UPDATE SET
-                    token_digest = excluded.token_digest,
-                    user_id = excluded.user_id,
-                    username = excluded.username,
-                    is_admin = excluded.is_admin,
-                    expires_at = excluded.expires_at,
-                    last_seen_at = excluded.last_seen_at
-                ''', (storage_id, digest, user_id, username, int(bool(is_admin)), now, expires_at, now))
+                self.auth_session_repository.save(
+                    storage_id, digest, user_id, username, is_admin, now, expires_at
+                )
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -1583,15 +1576,8 @@ class DBManager:
         """读取未过期的后台登录会话"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
                 digest = token_digest(token)
-                self._execute_sql(cursor, '''
-                SELECT token, user_id, username, is_admin, created_at, expires_at, last_seen_at, token_digest
-                FROM auth_sessions
-                WHERE token_digest = ? OR token = ?
-                LIMIT 1
-                ''', (digest, token))
-                row = cursor.fetchone()
+                row = self.auth_session_repository.get(digest, token)
                 if not row:
                     return None
 
@@ -1599,11 +1585,7 @@ class DBManager:
                     self.delete_auth_session(token)
                     return None
 
-                self._execute_sql(
-                    cursor,
-                    "UPDATE auth_sessions SET last_seen_at = ? WHERE token_digest = ? OR token = ?",
-                    (time.time(), digest, token),
-                )
+                self.auth_session_repository.touch(digest, token, time.time())
                 self.conn.commit()
                 return {
                     'token': token,
@@ -1622,13 +1604,8 @@ class DBManager:
         """删除指定后台登录会话"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
                 digest = token_digest(token)
-                self._execute_sql(
-                    cursor,
-                    "DELETE FROM auth_sessions WHERE token_digest = ? OR token = ?",
-                    (digest, token),
-                )
+                self.auth_session_repository.delete(digest, token)
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -1640,8 +1617,7 @@ class DBManager:
         """清理过期后台登录会话"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
+                self.auth_session_repository.cleanup_expired(time.time())
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -3768,13 +3744,10 @@ class DBManager:
         """创建新用户"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
                 password_hash_v2 = hash_user_password(password)
-
-                cursor.execute('''
-                INSERT INTO users (username, email, password_hash, password_hash_v2, password_hash_version)
-                VALUES (?, ?, '', ?, ?)
-                ''', (username, email, password_hash_v2, PASSWORD_HASH_VERSION))
+                self.user_repository.create(
+                    username, email, password_hash_v2, PASSWORD_HASH_VERSION
+                )
 
                 self.conn.commit()
                 logger.info(f"创建用户成功: {username} ({email})")
@@ -3792,27 +3765,7 @@ class DBManager:
         """根据用户名获取用户信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at,
-                       password_hash_v2, password_hash_version
-                FROM users WHERE username = ?
-                ''', (username,))
-
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'password_hash': row[3],
-                        'is_active': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6],
-                        'password_hash_v2': row[7] or '',
-                        'password_hash_version': row[8] or 1,
-                    }
-                return None
+                return self.user_repository.get_by_username(username)
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
@@ -3821,69 +3774,26 @@ class DBManager:
         """根据邮箱获取用户信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at,
-                       password_hash_v2, password_hash_version
-                FROM users WHERE email = ?
-                ''', (email,))
-
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'password_hash': row[3],
-                        'is_active': row[4],
-                        'created_at': row[5],
-                        'updated_at': row[6],
-                        'password_hash_v2': row[7] or '',
-                        'password_hash_version': row[8] or 1,
-                    }
-                return None
+                return self.user_repository.get_by_email(email)
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
 
     def verify_user_password(self, username: str, password: str) -> bool:
         """验证用户密码"""
-        user = self.get_user_by_username(username)
-        if not user:
-            return False
-
-        if not user['is_active']:
-            return False
-        if user.get('password_hash_v2'):
-            return verify_user_password_hash(password, user['password_hash_v2'])
-        if not verify_legacy_sha256(password, user.get('password_hash', '')):
-            return False
-
-        upgraded_hash = hash_user_password(password)
         with self.lock:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "UPDATE users SET password_hash_v2 = ?, password_hash_version = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (upgraded_hash, PASSWORD_HASH_VERSION, user['id']),
-            )
-            self.conn.commit()
-        return True
+            return self.auth_service.verify_password(username, password)
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
                 password_hash_v2 = hash_user_password(new_password)
+                row_count = self.user_repository.set_password(
+                    username, password_hash_v2, PASSWORD_HASH_VERSION
+                )
 
-                cursor.execute('''
-                UPDATE users SET password_hash = '', password_hash_v2 = ?, password_hash_version = ?,
-                                 updated_at = CURRENT_TIMESTAMP
-                WHERE username = ?
-                ''', (password_hash_v2, PASSWORD_HASH_VERSION, username))
-
-                if cursor.rowcount > 0:
+                if row_count > 0:
                     self.conn.commit()
                     logger.info(f"用户 {username} 密码更新成功")
                     return True

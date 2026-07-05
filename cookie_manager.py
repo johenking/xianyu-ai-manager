@@ -58,6 +58,16 @@ class CookieManager:
         logger.info(f"数据重新加载完成: Cookie {old_cookies_count} -> {new_cookies_count}, 关键字组 {old_keywords_count} -> {new_keywords_count}")
         return True
 
+    async def shutdown(self) -> None:
+        """Cancel every account listener on the manager's owning event loop."""
+        tasks = [task for task in self.tasks.values() if task and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.clear()
+        logger.info("CookieManager 账号监听任务已全部停止")
+
     # ------------------------ 内部协程 ------------------------
     async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
         """在事件循环中启动 XianyuLive.main"""
