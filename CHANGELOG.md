@@ -4,6 +4,22 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-07-05
+
+### Added
+
+- Add ordered, transactional SQLite migrations with database and local-key backups.
+- Add an independent Fernet key for Xianyu account login credentials.
+
+### Changed
+
+- Hash new backend passwords with bcrypt cost 12 and upgrade legacy SHA-256 hashes after a successful login.
+- Store new backend Session tokens by SHA-256 digest while retaining legacy-session compatibility.
+
+### Security
+
+- Remove plaintext Xianyu login passwords after encryption and never expose the ciphertext through APIs.
+
 ## [1.1.0] - 2026-07-05
 
 ### Added

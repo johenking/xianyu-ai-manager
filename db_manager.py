@@ -14,6 +14,17 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
 
+from schema_migrations import MigrationRunner, get_schema_version
+from security_utils import (
+    ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
+    PASSWORD_HASH_VERSION,
+    AccountCredentialCipher,
+    hash_user_password,
+    token_digest,
+    verify_legacy_sha256,
+    verify_user_password_hash,
+)
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
 
@@ -47,6 +58,7 @@ class DBManager:
                 logger.warning(f"使用当前目录作为数据库路径: {db_path}")
 
         self.db_path = db_path
+        self._database_preexisting = os.path.exists(db_path) and os.path.getsize(db_path) > 0
         logger.info(f"数据库路径: {self.db_path}")
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
@@ -732,6 +744,15 @@ class DBManager:
             self._migrate_database(cursor)
 
             self.conn.commit()
+            migration_runner = MigrationRunner(
+                self.conn,
+                self.db_path,
+                backup_enabled=self._database_preexisting,
+            )
+            applied_migrations = migration_runner.run()
+            self.schema_version = get_schema_version(self.conn)
+            if applied_migrations:
+                logger.info(f"数据库迁移完成: {', '.join(applied_migrations)}")
             self.backfill_cookie_identities()
             logger.info("数据库初始化完成")
         except Exception as e:
@@ -1537,11 +1558,20 @@ class DBManager:
             try:
                 now = time.time()
                 cursor = self.conn.cursor()
+                digest = token_digest(token)
+                storage_id = f"digest:{digest}"
                 self._execute_sql(cursor, '''
-                INSERT OR REPLACE INTO auth_sessions
-                (token, user_id, username, is_admin, created_at, expires_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (token, user_id, username, int(bool(is_admin)), now, expires_at, now))
+                INSERT INTO auth_sessions
+                (token, token_digest, user_id, username, is_admin, created_at, expires_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                    token_digest = excluded.token_digest,
+                    user_id = excluded.user_id,
+                    username = excluded.username,
+                    is_admin = excluded.is_admin,
+                    expires_at = excluded.expires_at,
+                    last_seen_at = excluded.last_seen_at
+                ''', (storage_id, digest, user_id, username, int(bool(is_admin)), now, expires_at, now))
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -1554,11 +1584,13 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                digest = token_digest(token)
                 self._execute_sql(cursor, '''
-                SELECT token, user_id, username, is_admin, created_at, expires_at, last_seen_at
+                SELECT token, user_id, username, is_admin, created_at, expires_at, last_seen_at, token_digest
                 FROM auth_sessions
-                WHERE token = ?
-                ''', (token,))
+                WHERE token_digest = ? OR token = ?
+                LIMIT 1
+                ''', (digest, token))
                 row = cursor.fetchone()
                 if not row:
                     return None
@@ -1567,10 +1599,14 @@ class DBManager:
                     self.delete_auth_session(token)
                     return None
 
-                self._execute_sql(cursor, "UPDATE auth_sessions SET last_seen_at = ? WHERE token = ?", (time.time(), token))
+                self._execute_sql(
+                    cursor,
+                    "UPDATE auth_sessions SET last_seen_at = ? WHERE token_digest = ? OR token = ?",
+                    (time.time(), digest, token),
+                )
                 self.conn.commit()
                 return {
-                    'token': row[0],
+                    'token': token,
                     'user_id': row[1],
                     'username': row[2],
                     'is_admin': bool(row[3]),
@@ -1587,7 +1623,12 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM auth_sessions WHERE token = ?", (token,))
+                digest = token_digest(token)
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM auth_sessions WHERE token_digest = ? OR token = ?",
+                    (digest, token),
+                )
                 self.conn.commit()
                 return True
             except Exception as e:
@@ -1789,9 +1830,12 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at, xianyu_unb FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at, xianyu_unb, password_encrypted FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
+                    password = result[7] or ''
+                    if result[11]:
+                        password = AccountCredentialCipher(self.db_path).decrypt(result[11])
                     return {
                         'id': result[0],
                         'value': result[1],
@@ -1800,7 +1844,7 @@ class DBManager:
                         'remark': result[4] or '',
                         'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[6] or '',
-                        'password': result[7] or '',
+                        'password': password,
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'created_at': result[9],
                         'xianyu_unb': result[10] or '',
@@ -1993,9 +2037,10 @@ class DBManager:
                         insert_placeholders.append('?')
 
                     if password is not None:
-                        insert_fields.append('password')
-                        insert_values.append(password)
-                        insert_placeholders.append('?')
+                        encrypted_password = AccountCredentialCipher(self.db_path).encrypt(password)
+                        insert_fields.extend(['password', 'password_encrypted', 'password_encryption_version'])
+                        insert_values.extend(['', encrypted_password, ACCOUNT_PASSWORD_ENCRYPTION_VERSION])
+                        insert_placeholders.extend(['?', '?', '?'])
 
                     if show_browser is not None:
                         insert_fields.append('show_browser')
@@ -2026,8 +2071,15 @@ class DBManager:
                         params.append(username)
 
                     if password is not None:
-                        update_fields.append("password = ?")
-                        params.append(password)
+                        update_fields.extend([
+                            "password = ''",
+                            "password_encrypted = ?",
+                            "password_encryption_version = ?",
+                        ])
+                        params.extend([
+                            AccountCredentialCipher(self.db_path).encrypt(password),
+                            ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
+                        ])
 
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")
@@ -3717,12 +3769,12 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                password_hash_v2 = hash_user_password(password)
 
                 cursor.execute('''
-                INSERT INTO users (username, email, password_hash)
-                VALUES (?, ?, ?)
-                ''', (username, email, password_hash))
+                INSERT INTO users (username, email, password_hash, password_hash_v2, password_hash_version)
+                VALUES (?, ?, '', ?, ?)
+                ''', (username, email, password_hash_v2, PASSWORD_HASH_VERSION))
 
                 self.conn.commit()
                 logger.info(f"创建用户成功: {username} ({email})")
@@ -3742,7 +3794,8 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at,
+                       password_hash_v2, password_hash_version
                 FROM users WHERE username = ?
                 ''', (username,))
 
@@ -3755,7 +3808,9 @@ class DBManager:
                         'password_hash': row[3],
                         'is_active': row[4],
                         'created_at': row[5],
-                        'updated_at': row[6]
+                        'updated_at': row[6],
+                        'password_hash_v2': row[7] or '',
+                        'password_hash_version': row[8] or 1,
                     }
                 return None
             except Exception as e:
@@ -3768,7 +3823,8 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at,
+                       password_hash_v2, password_hash_version
                 FROM users WHERE email = ?
                 ''', (email,))
 
@@ -3781,7 +3837,9 @@ class DBManager:
                         'password_hash': row[3],
                         'is_active': row[4],
                         'created_at': row[5],
-                        'updated_at': row[6]
+                        'updated_at': row[6],
+                        'password_hash_v2': row[7] or '',
+                        'password_hash_version': row[8] or 1,
                     }
                 return None
             except Exception as e:
@@ -3794,20 +3852,36 @@ class DBManager:
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return user['password_hash'] == password_hash and user['is_active']
+        if not user['is_active']:
+            return False
+        if user.get('password_hash_v2'):
+            return verify_user_password_hash(password, user['password_hash_v2'])
+        if not verify_legacy_sha256(password, user.get('password_hash', '')):
+            return False
+
+        upgraded_hash = hash_user_password(password)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE users SET password_hash_v2 = ?, password_hash_version = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (upgraded_hash, PASSWORD_HASH_VERSION, user['id']),
+            )
+            self.conn.commit()
+        return True
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                password_hash_v2 = hash_user_password(new_password)
 
                 cursor.execute('''
-                UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
+                UPDATE users SET password_hash = '', password_hash_v2 = ?, password_hash_version = ?,
+                                 updated_at = CURRENT_TIMESTAMP
                 WHERE username = ?
-                ''', (password_hash, username))
+                ''', (password_hash_v2, PASSWORD_HASH_VERSION, username))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()

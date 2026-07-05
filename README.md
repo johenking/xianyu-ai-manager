@@ -102,6 +102,7 @@ python Start.py
 
 默认后台用户名为 `admin`。请在 `.env` 中设置强密码 `ADMIN_PASSWORD` 和随机 `JWT_SECRET_KEY`，不要在公网使用默认值。
 AI 平台密钥使用 Fernet 加密保存。生产环境请另外设置随机的 `AI_PROVIDER_ENCRYPTION_KEY`；未设置时会在 `data/.ai_provider_key` 生成仅本机可读的密钥文件，请与数据库一起备份且不要提交。
+闲鱼账号登录密码使用另一把 Fernet 密钥。生产环境建议设置独立的 `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY`；未设置时会生成权限为 `0600` 的 `data/.account_credential_key`。数据库迁移会在修改前同时备份数据库和本地密钥。
 
 ## Docker
 
@@ -117,6 +118,9 @@ docker compose up --build -d
 
 - 全局 AI Key 与 SMTP 密码不会通过设置 API 明文返回。
 - 平台 API Key 使用 Fernet 加密保存，平台接口只返回配置状态和掩码。
+- 后台密码使用 bcrypt cost 12；旧 SHA-256 密码会在一次成功登录后自动升级。
+- 新后台 Session 只保存 Token 摘要，旧 Session 在过渡期内继续兼容。
+- 闲鱼账号登录密码使用独立密钥加密，接口不返回密码或密文。
 - 账号专属 AI Key 使用 `keep / set / clear` 操作，空输入不会误删旧 Key。
 - 不要提交 `data/`、数据库、Cookie、日志、浏览器状态、上传文件或 `.env`。
 - SMTP 是可选能力，未配置不代表系统故障；连接检测只做连接与认证，不发送邮件。

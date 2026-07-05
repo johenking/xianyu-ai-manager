@@ -6753,6 +6753,8 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
             # 隐藏密码字段
             if 'password_hash' in user:
                 del user['password_hash']
+            if 'password_hash_v2' in user:
+                del user['password_hash_v2']
 
         log_with_user('info', f"返回用户信息，共 {len(users)} 个用户", admin_user)
         return {"users": users}
