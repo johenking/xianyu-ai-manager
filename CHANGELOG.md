@@ -14,6 +14,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Improve the product-knowledge copy panel with select all, clear, overwrite explanation, sticky action, and save-before-copy behavior for dirty drafts.
 - Show when the training lab used a rule guard fallback instead of returning the model's violating reply.
 
+### Fixed
+
+- Detect completed Xianyu face-verification refresh sessions using login-state and Cookie checks, and add an account-page action to recheck after the user finishes verification.
+
 ## [1.4.0] - 2026-07-05
 
 ### Added

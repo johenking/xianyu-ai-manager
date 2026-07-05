@@ -2503,6 +2503,81 @@ class XianyuSliderStealth:
 
     # ==================== Playwright 登录辅助方法 ====================
 
+    def _visible_element_exists(self, scope, selector: str) -> bool:
+        try:
+            element = scope.query_selector(selector)
+            return bool(element and element.is_visible())
+        except Exception:
+            return False
+
+    def _has_active_login_or_verification_challenge(self, page) -> bool:
+        """判断页面是否仍停留在登录/安全验证态。
+
+        关键用途：避免仅凭旧 Cookie 把仍在登录页或人脸验证页的会话误判为成功。
+        """
+        login_selectors = [
+            '#fm-login-id',
+            'input[name="fm-login-id"]',
+            '#fm-login-password',
+            'input[name="fm-login-password"]',
+            'button.password-login',
+        ]
+        verification_selectors = [
+            'iframe#alibaba-login-box',
+            '#nc_1_n1z',
+            '.nc-container',
+            '.nc_scale',
+            '.nc-wrapper',
+            '#baxia-dialog-content',
+            '#nocaptcha',
+        ]
+        frames_to_check = [page] + list(getattr(page, 'frames', []) or [])
+        for scope in frames_to_check:
+            for selector in login_selectors + verification_selectors:
+                if self._visible_element_exists(scope, selector):
+                    logger.debug(f"【{self.pure_user_id}】仍检测到登录/验证元素: {selector}")
+                    return True
+            try:
+                frame_url = getattr(scope, 'url', '') or ''
+                if 'mini_login' in frame_url or '/iv/' in frame_url:
+                    logger.debug(f"【{self.pure_user_id}】仍检测到安全验证 frame（地址已隐藏）")
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _has_authenticated_cookie_set(self, page) -> bool:
+        try:
+            cookies = getattr(page, 'context').cookies()
+        except Exception:
+            return False
+        cookie_names = {
+            str(cookie.get('name', ''))
+            for cookie in cookies
+            if cookie.get('name') and cookie.get('value')
+        }
+        has_identity = 'unb' in cookie_names
+        has_session = any(
+            key in cookie_names
+            for key in ('cookie2', 'sgcookie', 't', '_m_h5_tk', '_m_h5_tk_enc')
+        )
+        if has_identity and has_session:
+            logger.info(
+                f"【{self.pure_user_id}】检测到登录关键 Cookie: "
+                f"identity={has_identity}, session={has_session}"
+            )
+        return has_identity and has_session
+
+    def _looks_like_post_login_page(self, page) -> bool:
+        try:
+            current_url = getattr(page, 'url', '') or ''
+        except Exception:
+            current_url = ''
+        return any(
+            marker in current_url
+            for marker in ('goofish.com/im', 'goofish.com/message')
+        )
+
     def _check_login_success_by_element(self, page) -> bool:
         """通过页面元素检测登录是否成功
 
@@ -2539,13 +2614,24 @@ class XianyuSliderStealth:
                     logger.info(f"【{self.pure_user_id}】================================================")
                     return True
                 else:
-                    logger.debug(f"【{self.pure_user_id}】列表为空，登录未完成")
-                    logger.info(f"【{self.pure_user_id}】================================================")
-                    return False
+                    logger.debug(f"【{self.pure_user_id}】列表为空，继续用 Cookie 与页面状态复核登录态")
             else:
                 logger.debug(f"【{self.pure_user_id}】未找到目标元素: {selector}")
+
+            has_challenge = self._has_active_login_or_verification_challenge(page)
+            has_auth_cookies = self._has_authenticated_cookie_set(page)
+            post_login_page = self._looks_like_post_login_page(page)
+            if not has_challenge and has_auth_cookies and post_login_page:
+                logger.success(f"【{self.pure_user_id}】✅ 登录成功！安全验证已消失且关键 Cookie 已存在")
                 logger.info(f"【{self.pure_user_id}】================================================")
-                return False
+                return True
+
+            logger.debug(
+                f"【{self.pure_user_id}】登录态复核未通过: "
+                f"challenge={has_challenge}, cookies={has_auth_cookies}, post_login_page={post_login_page}"
+            )
+            logger.info(f"【{self.pure_user_id}】================================================")
+            return False
 
         except Exception as e:
             logger.debug(f"【{self.pure_user_id}】检查登录状态时出错: {e}")

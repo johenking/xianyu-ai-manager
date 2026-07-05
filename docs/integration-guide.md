@@ -174,7 +174,7 @@ curl -sS -X POST "$BASE_URL/api/accounts/$COOKIE_ID/session-refresh" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Manual refresh requires the account listener to be running. A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. Cancel with `POST .../session-refresh/cancel`.
+Manual refresh requires the account listener to be running. A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. After verification, the account page can recheck the refresh state, but success is only shown after the backend detects the logged-in page and refreshed Cookie. Cancel with `POST .../session-refresh/cancel`.
 
 QR is the recommended binding path. Password login depends on the current Xianyu web page and risk-control flow, so it may stop working after platform changes. Use QR or update the existing account Cookie when that happens; do not delete the account merely to retry authentication.
 

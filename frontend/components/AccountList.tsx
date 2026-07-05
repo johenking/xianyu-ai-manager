@@ -61,6 +61,7 @@ const AccountList: React.FC = () => {
   const [diagnosingId, setDiagnosingId] = useState<string>('');
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AccountSessionRefreshStatus>>({});
   const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
+  const [checkingSessionId, setCheckingSessionId] = useState<string>('');
   const [passwordForm, setPasswordForm] = useState({
     account_id: '',
     account: '',
@@ -120,7 +121,7 @@ const AccountList: React.FC = () => {
       }
     }));
     const next = Object.fromEntries(results.filter((entry): entry is readonly [string, AccountSessionRefreshStatus] => Boolean(entry)));
-    setSessionStatuses(next);
+    setSessionStatuses((current) => ({ ...current, ...next }));
   };
 
   const clearQRPolling = () => {
@@ -330,6 +331,25 @@ const AccountList: React.FC = () => {
       setPageNotice({ tone: 'info', text: result.message || 'Cookie 刷新已取消' });
     } catch (error) {
       setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '取消刷新失败' });
+    }
+  };
+
+  const handleCheckSessionRefreshStatus = async (account: AccountDetail) => {
+    setCheckingSessionId(account.id);
+    try {
+      const status = await getAccountSessionStatus(account.id);
+      setSessionStatuses((current) => ({ ...current, [account.id]: status }));
+      if (status.state === 'success') {
+        setPageNotice({ tone: 'success', text: '已检测到验证完成，账号监听状态已更新' });
+      } else if (status.state === 'verification_required' || status.state === 'refreshing') {
+        setPageNotice({ tone: 'info', text: '后台还未检测到登录成功，请确认手机端验证已完成并稍后再检查' });
+      } else {
+        setPageNotice({ tone: status.state === 'failed' || status.state === 'timeout' ? 'error' : 'info', text: status.message || '账号刷新状态已更新' });
+      }
+    } catch (error) {
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '检查验证状态失败' });
+    } finally {
+      setCheckingSessionId('');
     }
   };
 
@@ -822,6 +842,16 @@ const AccountList: React.FC = () => {
                 <div className="flex shrink-0 gap-2">
                   {(sessionStatus.state === 'refreshing' || sessionStatus.state === 'verification_required') && (
                     <button type="button" onClick={() => void handleCancelSessionRefresh(account)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700">取消</button>
+                  )}
+                  {sessionStatus.state === 'verification_required' && (
+                    <button
+                      type="button"
+                      onClick={() => void handleCheckSessionRefreshStatus(account)}
+                      disabled={checkingSessionId === account.id}
+                      className="rounded-lg bg-[#FFE815] px-3 py-2 text-xs font-bold text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {checkingSessionId === account.id ? '正在检查...' : '我已完成验证，立即检查'}
+                    </button>
                   )}
                   {(sessionStatus.state === 'failed' || sessionStatus.state === 'timeout') && (
                     <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-black px-3 py-2 text-xs font-bold text-white">重新刷新</button>
