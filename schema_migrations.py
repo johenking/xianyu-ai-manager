@@ -79,8 +79,36 @@ def _security_credentials_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
             )
 
 
+def _runtime_sessions_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_sessions (
+            session_id TEXT PRIMARY KEY,
+            session_type TEXT NOT NULL,
+            owner_user_id INTEGER,
+            account_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runtime_sessions_owner "
+        "ON runtime_sessions(owner_user_id, session_type, updated_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runtime_sessions_expiry "
+        "ON runtime_sessions(expires_at)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
+    Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
 )
 
 

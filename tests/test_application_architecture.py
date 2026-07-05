@@ -12,7 +12,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
         routes = [route for route in app.routes if isinstance(route, APIRoute)]
-        self.assertEqual(len(routes), 201)
+        self.assertEqual(len(routes), 203)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -33,6 +33,8 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/api/orders/sync"), signatures)
         self.assertIn(("POST", "/ai-reply-lab/reply/{cookie_id}"), signatures)
         self.assertIn(("GET", "/api/accounts/{cookie_id}/session-status"), signatures)
+        self.assertIn(("GET", "/health/live"), signatures)
+        self.assertIn(("GET", "/health/ready"), signatures)
 
     async def test_lifespan_starts_and_stops_runtime_on_the_same_loop(self):
         app = create_app()
