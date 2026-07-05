@@ -1,0 +1,8 @@
+-r requirements.in
+
+# Tests, linting, dependency auditing, and optional binary builds.
+ruff>=0.12.0
+pip-audit>=2.9.0
+nuitka>=2.7
+ordered-set>=4.1.0
+zstandard>=0.22.0

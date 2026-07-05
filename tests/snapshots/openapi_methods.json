@@ -1,0 +1,519 @@
+{
+  "/admin/backup/download": [
+    "GET"
+  ],
+  "/admin/backup/list": [
+    "GET"
+  ],
+  "/admin/backup/upload": [
+    "POST"
+  ],
+  "/admin/cookies": [
+    "GET"
+  ],
+  "/admin/data/{table_name}": [
+    "DELETE",
+    "GET"
+  ],
+  "/admin/data/{table_name}/{record_id}": [
+    "DELETE"
+  ],
+  "/admin/log-files": [
+    "GET"
+  ],
+  "/admin/logs": [
+    "GET"
+  ],
+  "/admin/logs/export": [
+    "GET"
+  ],
+  "/admin/reload-cache": [
+    "POST"
+  ],
+  "/admin/risk-control-logs": [
+    "GET"
+  ],
+  "/admin/stats": [
+    "GET"
+  ],
+  "/admin/users": [
+    "GET"
+  ],
+  "/admin/users/{user_id}": [
+    "DELETE"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}": [
+    "GET"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/copy": [
+    "POST"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/draft": [
+    "PUT"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/generate": [
+    "POST"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/publish": [
+    "POST"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/rollback/{version}": [
+    "POST"
+  ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/versions": [
+    "GET"
+  ],
+  "/ai-reply-lab/reply/{cookie_id}": [
+    "POST"
+  ],
+  "/ai-reply-lab/save/{cookie_id}": [
+    "POST"
+  ],
+  "/ai-reply-settings": [
+    "GET"
+  ],
+  "/ai-reply-settings/{cookie_id}": [
+    "GET",
+    "PUT"
+  ],
+  "/ai-reply-test/{cookie_id}": [
+    "POST"
+  ],
+  "/ai-training-rules/{cookie_id}": [
+    "GET",
+    "POST"
+  ],
+  "/ai-training-rules/{cookie_id}/{rule_id}": [
+    "DELETE",
+    "PATCH"
+  ],
+  "/analytics/orders": [
+    "GET"
+  ],
+  "/analytics/orders/valid": [
+    "GET"
+  ],
+  "/api/accounts/{cookie_id}/session-refresh": [
+    "POST"
+  ],
+  "/api/accounts/{cookie_id}/session-refresh/cancel": [
+    "POST"
+  ],
+  "/api/accounts/{cookie_id}/session-status": [
+    "GET"
+  ],
+  "/api/ai/providers": [
+    "GET",
+    "POST"
+  ],
+  "/api/ai/providers/{profile_id}": [
+    "DELETE",
+    "PUT"
+  ],
+  "/api/ai/providers/{profile_id}/models/refresh": [
+    "POST"
+  ],
+  "/api/ai/providers/{profile_id}/test": [
+    "POST"
+  ],
+  "/api/captcha/check_completion": [
+    "POST"
+  ],
+  "/api/captcha/control": [
+    "GET"
+  ],
+  "/api/captcha/control/{session_id}": [
+    "GET"
+  ],
+  "/api/captcha/mouse_event": [
+    "POST"
+  ],
+  "/api/captcha/screenshot/{session_id}": [
+    "GET"
+  ],
+  "/api/captcha/session/{session_id}": [
+    "DELETE",
+    "GET"
+  ],
+  "/api/captcha/sessions": [
+    "GET"
+  ],
+  "/api/captcha/status/{session_id}": [
+    "GET"
+  ],
+  "/api/check-default-password": [
+    "GET"
+  ],
+  "/api/default-reply/{cid}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/api/default-reply/{cid}/clear-records": [
+    "POST"
+  ],
+  "/api/diagnostics/auto-reply/{cookie_id}": [
+    "GET"
+  ],
+  "/api/orders": [
+    "GET"
+  ],
+  "/api/orders/import": [
+    "POST"
+  ],
+  "/api/orders/manual-ship": [
+    "POST"
+  ],
+  "/api/orders/refresh": [
+    "POST"
+  ],
+  "/api/orders/sync": [
+    "POST"
+  ],
+  "/api/orders/{order_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/api/orders/{order_id}/refresh": [
+    "POST"
+  ],
+  "/api/settings/sections/{section}": [
+    "PUT"
+  ],
+  "/api/settings/summary": [
+    "GET"
+  ],
+  "/api/settings/verify/{section}": [
+    "POST"
+  ],
+  "/api/skills/agent/prompts": [
+    "GET"
+  ],
+  "/api/skills/agent/prompts/{prompt_type}": [
+    "PUT"
+  ],
+  "/api/skills/agent/test-reply": [
+    "POST"
+  ],
+  "/api/skills/capabilities": [
+    "GET"
+  ],
+  "/api/skills/monitor/results": [
+    "GET"
+  ],
+  "/api/skills/monitor/tasks": [
+    "GET",
+    "POST"
+  ],
+  "/api/skills/monitor/tasks/{task_id}/run": [
+    "POST"
+  ],
+  "/api/skills/ops/browser-status": [
+    "GET"
+  ],
+  "/api/skills/ops/delivery-diagnostics": [
+    "GET"
+  ],
+  "/api/skills/ops/health": [
+    "GET"
+  ],
+  "/backup/export": [
+    "GET"
+  ],
+  "/backup/import": [
+    "POST"
+  ],
+  "/cards": [
+    "GET",
+    "POST"
+  ],
+  "/cards/{card_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/cards/{card_id}/image": [
+    "PUT"
+  ],
+  "/change-admin-password": [
+    "POST"
+  ],
+  "/change-password": [
+    "POST"
+  ],
+  "/cookie/{cid}/account-info": [
+    "POST"
+  ],
+  "/cookie/{cid}/details": [
+    "GET"
+  ],
+  "/cookies": [
+    "GET",
+    "POST"
+  ],
+  "/cookies/check": [
+    "GET"
+  ],
+  "/cookies/details": [
+    "GET"
+  ],
+  "/cookies/{cid}": [
+    "DELETE",
+    "PUT"
+  ],
+  "/cookies/{cid}/auto-confirm": [
+    "GET",
+    "PUT"
+  ],
+  "/cookies/{cid}/login-info": [
+    "PUT"
+  ],
+  "/cookies/{cid}/pause-duration": [
+    "GET",
+    "PUT"
+  ],
+  "/cookies/{cid}/remark": [
+    "GET",
+    "PUT"
+  ],
+  "/cookies/{cid}/status": [
+    "PUT"
+  ],
+  "/debug/keywords-table-info": [
+    "GET"
+  ],
+  "/default-replies": [
+    "GET"
+  ],
+  "/default-replies/{cid}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/default-replies/{cid}/clear-records": [
+    "POST"
+  ],
+  "/delivery-rules": [
+    "GET",
+    "POST"
+  ],
+  "/delivery-rules/{rule_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/face-verification/screenshot/{account_id}": [
+    "DELETE",
+    "GET"
+  ],
+  "/geetest/register": [
+    "GET"
+  ],
+  "/geetest/validate": [
+    "POST"
+  ],
+  "/generate-captcha": [
+    "POST"
+  ],
+  "/health": [
+    "GET"
+  ],
+  "/health/live": [
+    "GET"
+  ],
+  "/health/ready": [
+    "GET"
+  ],
+  "/item-reply/batch": [
+    "DELETE"
+  ],
+  "/item-reply/{cookie_id}/{item_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/itemReplays": [
+    "GET"
+  ],
+  "/itemReplays/cookie/{cookie_id}": [
+    "GET"
+  ],
+  "/items": [
+    "GET"
+  ],
+  "/items/batch": [
+    "DELETE"
+  ],
+  "/items/cookie/{cookie_id}": [
+    "GET"
+  ],
+  "/items/get-all-from-account": [
+    "POST"
+  ],
+  "/items/get-by-page": [
+    "POST"
+  ],
+  "/items/search": [
+    "POST"
+  ],
+  "/items/search_multiple": [
+    "POST"
+  ],
+  "/items/{cid}": [
+    "GET"
+  ],
+  "/items/{cookie_id}/{item_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/items/{cookie_id}/{item_id}/multi-quantity-delivery": [
+    "PUT"
+  ],
+  "/items/{cookie_id}/{item_id}/multi-spec": [
+    "PUT"
+  ],
+  "/keywords-export/{cid}": [
+    "GET"
+  ],
+  "/keywords-import/{cid}": [
+    "POST"
+  ],
+  "/keywords-with-item-id/{cid}": [
+    "GET",
+    "POST"
+  ],
+  "/keywords-with-type/{cid}": [
+    "GET"
+  ],
+  "/keywords/{cid}": [
+    "GET",
+    "POST"
+  ],
+  "/keywords/{cid}/image": [
+    "POST"
+  ],
+  "/keywords/{cid}/{index}": [
+    "DELETE"
+  ],
+  "/login": [
+    "POST"
+  ],
+  "/login-info-settings": [
+    "PUT"
+  ],
+  "/login-info-status": [
+    "GET"
+  ],
+  "/logout": [
+    "POST"
+  ],
+  "/logs": [
+    "GET"
+  ],
+  "/logs/clear": [
+    "POST"
+  ],
+  "/logs/stats": [
+    "GET"
+  ],
+  "/message-notifications": [
+    "GET"
+  ],
+  "/message-notifications/account/{cid}": [
+    "DELETE"
+  ],
+  "/message-notifications/{cid}": [
+    "GET",
+    "POST"
+  ],
+  "/message-notifications/{notification_id}": [
+    "DELETE"
+  ],
+  "/notification-channels": [
+    "GET",
+    "POST"
+  ],
+  "/notification-channels/{channel_id}": [
+    "DELETE",
+    "GET",
+    "PUT"
+  ],
+  "/password-login": [
+    "POST"
+  ],
+  "/password-login/check/{session_id}": [
+    "GET"
+  ],
+  "/qr-login/check/{session_id}": [
+    "GET"
+  ],
+  "/qr-login/continue/{session_id}": [
+    "POST"
+  ],
+  "/qr-login/cooldown-status/{cookie_id}": [
+    "GET"
+  ],
+  "/qr-login/generate": [
+    "POST"
+  ],
+  "/qr-login/refresh-cookies": [
+    "POST"
+  ],
+  "/qr-login/reset-cooldown/{cookie_id}": [
+    "POST"
+  ],
+  "/register": [
+    "POST"
+  ],
+  "/registration-settings": [
+    "PUT"
+  ],
+  "/registration-status": [
+    "GET"
+  ],
+  "/risk-control-logs": [
+    "GET"
+  ],
+  "/risk-control-logs/{log_id}": [
+    "DELETE"
+  ],
+  "/send-message": [
+    "POST"
+  ],
+  "/send-verification-code": [
+    "POST"
+  ],
+  "/system-settings": [
+    "GET"
+  ],
+  "/system-settings/public": [
+    "GET"
+  ],
+  "/system-settings/{key}": [
+    "PUT"
+  ],
+  "/system/reload-cache": [
+    "POST"
+  ],
+  "/upload-image": [
+    "POST"
+  ],
+  "/user-settings": [
+    "GET"
+  ],
+  "/user-settings/{key}": [
+    "GET",
+    "PUT"
+  ],
+  "/verify": [
+    "GET"
+  ],
+  "/verify-captcha": [
+    "POST"
+  ],
+  "/xianyu/reply": [
+    "POST"
+  ]
+}

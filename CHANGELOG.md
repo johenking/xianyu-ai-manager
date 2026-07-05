@@ -4,6 +4,27 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-05
+
+### Added
+
+- Add page-level React lazy loading while preserving the existing tab navigation contract.
+- Split frontend API and type definitions into domain modules with compatibility re-exports.
+- Add exact Python runtime and development lock files generated for Python 3.11.
+- Add Ruff correctness checks, Gitleaks, and an OpenAPI path/method contract snapshot to CI.
+- Add build verification for entry size, source-map policy, and retained static generations.
+
+### Changed
+
+- Reduce the production entry chunk from 865.91 kB to 215.73 kB (75.1%) before lazy page chunks load.
+- Disable production source maps by default; enable them only with `VITE_BUILD_SOURCEMAP=true`.
+- Retain only the current and previous successful static asset generations after builds.
+- Keep `requirements.txt` as a compatibility entry point backed by `requirements.lock`.
+
+### Fixed
+
+- Initialize the SMTP notification port before selecting TLS or SSL behavior.
+
 ## [1.3.0] - 2026-07-05
 
 ### Added

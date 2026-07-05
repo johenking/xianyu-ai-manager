@@ -55,6 +55,7 @@ frontend/.vite/
 frontend/coverage/
 static/assets/
 static/index.html
+static/.asset-generations.json
 npm-debug.log*
 
 # Browser and test artifacts

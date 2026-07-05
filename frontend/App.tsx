@@ -1,15 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { Suspense, lazy, useEffect, useState } from 'react';
 import Sidebar from './components/Sidebar';
-import Dashboard from './components/Dashboard';
-import AccountList from './components/AccountList';
-import OrderList from './components/OrderList';
-import CardList from './components/CardList';
-import ItemList from './components/ItemList';
-import Settings from './components/Settings';
-import Keywords from './components/Keywords';
-import SkillCenter from './components/SkillCenter';
 import { login, verifyToken, logout } from './services/api';
 import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu } from 'lucide-react';
+
+const Dashboard = lazy(() => import('./components/Dashboard'));
+const AccountList = lazy(() => import('./components/AccountList'));
+const OrderList = lazy(() => import('./components/OrderList'));
+const CardList = lazy(() => import('./components/CardList'));
+const ItemList = lazy(() => import('./components/ItemList'));
+const Settings = lazy(() => import('./components/Settings'));
+const Keywords = lazy(() => import('./components/Keywords'));
+const SkillCenter = lazy(() => import('./components/SkillCenter'));
+
+const PageLoading: React.FC = () => (
+  <div className="flex min-h-[50vh] items-center justify-center" role="status" aria-label="页面加载中">
+    <Loader2 className="h-8 w-8 animate-spin text-[#D6B500]" />
+  </div>
+);
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -183,7 +190,9 @@ const App: React.FC = () => {
           <span className="font-extrabold text-gray-900">闲鱼智控</span>
         </div>
         <div className="max-w-[1400px] mx-auto pb-10">
-            {renderContent()}
+            <Suspense fallback={<PageLoading />}>
+              {renderContent()}
+            </Suspense>
         </div>
       </main>
     </div>
