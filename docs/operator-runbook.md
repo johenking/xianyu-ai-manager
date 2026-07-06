@@ -14,6 +14,20 @@ Open `http://127.0.0.1:8091`. If tmux manages the service, inspect it without re
 tmux capture-pane -t xianyu-butler -p -S -200
 ```
 
+## Current Mac Public Tunnel
+
+On this Mac, `https://xianyu.cxywjx.top` routes through the existing Cloudflare Tunnel to `http://127.0.0.1:8091`. Verify the process path before claiming a release is deployed:
+
+```bash
+curl -sS https://xianyu.cxywjx.top/health/live
+curl -sS https://xianyu.cxywjx.top/health/ready
+lsof -nP -iTCP:8091 -sTCP:LISTEN
+ps -axo pid,ppid,command | rg 'cloudflared|Start.py|uvicorn|xianyu'
+curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
+```
+
+The current live runtime path is `/Users/mac/Documents/Codex/2026-06-09/github-23star-xianyu-super-butler-https-3/work/xianyu-super-butler`; it tracks `https://github.com/johenking/xianyu-ai-manager.git` as `origin`. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
+
 ## Backup Before Risky Changes
 
 Back up the live SQLite database before migrations, account identity changes, or bulk data operations:

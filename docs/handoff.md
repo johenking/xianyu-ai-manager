@@ -2,7 +2,7 @@
 
 ## Current State On 2026-07-06
 
-When started locally, the application serves at `http://127.0.0.1:8091`. The public source repository is `johenking/xianyu-ai-manager`. Passwords, Cookies, API keys, deployment tokens, and live database contents are intentionally absent from documentation and source control.
+When started locally, the application serves at `http://127.0.0.1:8091`. On this Mac, `https://xianyu.cxywjx.top` routes through Cloudflare Tunnel to the same local port. The live runtime directory is `/Users/mac/Documents/Codex/2026-06-09/github-23star-xianyu-super-butler-https-3/work/xianyu-super-butler`, now tracking `johenking/xianyu-ai-manager` `main`; keep `/Users/mac/Documents/咸鱼监控台` as the release workspace unless the listening process proves otherwise. Passwords, Cookies, API keys, deployment tokens, and live database contents are intentionally absent from documentation and source control.
 
 ## Working Capabilities
 
@@ -52,6 +52,8 @@ npm run verify:build
 Also exercise one desktop and one mobile viewport for account management, AI training, product knowledge, provider selection, and settings. Record the actual pass counts at release time rather than treating an old count as permanent evidence.
 
 Verified on 2026-07-06 for PR #22: 79 backend unit tests and the 198-method OpenAPI contract passed. TypeScript, 11 frontend test files with 22 tests, Vite production build, static-retention verification, and `git diff --check` passed. The entry chunk measured 215,727 bytes versus the v1.1.0 baseline of 865,910 bytes, a 75.1% reduction. GitHub CI reported `secrets` and `test` checks passing.
+
+Deployed on 2026-07-06: PR #22 was squash-merged as `3f6983f`, the live runtime was switched to that commit, and `https://xianyu.cxywjx.top/health/live` plus `/health/ready` returned 200. The public HTML referenced `/static/assets/index-B44UbKTy.js`; `AccountList-Dneps8tY.js` contained the Cookie-refresh UI text and `ItemList-BbhJ7c0_.js` contained the account-filter UI text. Cloudflare may keep old hashed bundles as cache hits even after the local file is gone; treat the HTML entry bundle and health endpoints as the deploy source of truth.
 
 Manual `pip-audit` still reports four advisories against `protobuf==3.10.0`, which is an exact transitive requirement of `blackboxprotobuf==1.0.1`. Do not force-upgrade protobuf without first replacing or compatibility-testing the Xianyu protocol decoder.
 
