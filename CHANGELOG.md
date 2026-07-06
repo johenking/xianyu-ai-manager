@@ -8,11 +8,14 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 - Add a hard guard for price, plan, package, and warranty-price training rules so a final AI reply cannot keep a conflicting price after audit.
 - Add copy-result metadata for product knowledge drafts, including source kind, counts, and skipped reasons.
+- Add account-level scheduled Cookie refresh controls with a conservative default-off state and 1-hour to 7-day intervals.
+- Add an explicit product account filter so item management shows one account's products by default and all products only after choosing all accounts.
 
 ### Changed
 
 - Improve the product-knowledge copy panel with select all, clear, overwrite explanation, sticky action, and save-before-copy behavior for dirty drafts.
 - Show when the training lab used a rule guard fallback instead of returning the model's violating reply.
+- Keep manual Cookie refresh independent from scheduled preventive refresh settings.
 
 ### Fixed
 

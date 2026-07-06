@@ -8,6 +8,7 @@ import {
   getAccountDetails,
   getAllAISettings,
   getAccountSessionStatus,
+  updateAccountCookieRefreshSettings,
 } from '../services/api';
 
 vi.mock('../services/api', () => ({
@@ -25,6 +26,7 @@ vi.mock('../services/api', () => ({
   updateAccountPauseDuration: vi.fn(),
   updateAccountCookie: vi.fn(),
   updateAccountLoginInfo: vi.fn(),
+  updateAccountCookieRefreshSettings: vi.fn(),
   updateAccountAISettings: vi.fn(),
   getAllAISettings: vi.fn(),
   getAccountAISettings: vi.fn(),
@@ -53,6 +55,8 @@ describe('AccountList session verification UI', () => {
         nickname: '验证账号',
         avatar_url: '',
         ai_enabled: false,
+        cookie_refresh_enabled: false,
+        cookie_refresh_interval_minutes: 1440,
       } as any,
       {
         id: 'account-2',
@@ -66,9 +70,23 @@ describe('AccountList session verification UI', () => {
         nickname: '其他账号',
         avatar_url: '',
         ai_enabled: false,
+        cookie_refresh_enabled: true,
+        cookie_refresh_interval_minutes: 360,
       } as any,
     ]);
     vi.mocked(getAllAISettings).mockResolvedValue({});
+    vi.mocked(getAccountSessionStatus).mockResolvedValue({
+      state: 'idle',
+      trigger: '',
+      message: '',
+      error_code: '',
+      verification_image_url: '',
+      started_at: null,
+      last_attempt_at: null,
+      last_success_at: null,
+      expires_at: null,
+      updated_at: null,
+    });
   });
 
   afterEach(() => {
@@ -135,5 +153,28 @@ describe('AccountList session verification UI', () => {
       expect(screen.getByText('Cookie 已刷新')).toBeInTheDocument();
     });
     expect(screen.getByText('其他账号刷新失败')).toBeInTheDocument();
+  });
+
+  it('shows scheduled cookie refresh off by default and saves interval settings without hiding manual refresh', async () => {
+    render(<AccountList />);
+
+    await screen.findByText('定时刷新关闭');
+    expect(screen.getAllByTitle('立即刷新 Cookie').length).toBeGreaterThan(0);
+
+    const accountCard = screen.getByRole('heading', { name: '验证账号' }).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('编辑账号'));
+
+    await screen.findByText('自动定时 Cookie 刷新');
+    fireEvent.click(screen.getByLabelText('自动定时 Cookie 刷新'));
+    fireEvent.change(screen.getByLabelText('刷新间隔'), { target: { value: '360' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(updateAccountCookieRefreshSettings).toHaveBeenCalledWith('account-1', {
+        cookie_refresh_enabled: true,
+        cookie_refresh_interval_minutes: 360,
+      });
+    });
   });
 });

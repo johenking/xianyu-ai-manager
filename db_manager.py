@@ -25,6 +25,11 @@ from security_utils import (
 from repositories.auth_repository import AuthSessionRepository, UserRepository
 from services.auth_service import AuthService
 
+COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
+COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
+COOKIE_REFRESH_MAX_INTERVAL_MINUTES = 10080
+
+
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
 
@@ -147,6 +152,8 @@ class DBManager:
                 username TEXT DEFAULT '',
                 password TEXT DEFAULT '',
                 show_browser INTEGER DEFAULT 0,
+                cookie_refresh_enabled INTEGER DEFAULT 0,
+                cookie_refresh_interval_minutes INTEGER DEFAULT 1440,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -798,6 +805,18 @@ class DBManager:
                 logger.info("添加cookies表的xianyu_unb列...")
                 cursor.execute("ALTER TABLE cookies ADD COLUMN xianyu_unb TEXT")
                 logger.info("数据库迁移完成：添加xianyu_unb列")
+
+            if 'cookie_refresh_enabled' not in cookie_columns:
+                logger.info("添加cookies表的cookie_refresh_enabled列...")
+                cursor.execute("ALTER TABLE cookies ADD COLUMN cookie_refresh_enabled INTEGER DEFAULT 0")
+                logger.info("数据库迁移完成：添加cookie_refresh_enabled列")
+
+            if 'cookie_refresh_interval_minutes' not in cookie_columns:
+                logger.info("添加cookies表的cookie_refresh_interval_minutes列...")
+                cursor.execute(
+                    "ALTER TABLE cookies ADD COLUMN cookie_refresh_interval_minutes INTEGER DEFAULT 1440"
+                )
+                logger.info("数据库迁移完成：添加cookie_refresh_interval_minutes列")
 
             cursor.execute('''
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_user_unb
@@ -1807,7 +1826,14 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at, xianyu_unb, password_encrypted FROM cookies WHERE id = ?", (cookie_id,))
+                self._execute_sql(
+                    cursor,
+                    "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, "
+                    "show_browser, created_at, xianyu_unb, password_encrypted, "
+                    "cookie_refresh_enabled, cookie_refresh_interval_minutes "
+                    "FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
                 result = cursor.fetchone()
                 if result:
                     password = result[7] or ''
@@ -1825,11 +1851,94 @@ class DBManager:
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'created_at': result[9],
                         'xianyu_unb': result[10] or '',
+                        'cookie_refresh_enabled': bool(result[12]) if result[12] is not None else False,
+                        'cookie_refresh_interval_minutes': (
+                            result[13]
+                            if result[13] is not None
+                            else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
+                        ),
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    def _validate_cookie_refresh_interval(self, interval_minutes: int) -> int:
+        try:
+            normalized_interval = int(interval_minutes)
+        except (TypeError, ValueError):
+            raise ValueError("Cookie定时刷新间隔必须是数字")
+
+        if not (
+            COOKIE_REFRESH_MIN_INTERVAL_MINUTES
+            <= normalized_interval
+            <= COOKIE_REFRESH_MAX_INTERVAL_MINUTES
+        ):
+            raise ValueError("Cookie定时刷新间隔必须在1小时到7天之间")
+
+        return normalized_interval
+
+    def update_cookie_refresh_settings(
+        self,
+        cookie_id: str,
+        *,
+        enabled: bool,
+        interval_minutes: int,
+    ) -> bool:
+        """更新账号级定时Cookie刷新设置"""
+        normalized_interval = self._validate_cookie_refresh_interval(interval_minutes)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET cookie_refresh_enabled = ?, cookie_refresh_interval_minutes = ? WHERE id = ?",
+                    (1 if enabled else 0, normalized_interval, cookie_id),
+                )
+                self.conn.commit()
+                if cursor.rowcount <= 0:
+                    logger.warning(f"账号 {cookie_id} 不存在，无法更新Cookie定时刷新设置")
+                    return False
+                status = "开启" if enabled else "关闭"
+                logger.info(f"更新账号 {cookie_id} Cookie定时刷新设置: {status}, 间隔 {normalized_interval} 分钟")
+                return True
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.error(f"更新账号Cookie定时刷新设置失败: {e}")
+                return False
+
+    def get_cookie_refresh_settings(self, cookie_id: str) -> Dict[str, Any]:
+        """获取账号级定时Cookie刷新设置，缺失时使用保守默认值"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT cookie_refresh_enabled, cookie_refresh_interval_minutes FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return {
+                        'enabled': False,
+                        'interval_minutes': COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES,
+                    }
+                interval = row[1] if row[1] is not None else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
+                try:
+                    interval = self._validate_cookie_refresh_interval(interval)
+                except ValueError:
+                    interval = COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
+                return {
+                    'enabled': bool(row[0]) if row[0] is not None else False,
+                    'interval_minutes': interval,
+                }
+            except Exception as e:
+                logger.error(f"获取账号Cookie定时刷新设置失败: {e}")
+                return {
+                    'enabled': False,
+                    'interval_minutes': COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES,
+                }
 
     def update_account_session_refresh(
         self,

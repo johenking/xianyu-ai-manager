@@ -140,6 +140,32 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
             )
         )
 
+    def test_cookie_refresh_settings_default_to_disabled_and_can_be_updated(self):
+        details = self.db.get_cookie_details("account-1")
+
+        self.assertFalse(details["cookie_refresh_enabled"])
+        self.assertEqual(details["cookie_refresh_interval_minutes"], 1440)
+
+        self.assertTrue(
+            self.db.update_cookie_refresh_settings(
+                "account-1",
+                enabled=True,
+                interval_minutes=360,
+            )
+        )
+
+        updated = self.db.get_cookie_details("account-1")
+        self.assertTrue(updated["cookie_refresh_enabled"])
+        self.assertEqual(updated["cookie_refresh_interval_minutes"], 360)
+
+    def test_cookie_refresh_interval_rejects_risky_short_schedules(self):
+        with self.assertRaises(ValueError):
+            self.db.update_cookie_refresh_settings(
+                "account-1",
+                enabled=True,
+                interval_minutes=30,
+            )
+
     def test_ai_api_url_is_not_accepted_as_xianyu_login_username(self):
         self.assertFalse(is_valid_account_login_username("https://api.deepseek.com"))
         self.assertFalse(is_valid_account_login_username("http://localhost:3000/v1"))

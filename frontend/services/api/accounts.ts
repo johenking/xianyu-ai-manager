@@ -25,6 +25,8 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     has_login_password: item.has_login_password,
     login_credentials_valid: item.login_credentials_valid,
     show_browser: item.show_browser,
+    cookie_refresh_enabled: item.cookie_refresh_enabled,
+    cookie_refresh_interval_minutes: item.cookie_refresh_interval_minutes,
     nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
     avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
     ai_enabled: false, // 需要从AI设置API获取
@@ -129,6 +131,13 @@ export const updateAccountLoginInfo = async (id: string, data: {
   show_browser?: boolean;
 }): Promise<any> => {
   return put(`/cookies/${id}/login-info`, data);
+};
+
+export const updateAccountCookieRefreshSettings = async (id: string, data: {
+  cookie_refresh_enabled: boolean;
+  cookie_refresh_interval_minutes: number;
+}): Promise<any> => {
+  return put(`/cookies/${id}/cookie-refresh-settings`, data);
 };
 
 export const getAllAISettings = async (): Promise<Record<string, AIReplySettings>> => {
