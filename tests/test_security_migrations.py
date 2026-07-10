@@ -38,6 +38,12 @@ def create_legacy_database(path: Path) -> None:
             expires_at REAL NOT NULL,
             last_seen_at REAL
         );
+        CREATE TABLE system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            description TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     connection.execute(
@@ -52,6 +58,10 @@ def create_legacy_database(path: Path) -> None:
         "INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
         ("legacy-token", 1, "legacy", 0, 1.0, 9_999_999_999.0, 1.0),
     )
+    connection.executemany(
+        "INSERT INTO system_settings (key, value) VALUES (?, ?)",
+        (("registration_enabled", "true"), ("smtp_password", "")),
+    )
     connection.commit()
     connection.close()
 
@@ -63,7 +73,11 @@ class SchemaMigrationTests(unittest.TestCase):
         self.db_path = self.root / "legacy.db"
         self.key_path = self.root / ".account-key"
         self.previous_key_file = os.environ.get("ACCOUNT_CREDENTIAL_KEY_FILE")
+        self.previous_system_key_file = os.environ.get("SYSTEM_SECRET_KEY_FILE")
+        self.previous_system_key = os.environ.get("SYSTEM_SECRET_ENCRYPTION_KEY")
         os.environ["ACCOUNT_CREDENTIAL_KEY_FILE"] = str(self.key_path)
+        os.environ["SYSTEM_SECRET_KEY_FILE"] = str(self.root / ".system-key")
+        os.environ.pop("SYSTEM_SECRET_ENCRYPTION_KEY", None)
         create_legacy_database(self.db_path)
 
     def tearDown(self):
@@ -71,19 +85,27 @@ class SchemaMigrationTests(unittest.TestCase):
             os.environ.pop("ACCOUNT_CREDENTIAL_KEY_FILE", None)
         else:
             os.environ["ACCOUNT_CREDENTIAL_KEY_FILE"] = self.previous_key_file
+        if self.previous_system_key_file is None:
+            os.environ.pop("SYSTEM_SECRET_KEY_FILE", None)
+        else:
+            os.environ["SYSTEM_SECRET_KEY_FILE"] = self.previous_system_key_file
+        if self.previous_system_key is None:
+            os.environ.pop("SYSTEM_SECRET_ENCRYPTION_KEY", None)
+        else:
+            os.environ["SYSTEM_SECRET_ENCRYPTION_KEY"] = self.previous_system_key
         self.tempdir.cleanup()
 
     def test_migration_is_backed_up_idempotent_and_removes_plaintext_credentials(self):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
-        self.assertEqual(runner.run(), ["2026070501", "2026070502"])
+        self.assertEqual(runner.run(), ["2026070501", "2026070502", "2026071101"])
         self.assertIsNotNone(runner.last_backup_dir)
         self.assertTrue((runner.last_backup_dir / self.db_path.name).exists())
         self.assertTrue((runner.last_backup_dir / self.key_path.name).exists())
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            2,
+            3,
         )
 
         password, encrypted, version = connection.execute(
@@ -130,7 +152,11 @@ class CredentialCompatibilityTests(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.db_path = self.root / "manager.db"
         self.previous_key_file = os.environ.get("ACCOUNT_CREDENTIAL_KEY_FILE")
+        self.previous_system_key_file = os.environ.get("SYSTEM_SECRET_KEY_FILE")
+        self.previous_system_key = os.environ.get("SYSTEM_SECRET_ENCRYPTION_KEY")
         os.environ["ACCOUNT_CREDENTIAL_KEY_FILE"] = str(self.root / ".account-key")
+        os.environ["SYSTEM_SECRET_KEY_FILE"] = str(self.root / ".system-key")
+        os.environ.pop("SYSTEM_SECRET_ENCRYPTION_KEY", None)
         self.db = DBManager(str(self.db_path))
 
     def tearDown(self):
@@ -139,6 +165,14 @@ class CredentialCompatibilityTests(unittest.TestCase):
             os.environ.pop("ACCOUNT_CREDENTIAL_KEY_FILE", None)
         else:
             os.environ["ACCOUNT_CREDENTIAL_KEY_FILE"] = self.previous_key_file
+        if self.previous_system_key_file is None:
+            os.environ.pop("SYSTEM_SECRET_KEY_FILE", None)
+        else:
+            os.environ["SYSTEM_SECRET_KEY_FILE"] = self.previous_system_key_file
+        if self.previous_system_key is None:
+            os.environ.pop("SYSTEM_SECRET_ENCRYPTION_KEY", None)
+        else:
+            os.environ["SYSTEM_SECRET_ENCRYPTION_KEY"] = self.previous_system_key
         self.tempdir.cleanup()
 
     def test_legacy_user_login_upgrades_to_bcrypt(self):

@@ -734,7 +734,7 @@ class DBManager:
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
-            ('registration_enabled', 'true', '是否开启用户注册'),
+            ('registration_enabled', 'false', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '登录滑动验证码开关'),
             ('smtp_server', '', 'SMTP服务器地址'),
@@ -744,6 +744,11 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('terms_version', 'v1', '当前注册条款版本'),
+            ('support_email', '', '公开支持邮箱'),
+            ('smtp_verified_fingerprint', '', '已验证SMTP配置指纹'),
+            ('smtp_verified_at', '', 'SMTP配置验证时间'),
+            ('auth_trusted_proxies', '', '认证可信代理列表'),
             ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),

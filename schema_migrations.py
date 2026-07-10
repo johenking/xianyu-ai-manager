@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Optional, Sequence
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
     AccountCredentialCipher,
+    SystemSecretCipher,
     token_digest,
 )
 
@@ -106,9 +107,175 @@ def _runtime_sessions_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _normalized_users(cursor: sqlite3.Cursor) -> list[tuple[int, str, str]]:
+    normalized_rows: list[tuple[int, str, str]] = []
+    usernames: dict[str, int] = {}
+    emails: dict[str, int] = {}
+    for user_id, username, email in cursor.execute(
+        "SELECT id, username, email FROM users ORDER BY id"
+    ).fetchall():
+        username_normalized = str(username).casefold()
+        email_normalized = str(email).strip().casefold()
+        if username_normalized in usernames:
+            raise ValueError(
+                "normalized username conflict between user IDs "
+                f"{usernames[username_normalized]} and {user_id}"
+            )
+        if email_normalized in emails:
+            raise ValueError(
+                "normalized email conflict between user IDs "
+                f"{emails[email_normalized]} and {user_id}"
+            )
+        usernames[username_normalized] = int(user_id)
+        emails[email_normalized] = int(user_id)
+        normalized_rows.append(
+            (int(user_id), username_normalized, email_normalized)
+        )
+    return normalized_rows
+
+
+def _registration_security_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
+    normalized_users = _normalized_users(cursor)
+
+    _add_column(cursor, "users", "username_normalized TEXT")
+    _add_column(cursor, "users", "email_normalized TEXT")
+    _add_column(cursor, "users", "terms_version TEXT")
+    _add_column(cursor, "users", "terms_accepted_at REAL")
+    for user_id, username_normalized, email_normalized in normalized_users:
+        cursor.execute(
+            "UPDATE users SET username_normalized = ?, email_normalized = ? WHERE id = ?",
+            (username_normalized, email_normalized, user_id),
+        )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_normalized "
+        "ON users(username_normalized)"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_normalized "
+        "ON users(email_normalized)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registration_invites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_digest TEXT NOT NULL,
+            code_hint TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            expires_at REAL NOT NULL,
+            used_at REAL,
+            used_by_user_id INTEGER,
+            revoked_at REAL,
+            created_by_user_id INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (used_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_registration_invites_code_digest "
+        "ON registration_invites(code_digest)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_registration_invites_lookup "
+        "ON registration_invites(revoked_at, used_at, expires_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_registration_invites_creator "
+        "ON registration_invites(created_by_user_id, created_at)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_challenges (
+            challenge_id TEXT PRIMARY KEY,
+            purpose TEXT NOT NULL,
+            subject_digest TEXT NOT NULL,
+            context_digest TEXT NOT NULL DEFAULT '',
+            secret_digest TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+            expires_at REAL NOT NULL,
+            consumed_at REAL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_challenges_subject "
+        "ON auth_challenges(purpose, subject_digest, expires_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_challenges_expiry "
+        "ON auth_challenges(expires_at, consumed_at)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auth_rate_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            ip_digest TEXT NOT NULL DEFAULT '',
+            email_digest TEXT NOT NULL DEFAULT '',
+            account_digest TEXT NOT NULL DEFAULT '',
+            success INTEGER NOT NULL DEFAULT 0 CHECK (success IN (0, 1)),
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_rate_events_ip "
+        "ON auth_rate_events(event_type, ip_digest, created_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_rate_events_email "
+        "ON auth_rate_events(event_type, email_digest, created_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_rate_events_account "
+        "ON auth_rate_events(event_type, account_digest, created_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_auth_rate_events_created_at "
+        "ON auth_rate_events(created_at)"
+    )
+
+    cursor.execute(
+        "INSERT OR IGNORE INTO system_settings (key, value, description) "
+        "VALUES ('registration_enabled', 'false', 'Whether public registration is enabled')"
+    )
+    cursor.execute(
+        "UPDATE system_settings SET value = 'false' WHERE key = 'registration_enabled'"
+    )
+    cursor.executemany(
+        "INSERT OR IGNORE INTO system_settings (key, value, description) VALUES (?, ?, ?)",
+        (
+            ("terms_version", "v1", "Current registration terms version"),
+            ("support_email", "", "Public support email"),
+            ("smtp_verified_fingerprint", "", "Fingerprint of verified SMTP settings"),
+            ("smtp_verified_at", "", "Time the SMTP settings were verified"),
+            ("auth_trusted_proxies", "", "Trusted proxies used for client IP resolution"),
+        ),
+    )
+
+    smtp_password_row = cursor.execute(
+        "SELECT value FROM system_settings WHERE key = 'smtp_password'"
+    ).fetchone()
+    if smtp_password_row and smtp_password_row[0]:
+        cipher = SystemSecretCipher(db_path)
+        encrypted_password = cipher.encrypt(str(smtp_password_row[0]))
+        if encrypted_password != smtp_password_row[0]:
+            cursor.execute(
+                "UPDATE system_settings SET value = ? WHERE key = 'smtp_password'",
+                (encrypted_password,),
+            )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
+    Migration("2026071101", "registration_security_v1", _registration_security_v1),
 )
 
 
@@ -152,6 +319,7 @@ class MigrationRunner:
         candidate_keys = {
             Path(os.getenv("ACCOUNT_CREDENTIAL_KEY_FILE", str(db_path.parent / ".account_credential_key"))),
             Path(os.getenv("AI_PROVIDER_KEY_FILE", str(db_path.parent / ".ai_provider_key"))),
+            Path(os.getenv("SYSTEM_SECRET_KEY_FILE", str(db_path.parent / ".system_secret_key"))),
         }
         for key_path in candidate_keys:
             if key_path.exists() and key_path.is_file():
@@ -167,8 +335,9 @@ class MigrationRunner:
         if not pending:
             return []
 
-        # Ensure the local key exists before the backup so DB and key can be restored together.
+        # Ensure local keys exist before the backup so DB and keys can be restored together.
         AccountCredentialCipher(self.db_path)
+        SystemSecretCipher(self.db_path)
         if self.backup_enabled:
             self._create_backup()
         cursor = self.connection.cursor()
