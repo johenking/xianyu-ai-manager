@@ -12,6 +12,11 @@ export interface SkillMonitorTask {
   notify_enabled: boolean;
   account_id?: string;
   enabled: boolean;
+  schedule_enabled?: boolean;
+  schedule_interval_minutes?: number;
+  next_run_at?: string | null;
+  last_status?: 'idle' | 'running' | 'success' | 'failed';
+  last_error?: string | null;
   last_run_at?: string | null;
   created_at?: string;
   updated_at?: string;
@@ -28,7 +33,7 @@ export interface SkillMonitorResult {
   seller_name?: string;
   ai_score: number;
   ai_reason?: string;
-  notify_status: string;
+  notify_status: 'pending' | 'disabled' | 'skipped_no_channel' | 'sent' | 'partial' | 'failed';
   raw_data?: {
     source?: string;
     is_real_data?: boolean;

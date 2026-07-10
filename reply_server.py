@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 import hashlib
 import secrets
 import time
@@ -18,8 +18,9 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
+import requests
 
 import cookie_manager
 from db_manager import db_manager
@@ -4744,6 +4745,25 @@ class SkillMonitorTaskIn(BaseModel):
     notify_enabled: bool = False
     account_id: str = ""
     enabled: bool = True
+    schedule_enabled: bool = False
+    schedule_interval_minutes: int = 60
+    next_run_at: Optional[str] = None
+
+
+class SkillMonitorTaskUpdate(BaseModel):
+    name: Optional[str] = None
+    keyword: Optional[str] = None
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    region: Optional[str] = None
+    published_within_hours: Optional[int] = None
+    ai_filter: Optional[str] = None
+    notify_enabled: Optional[bool] = None
+    account_id: Optional[str] = None
+    enabled: Optional[bool] = None
+    schedule_enabled: Optional[bool] = None
+    schedule_interval_minutes: Optional[int] = None
+    next_run_at: Optional[str] = None
 
 
 class SkillAgentPromptIn(BaseModel):
@@ -5838,9 +5858,299 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
 
 # ==================== 技能中心API ====================
 
+SKILL_NOTIFICATION_CHANNEL_TYPES = {
+    'webhook',
+    'wechat',
+    'dingtalk',
+    'ding_talk',
+    'feishu',
+    'lark',
+    'bark',
+    'telegram',
+}
+
+def _skill_interval_minutes(value: Any) -> int:
+    try:
+        return max(15, int(value or 60))
+    except (TypeError, ValueError):
+        return 60
+
+
+def _skill_next_run_at(interval_minutes: Any) -> str:
+    return (datetime.utcnow() + timedelta(minutes=_skill_interval_minutes(interval_minutes))).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _enabled_notification_channels(user_id: int) -> List[Dict[str, Any]]:
+    channels = db_manager.get_notification_channels(user_id) or []
+    return [
+        channel
+        for channel in channels
+        if channel.get('enabled')
+        and str(channel.get('type') or '').strip().lower() in SKILL_NOTIFICATION_CHANNEL_TYPES
+    ]
+
+
+def _parse_channel_config(channel: Dict[str, Any]) -> Dict[str, Any]:
+    config = channel.get('config') or {}
+    if isinstance(config, dict):
+        return config
+    try:
+        parsed = json.loads(config)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _user_ai_cookie_settings(user_id: int, preferred_cookie_id: str = "") -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    user_cookies = db_manager.get_all_cookies(user_id)
+    candidates: List[str] = []
+    if preferred_cookie_id and preferred_cookie_id in user_cookies:
+        candidates.append(preferred_cookie_id)
+    candidates.extend([cookie_id for cookie_id in user_cookies.keys() if cookie_id not in candidates])
+
+    for cookie_id in candidates:
+        settings = db_manager.get_ai_reply_settings(cookie_id)
+        if settings.get('ai_enabled') and settings.get('api_key') and settings.get('base_url') and settings.get('model_name'):
+            return cookie_id, settings
+    return None, None
+
+
+def _user_has_ai_configuration(user_id: int) -> bool:
+    return _user_ai_cookie_settings(user_id)[0] is not None
+
+
+def _json_from_model_text(text: str) -> Dict[str, Any]:
+    cleaned = (text or '').strip()
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(0)
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        lowered = cleaned.lower()
+        return {
+            'recommended': any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')),
+            'score': 80 if any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')) else 20,
+            'reason': cleaned[:200] or 'AI未返回可解析理由',
+        }
+
+
+def _run_skill_ai_filter(item: Dict[str, Any], task: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    ai_filter = str(task.get('ai_filter') or '').strip()
+    if not ai_filter:
+        return {'recommended': True, 'score': 0, 'reason': ''}
+
+    cookie_id, settings = _user_ai_cookie_settings(user_id, task.get('account_id') or '')
+    if not cookie_id or not settings:
+        raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
+
+    client = ai_reply_engine._create_openai_client(cookie_id)
+    if not client:
+        raise HTTPException(status_code=400, detail="AI筛选需要可用的AI客户端")
+
+    item_summary = {
+        'title': item.get('title') or '',
+        'price': item.get('price') or '',
+        'region': item.get('area') or item.get('region') or '',
+        'seller_name': item.get('seller_name') or '',
+        'description': item.get('desc') or item.get('description') or '',
+        'publish_time': item.get('publish_time') or '',
+        'want_count': item.get('want_count') or '',
+    }
+    messages = [
+        {
+            'role': 'system',
+            'content': (
+                '你是闲鱼监控商品筛选助手。根据用户的筛选要求判断商品是否值得保留。'
+                '只输出JSON：{"recommended":true/false,"score":0-100,"reason":"简短中文理由"}。'
+            ),
+        },
+        {
+            'role': 'user',
+            'content': f"筛选要求：{ai_filter}\n商品信息：{json.dumps(item_summary, ensure_ascii=False)}",
+        },
+    ]
+    raw = ai_reply_engine._call_openai_api(client, settings, messages, max_tokens=220, temperature=0.1)
+    parsed = _json_from_model_text(raw)
+    score = parsed.get('score', 0)
+    try:
+        score = max(0, min(100, int(float(score))))
+    except (TypeError, ValueError):
+        score = 0
+    recommended = bool(parsed.get('recommended')) and score >= 50
+    reason = str(parsed.get('reason') or raw or '').strip()[:300]
+    return {'recommended': recommended, 'score': score, 'reason': reason or 'AI筛选完成'}
+
+
+def _raise_skill_notification_api_error(response: Any, channel_type: str) -> None:
+    try:
+        payload = response.json()
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+
+    if channel_type in {'wechat', 'dingtalk', 'ding_talk'}:
+        code = payload.get('errcode')
+        message = payload.get('errmsg') or payload.get('message')
+    elif channel_type in {'feishu', 'lark'}:
+        code = payload.get('code')
+        message = payload.get('msg') or payload.get('message')
+    elif channel_type == 'telegram':
+        code = 0 if payload.get('ok', True) else payload.get('error_code', -1)
+        message = payload.get('description')
+    elif channel_type == 'bark':
+        code = payload.get('code')
+        message = payload.get('message')
+        if code == 200:
+            code = 0
+    else:
+        return
+
+    if code not in (None, 0, '0'):
+        raise ValueError(str(message or f'{channel_type} API error {code}')[:300])
+
+
+def _safe_skill_notification_error(error: Exception) -> str:
+    message = str(error or type(error).__name__)
+    message = re.sub(r'https?://[^\s；]+', '[redacted-url]', message, flags=re.IGNORECASE)
+    return message[:240] or type(error).__name__
+
+
+def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str, Any], result_payload: Dict[str, Any]) -> None:
+    config = _parse_channel_config(channel)
+    channel_type = str(channel.get('type') or '').strip().lower()
+    title = f"闲鱼监控命中：{result_payload.get('title') or task.get('keyword')}"
+    lines = [
+        title,
+        f"任务：{task.get('name') or task.get('keyword')}",
+        f"价格：{result_payload.get('price') if result_payload.get('price') is not None else '-'}",
+        f"地区：{result_payload.get('region') or '-'}",
+        f"理由：{result_payload.get('ai_reason') or '-'}",
+    ]
+    if result_payload.get('item_url'):
+        lines.append(f"链接：{result_payload['item_url']}")
+    message = "\n".join(lines)
+
+    timeout = 10
+    if channel_type in {'webhook', 'wechat', 'dingtalk', 'ding_talk', 'feishu', 'lark'}:
+        url = config.get('url') or config.get('webhook') or config.get('webhook_url')
+        if not url:
+            raise ValueError("Webhook通知缺少url")
+
+        request_kwargs: Dict[str, Any] = {}
+        if channel_type == 'wechat':
+            payload = {'msgtype': 'text', 'text': {'content': message}}
+        elif channel_type in {'dingtalk', 'ding_talk'}:
+            payload = {'msgtype': 'markdown', 'markdown': {'title': title, 'text': message}}
+            secret = str(config.get('secret') or '').strip()
+            if secret:
+                import base64
+                import hashlib
+                import hmac
+
+                timestamp = str(round(time.time() * 1000))
+                signature = base64.b64encode(
+                    hmac.new(
+                        secret.encode('utf-8'),
+                        f'{timestamp}\n{secret}'.encode('utf-8'),
+                        digestmod=hashlib.sha256,
+                    ).digest()
+                ).decode('utf-8')
+                request_kwargs['params'] = {'timestamp': timestamp, 'sign': signature}
+        elif channel_type in {'feishu', 'lark'}:
+            payload = {'msg_type': 'text', 'content': {'text': message}}
+            secret = str(config.get('secret') or '').strip()
+            if secret:
+                import base64
+                import hashlib
+                import hmac
+
+                timestamp = str(int(time.time()))
+                string_to_sign = f'{timestamp}\n{secret}'
+                signature = base64.b64encode(
+                    hmac.new(string_to_sign.encode('utf-8'), b'', digestmod=hashlib.sha256).digest()
+                ).decode('utf-8')
+                payload.update({'timestamp': timestamp, 'sign': signature})
+        else:
+            payload = config.get('payload_template')
+        if not isinstance(payload, dict):
+            payload = {'title': title, 'text': message, 'message': message, 'item_url': result_payload.get('item_url')}
+        response = requests.post(url, json=payload, timeout=timeout, **request_kwargs)
+        response.raise_for_status()
+        _raise_skill_notification_api_error(response, channel_type)
+        return
+
+    if channel_type == 'bark':
+        url = config.get('url')
+        if not url:
+            server = (config.get('server_url') or config.get('server') or 'https://api.day.app').rstrip('/')
+            key = config.get('key') or config.get('device_key')
+            if not key:
+                raise ValueError("Bark通知缺少url或device_key")
+            url = f"{server}/{key}/{quote(title)}/{quote(message)}"
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        _raise_skill_notification_api_error(response, channel_type)
+        return
+
+    if channel_type == 'telegram':
+        token = config.get('bot_token') or config.get('token')
+        chat_id = config.get('chat_id')
+        api_base = (config.get('api_base_url') or 'https://api.telegram.org').rstrip('/')
+        if not token or not chat_id:
+            raise ValueError("Telegram通知缺少bot_token或chat_id")
+        response = requests.post(
+            f"{api_base}/bot{token}/sendMessage",
+            json={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': False},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        _raise_skill_notification_api_error(response, channel_type)
+        return
+
+    raise ValueError(f"暂不支持的通知渠道类型: {channel_type}")
+
+
+def _notify_skill_monitor_result(task: Dict[str, Any], user_id: int, result_id: int, result_payload: Dict[str, Any]) -> Tuple[str, str]:
+    if not task.get('notify_enabled'):
+        return 'disabled', ''
+
+    channels = _enabled_notification_channels(user_id)
+    if not channels:
+        db_manager.update_skill_monitor_result_notification(result_id, user_id, 'skipped_no_channel', '没有启用的通知渠道')
+        return 'skipped_no_channel', '没有启用的通知渠道'
+
+    errors = []
+    sent_count = 0
+    for channel in channels:
+        try:
+            _send_skill_notification_to_channel(channel, task, result_payload)
+            sent_count += 1
+        except Exception as exc:
+            errors.append(
+                f"{channel.get('name') or channel.get('type')}: {_safe_skill_notification_error(exc)}"
+            )
+
+    error = "；".join(errors)[:500]
+    if sent_count == len(channels):
+        status = 'sent'
+    elif sent_count > 0:
+        status = 'partial'
+    else:
+        status = 'failed'
+        error = error or '通知发送失败'
+    db_manager.update_skill_monitor_result_notification(result_id, user_id, status, error)
+    return status, error
+
+
 @skills_router.get('/api/skills/capabilities')
 def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_user)):
     account_count = len(db_manager.get_all_cookies(current_user['user_id']))
+    user_id = current_user['user_id']
+    has_ai = _user_has_ai_configuration(user_id)
+    channels = _enabled_notification_channels(user_id)
     return {
         'success': True,
         'data': {
@@ -5850,19 +6160,19 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                 'detail': '使用Playwright执行单次真实搜索',
             },
             'scheduled_monitor': {
-                'available': False,
-                'label': '暂不可用',
-                'detail': '当前版本不包含定时调度器',
+                'available': True,
+                'label': '可用',
+                'detail': '单worker内置调度器按任务间隔运行',
             },
             'ai_filter': {
-                'available': False,
-                'label': '暂不可用',
-                'detail': '当前版本只执行关键词、价格、地区和发布时间筛选',
+                'available': has_ai,
+                'label': '可用' if has_ai else '需配置AI',
+                'detail': '命中规则后调用AI判断是否推荐' if has_ai else '请先为至少一个账号配置并启用AI',
             },
             'notifications': {
-                'available': False,
-                'label': '暂不可用',
-                'detail': '监控结果尚未接入真实通知发送',
+                'available': len(channels) > 0,
+                'label': '可用' if channels else '缺少渠道',
+                'detail': f'将发送到 {len(channels)} 个启用通知渠道' if channels else '请先创建并启用通知渠道',
             },
             'expert_live_reply': {
                 'available': account_count > 0,
@@ -6038,10 +6348,15 @@ def _skill_item_matches_task(item: Dict[str, Any], task: Dict[str, Any]) -> Tupl
     return True, f'命中关键词、价格、地区过滤{publish_reason}', price
 
 
-async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int) -> Tuple[List[int], int, Dict[str, Any]]:
+async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Tuple[List[int], int, Dict[str, Any]]:
     from utils.item_search import search_xianyu_items
 
     keyword = (task.get('keyword') or '').strip()
+    if str(task.get('ai_filter') or '').strip():
+        _user_ai_cookie_settings(user_id, task.get('account_id') or '')
+        if not _user_has_ai_configuration(user_id):
+            raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
+
     page_size = 20
     search_result = await search_xianyu_items(keyword=keyword, page=1, page_size=page_size)
 
@@ -6062,10 +6377,19 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int) -> Tuple[L
             continue
 
         item_url = item.get('item_url') or ''
-        dedupe_key = item_url or item.get('item_id') or item.get('title')
+        item_id = str(item.get('item_id') or '')
+        dedupe_key = item_url or item_id or item.get('title')
         if dedupe_key in seen_urls:
             continue
         seen_urls.add(dedupe_key)
+        if db_manager.skill_monitor_result_exists(task['id'], user_id, item_url, item_id):
+            continue
+
+        ai_filter_result = {'recommended': True, 'score': 0, 'reason': reason}
+        if str(task.get('ai_filter') or '').strip():
+            ai_filter_result = _run_skill_ai_filter(item, task, user_id)
+            if not ai_filter_result.get('recommended'):
+                continue
 
         result_payload = {
             'task_id': task['id'],
@@ -6076,25 +6400,84 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int) -> Tuple[L
             'item_url': item_url,
             'item_image': item.get('main_image') or item.get('item_image') or '',
             'seller_name': item.get('seller_name') or '',
-            'ai_score': 0,
-            'ai_reason': reason,
-            'notify_status': 'unavailable' if task.get('notify_enabled') else 'disabled',
+            'ai_score': ai_filter_result.get('score') or 0,
+            'ai_reason': ai_filter_result.get('reason') or reason,
+            'notify_status': 'pending' if task.get('notify_enabled') else 'disabled',
             'raw_data': {
                 'source': search_result.get('source') or 'playwright',
                 'is_real_data': True,
                 'keyword': keyword,
                 'filter_reason': reason,
+                'ai_filter': task.get('ai_filter') or '',
+                'ai_recommended': bool(ai_filter_result.get('recommended')),
+                'scheduled_run': scheduled_run,
                 'published_within_hours': task.get('published_within_hours'),
-                'item_id': item.get('item_id'),
+                'item_id': item_id,
                 'publish_time': item.get('publish_time'),
                 'want_count': item.get('want_count'),
             }
         }
         result_id = db_manager.create_skill_monitor_result(result_payload)
         if result_id:
+            notify_status, notify_error = _notify_skill_monitor_result(task, user_id, result_id, result_payload)
+            if notify_error:
+                result_payload.setdefault('raw_data', {})['notify_error'] = notify_error
+            result_payload['notify_status'] = notify_status
             created_ids.append(result_id)
 
     return created_ids, len(raw_items), search_result
+
+
+async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Dict[str, Any]:
+    if not db_manager.mark_skill_monitor_task_running(task['id'], user_id):
+        raise HTTPException(status_code=409, detail="监控任务正在运行，请稍后再试")
+
+    try:
+        result_ids, raw_count, search_result = await _run_real_skill_monitor(task, user_id, scheduled_run=scheduled_run)
+        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
+        db_manager.update_skill_monitor_task_run(
+            task['id'],
+            user_id,
+            status='success',
+            error='',
+            next_run_at=next_run_at,
+        )
+        db_manager.log_skill_event(
+            user_id,
+            'monitor',
+            f"{'定时' if scheduled_run else '手动'}运行监控任务: {task['keyword']}",
+            payload={
+                'task_id': task['id'],
+                'result_ids': result_ids,
+                'raw_count': raw_count,
+                'source': search_result.get('source'),
+                'scheduled_run': scheduled_run,
+            }
+        )
+        return {
+            "success": True,
+            "message": f"真实监控完成，抓取 {raw_count} 条，命中 {len(result_ids)} 条",
+            "result_ids": result_ids,
+            "created_count": len(result_ids),
+            "raw_count": raw_count,
+            "source": search_result.get('source'),
+            "is_real_data": True,
+            "scheduled_run": scheduled_run,
+            "next_run_at": next_run_at,
+        }
+    except Exception as exc:
+        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
+        message = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        db_manager.update_skill_monitor_task_run(
+            task['id'],
+            user_id,
+            status='failed',
+            error=str(message)[:500],
+            next_run_at=next_run_at,
+        )
+        if isinstance(exc, HTTPException):
+            raise
+        raise
 
 
 @skills_router.get("/api/skills/monitor/tasks")
@@ -6112,6 +6495,10 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
     try:
         if not task.keyword.strip():
             raise HTTPException(status_code=400, detail="关键词不能为空")
+        if task.schedule_interval_minutes < 15:
+            raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
+        if task.notify_enabled and not _enabled_notification_channels(current_user['user_id']):
+            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
         try:
             validate_skill_monitor_features(
                 notify_enabled=task.notify_enabled,
@@ -6125,7 +6512,12 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
             if task.account_id not in user_cookies:
                 raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
 
-        task_id = db_manager.create_skill_monitor_task(current_user['user_id'], task.dict())
+        task_payload = task.dict()
+        task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task.schedule_interval_minutes)
+        if task.schedule_enabled and not task.next_run_at:
+            task_payload['next_run_at'] = _skill_next_run_at(task_payload['schedule_interval_minutes'])
+
+        task_id = db_manager.create_skill_monitor_task(current_user['user_id'], task_payload)
         if not task_id:
             raise HTTPException(status_code=400, detail="创建监控任务失败")
 
@@ -6143,6 +6535,46 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
+@skills_router.put("/api/skills/monitor/tasks/{task_id}")
+def update_skill_monitor_task(task_id: int, task: SkillMonitorTaskUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """更新技能监控任务"""
+    try:
+        existing = db_manager.get_skill_monitor_task(task_id, current_user['user_id'])
+        if not existing:
+            raise HTTPException(status_code=404, detail="监控任务不存在")
+
+        task_payload = task.dict(exclude_unset=True)
+        if 'keyword' in task_payload and not str(task_payload.get('keyword') or '').strip():
+            raise HTTPException(status_code=400, detail="关键词不能为空")
+        if 'schedule_interval_minutes' in task_payload:
+            if task_payload['schedule_interval_minutes'] is not None and task_payload['schedule_interval_minutes'] < 15:
+                raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
+            task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task_payload['schedule_interval_minutes'])
+        if task_payload.get('notify_enabled') and not _enabled_notification_channels(current_user['user_id']):
+            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
+        account_id = task_payload.get('account_id')
+        if account_id:
+            user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+            if account_id not in user_cookies:
+                raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+
+        schedule_enabled = task_payload.get('schedule_enabled', existing.get('schedule_enabled'))
+        interval = task_payload.get('schedule_interval_minutes', existing.get('schedule_interval_minutes') or 60)
+        if schedule_enabled and ('next_run_at' not in task_payload or not task_payload.get('next_run_at')):
+            task_payload['next_run_at'] = _skill_next_run_at(interval)
+        if not schedule_enabled and task_payload.get('schedule_enabled') is False:
+            task_payload['next_run_at'] = None
+
+        if not db_manager.update_skill_monitor_task(task_id, current_user['user_id'], task_payload):
+            raise HTTPException(status_code=400, detail="更新监控任务失败")
+        return {"success": True, "message": "监控任务已更新"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新技能监控任务异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
 @skills_router.post("/api/skills/monitor/tasks/{task_id}/run")
 async def run_skill_monitor_task(task_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """运行技能监控任务，调用真实闲鱼搜索并写入真实结果"""
@@ -6151,28 +6583,7 @@ async def run_skill_monitor_task(task_id: int, current_user: Dict[str, Any] = De
         if not task:
             raise HTTPException(status_code=404, detail="监控任务不存在")
 
-        result_ids, raw_count, search_result = await _run_real_skill_monitor(task, current_user['user_id'])
-        db_manager.update_skill_monitor_task_run(task_id, current_user['user_id'])
-        db_manager.log_skill_event(
-            current_user['user_id'],
-            'monitor',
-            f"运行监控任务: {task['keyword']}",
-            payload={
-                'task_id': task_id,
-                'result_ids': result_ids,
-                'raw_count': raw_count,
-                'source': search_result.get('source'),
-            }
-        )
-        return {
-            "success": True,
-            "message": f"真实监控完成，抓取 {raw_count} 条，命中 {len(result_ids)} 条",
-            "result_ids": result_ids,
-            "created_count": len(result_ids),
-            "raw_count": raw_count,
-            "source": search_result.get('source'),
-            "is_real_data": True
-        }
+        return await execute_skill_monitor_task(task, current_user['user_id'], scheduled_run=False)
     except HTTPException:
         raise
     except Exception as e:

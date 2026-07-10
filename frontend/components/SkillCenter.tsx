@@ -29,6 +29,7 @@ import {
   runSkillMonitorTask,
   testSkillAgentReply,
   updateSkillAgentPrompt,
+  updateSkillMonitorTask,
 } from '../services/api';
 import {
   AccountDetail,
@@ -53,6 +54,10 @@ const emptyTaskForm = {
   region: '',
   published_within_hours: '24',
   account_id: '',
+  ai_filter: '',
+  notify_enabled: false,
+  schedule_enabled: false,
+  schedule_interval_minutes: '60',
 };
 
 const promptOrder: SkillAgentPrompt['prompt_type'][] = ['price', 'tech', 'default'];
@@ -91,6 +96,11 @@ const SkillCenter: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [runningTaskId, setRunningTaskId] = useState<number | null>(null);
   const [statusText, setStatusText] = useState('');
+  const [loadedTabs, setLoadedTabs] = useState<Record<SkillTab, boolean>>({
+    monitor: false,
+    agent: false,
+    ops: false,
+  });
 
   const promptMap = useMemo(() => {
     return prompts.reduce<Record<string, SkillAgentPrompt>>((acc, prompt) => {
@@ -106,10 +116,12 @@ const SkillCenter: React.FC = () => {
     ]);
     setTasks(taskList);
     setResults(resultList);
+    setLoadedTabs((current) => ({ ...current, monitor: true }));
   };
 
   const loadAgent = async () => {
     setPrompts(await getSkillAgentPrompts());
+    setLoadedTabs((current) => ({ ...current, agent: true }));
   };
 
   const loadOps = async () => {
@@ -121,6 +133,7 @@ const SkillCenter: React.FC = () => {
     setOpsHealth(health);
     setBrowserStatus(browser);
     setDeliveryDiagnostics(delivery);
+    setLoadedTabs((current) => ({ ...current, ops: true }));
   };
 
   const loadAll = async () => {
@@ -130,8 +143,6 @@ const SkillCenter: React.FC = () => {
         getAccountDetails(),
         getSkillCapabilities(),
         loadMonitor(),
-        loadAgent(),
-        loadOps(),
       ]);
       setAccounts(accountList);
       setCapabilities(capabilityList);
@@ -148,6 +159,15 @@ const SkillCenter: React.FC = () => {
   useEffect(() => {
     loadAll();
   }, []);
+
+  useEffect(() => {
+    if (activeSkill === 'agent' && !loadedTabs.agent) {
+      loadAgent().catch((error) => setStatusText(error instanceof Error ? error.message : '专家配置加载失败'));
+    }
+    if (activeSkill === 'ops' && !loadedTabs.ops) {
+      loadOps().catch((error) => setStatusText(error instanceof Error ? error.message : '诊断数据加载失败'));
+    }
+  }, [activeSkill, loadedTabs.agent, loadedTabs.ops]);
 
   useEffect(() => {
     if (!testAccountId) {
@@ -184,10 +204,12 @@ const SkillCenter: React.FC = () => {
         max_price: taskForm.max_price ? Number(taskForm.max_price) : null,
         region: taskForm.region,
         published_within_hours: Number(taskForm.published_within_hours) || 24,
-        ai_filter: '',
-        notify_enabled: false,
+        ai_filter: taskForm.ai_filter,
+        notify_enabled: taskForm.notify_enabled,
         account_id: taskForm.account_id,
         enabled: true,
+        schedule_enabled: taskForm.schedule_enabled,
+        schedule_interval_minutes: Number(taskForm.schedule_interval_minutes) || 60,
       });
       setTaskForm(emptyTaskForm);
       setStatusText('监控任务已创建');
@@ -205,11 +227,30 @@ const SkillCenter: React.FC = () => {
       const result = await runSkillMonitorTask(taskId);
       setStatusText(result.message || `真实监控完成，命中 ${result.created_count || 0} 条`);
       await loadMonitor();
-      await loadOps();
+      if (loadedTabs.ops) {
+        await loadOps();
+      }
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : '运行失败');
     } finally {
       setRunningTaskId(null);
+    }
+  };
+
+  const handleToggleTaskSchedule = async (task: SkillMonitorTask) => {
+    setLoading(true);
+    try {
+      await updateSkillMonitorTask(task.id, {
+        schedule_enabled: !task.schedule_enabled,
+        schedule_interval_minutes: task.schedule_interval_minutes || 60,
+      });
+      setStatusText(!task.schedule_enabled ? '已开启定时监控' : '已关闭定时监控');
+      await loadMonitor();
+      setCapabilities(await getSkillCapabilities());
+    } catch (error) {
+      setStatusText(error instanceof Error ? error.message : '更新定时状态失败');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -342,8 +383,46 @@ const SkillCenter: React.FC = () => {
               </option>
             ))}
           </select>
+          <textarea
+            value={taskForm.ai_filter}
+            onChange={(event) => setTaskForm({ ...taskForm, ai_filter: event.target.value })}
+            placeholder="AI 商品过滤要求，例如：只保留价格明显低于市场价、卖家描述可信、适合捡漏的商品"
+            className="w-full ios-input px-4 py-3 rounded-xl min-h-24 resize-none"
+          />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <label className="flex items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-sm font-bold text-gray-700">
+              <span>定时运行</span>
+              <input
+                type="checkbox"
+                checked={taskForm.schedule_enabled}
+                onChange={(event) => setTaskForm({ ...taskForm, schedule_enabled: event.target.checked })}
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-sm font-bold text-gray-700">
+              <span>命中后通知</span>
+              <input
+                type="checkbox"
+                checked={taskForm.notify_enabled}
+                onChange={(event) => setTaskForm({ ...taskForm, notify_enabled: event.target.checked })}
+              />
+            </label>
+          </div>
+          {taskForm.schedule_enabled && (
+            <select
+              value={taskForm.schedule_interval_minutes}
+              onChange={(event) => setTaskForm({ ...taskForm, schedule_interval_minutes: event.target.value })}
+              className="w-full ios-input px-4 py-3 rounded-xl"
+            >
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 1 小时</option>
+              <option value="360">每 6 小时</option>
+              <option value="720">每 12 小时</option>
+              <option value="1440">每 24 小时</option>
+            </select>
+          )}
           <InlineNotice>
-            当前只支持手动运行与规则筛选。定时调度、AI 商品过滤和结果通知暂不可用。
+            定时默认关闭，最短 15 分钟。AI 过滤会在规则命中后再判断；通知支持 Webhook、微信、钉钉、飞书、Bark 和 Telegram，并发送到全部已启用的受支持渠道。
           </InlineNotice>
           <button
             onClick={handleCreateTask}
@@ -370,15 +449,42 @@ const SkillCenter: React.FC = () => {
                   <div className="text-xs text-gray-500 mt-1">
                     {task.keyword} · {task.region || '全国'} · {task.min_price ?? '-'}-{task.max_price ?? '-'} 元
                   </div>
+                  <div className="mt-2 flex flex-wrap gap-2 text-[11px] font-bold">
+                    <span className={`rounded-full px-2 py-1 ${task.schedule_enabled ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.schedule_enabled ? `定时每 ${task.schedule_interval_minutes || 60} 分钟` : '定时关闭'}
+                    </span>
+                    <span className={`rounded-full px-2 py-1 ${task.ai_filter ? 'bg-purple-100 text-purple-700' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.ai_filter ? 'AI过滤开启' : 'AI过滤关闭'}
+                    </span>
+                    <span className={`rounded-full px-2 py-1 ${task.notify_enabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.notify_enabled ? '通知开启' : '通知关闭'}
+                    </span>
+                    {task.last_status && (
+                      <span className={`rounded-full px-2 py-1 ${task.last_status === 'failed' ? 'bg-red-100 text-red-700' : task.last_status === 'running' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-500'}`}>
+                        {task.last_status}
+                      </span>
+                    )}
+                  </div>
+                  {task.next_run_at && <div className="mt-1 text-[11px] text-gray-400">下次运行：{task.next_run_at}</div>}
+                  {task.last_error && <div className="mt-1 text-[11px] text-red-500">错误：{task.last_error}</div>}
                 </div>
-                <button
-                  onClick={() => handleRunTask(task.id)}
-                  disabled={runningTaskId === task.id}
-                  className="px-4 py-2 rounded-xl bg-black text-white font-bold text-sm flex items-center gap-2 hover:bg-gray-800 transition-colors"
-                >
-                  {runningTaskId === task.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                  运行
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => handleToggleTaskSchedule(task)}
+                    disabled={loading}
+                    className="px-4 py-2 rounded-xl bg-gray-100 text-gray-700 font-bold text-sm hover:bg-gray-200 transition-colors"
+                  >
+                    {task.schedule_enabled ? '关闭定时' : '开启定时'}
+                  </button>
+                  <button
+                    onClick={() => handleRunTask(task.id)}
+                    disabled={runningTaskId === task.id}
+                    className="px-4 py-2 rounded-xl bg-black text-white font-bold text-sm flex items-center gap-2 hover:bg-gray-800 transition-colors"
+                  >
+                    {runningTaskId === task.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                    运行
+                  </button>
+                </div>
               </div>
             ))}
             {tasks.length === 0 && <div className="text-sm text-gray-500 py-8 text-center">暂无监控任务</div>}
@@ -398,6 +504,8 @@ const SkillCenter: React.FC = () => {
                   <th className="py-3 pr-4">价格</th>
                   <th className="py-3 pr-4">地区</th>
                   <th className="py-3 pr-4">来源</th>
+                  <th className="py-3 pr-4">AI</th>
+                  <th className="py-3 pr-4">通知</th>
                   <th className="py-3 pr-4">过滤</th>
                 </tr>
               </thead>
@@ -421,6 +529,19 @@ const SkillCenter: React.FC = () => {
                           非真实
                         </span>
                       )}
+                    </td>
+                    <td className="py-3 pr-4 text-xs text-gray-500">
+                      {result.raw_data?.ai_filter ? (
+                        <span className="px-2 py-1 rounded-lg bg-purple-100 text-purple-700 font-bold">
+                          {result.ai_score} · {result.ai_reason || 'AI推荐'}
+                        </span>
+                      ) : '未启用'}
+                    </td>
+                    <td className="py-3 pr-4 text-xs text-gray-500">
+                      <span className="px-2 py-1 rounded-lg bg-gray-100 font-bold">
+                        {result.notify_status || 'disabled'}
+                      </span>
+                      {result.raw_data?.notify_error ? <div className="mt-1 text-red-500">{result.raw_data.notify_error}</div> : null}
                     </td>
                     <td className="py-3 pr-4 text-xs text-gray-500">
                       {result.raw_data?.filter_reason || '-'}

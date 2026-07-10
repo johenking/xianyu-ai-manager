@@ -3,14 +3,49 @@ import Sidebar from './components/Sidebar';
 import { login, verifyToken, logout } from './services/api';
 import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu } from 'lucide-react';
 
-const Dashboard = lazy(() => import('./components/Dashboard'));
-const AccountList = lazy(() => import('./components/AccountList'));
-const OrderList = lazy(() => import('./components/OrderList'));
-const CardList = lazy(() => import('./components/CardList'));
-const ItemList = lazy(() => import('./components/ItemList'));
-const Settings = lazy(() => import('./components/Settings'));
-const Keywords = lazy(() => import('./components/Keywords'));
-const SkillCenter = lazy(() => import('./components/SkillCenter'));
+const pageLoaders = {
+  dashboard: () => import('./components/Dashboard'),
+  accounts: () => import('./components/AccountList'),
+  orders: () => import('./components/OrderList'),
+  cards: () => import('./components/CardList'),
+  items: () => import('./components/ItemList'),
+  keywords: () => import('./components/Keywords'),
+  skills: () => import('./components/SkillCenter'),
+  settings: () => import('./components/Settings'),
+};
+
+const Dashboard = lazy(pageLoaders.dashboard);
+const AccountList = lazy(pageLoaders.accounts);
+const OrderList = lazy(pageLoaders.orders);
+const CardList = lazy(pageLoaders.cards);
+const ItemList = lazy(pageLoaders.items);
+const Settings = lazy(pageLoaders.settings);
+const Keywords = lazy(pageLoaders.keywords);
+const SkillCenter = lazy(pageLoaders.skills);
+
+type PageKey = keyof typeof pageLoaders;
+
+const preloadPage = (page: string) => {
+  const loader = pageLoaders[page as PageKey];
+  if (loader) {
+    void loader();
+  }
+};
+
+const preloadAppPages = () => {
+  const run = () => {
+    (Object.keys(pageLoaders) as PageKey[]).forEach((key) => {
+      if (key !== 'dashboard') {
+        void pageLoaders[key]();
+      }
+    });
+  };
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(run, { timeout: 2000 });
+  } else {
+    globalThis.setTimeout(run, 500);
+  }
+};
 
 const PageLoading: React.FC = () => (
   <div className="flex min-h-[50vh] items-center justify-center" role="status" aria-label="页面加载中">
@@ -50,6 +85,12 @@ const App: React.FC = () => {
       window.addEventListener('auth:logout', handleLogout);
       return () => window.removeEventListener('auth:logout', handleLogout);
   }, []);
+
+  useEffect(() => {
+      if (isLoggedIn) {
+          preloadAppPages();
+      }
+  }, [isLoggedIn]);
 
   const handleLogin = async (e: React.FormEvent) => {
       e.preventDefault();
@@ -165,6 +206,7 @@ const App: React.FC = () => {
       <Sidebar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        onPreloadTab={preloadPage}
         onLogout={async () => {
             try {
                 await logout();
