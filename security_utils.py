@@ -141,8 +141,15 @@ class SystemSecretCipher:
         return secret
 
     def encrypt(self, value: str) -> str:
-        if not value or value.startswith(SYSTEM_SECRET_PREFIX):
+        if not value:
             return value
+        if value.startswith(SYSTEM_SECRET_PREFIX):
+            try:
+                self._decrypt_prefixed(value)
+            except (InvalidToken, UnicodeError):
+                pass
+            else:
+                return value
         token = self.fernet.encrypt(value.encode("utf-8")).decode("ascii")
         return SYSTEM_SECRET_PREFIX + token
 
@@ -150,10 +157,13 @@ class SystemSecretCipher:
         if not value or not value.startswith(SYSTEM_SECRET_PREFIX):
             return value
         try:
-            token = value[len(SYSTEM_SECRET_PREFIX):]
-            return self.fernet.decrypt(token.encode("ascii")).decode("utf-8")
-        except (InvalidToken, UnicodeError, ValueError) as exc:
+            return self._decrypt_prefixed(value)
+        except (InvalidToken, UnicodeError) as exc:
             raise ValueError("系统秘密无法解密，请检查系统秘密密钥") from exc
+
+    def _decrypt_prefixed(self, value: str) -> str:
+        token = value[len(SYSTEM_SECRET_PREFIX):]
+        return self.fernet.decrypt(token.encode("ascii")).decode("utf-8")
 
     def digest(self, value: str, *, purpose: str) -> str:
         normalized_purpose = str(purpose or "").strip()

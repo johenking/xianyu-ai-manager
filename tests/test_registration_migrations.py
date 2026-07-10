@@ -161,6 +161,16 @@ class RegistrationMigrationTests(unittest.TestCase):
             )
         )
 
+    def test_system_secret_cipher_encrypts_plaintext_with_ciphertext_prefix(self):
+        cipher = security_utils.SystemSecretCipher(str(self.db_path))
+        plaintext = security_utils.SYSTEM_SECRET_PREFIX + "not-a-valid-fernet-token"
+
+        encrypted = cipher.encrypt(plaintext)
+
+        self.assertNotEqual(encrypted, plaintext)
+        self.assertTrue(encrypted.startswith(security_utils.SYSTEM_SECRET_PREFIX))
+        self.assertEqual(cipher.decrypt(encrypted), plaintext)
+
     def test_v150_upgrade_adds_registration_schema_defaults_and_secure_backup(self):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
