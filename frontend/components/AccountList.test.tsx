@@ -96,10 +96,10 @@ describe('AccountList session verification UI', () => {
   });
 
   it('lets the user manually check a completed face verification without clearing other account statuses', async () => {
+    let verificationCompleted = false;
     vi.mocked(getAccountSessionStatus).mockImplementation(async (accountId: string) => {
       if (accountId === 'account-1') {
-        const callsForAccount1 = vi.mocked(getAccountSessionStatus).mock.calls.filter(([id]) => id === 'account-1').length;
-        return callsForAccount1 >= 2
+        return verificationCompleted
           ? {
               state: 'success',
               trigger: 'manual',
@@ -148,6 +148,7 @@ describe('AccountList session verification UI', () => {
 
     const verificationCard = screen.getByRole('heading', { name: '验证账号' }).closest('.ios-card');
     expect(verificationCard).not.toBeNull();
+    verificationCompleted = true;
     fireEvent.click(within(verificationCard as HTMLElement).getByRole('button', { name: '我已完成验证，立即检查' }));
 
     await waitFor(() => {
