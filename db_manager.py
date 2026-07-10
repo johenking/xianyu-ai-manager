@@ -329,6 +329,11 @@ class DBManager:
                 notify_enabled BOOLEAN DEFAULT FALSE,
                 account_id TEXT DEFAULT '',
                 enabled BOOLEAN DEFAULT TRUE,
+                schedule_enabled BOOLEAN DEFAULT FALSE,
+                schedule_interval_minutes INTEGER DEFAULT 60,
+                next_run_at TIMESTAMP,
+                last_status TEXT DEFAULT 'idle',
+                last_error TEXT DEFAULT '',
                 last_run_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -961,11 +966,55 @@ class DBManager:
                 self.set_system_setting("db_version", "1.5", "数据库版本号")
                 logger.info("数据库升级到版本1.5完成")
 
+            if current_version < "1.6":
+                logger.info("开始升级数据库到版本1.6...")
+                self.upgrade_skill_monitor_tasks_for_scheduler(cursor)
+                self.set_system_setting("db_version", "1.6", "数据库版本号")
+                logger.info("数据库升级到版本1.6完成")
+
             # 迁移遗留数据（在所有版本升级完成后执行）
+            self.upgrade_skill_monitor_tasks_for_scheduler(cursor)
             self.migrate_legacy_data(cursor)
 
         except Exception as e:
             logger.error(f"数据库版本检查或升级失败: {e}")
+            raise
+
+    def upgrade_skill_monitor_tasks_for_scheduler(self, cursor):
+        """为技能中心监控任务补齐调度和运行状态字段。"""
+        columns = {
+            'schedule_enabled': "ALTER TABLE skill_monitor_tasks ADD COLUMN schedule_enabled BOOLEAN DEFAULT FALSE",
+            'schedule_interval_minutes': "ALTER TABLE skill_monitor_tasks ADD COLUMN schedule_interval_minutes INTEGER DEFAULT 60",
+            'next_run_at': "ALTER TABLE skill_monitor_tasks ADD COLUMN next_run_at TIMESTAMP",
+            'last_status': "ALTER TABLE skill_monitor_tasks ADD COLUMN last_status TEXT DEFAULT 'idle'",
+            'last_error': "ALTER TABLE skill_monitor_tasks ADD COLUMN last_error TEXT DEFAULT ''",
+        }
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='skill_monitor_tasks'")
+            if not cursor.fetchone():
+                return
+            cursor.execute("PRAGMA table_info(skill_monitor_tasks)")
+            existing = {row[1] for row in cursor.fetchall()}
+            for column, sql in columns.items():
+                if column not in existing:
+                    self._execute_sql(cursor, sql)
+                    logger.info(f"为skill_monitor_tasks添加字段: {column}")
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET schedule_interval_minutes = 60 "
+                "WHERE schedule_interval_minutes IS NULL OR schedule_interval_minutes < 15"
+            )
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET last_status = 'idle' "
+                "WHERE last_status IS NULL OR last_status = ''"
+            )
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET last_error = '' WHERE last_error IS NULL"
+            )
+        except Exception as e:
+            logger.error(f"升级skill_monitor_tasks调度字段失败: {e}")
             raise
 
     def update_admin_user_id(self, cursor):
@@ -7146,9 +7195,14 @@ class DBManager:
             'notify_enabled': bool(row[9]),
             'account_id': row[10],
             'enabled': bool(row[11]),
-            'last_run_at': row[12],
-            'created_at': row[13],
-            'updated_at': row[14],
+            'schedule_enabled': bool(row[12]),
+            'schedule_interval_minutes': row[13] if row[13] is not None else 60,
+            'next_run_at': row[14],
+            'last_status': row[15] or 'idle',
+            'last_error': row[16] or '',
+            'last_run_at': row[17],
+            'created_at': row[18],
+            'updated_at': row[19],
         }
 
     def _skill_monitor_result_from_row(self, row) -> Dict[str, Any]:
@@ -7181,7 +7235,8 @@ class DBManager:
                 cursor.execute('''
                     SELECT id, user_id, name, keyword, min_price, max_price, region,
                            published_within_hours, ai_filter, notify_enabled, account_id,
-                           enabled, last_run_at, created_at, updated_at
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
                     FROM skill_monitor_tasks
                     WHERE user_id = ?
                     ORDER BY updated_at DESC, id DESC
@@ -7198,7 +7253,8 @@ class DBManager:
                 cursor.execute('''
                     SELECT id, user_id, name, keyword, min_price, max_price, region,
                            published_within_hours, ai_filter, notify_enabled, account_id,
-                           enabled, last_run_at, created_at, updated_at
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
                     FROM skill_monitor_tasks
                     WHERE id = ? AND user_id = ?
                 ''', (task_id, user_id))
@@ -7215,8 +7271,9 @@ class DBManager:
                 cursor.execute('''
                     INSERT INTO skill_monitor_tasks (
                         user_id, name, keyword, min_price, max_price, region,
-                        published_within_hours, ai_filter, notify_enabled, account_id, enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        published_within_hours, ai_filter, notify_enabled, account_id, enabled,
+                        schedule_enabled, schedule_interval_minutes, next_run_at, last_status, last_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id,
                     task_data.get('name') or task_data.get('keyword') or '监控任务',
@@ -7229,6 +7286,11 @@ class DBManager:
                     1 if task_data.get('notify_enabled') else 0,
                     task_data.get('account_id', ''),
                     1 if task_data.get('enabled', True) else 0,
+                    1 if task_data.get('schedule_enabled') else 0,
+                    max(15, int(task_data.get('schedule_interval_minutes') or 60)),
+                    task_data.get('next_run_at'),
+                    task_data.get('last_status') or 'idle',
+                    task_data.get('last_error') or '',
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
@@ -7237,15 +7299,126 @@ class DBManager:
                 self.conn.rollback()
                 return None
 
-    def update_skill_monitor_task_run(self, task_id: int, user_id: int) -> bool:
+    def update_skill_monitor_task(self, task_id: int, user_id: int, task_data: Dict[str, Any]) -> bool:
+        allowed = {
+            'name',
+            'keyword',
+            'min_price',
+            'max_price',
+            'region',
+            'published_within_hours',
+            'ai_filter',
+            'notify_enabled',
+            'account_id',
+            'enabled',
+            'schedule_enabled',
+            'schedule_interval_minutes',
+            'next_run_at',
+        }
+        updates = []
+        params = []
+        for key in allowed:
+            if key not in task_data:
+                continue
+            value = task_data[key]
+            if key in {'notify_enabled', 'enabled', 'schedule_enabled'}:
+                value = 1 if value else 0
+            if key == 'schedule_interval_minutes':
+                value = max(15, int(value or 60))
+            updates.append(f"{key} = ?")
+            params.append(value)
+
+        if not updates:
+            return True
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.extend([task_id, user_id])
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    f"UPDATE skill_monitor_tasks SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                    params,
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新技能监控任务失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def list_due_skill_monitor_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id, user_id, name, keyword, min_price, max_price, region,
+                           published_within_hours, ai_filter, notify_enabled, account_id,
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
+                    FROM skill_monitor_tasks
+                    WHERE enabled = 1
+                      AND schedule_enabled = 1
+                      AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
+                      AND COALESCE(last_status, 'idle') != 'running'
+                    ORDER BY COALESCE(next_run_at, created_at) ASC, id ASC
+                    LIMIT ?
+                ''', (limit,))
+                return [self._skill_monitor_task_from_row(row) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取到期技能监控任务失败: {e}")
+                return []
+
+    def mark_skill_monitor_task_running(self, task_id: int, user_id: int) -> bool:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     UPDATE skill_monitor_tasks
-                    SET last_run_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND user_id = ?
+                    SET last_status = 'running', last_error = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ? AND COALESCE(last_status, 'idle') != 'running'
                 ''', (task_id, user_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"标记技能监控任务运行中失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def reset_running_skill_monitor_tasks(self) -> int:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'failed',
+                        last_error = '服务重启时中断',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE last_status = 'running'
+                ''')
+                self.conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                logger.error(f"重置运行中技能监控任务失败: {e}")
+                self.conn.rollback()
+                return 0
+
+    def update_skill_monitor_task_run(self, task_id: int, user_id: int, *,
+                                      status: str = 'success',
+                                      error: str = '',
+                                      next_run_at: str = None) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_run_at = CURRENT_TIMESTAMP,
+                        last_status = ?,
+                        last_error = ?,
+                        next_run_at = COALESCE(?, next_run_at),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (status, error or '', next_run_at, task_id, user_id))
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
@@ -7282,6 +7455,77 @@ class DBManager:
                 logger.error(f"创建技能监控结果失败: {e}")
                 self.conn.rollback()
                 return None
+
+    def skill_monitor_result_exists(self, task_id: int, user_id: int,
+                                    item_url: str = '', item_id: str = '') -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if item_url:
+                    cursor.execute('''
+                        SELECT 1 FROM skill_monitor_results
+                        WHERE task_id = ? AND user_id = ? AND item_url = ?
+                        LIMIT 1
+                    ''', (task_id, user_id, item_url))
+                    if cursor.fetchone():
+                        return True
+
+                if not item_id:
+                    return False
+                cursor.execute('''
+                    SELECT raw_data FROM skill_monitor_results
+                    WHERE task_id = ? AND user_id = ?
+                ''', (task_id, user_id))
+                for row in cursor.fetchall():
+                    try:
+                        raw_data = json.loads(row[0] or '{}')
+                    except Exception:
+                        continue
+                    if str(raw_data.get('item_id') or '') == str(item_id):
+                        return True
+                return False
+            except Exception as e:
+                logger.error(f"检查技能监控结果重复失败: {e}")
+                return False
+
+    def update_skill_monitor_result_notification(self, result_id: int, user_id: int,
+                                                 notify_status: str,
+                                                 notify_error: str = '') -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT raw_data FROM skill_monitor_results
+                    WHERE id = ? AND user_id = ?
+                ''', (result_id, user_id))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                try:
+                    raw_data = json.loads(row[0] or '{}')
+                except Exception:
+                    raw_data = {}
+                if notify_error:
+                    raw_data['notify_error'] = notify_error
+                elif 'notify_error' in raw_data:
+                    raw_data.pop('notify_error', None)
+
+                cursor.execute('''
+                    UPDATE skill_monitor_results
+                    SET notify_status = ?, raw_data = ?
+                    WHERE id = ? AND user_id = ?
+                ''', (
+                    notify_status,
+                    json.dumps(raw_data, ensure_ascii=False),
+                    result_id,
+                    user_id,
+                ))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新技能监控结果通知状态失败: {e}")
+                self.conn.rollback()
+                return False
 
     def list_skill_monitor_results(self, user_id: int, task_id: int = None, limit: int = 100) -> List[Dict[str, Any]]:
         with self.lock:

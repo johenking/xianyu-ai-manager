@@ -8,6 +8,7 @@ import {
   getAccountDetails,
   getAllAISettings,
   getAccountSessionStatus,
+  passwordLogin,
   updateAccountCookieRefreshSettings,
 } from '../services/api';
 
@@ -95,10 +96,10 @@ describe('AccountList session verification UI', () => {
   });
 
   it('lets the user manually check a completed face verification without clearing other account statuses', async () => {
+    let verificationCompleted = false;
     vi.mocked(getAccountSessionStatus).mockImplementation(async (accountId: string) => {
       if (accountId === 'account-1') {
-        const callsForAccount1 = vi.mocked(getAccountSessionStatus).mock.calls.filter(([id]) => id === 'account-1').length;
-        return callsForAccount1 >= 2
+        return verificationCompleted
           ? {
               state: 'success',
               trigger: 'manual',
@@ -147,6 +148,7 @@ describe('AccountList session verification UI', () => {
 
     const verificationCard = screen.getByRole('heading', { name: '验证账号' }).closest('.ios-card');
     expect(verificationCard).not.toBeNull();
+    verificationCompleted = true;
     fireEvent.click(within(verificationCard as HTMLElement).getByRole('button', { name: '我已完成验证，立即检查' }));
 
     await waitFor(() => {
@@ -174,6 +176,37 @@ describe('AccountList session verification UI', () => {
       expect(updateAccountCookieRefreshSettings).toHaveBeenCalledWith('account-1', {
         cookie_refresh_enabled: true,
         cookie_refresh_interval_minutes: 360,
+      });
+    });
+  });
+
+  it('submits official password login without a client supplied account id', async () => {
+    vi.mocked(passwordLogin).mockResolvedValue({
+      success: false,
+      message: '测试已接收请求',
+    });
+    render(<AccountList />);
+
+    await screen.findByText('定时刷新关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(await screen.findByRole('button', { name: '账号密码' }));
+
+    expect(screen.queryByText('账号ID')).not.toBeInTheDocument();
+    expect(screen.getByText('密码会使用独立密钥加密保存，仅在官方登录态失效时用于自动续期。')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText('用于登录闲鱼官方网站'), {
+      target: { value: 'seller@example.com' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('登录成功后加密保存'), {
+      target: { value: 'secret' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '开始账号密码登录' }));
+
+    await waitFor(() => {
+      expect(passwordLogin).toHaveBeenCalledWith({
+        account: 'seller@example.com',
+        password: 'secret',
+        show_browser: true,
       });
     });
   });

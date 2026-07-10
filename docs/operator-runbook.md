@@ -30,23 +30,24 @@ The current live runtime path is `/Users/mac/Documents/Codex/2026-06-09/github-2
 
 ## Backup Before Risky Changes
 
-Back up the live SQLite database before migrations, account identity changes, or bulk data operations:
+Back up the live SQLite database before migrations, account identity changes, authentication deployments, or bulk data operations:
 
 ```bash
-mkdir -p backups
+mkdir -p data/backups
 STAMP=$(date +%Y%m%d-%H%M%S)
-sqlite3 data/xianyu_data.db ".backup 'backups/xianyu_data_${STAMP}.db'"
-shasum -a 256 data/xianyu_data.db "backups/xianyu_data_${STAMP}.db"
+sqlite3 data/xianyu_data.db ".backup 'data/backups/xianyu_data_${STAMP}.db'"
+sqlite3 "data/backups/xianyu_data_${STAMP}.db" "PRAGMA integrity_check;"
+shasum -a 256 "data/backups/xianyu_data_${STAMP}.db"
 ```
 
-Back up `data/.ai_provider_key` with the database when `AI_PROVIDER_ENCRYPTION_KEY` is not supplied by the environment. Never commit either file.
+Back up `data/.ai_provider_key` and `data/.account_credential_key` with the database when their environment keys are not supplied. Before replacing authentication code or profiles, stop the service and copy all of `browser_data/`; a live Chromium profile is not a reliable filesystem backup. Do not delete unmatched `user_*` profiles during cleanup because their identity may not yet be reconciled.
 
 ## Verification
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -115,7 +116,9 @@ sdk: docker
 app_port: 8080
 ```
 
-Persist and protect the database, logs, uploads, and provider encryption key. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
+Persist and protect the database, logs, uploads, both local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
+
+Official password login and renewal launch headed Chromium because Goofish rejects headless mode. The current container entrypoint does not create a virtual display, so do not claim Docker or cloud credential renewal works until a display/Xvfb setup and human-verification workflow have been tested on that deployment.
 
 ## AI And Knowledge Diagnostics
 
@@ -137,15 +140,36 @@ Symptoms include missing message Tokens, expired Cookies, or a `verification_req
 Recommended order:
 
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
-2. Keep the account listener running, then trigger `/session-refresh` once.
-3. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
-4. Complete the account-page verification when required; platform verification cannot be bypassed.
-5. Re-login locally or update the existing Cookie if refresh cannot recover it.
-6. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
+2. Confirm `cookies.xianyu_unb` is present and `browser_data/user_<unb>` exists; the refresh service always tries that profile first.
+3. Keep the account listener running, then trigger `/session-refresh` once.
+4. If the status reports `no_credentials`, perform one official account-password login so encrypted fallback credentials are saved.
+5. Complete the account-page verification when required; the visible browser waits for up to 15 minutes and platform verification cannot be bypassed.
+6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
+7. Use QR or update the existing Cookie only when the official profile and password fallback cannot recover the session.
+8. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
-QR is the recommended login method. Password login is a compatibility path tied to the current Xianyu page structure; when it fails after a platform change, update the existing account through QR or Cookie instead of deleting it.
+Do not switch the renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Background renewal intentionally launches a headed browser off-screen and reopens it visibly only for human verification. Password login still depends on the current official page structure; when that flow breaks after a platform change, use QR or Cookie recovery without deleting the account.
+
+## Skill Monitor Troubleshooting
+
+The scheduler runs inside the one Uvicorn worker and polls every 30 seconds. Keep `WEB_CONCURRENCY=1`; multiple processes can race on the same SQLite task state.
+
+1. Read `/api/skills/monitor/tasks` and check `schedule_enabled`, `next_run_at`, `last_status`, and `last_error`.
+2. Confirm the interval is at least 15 minutes and the task is enabled.
+3. For AI filtering, verify the bound account has an enabled provider, key, base URL, and model that passed a generated-reply test.
+4. For notifications, enable at least one supported Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channel. QQ and email are not Skill Center senders.
+5. Interpret `partial` as at least one successful and at least one failed channel; inspect `raw_data.notify_error` for per-channel errors.
+6. A repeated item is intentionally skipped when the same task already stored its URL or platform item ID.
+7. After a service restart, a task left in `running` becomes `failed` with an interruption error and can run again on its next schedule.
+
+Smoke-test a task manually before enabling its schedule:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks/$TASK_ID/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ## Order Sync Troubleshooting
 

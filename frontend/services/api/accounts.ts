@@ -61,13 +61,23 @@ export interface QRLoginStatusResponse {
 }
 
 export interface PasswordLoginStatusResponse {
-  status: 'processing' | 'success' | 'failed' | 'verification_required' | 'not_found' | 'forbidden' | 'error';
+  status:
+    | 'processing'
+    | 'success'
+    | 'failed'
+    | 'verification_required'
+    | 'timeout'
+    | 'cancelled'
+    | 'interrupted'
+    | 'not_found'
+    | 'forbidden'
+    | 'error';
   message?: string;
   error?: string;
+  error_code?: string;
   account_id?: string;
   is_new_account?: boolean;
   cookie_count?: number;
-  verification_url?: string | null;
   screenshot_path?: string | null;
   qr_code_url?: string | null;
 }
@@ -89,7 +99,6 @@ export const continueQRLoginAfterVerification = async (sessionId: string): Promi
 };
 
 export const passwordLogin = async (data: {
-  account_id: string;
   account: string;
   password: string;
   show_browser?: boolean;

@@ -206,6 +206,9 @@
     "GET",
     "POST"
   ],
+  "/api/skills/monitor/tasks/{task_id}": [
+    "PUT"
+  ],
   "/api/skills/monitor/tasks/{task_id}/run": [
     "POST"
   ],

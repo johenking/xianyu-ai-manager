@@ -35,7 +35,7 @@ import {
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Upload, Key, Eye, EyeOff, Bot, Settings, ExternalLink
+  Upload, Key, Eye, EyeOff, Bot, Settings
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -81,7 +81,6 @@ const AccountList: React.FC = () => {
   const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
   const [checkingSessionId, setCheckingSessionId] = useState<string>('');
   const [passwordForm, setPasswordForm] = useState({
-    account_id: '',
     account: '',
     password: '',
     show_browser: true,
@@ -89,7 +88,6 @@ const AccountList: React.FC = () => {
   });
   const [passwordStatus, setPasswordStatus] = useState<AddLoginStatus>('idle');
   const [passwordMessage, setPasswordMessage] = useState('');
-  const [passwordVerificationUrl, setPasswordVerificationUrl] = useState('');
   const [passwordVerificationImage, setPasswordVerificationImage] = useState('');
   const [passwordSubmitting, setPasswordSubmitting] = useState(false);
   const [manualCookieForm, setManualCookieForm] = useState({ id: '', value: '' });
@@ -164,10 +162,8 @@ const AccountList: React.FC = () => {
     setShowAddModal(false);
     setPasswordStatus('idle');
     setPasswordMessage('');
-    setPasswordVerificationUrl('');
     setPasswordVerificationImage('');
     setPasswordForm({
-      account_id: '',
       account: '',
       password: '',
       show_browser: true,
@@ -182,7 +178,6 @@ const AccountList: React.FC = () => {
     clearPasswordPolling();
     setPasswordStatus('idle');
     setPasswordMessage('');
-    setPasswordVerificationUrl('');
     setPasswordVerificationImage('');
   };
 
@@ -630,7 +625,6 @@ const AccountList: React.FC = () => {
         } else if (statusRes.status === 'verification_required') {
           setPasswordStatus('verification_required');
           setPasswordMessage(statusRes.message || '需要完成闲鱼安全验证');
-          setPasswordVerificationUrl(statusRes.verification_url || '');
           setPasswordVerificationImage(getReachableVerificationImage(statusRes.qr_code_url, statusRes.screenshot_path));
         } else if (statusRes.status === 'success') {
           clearPasswordPolling();
@@ -643,6 +637,9 @@ const AccountList: React.FC = () => {
           }, 1000);
         } else if (
           statusRes.status === 'failed' ||
+          statusRes.status === 'timeout' ||
+          statusRes.status === 'cancelled' ||
+          statusRes.status === 'interrupted' ||
           statusRes.status === 'error' ||
           statusRes.status === 'not_found' ||
           statusRes.status === 'forbidden'
@@ -663,10 +660,9 @@ const AccountList: React.FC = () => {
     event.preventDefault();
     resetPasswordStatus();
     const account = passwordForm.account.trim();
-    const accountId = passwordForm.account_id.trim() || account;
-    if (!accountId || !account || !passwordForm.password) {
+    if (!account || !passwordForm.password) {
       setPasswordStatus('failed');
-      setPasswordMessage('请填写账号ID、登录账号和密码');
+      setPasswordMessage('请填写闲鱼账号和密码');
       return;
     }
 
@@ -675,7 +671,6 @@ const AccountList: React.FC = () => {
     setPasswordMessage('正在启动账号密码登录');
     try {
       const result = await passwordLogin({
-        account_id: accountId,
         account,
         password: passwordForm.password,
         show_browser: passwordForm.show_browser,
@@ -1043,33 +1038,21 @@ const AccountList: React.FC = () => {
                             重新生成二维码
                           </button>
                         </div>
-                        <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl mt-4">二维码有效期为5分钟；二次验证由后台浏览器最多等待7.5分钟。</p>
+                        <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl mt-4">二维码有效期为5分钟；二次验证由后台浏览器最多等待15分钟。</p>
                       </div>
                     )}
 
                     {activeAddMethod === 'password' && (
                       <form onSubmit={handlePasswordLoginSubmit} className="space-y-4">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <div>
-                            <label className="block text-sm font-bold text-gray-700 mb-2">账号ID</label>
-                            <input
-                              type="text"
-                              value={passwordForm.account_id}
-                              onChange={(e) => setPasswordForm({ ...passwordForm, account_id: e.target.value })}
-                              placeholder="留空时使用登录账号"
-                              className="w-full ios-input px-4 py-3 rounded-xl"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-sm font-bold text-gray-700 mb-2">闲鱼账号/手机号</label>
-                            <input
-                              type="text"
-                              value={passwordForm.account}
-                              onChange={(e) => setPasswordForm({ ...passwordForm, account: e.target.value })}
-                              placeholder="用于登录闲鱼"
-                              className="w-full ios-input px-4 py-3 rounded-xl"
-                            />
-                          </div>
+                        <div>
+                          <label className="block text-sm font-bold text-gray-700 mb-2">闲鱼账号/手机号</label>
+                          <input
+                            type="text"
+                            value={passwordForm.account}
+                            onChange={(e) => setPasswordForm({ ...passwordForm, account: e.target.value })}
+                            placeholder="用于登录闲鱼官方网站"
+                            className="w-full ios-input px-4 py-3 rounded-xl"
+                          />
                         </div>
                         <div>
                           <label className="block text-sm font-bold text-gray-700 mb-2">登录密码</label>
@@ -1078,7 +1061,7 @@ const AccountList: React.FC = () => {
                               type={passwordForm.showPassword ? 'text' : 'password'}
                               value={passwordForm.password}
                               onChange={(e) => setPasswordForm({ ...passwordForm, password: e.target.value })}
-                              placeholder="仅用于本次登录请求"
+                              placeholder="登录成功后加密保存"
                               className="w-full ios-input px-4 py-3 rounded-xl pr-12"
                             />
                             <button
@@ -1089,6 +1072,9 @@ const AccountList: React.FC = () => {
                               {passwordForm.showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                             </button>
                           </div>
+                          <p className="mt-2 text-xs text-gray-500">
+                            密码会使用独立密钥加密保存，仅在官方登录态失效时用于自动续期。
+                          </p>
                         </div>
                         <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
                           <div>
@@ -1119,17 +1105,6 @@ const AccountList: React.FC = () => {
                                 alt="闲鱼安全验证截图"
                                 className="w-full max-h-80 object-contain rounded-2xl bg-gray-50 border border-gray-100"
                               />
-                            )}
-                            {passwordVerificationUrl && (
-                              <a
-                                href={passwordVerificationUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-black text-white px-4 py-2 rounded-full hover:bg-gray-800 transition-colors"
-                              >
-                                <ExternalLink className="w-4 h-4" />
-                                打开安全验证
-                              </a>
                             )}
                           </div>
                         )}

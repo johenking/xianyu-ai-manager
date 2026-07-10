@@ -13,6 +13,7 @@ import cookie_manager as cookie_manager_module
 from config import COOKIES_LIST
 from db_manager import db_manager
 from session_registry import initialize_session_registry
+from skill_monitor_scheduler import skill_monitor_scheduler
 
 
 def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
@@ -70,11 +71,14 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     if env_cookie and "default" not in manager.cookies:
         await manager._add_cookie_async("default", env_cookie)
 
+    await skill_monitor_scheduler.start()
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
+    await skill_monitor_scheduler.stop()
+
     manager = cookie_manager_module.manager
     if manager is not None:
         await manager.shutdown()

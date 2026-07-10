@@ -4,12 +4,13 @@ import { LayoutDashboard, Users, ShoppingBag, CreditCard, Settings, LogOut, Box,
 interface SidebarProps {
   activeTab: string;
   setActiveTab: (tab: string) => void;
+  onPreloadTab?: (tab: string) => void;
   onLogout: () => void;
   mobileOpen?: boolean;
   onMobileClose?: () => void;
 }
 
-const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout, mobileOpen = false, onMobileClose }) => {
+const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onPreloadTab, onLogout, mobileOpen = false, onMobileClose }) => {
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: '仪表盘' },
     { id: 'accounts', icon: Users, label: '账号管理' },
@@ -41,7 +42,10 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onLogout, mo
             return (
               <button
                 key={item.id}
+                onMouseEnter={() => onPreloadTab?.(item.id)}
+                onFocus={() => onPreloadTab?.(item.id)}
                 onClick={() => {
+                  onPreloadTab?.(item.id);
                   setActiveTab(item.id);
                   onMobileClose?.();
                 }}

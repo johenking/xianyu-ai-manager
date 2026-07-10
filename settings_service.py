@@ -97,7 +97,8 @@ def apply_secret_action(existing: str, action: str, value: str) -> str:
 
 
 def validate_skill_monitor_features(*, notify_enabled: bool, ai_filter: str) -> None:
-    if notify_enabled:
-        raise ValueError("通知发送暂不可用，请关闭通知后重试")
-    if str(ai_filter or "").strip():
-        raise ValueError("AI筛选暂不可用，请清空AI筛选条件后重试")
+    # AI筛选和通知已经由技能中心运行时根据真实配置处理：
+    # - AI不可用时任务运行会返回明确错误/跳过原因；
+    # - 通知无渠道时任务运行会标记 skipped_no_channel。
+    # 保留该函数作为旧调用点的兼容验证入口。
+    return None

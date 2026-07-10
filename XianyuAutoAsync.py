@@ -2162,18 +2162,16 @@ class XianyuLive:
             await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
 
     async def _try_password_login_refresh(self, trigger_reason: str = "令牌/Session过期", reuse_active_registration: bool = False):
-        """尝试通过密码登录刷新Cookie并重启实例
-
-        Args:
-            trigger_reason: 触发原因，用于日志记录
-
-        Returns:
-            bool: 是否成功刷新Cookie
-        """
-        from account_session_refresh import active_refresh_registry, remove_verification_image
+        """Reuse the account's official browser profile, then fall back to saved credentials."""
+        from account_session_refresh import (
+            active_refresh_registry,
+            is_valid_account_login_username,
+            remove_verification_image,
+        )
         from db_manager import db_manager
+        from utils.xianyu_official_login import OfficialLoginWorker, XianyuOfficialLoginService
 
-        logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
+        logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备复用闲鱼官方浏览器档案...")
         if reuse_active_registration:
             if not active_refresh_registry.is_active(self.cookie_id):
                 active_refresh_registry.register(self.cookie_id, self)
@@ -2191,33 +2189,19 @@ class XianyuLive:
             message='正在刷新闲鱼登录状态',
         )
 
-        # 检查是否在密码登录冷却期内，避免重复登录
         current_time = time.time()
         last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
         time_since_last_login = current_time - last_password_login
+        allow_password = not (
+            last_password_login > 0
+            and time_since_last_login < XianyuLive._password_login_cooldown
+        )
 
-        if last_password_login > 0 and time_since_last_login < XianyuLive._password_login_cooldown:
-            remaining_time = XianyuLive._password_login_cooldown - time_since_last_login
-            logger.warning(f"【{self.cookie_id}】距离上次密码登录仅 {time_since_last_login:.1f} 秒，仍在冷却期内（还需等待 {remaining_time:.1f} 秒），跳过密码登录")
-            logger.warning(f"【{self.cookie_id}】提示：如果新Cookie仍然无效，请检查账号状态或手动更新Cookie")
-            db_manager.update_account_session_refresh(
-                self.cookie_id,
-                state='failed',
-                trigger=trigger_reason,
-                message='刷新请求仍在冷却时间内，请稍后重试',
-                error_code='cooldown',
-            )
-            active_refresh_registry.unregister(self.cookie_id)
-            return False
-
-        # 记录到日志文件
         log_captcha_event(self.cookie_id, f"{trigger_reason}触发Cookie刷新和实例重启", None,
             f"检测到{trigger_reason}，准备刷新Cookie并重启实例")
 
         try:
-            # 从数据库获取账号登录信息
             account_info = db_manager.get_cookie_details(self.cookie_id)
-
             if not account_info:
                 logger.error(f"【{self.cookie_id}】无法获取账号信息")
                 db_manager.update_account_session_refresh(
@@ -2226,8 +2210,6 @@ class XianyuLive:
                 )
                 return False
 
-            # 【重要】先检查数据库中的cookie是否已经更新
-            # 如果用户已经手动更新了cookie，就不需要触发密码登录刷新
             db_cookie_value = account_info.get('value', '')
             if db_cookie_value and db_cookie_value != self.cookies_str:
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
@@ -2240,137 +2222,102 @@ class XianyuLive:
                 )
                 return True
 
-            username = account_info.get('username', '')
-            password = account_info.get('password', '')
+            profile_unb = (
+                str(account_info.get('xianyu_unb') or '').strip()
+                or str(self.cookies.get('unb') or '').strip()
+            )
+            if not profile_unb:
+                db_manager.update_account_session_refresh(
+                    self.cookie_id, state='failed', trigger=trigger_reason,
+                    message='账号缺少真实 unb，无法定位官方浏览器档案',
+                    error_code='account_identity_missing',
+                )
+                return False
+
+            username = str(account_info.get('username') or '').strip()
+            password = account_info.get('password') or ''
             show_browser = account_info.get('show_browser', False)
-
-            # 检查是否配置了用户名和密码
-            if not username or not password:
-                logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
-                await self.send_token_refresh_notification(
-                    f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
-                    "no_credentials"
-                )
-                db_manager.update_account_session_refresh(
-                    self.cookie_id, state='failed', trigger=trigger_reason,
-                    message='未保存闲鱼账号密码，无法自动刷新', error_code='no_credentials',
-                )
-                return False
-
-            from account_session_refresh import is_valid_account_login_username
             if not is_valid_account_login_username(username):
-                logger.warning(f"【{self.cookie_id}】保存的登录账号格式异常，停止自动登录刷新")
-                db_manager.update_account_session_refresh(
-                    self.cookie_id, state='failed', trigger=trigger_reason,
-                    message='已保存的闲鱼登录账号格式异常，请重新填写',
-                    error_code='invalid_credentials',
-                )
-                return False
+                username = ''
+                password = ''
 
-            # 使用集成的 Playwright 登录方法（无需猴子补丁）
-            from utils.xianyu_slider_stealth import XianyuSliderStealth
-            browser_mode = "有头" if show_browser else "无头"
-            logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
-            logger.info(f"【{self.cookie_id}】使用账号: {username}")
+            owner_loop = asyncio.get_running_loop()
 
-            # 创建一个通知回调包装函数，支持接收截图路径和验证链接
-            async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
-                """通知回调包装函数，支持接收截图路径和验证链接"""
+            def notification_callback(result):
+                if result.status != 'verification_required':
+                    return
                 safe_message = '需要完成闲鱼身份验证，验证后系统会自动继续'
                 db_manager.update_account_session_refresh(
                     self.cookie_id,
                     state='verification_required',
                     trigger=trigger_reason,
                     message=safe_message,
-                    verification_image_path=screenshot_path or '',
-                    expires_at=time.time() + 450,
+                    verification_image_path=result.verification_image_path or '',
+                    expires_at=time.time() + 900,
                 )
-                await self.send_token_refresh_notification(
-                    error_message=safe_message,
-                    notification_type="token_refresh",
-                    chat_id=None,
-                    attachment_path=screenshot_path,
-                    verification_url=None
+                asyncio.run_coroutine_threadsafe(
+                    self.send_token_refresh_notification(
+                        error_message=safe_message,
+                        notification_type="token_refresh",
+                        chat_id=None,
+                        attachment_path=result.verification_image_path or None,
+                        verification_url=None,
+                    ),
+                    owner_loop,
                 )
 
-            # 在单独的线程中运行同步的登录方法
-            import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
-            active_refresh_registry.set_worker(self.cookie_id, slider)
+            worker = OfficialLoginWorker()
+            active_refresh_registry.set_worker(self.cookie_id, worker)
+            service = XianyuOfficialLoginService()
             result = await asyncio.to_thread(
-                slider.login_with_password_playwright,
+                service.refresh_session,
+                profile_unb=profile_unb,
+                current_cookie=db_cookie_value or self.cookies_str,
                 account=username,
                 password=password,
                 show_browser=show_browser,
-                notification_callback=notification_callback_wrapper
+                allow_password=allow_password,
+                worker=worker,
+                on_status=notification_callback,
             )
 
-            if result:
-                logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
-                logger.info(f"【{self.cookie_id}】密码登录获取Cookie成功，字段数: {len(result)}")
-
-                # 打印密码登录获取的Cookie字段详情
-                logger.info(f"【{self.cookie_id}】========== 密码登录Cookie字段详情 ==========")
-                logger.info(f"【{self.cookie_id}】Cookie字段数: {len(result)}")
-                logger.info(f"【{self.cookie_id}】Cookie字段列表:")
-                for i, (key, value) in enumerate(result.items(), 1):
-                    logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: [已隐藏] (长度: {len(str(value))})")
-
-                # 检查关键字段
-                important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
-                logger.info(f"【{self.cookie_id}】关键字段检查:")
-                for key in important_keys:
-                    if key in result:
-                        val = result[key]
-                        logger.info(f"【{self.cookie_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  ❌ {key}: 缺失")
-                logger.info(f"【{self.cookie_id}】==========================================")
-
-                # 将cookie字典转换为字符串格式
-                new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
-                logger.info(f"【{self.cookie_id}】Cookie字符串已生成，长度: {len(new_cookies_str)}")
-
-                # 记录密码登录时间，防止重复登录
-                XianyuLive._last_password_login_time[self.cookie_id] = time.time()
-                logger.warning(f"【{self.cookie_id}】已记录密码登录时间，冷却期 {XianyuLive._password_login_cooldown} 秒")
-
-                # 更新cookies并重启任务
-                update_success = await self._update_cookies_and_restart(new_cookies_str)
-
-                if update_success:
-                    logger.info(f"【{self.cookie_id}】Cookie更新并重启任务成功")
-                    # 发送账号密码登录成功通知
-                    await self.send_token_refresh_notification(
-                        f"账号密码登录成功，Cookie已更新，任务已重启",
-                        "password_login_success"
-                    )
-                    db_manager.update_account_session_refresh(
-                        self.cookie_id, state='success', trigger=trigger_reason,
-                        message='Cookie 已刷新，账号监听已恢复',
-                    )
-                    return True
-                else:
-                    logger.error(f"【{self.cookie_id}】Cookie更新失败")
-                    db_manager.update_account_session_refresh(
-                        self.cookie_id, state='failed', trigger=trigger_reason,
-                        message='Cookie 已获取，但更新监听任务失败', error_code='restart_failed',
-                    )
-                    return False
-
-            else:
-                logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie")
-                current_status = db_manager.get_account_session_refresh(self.cookie_id)
-                was_verifying = current_status.get('state') == 'verification_required'
+            if not result.succeeded:
+                result_state = result.status if result.status in {'timeout', 'cancelled'} else 'failed'
                 db_manager.update_account_session_refresh(
                     self.cookie_id,
-                    state='timeout' if was_verifying else 'failed',
+                    state=result_state,
                     trigger=trigger_reason,
-                    message='身份验证等待超时' if was_verifying else '密码登录未能刷新 Cookie',
-                    error_code='verification_timeout' if was_verifying else 'login_failed',
+                    message=result.message or '官方浏览器未能刷新 Cookie',
+                    error_code=result.error_code or 'login_failed',
+                )
+                if result.error_code == 'no_credentials':
+                    await self.send_token_refresh_notification(
+                        f"检测到{trigger_reason}，官方登录态已失效且未保存闲鱼账号密码",
+                        "no_credentials",
+                    )
+                return False
+
+            new_cookies_str = service.cookies_to_string(result.cookies)
+            if result.used_password:
+                XianyuLive._last_password_login_time[self.cookie_id] = time.time()
+
+            update_success = await self._update_cookies_and_restart(new_cookies_str)
+            if not update_success:
+                db_manager.update_account_session_refresh(
+                    self.cookie_id, state='failed', trigger=trigger_reason,
+                    message='Cookie 已获取，但更新监听任务失败', error_code='restart_failed',
                 )
                 return False
 
+            db_manager.update_account_session_refresh(
+                self.cookie_id, state='success', trigger=trigger_reason,
+                message='Cookie 已刷新，账号监听已恢复',
+            )
+            logger.info(
+                f"【{self.cookie_id}】官方浏览器档案刷新成功"
+                f"{'，并已使用保存凭据重新登录' if result.used_password else ''}"
+            )
+            return True
         except Exception as refresh_e:
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
             import traceback
@@ -5774,121 +5721,29 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】Cookie刷新循环已退出")
 
     async def _execute_cookie_refresh(self, current_time):
-        """独立执行Cookie刷新任务，避免阻塞主循环"""
-
+        """Run scheduled renewal through the same official profile service."""
         from account_session_refresh import active_refresh_registry
-        from db_manager import db_manager
-        if not active_refresh_registry.register(self.cookie_id, self):
+
+        if active_refresh_registry.is_active(self.cookie_id):
             logger.info(f"【{self.cookie_id}】已有Cookie刷新或验证任务运行中，跳过定时刷新")
             return
-        db_manager.update_account_session_refresh(
-            self.cookie_id,
-            state='refreshing',
-            trigger='scheduled_cookie_refresh',
-            message=f'正在执行每{self._format_cookie_refresh_interval()}一次的 Cookie 预防性刷新',
-        )
 
-        # 使用Lock确保原子性，防止重复执行
         async with self.cookie_refresh_lock:
             try:
-                logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
-
-                # 暂时暂停心跳任务，避免与浏览器操作冲突
-                heartbeat_was_running = False
-                if self.heartbeat_task and not self.heartbeat_task.done():
-                    heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
-                    logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
-
-                # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
-                success = await asyncio.wait_for(
-                    self._refresh_cookies_via_browser(),
-                    timeout=180.0  # 3分钟超时，减少对WebSocket的影响
+                success = await self._try_password_login_refresh(
+                    f"定时 Cookie 刷新（每{self._format_cookie_refresh_interval()}）"
                 )
-
-                # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
-                    logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
-
                 if success:
                     self.last_cookie_refresh_time = current_time
-                    logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
-
-                    # 刷新成功后，验证Cookie有效性
-                    logger.info(f"【{self.cookie_id}】开始验证刷新后的Cookie有效性...")
-                    try:
-                        validation_result = await self._verify_cookie_validity()
-
-                        if not validation_result['valid']:
-                            logger.warning(f"【{self.cookie_id}】❌ Cookie验证失败: {validation_result['details']}")
-                            logger.warning(f"【{self.cookie_id}】检测到Cookie可能无法用于关键API，尝试通过密码登录重新获取...")
-
-                            # 触发密码登录刷新
-                            password_refresh_success = await self._try_password_login_refresh(
-                                "Cookie验证失败(关键API不可用)",
-                                reuse_active_registration=True,
-                            )
-
-                            if password_refresh_success:
-                                logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，Cookie已更新")
-                            else:
-                                logger.warning(f"【{self.cookie_id}】⚠️ 密码登录刷新失败，Cookie可能仍然无效")
-                                # 发送通知
-                                await self.send_token_refresh_notification(
-                                    f"Cookie验证失败且密码登录刷新也失败\n验证详情: {validation_result['details']}",
-                                    "cookie_validation_failed"
-                                )
-                        else:
-                            logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
-                            db_manager.update_account_session_refresh(
-                                self.cookie_id, state='success', trigger='scheduled_cookie_refresh',
-                                message='Cookie 预防性刷新成功',
-                            )
-
-                    except Exception as verify_e:
-                        logger.error(f"【{self.cookie_id}】Cookie验证过程异常: {self._safe_str(verify_e)}")
-                        import traceback
-                        logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
-                        db_manager.update_account_session_refresh(
-                            self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
-                            message='Cookie 已刷新，但有效性检查异常', error_code='validation_exception',
-                        )
+                    logger.info(f"【{self.cookie_id}】定时 Cookie 刷新完成")
                 else:
-                    logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
-                    db_manager.update_account_session_refresh(
-                        self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
-                        message='浏览器未能刷新 Cookie', error_code='browser_refresh_failed',
-                    )
-                    # 即使失败也要更新时间，避免频繁重试
                     self.last_cookie_refresh_time = current_time
-
-            except asyncio.TimeoutError:
-                # 超时也要更新时间，避免频繁重试
-                self.last_cookie_refresh_time = current_time
-                db_manager.update_account_session_refresh(
-                    self.cookie_id, state='timeout', trigger='scheduled_cookie_refresh',
-                    message='Cookie 刷新超过三分钟', error_code='browser_refresh_timeout',
-                )
+                    logger.warning(f"【{self.cookie_id}】定时 Cookie 刷新未完成")
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
-                # 异常也要更新时间，避免频繁重试
                 self.last_cookie_refresh_time = current_time
-                db_manager.update_account_session_refresh(
-                    self.cookie_id, state='failed', trigger='scheduled_cookie_refresh',
-                    message='Cookie 预防性刷新出现异常', error_code='scheduled_refresh_exception',
-                )
             finally:
-                active_refresh_registry.unregister(self.cookie_id)
-                # 确保心跳任务恢复（如果WebSocket仍然连接）
-                if (self.ws and not self.ws.closed and
-                    (not self.heartbeat_task or self.heartbeat_task.done())):
-                    logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
-
-                # 清空消息接收标志，允许下次正常执行Cookie刷新
                 self.last_message_received_time = 0
-                logger.warning(f"【{self.cookie_id}】Cookie刷新完成，已清空消息接收标志")
 
 
 

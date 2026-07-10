@@ -9,14 +9,14 @@
 
 ## 功能
 
-- 多账号管理：扫码和手动 Cookie 绑定、监听与自动确认状态诊断；账号级定时 Cookie 预防刷新默认关闭，可按需开启。
+- 多账号管理：官方账号密码登录、扫码和手动 Cookie 绑定，按真实 `unb` 保留账号数据；持久浏览器档案可续期 Cookie，账号级定时刷新默认关闭。
 - 商品管理：按账号筛选和同步真实商品，只有选择“全部账号”时才展示全量商品；每件商品可维护独立知识档案和训练规则，相同商品可复刻知识草稿。
 - AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复；不同账号可选择不同平台和模型。
 - AI 训练：在独立对话框中模拟买家咨询，显示实际加载、排除和停用的规则；修正确认后才写入线上配置。
 - 关键词回复：账号级关键词回复、默认回复与关键词发货规则。
 - 订单与卡密：发现并同步近 90 天订单，区分签收、退款中、已退款和关闭状态，并管理卡密库存与自动发货规则。
 - 系统设置：基础、AI、SMTP 三个独立配置区，保存复读确认和真实连接检测。
-- 技能中心：手动真实商品监控、专家提示词、运行诊断。
+- 技能中心：手动与定时真实商品监控、AI 商品筛选、结果通知、专家提示词和运行诊断。
 
 当前技能中心能力边界：
 
@@ -24,11 +24,11 @@
 | --- | --- |
 | 手动执行一次真实商品搜索 | 可用 |
 | 专家策略用于测试与正式回复 | 可用 |
-| 定时监控调度 | 暂不可用 |
-| AI 商品过滤 | 暂不可用 |
-| 监控结果通知发送 | 暂不可用 |
+| 定时监控调度 | 可用，默认关闭，最短 15 分钟 |
+| AI 商品过滤 | 可用，需要至少一个账号完成 AI 配置 |
+| 监控结果通知发送 | 可用，支持 Webhook、微信、钉钉、飞书、Bark、Telegram |
 
-未实现能力会在界面和 API 中明确返回“暂不可用”，不会伪装成已排队或已发送。
+调度器运行在单进程事件循环中，每 30 秒检查到期任务。结果按任务和商品链接去重，缺少链接时使用商品 ID；通知会尝试全部已启用的受支持渠道，并记录 `sent`、`partial` 或 `failed`，不会把未发送结果伪装成成功。
 
 ## AI 上下文优先级
 
@@ -57,9 +57,11 @@
 
 同一后台用户重新扫码、密码登录或更新 Cookie 时，系统会优先按 Cookie 中的闲鱼 `unb` 找回原账号记录，因此原账号 ID、AI 配置、训练规则和商品知识可以继续复用。不要通过“删除账号”来解决过期登录：删除操作会清理该账号关联数据。
 
-Token 失效时会触发 Cookie 刷新；账号级定时预防性刷新默认关闭，可在账号编辑中开启并设置 1 小时到 7 天的间隔。手动“立即刷新 Cookie”始终保留。平台要求二次验证时，账号页会显示验证状态；安全验证本身无法被程序绕过。
+首次账号密码登录会打开闲鱼官方登录页，从默认短信模式切换到密码模式，并在成功后读取真实 `unb`，把临时浏览器档案归档为 `browser_data/user_<unb>`。前端不再要求账号 ID；旧客户端传入的 `account_id` 仅为兼容字段，不参与身份判定。登录密码使用独立密钥加密保存，接口不会返回明文或密文。
 
-扫码仍是推荐登录方式。账号密码登录依赖闲鱼网页结构和风控流程，平台页面变化时可能不可用；失败时请改用扫码或更新现有账号的 Cookie，不要删除账号重建。
+Token 失效、手动刷新和账号级定时刷新都复用同一官方浏览器档案。档案仍有效时可直接续期，不需要反复扫码；档案彻底退出时，系统才使用已保存凭据重新登录。定时刷新默认关闭，可设置 1 小时到 7 天的间隔。
+
+闲鱼要求短信、扫码、人脸或其他安全验证时，系统会保留可见浏览器并最多等待 15 分钟，同时在账号页显示验证截图。验证不能绕过，完成后系统才会继续保存 Cookie 并恢复监听。官方页面结构或风控策略变化时，密码登录仍可能需要维护；不要通过删除账号来重试登录。
 
 ## AI 平台与模型
 
@@ -133,7 +135,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 
