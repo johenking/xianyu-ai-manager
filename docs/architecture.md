@@ -7,7 +7,7 @@ Xianyu AI Manager is a FastAPI + SQLite + React/Vite application for Xianyu acco
 Main runtime path:
 
 1. `Start.py` starts one Uvicorn worker using the `app_factory:create_app` factory.
-2. `app_factory.py` owns FastAPI lifespan; `application_runtime.py` starts and stops the CookieManager and browser pool on the server event loop.
+2. `app_factory.py` owns FastAPI lifespan; `application_runtime.py` starts and stops the CookieManager, Skill Center scheduler, and browser pool on the server event loop.
 3. `reply_server.py` keeps endpoint implementations compatible while `api_routers.py` groups all routes into auth, account, AI, order, skill, settings, content, admin, system, and frontend `APIRouter` domains.
 4. `db_manager.py` retains the compatibility persistence facade. New domain SQL starts in `repositories/`, while domain decisions live in `services/`; authentication is the first extracted boundary.
 5. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account and exposes an awaited shutdown path.
@@ -20,7 +20,7 @@ The deployment model is intentionally one process, one Uvicorn worker, one async
 
 Backend users live in `users`. The initial `admin` password is read from `ADMIN_PASSWORD` only when a new database creates the user. New passwords use bcrypt cost 12; a successful legacy SHA-256 login upgrades the stored hash. New login Sessions store a Token digest, expire after 30 days, and are removed by `/logout`; legacy records remain readable during migration.
 
-`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database and local encryption keys before starting one transaction. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider key; account detail and status APIs never return the plaintext or ciphertext.
+`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database and local encryption keys before starting one transaction. The compatibility upgrader moves Skill Center task state to database version `1.6` by adding schedule, next-run, status, and error columns idempotently. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider key; account detail and status APIs never return the plaintext or ciphertext.
 
 Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
 
@@ -84,7 +84,7 @@ Core tables:
 - `ai_item_knowledge_profiles`, `ai_item_knowledge_versions`: knowledge draft, published snapshot, and version history.
 - `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory, delivery, synchronized orders and deferred status events, and products.
 - `notification_channels`, `message_notifications`, `risk_control_logs`: notification and risk-control records.
-- `skill_monitor_tasks`, `skill_monitor_results`, `skill_agent_prompts`, `skill_run_logs`: Skill Center state.
+- `skill_monitor_tasks`, `skill_monitor_results`, `skill_agent_prompts`, `skill_run_logs`: Skill Center schedules, run state, deduplicated results, expert prompts, and audit logs.
 
 ## Route Groups
 
@@ -102,7 +102,11 @@ Core tables:
 
 ## Skill Center Boundary
 
-The Skill Center is an independent safe rewrite informed by monitor workflow, expert-strategy, and diagnostics ideas from the projects named in `NOTICE`. Manual product searches, expert prompts, and diagnostics are functional. Scheduled monitoring, AI monitor filtering, and notification delivery are explicitly unavailable and must not be represented as queued or successful.
+The Skill Center is an independent safe rewrite informed by monitor workflow, expert-strategy, and diagnostics ideas from the projects named in `NOTICE`. Manual searches and scheduled tasks share `execute_skill_monitor_task`, so the database running flag prevents overlapping runs. The single-worker scheduler polls every 30 seconds, starts only enabled due tasks, resets interrupted `running` rows during startup, and computes the next run after success or failure. Schedules default off and accept intervals of at least 15 minutes.
+
+Rule-matched items can pass through the account's configured AI provider. Missing AI configuration fails the run instead of silently accepting items. Accepted results are deduplicated across runs by `(task_id, user_id, item_url)`, with `raw_data.item_id` as fallback when no URL exists.
+
+Skill notifications use enabled Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channels. Every supported channel is attempted. Results persist `sent` when all succeed, `partial` when only some succeed, and `failed` when all fail; disabled or missing-channel states remain explicit. QQ and email may exist elsewhere in the notification schema but are not advertised as Skill Center delivery channels.
 
 ## Deployment Notes
 

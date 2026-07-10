@@ -47,7 +47,7 @@ Back up `data/.ai_provider_key` and `data/.account_credential_key` with the data
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -151,6 +151,25 @@ Recommended order:
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
 Do not switch the renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Background renewal intentionally launches a headed browser off-screen and reopens it visibly only for human verification. Password login still depends on the current official page structure; when that flow breaks after a platform change, use QR or Cookie recovery without deleting the account.
+
+## Skill Monitor Troubleshooting
+
+The scheduler runs inside the one Uvicorn worker and polls every 30 seconds. Keep `WEB_CONCURRENCY=1`; multiple processes can race on the same SQLite task state.
+
+1. Read `/api/skills/monitor/tasks` and check `schedule_enabled`, `next_run_at`, `last_status`, and `last_error`.
+2. Confirm the interval is at least 15 minutes and the task is enabled.
+3. For AI filtering, verify the bound account has an enabled provider, key, base URL, and model that passed a generated-reply test.
+4. For notifications, enable at least one supported Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channel. QQ and email are not Skill Center senders.
+5. Interpret `partial` as at least one successful and at least one failed channel; inspect `raw_data.notify_error` for per-channel errors.
+6. A repeated item is intentionally skipped when the same task already stored its URL or platform item ID.
+7. After a service restart, a task left in `running` becomes `failed` with an interruption error and can run again on its next schedule.
+
+Smoke-test a task manually before enabling its schedule:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks/$TASK_ID/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ## Order Sync Troubleshooting
 

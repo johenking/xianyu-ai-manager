@@ -12,6 +12,8 @@ Set `ADMIN_PASSWORD` before public deployment, or change the password immediatel
 
 This project is a long-running FastAPI application with SQLite data, WebSocket/background work, and Playwright/Chromium browser automation. Netlify is best for static sites and serverless/edge functions. Its functions run in ephemeral runtimes and have execution limits, so it is not a good fit for keeping this app alive as a normal backend service.
 
+The account listeners and Skill Center scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
+
 ## Recommended Platforms
 
 Use a Docker web service platform instead:

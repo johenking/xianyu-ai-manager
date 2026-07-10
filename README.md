@@ -16,7 +16,7 @@
 - 关键词回复：账号级关键词回复、默认回复与关键词发货规则。
 - 订单与卡密：发现并同步近 90 天订单，区分签收、退款中、已退款和关闭状态，并管理卡密库存与自动发货规则。
 - 系统设置：基础、AI、SMTP 三个独立配置区，保存复读确认和真实连接检测。
-- 技能中心：手动真实商品监控、专家提示词、运行诊断。
+- 技能中心：手动与定时真实商品监控、AI 商品筛选、结果通知、专家提示词和运行诊断。
 
 当前技能中心能力边界：
 
@@ -24,11 +24,11 @@
 | --- | --- |
 | 手动执行一次真实商品搜索 | 可用 |
 | 专家策略用于测试与正式回复 | 可用 |
-| 定时监控调度 | 暂不可用 |
-| AI 商品过滤 | 暂不可用 |
-| 监控结果通知发送 | 暂不可用 |
+| 定时监控调度 | 可用，默认关闭，最短 15 分钟 |
+| AI 商品过滤 | 可用，需要至少一个账号完成 AI 配置 |
+| 监控结果通知发送 | 可用，支持 Webhook、微信、钉钉、飞书、Bark、Telegram |
 
-未实现能力会在界面和 API 中明确返回“暂不可用”，不会伪装成已排队或已发送。
+调度器运行在单进程事件循环中，每 30 秒检查到期任务。结果按任务和商品链接去重，缺少链接时使用商品 ID；通知会尝试全部已启用的受支持渠道，并记录 `sent`、`partial` 或 `failed`，不会把未发送结果伪装成成功。
 
 ## AI 上下文优先级
 
@@ -135,7 +135,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 

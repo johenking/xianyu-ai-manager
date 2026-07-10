@@ -222,7 +222,23 @@ The response reports `discovered`, `status_updated`, `details_updated`, `unchang
 
 ## Skill Center
 
-Manual monitor tasks require a real account. Create/list tasks at `/api/skills/monitor/tasks`, run one with `POST /api/skills/monitor/tasks/{task_id}/run`, and read results from `/api/skills/monitor/results`.
+Create and list monitor tasks at `/api/skills/monitor/tasks`, update one with `PUT /api/skills/monitor/tasks/{task_id}`, run one immediately with `POST /api/skills/monitor/tasks/{task_id}/run`, and read results from `/api/skills/monitor/results`. A scheduled task uses these additional fields:
+
+```json
+{
+  "schedule_enabled": true,
+  "schedule_interval_minutes": 60,
+  "ai_filter": "只保留价格明显低于市场价的商品",
+  "notify_enabled": true,
+  "account_id": "<owned-cookie-id>"
+}
+```
+
+Schedules default off and the interval must be at least 15 minutes. Task responses include `next_run_at`, `last_status`, `last_error`, and `last_run_at`. Manual and scheduled calls share one task lock; an overlapping manual run returns HTTP 409. Failed scheduled runs record the error and still compute their next attempt.
+
+AI filtering requires an owned account with an enabled provider, API key, base URL, and model. Missing configuration fails the run explicitly. Results are deduplicated across runs by task and `item_url`, falling back to platform item ID. Existing matches are not inserted or notified again.
+
+When notifications are enabled, the backend uses enabled Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram channels. It attempts all supported channels and stores `sent`, `partial`, or `failed`; `skipped_no_channel` means no supported enabled channel was available. QQ and email channel records are not used by Skill Center monitoring.
 
 Expert prompts live at `/api/skills/agent/prompts`; test them against a real account and product with `/api/skills/agent/test-reply`. Runtime diagnostics are available at:
 
@@ -232,4 +248,4 @@ curl -sS "$BASE_URL/api/skills/ops/browser-status" -H "Authorization: Bearer $TO
 curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" -H "Authorization: Bearer $TOKEN"
 ```
 
-Scheduled monitoring, AI monitor filtering, and notification delivery are not implemented. The API reports them as unavailable instead of simulating a queue or delivery.
+`GET /api/skills/capabilities` reports whether account AI configuration and at least one supported notification channel are currently available. Capability state reflects configuration readiness; it does not claim that a future run or external notification endpoint will succeed.

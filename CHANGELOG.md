@@ -2,7 +2,7 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
-## [Unreleased]
+## [1.5.0] - 2026-07-11
 
 ### Added
 
@@ -12,6 +12,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Add copy-result metadata for product knowledge drafts, including source kind, counts, and skipped reasons.
 - Add account-level scheduled Cookie refresh controls with a conservative default-off state and 1-hour to 7-day intervals.
 - Add an explicit product account filter so item management shows one account's products by default and all products only after choosing all accounts.
+- Add a single-loop Skill Center scheduler with default-off task schedules, 30-second polling, and a 15-minute minimum interval.
+- Add AI monitor filtering using an enabled account AI configuration.
+- Add result notifications for Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram channels with sent, partial, and failed outcomes.
+- Add cross-run result deduplication by task and item URL, falling back to item ID.
 
 ### Changed
 
@@ -20,11 +24,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Improve the product-knowledge copy panel with select all, clear, overwrite explanation, sticky action, and save-before-copy behavior for dirty drafts.
 - Show when the training lab used a rule guard fallback instead of returning the model's violating reply.
 - Keep manual Cookie refresh independent from scheduled preventive refresh settings.
+- Run manual and scheduled Skill Center tasks through the same account-scoped concurrency guard and reschedule both successful and failed scheduled runs.
 
 ### Fixed
 
 - Remove the duplicate temporary-browser refresh after a successful password login so CookieManager is updated once.
 - Detect completed Xianyu face-verification refresh sessions using login-state and Cookie checks, and add an account-page action to recheck after the user finishes verification.
+- Continue notification delivery after one channel fails instead of returning after the first successful channel.
 
 ### Security
 
