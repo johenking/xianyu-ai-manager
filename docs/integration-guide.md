@@ -30,6 +30,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
+| Official password login | `POST /password-login`, `GET /password-login/check/{session_id}` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Orders | `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
@@ -161,10 +162,25 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 Supported binding paths:
 
 - QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`.
-- Password compatibility path: `POST /password-login`, then poll `GET /password-login/check/{session_id}`.
+- Official password login: `POST /password-login`, then poll `GET /password-login/check/{session_id}`.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
-Re-login uses the Cookie's `unb` to find an existing account within the same backend user. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+Start an official password login without supplying an account ID:
+
+```bash
+curl -sS -X POST "$BASE_URL/password-login" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "account":"<xianyu-account-or-phone>",
+    "password":"<password>",
+    "show_browser":true
+  }'
+```
+
+The request returns a `session_id`. Poll `/password-login/check/{session_id}` until `success`, `verification_required`, `failed`, `timeout`, `cancelled`, or `interrupted`. Legacy clients may still send `account_id`, but the backend ignores it and resolves the account from the authenticated Cookie's real `unb`. Re-login updates the existing account within the same backend user, preserving its settings and related data.
+
+On first success, the browser session is stored as `browser_data/user_<unb>`, and the password is encrypted with the independent account-credential key. Status and account-detail responses never return the password or ciphertext. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
 
 Read or trigger structured refresh state:
 
@@ -176,7 +192,7 @@ curl -sS -X POST "$BASE_URL/api/accounts/$COOKIE_ID/session-refresh" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Manual refresh requires the account listener to be running. Scheduled preventive refresh is configured per account and defaults to off:
+Manual refresh, scheduled refresh, and expired-session recovery use the same official profile. The service first reuses `browser_data/user_<unb>`; a valid profile can renew without another QR scan. It uses saved credentials only after the profile has fully logged out. Manual refresh requires the account listener to be running. Scheduled preventive refresh is configured per account and defaults to off:
 
 ```bash
 curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/cookie-refresh-settings" \
@@ -187,9 +203,9 @@ curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/cookie-refresh-settings" \
 
 When enabled, `cookie_refresh_interval_minutes` must be between 60 and 10080. Turning scheduled refresh off does not disable manual refresh or refreshes triggered by an expired session.
 
-A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. After verification, the account page can recheck the refresh state, but success is only shown after the backend detects the logged-in page and refreshed Cookie. Cancel with `POST .../session-refresh/cancel`.
+A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. The backend keeps the same profile open visibly for up to 15 minutes and may return a safe screenshot path, but it never exposes the official verification URL. After verification, success is shown only when the login and security surfaces disappear and the backend detects both the expected `unb` and a valid session Cookie. Cancel with `POST .../session-refresh/cancel`.
 
-QR is the recommended binding path. Password login depends on the current Xianyu web page and risk-control flow, so it may stop working after platform changes. Use QR or update the existing account Cookie when that happens; do not delete the account merely to retry authentication.
+The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. QR and manual Cookie binding remain recovery options, but normal renewal should reuse the persisted official profile instead of repeatedly asking for QR login.
 
 ## Recent Order Sync
 

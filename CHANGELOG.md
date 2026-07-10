@@ -6,6 +6,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ### Added
 
+- Add an official Goofish browser-session service that promotes successful temporary profiles to `browser_data/user_<unb>` and reuses them for Cookie renewal.
+- Add profile-first renewal with encrypted credential fallback, visible secondary-verification waiting, cancellation, and transactional profile replacement backups.
 - Add a hard guard for price, plan, package, and warranty-price training rules so a final AI reply cannot keep a conflicting price after audit.
 - Add copy-result metadata for product knowledge drafts, including source kind, counts, and skipped reasons.
 - Add account-level scheduled Cookie refresh controls with a conservative default-off state and 1-hour to 7-day intervals.
@@ -13,13 +15,20 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ### Changed
 
+- Make `POST /password-login` identify accounts from the authenticated Cookie `unb`; legacy `account_id` input is accepted but ignored.
+- Route manual refresh, scheduled refresh, Token-expiry recovery, and repeated connection-failure recovery through the same official browser profile.
 - Improve the product-knowledge copy panel with select all, clear, overwrite explanation, sticky action, and save-before-copy behavior for dirty drafts.
 - Show when the training lab used a rule guard fallback instead of returning the model's violating reply.
 - Keep manual Cookie refresh independent from scheduled preventive refresh settings.
 
 ### Fixed
 
+- Remove the duplicate temporary-browser refresh after a successful password login so CookieManager is updated once.
 - Detect completed Xianyu face-verification refresh sessions using login-state and Cookie checks, and add an account-page action to recheck after the user finishes verification.
+
+### Security
+
+- Keep password-login task credentials out of session-status storage and do not expose official verification URLs or encrypted account passwords through APIs.
 
 ## [1.4.0] - 2026-07-05
 

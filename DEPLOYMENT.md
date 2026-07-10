@@ -74,7 +74,7 @@ TZ=Asia/Shanghai
 PYTHONUNBUFFERED=1
 ```
 
-When deploying with `huggingface_hub`, upload source and built assets only. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `logs/`, `backups/`, `.env`, and database files. If a Hugging Face token was pasted into chat or logs, rotate it after deployment.
+When deploying with `huggingface_hub`, upload source and built assets only. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files. If a Hugging Face token was pasted into chat or logs, rotate it after deployment.
 
 ## Local Docker
 
@@ -87,8 +87,11 @@ docker run --rm -p 8091:8080 \
   -e API_HOST=0.0.0.0 \
   -e ADMIN_PASSWORD='change-me' \
   -v "$PWD/data:/app/data" \
+  -v "$PWD/browser_data:/app/browser_data" \
   -v "$PWD/logs:/app/logs" \
   xianyu-ai-manager
 ```
 
 Then open `http://localhost:8091`.
+
+The official Goofish login flow requires headed Chromium; the current container command does not start a virtual display. Treat password login and automatic credential fallback as unsupported in Docker or cloud environments until a display/Xvfb setup and the human-verification path have been tested there. Persisting `browser_data/` is still required once that support exists.

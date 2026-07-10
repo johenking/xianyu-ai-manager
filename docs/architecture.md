@@ -20,13 +20,17 @@ The deployment model is intentionally one process, one Uvicorn worker, one async
 
 Backend users live in `users`. The initial `admin` password is read from `ADMIN_PASSWORD` only when a new database creates the user. New passwords use bcrypt cost 12; a successful legacy SHA-256 login upgrades the stored hash. New login Sessions store a Token digest, expire after 30 days, and are removed by `/logout`; legacy records remain readable during migration.
 
-`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database and local encryption keys before starting one transaction. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider key.
+`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database and local encryption keys before starting one transaction. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider key; account detail and status APIs never return the plaintext or ciphertext.
 
 Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
 
-Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Token failure can trigger an immediate refresh. Preventive scheduled refresh is account-level, opt-in, defaults to off, and uses `cookies.cookie_refresh_enabled` plus `cookies.cookie_refresh_interval_minutes`; manual refresh is unaffected by that setting. When Alibaba requires human verification, the account page reads the persisted status and verification image instead of pretending refresh succeeded.
+`utils/xianyu_official_login.py` owns official browser authentication. Initial password login uses a temporary `.login_<uuid>` profile, switches the embedded official page from SMS to password mode, confirms the agreement and keep-login prompts, and accepts success only when login and security surfaces disappear while both `unb` and a session Cookie exist. The profile is then promoted to `browser_data/user_<unb>`; an existing target is backed up and restored if replacement fails.
 
-Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. Passwords, Cookies, Tokens, complete verification URLs, Playwright objects, and AI conversation content remain in memory. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
+Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Manual refresh, scheduled refresh, Token failure, and repeated connection-failure recovery all call the same official service. It first opens the canonical `unb` profile and seeds the current Cookie when needed, then falls back to encrypted credentials only if the official profile has logged out. A returned `unb` must match the expected account before CookieManager is updated once.
+
+Goofish rejects Chromium headless mode as an illegal browser. Background renewal therefore uses a normal headed browser positioned off-screen. If Alibaba requires human verification, the service reopens the same profile visibly, stores only a safe verification screenshot, and waits up to 15 minutes. The account page reads the persisted status and image; verification URLs are not exposed and verification is never treated as bypassed.
+
+Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. The password-login task receives credentials only as its background-task arguments; the password is not stored in the login-session dictionaries or registry. Cookies, Tokens, verification URLs, Playwright objects, and AI conversation content are also excluded. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
 
 ## AI Context Flow
 
@@ -85,7 +89,7 @@ Core tables:
 ## Route Groups
 
 - Auth: `/login`, `/logout`, `/verify`, `/change-password`, `/change-admin-password`.
-- Account binding: `/qr-login/*`, `/password-login/*`, `/cookies*`, including `PUT /cookies/{cid}/cookie-refresh-settings`.
+- Account binding: `/qr-login/*`, `POST /password-login`, `GET /password-login/check/{session_id}`, and `/cookies*`, including `PUT /cookies/{cid}/cookie-refresh-settings`. Password login accepts `account`, `password`, and `show_browser`; caller-supplied account IDs are not authoritative.
 - Session refresh: `/api/accounts/{cookie_id}/session-status`, `/session-refresh`, `/session-refresh/cancel`.
 - Diagnostics: `/api/diagnostics/auto-reply/{cookie_id}` and `/api/skills/ops/*`.
 - Settings: `/api/settings/summary`, `/api/settings/sections/{section}`, `/api/settings/verify/{section}`.
@@ -112,4 +116,4 @@ Production source maps are disabled unless `VITE_BUILD_SOURCEMAP=true`. The Vite
 
 Python runtime requirements are declared in `requirements.in` and locked in `requirements.lock`; development and build tools are declared separately in `requirements-dev.in` and `requirements-dev.lock`. `requirements.txt` remains a compatibility include for existing deployment commands.
 
-Xianyu login remains environment-sensitive. Datacenter or overseas IPs and headless browser fingerprints can trigger Alibaba risk controls. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.
+Xianyu login remains environment-sensitive. Datacenter or overseas IPs can trigger Alibaba risk controls, and the official page currently rejects headless Chromium. Deployments that rely on automatic renewal must persist and back up `browser_data/` alongside SQLite and the account credential key. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.
