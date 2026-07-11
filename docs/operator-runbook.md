@@ -26,7 +26,7 @@ ps -axo pid,ppid,command | rg 'cloudflared|Start.py|uvicorn|xianyu'
 curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 ```
 
-The current live runtime path is `/Users/mac/Documents/Codex/2026-06-09/github-23star-xianyu-super-butler-https-3/work/xianyu-super-butler`; it tracks `https://github.com/johenking/xianyu-ai-manager.git` as `origin`. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
+Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
 
 ## Backup Before Risky Changes
 
@@ -40,14 +40,14 @@ sqlite3 "data/backups/xianyu_data_${STAMP}.db" "PRAGMA integrity_check;"
 shasum -a 256 "data/backups/xianyu_data_${STAMP}.db"
 ```
 
-Back up `data/.ai_provider_key` and `data/.account_credential_key` with the database when their environment keys are not supplied. Before replacing authentication code or profiles, stop the service and copy all of `browser_data/`; a live Chromium profile is not a reliable filesystem backup. Do not delete unmatched `user_*` profiles during cleanup because their identity may not yet be reconciled.
+Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with the database when their environment keys are not supplied. The system-secret key protects SMTP authorization codes and derives authentication HMAC digests; losing it prevents existing encrypted SMTP settings and one-time authentication records from being reused. Before replacing authentication code or profiles, stop the service and copy all of `browser_data/`; a live Chromium profile is not a reliable filesystem backup. Do not delete unmatched `user_*` profiles during cleanup because their identity may not yet be reconciled.
 
 ## Verification
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -89,6 +89,7 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `JWT_SECRET_KEY` | Signs backend session tokens; use an independent random value. |
 | `AI_PROVIDER_ENCRYPTION_KEY` | Encrypts provider API keys. If absent, a local key file is generated under `data/`. |
 | `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY` | Encrypts stored Xianyu login passwords with an independent key. |
+| `SYSTEM_SECRET_ENCRYPTION_KEY` | Encrypts SMTP authorization codes and derives purpose-isolated authentication digests. |
 | `PORT` | Cloud web port override. |
 | `API_PORT` | Alternative web port used by `entrypoint.sh` and `Start.py`. |
 | `API_HOST` | Bind host, usually `0.0.0.0` in containers. |
@@ -99,6 +100,22 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `VITE_BUILD_SOURCEMAP` | Set to `true` only when a production source map is explicitly required. |
 
 Do not commit secrets. Put deployment tokens, model keys, SMTP credentials, and Xianyu Cookies in platform secret stores or the Web UI.
+
+## Invitation Registration Rollout
+
+Registration is disabled on new installations and is forced disabled by the v1.6.0 registration migration. Keep it closed while configuring the system:
+
+1. In “系统与 AI”, save the SMTP server, port, sender address, authorization code, TLS/SSL mode, and public support email.
+2. Run SMTP verification. This sends a real test message to the support email, or to the sender address when support email is empty. Connection success without message delivery is not acceptance.
+3. Confirm the message arrived in a real mailbox, then create a small batch of single-use invites. Raw invite codes are visible only in that create response.
+4. Open registration only after the status card reports both verified SMTP and at least one active invite.
+5. Complete one real registration, automatic login, service-restart session restore, password reset, and second-use invite rejection before distributing the remaining codes.
+
+Changing any SMTP field invalidates the verified fingerprint. The backend refuses to reopen registration until the new configuration delivers another verification message. SMTP errors never generate a usable email challenge, and there is no third-party mail fallback.
+
+The default authentication limits are 30 image CAPTCHAs per IP per hour; one email send per email per 60 seconds, five per email per hour, and 20 per IP per hour; five attempts per 10-minute challenge; five failed logins per account or IP in 15 minutes followed by a 15-minute cooldown; and 10 registration or invite failures per IP per hour. HTTP 429 responses include `retry_after`.
+
+`CF-Connecting-IP`, `X-Forwarded-For`, and `X-Real-IP` are ignored unless the direct peer belongs to the comma-separated IP/CIDR list in the `auth_trusted_proxies` system setting. Configure only proxies you operate; leaving the setting empty is safer than trusting arbitrary forwarded headers. Database rate events contain HMAC digests rather than raw addresses, emails, or account identifiers.
 
 ## Container And Hugging Face Deployment
 
@@ -116,7 +133,7 @@ sdk: docker
 app_port: 8080
 ```
 
-Persist and protect the database, logs, uploads, both local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
+Persist and protect the database, logs, uploads, all three local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
 
 Official password login and renewal launch headed Chromium because Goofish rejects headless mode. The current container entrypoint does not create a virtual display, so do not claim Docker or cloud credential renewal works until a display/Xvfb setup and human-verification workflow have been tested on that deployment.
 

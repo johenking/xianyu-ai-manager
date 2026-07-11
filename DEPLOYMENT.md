@@ -52,6 +52,10 @@ API_HOST=0.0.0.0
 TZ=Asia/Shanghai
 PYTHONUNBUFFERED=1
 ADMIN_PASSWORD=<set-a-strong-password>
+JWT_SECRET_KEY=<set-an-independent-random-secret>
+AI_PROVIDER_ENCRYPTION_KEY=<set-an-independent-random-secret>
+ACCOUNT_CREDENTIAL_ENCRYPTION_KEY=<set-an-independent-random-secret>
+SYSTEM_SECRET_ENCRYPTION_KEY=<set-an-independent-random-secret>
 ```
 
 5. After deploy, open:
@@ -70,6 +74,10 @@ Required/recommended Space secrets or variables:
 
 ```bash
 ADMIN_PASSWORD=<set-a-strong-password>
+JWT_SECRET_KEY=<set-an-independent-random-secret>
+AI_PROVIDER_ENCRYPTION_KEY=<set-an-independent-random-secret>
+ACCOUNT_CREDENTIAL_ENCRYPTION_KEY=<set-an-independent-random-secret>
+SYSTEM_SECRET_ENCRYPTION_KEY=<set-an-independent-random-secret>
 PORT=8080
 API_HOST=0.0.0.0
 TZ=Asia/Shanghai
@@ -97,3 +105,9 @@ docker run --rm -p 8091:8080 \
 Then open `http://localhost:8091`.
 
 The official Goofish login flow requires headed Chromium; the current container command does not start a virtual display. Treat password login and automatic credential fallback as unsupported in Docker or cloud environments until a display/Xvfb setup and the human-verification path have been tested there. Persisting `browser_data/` is still required once that support exists.
+
+## Invitation Registration
+
+Do not enable registration as part of an unattended deployment. Start with `registration_enabled=false`, configure SMTP and the public support email in the administrator UI, and verify delivery to a real mailbox. The verified fingerprint becomes stale after any SMTP change. Create a small batch of single-use invites only after delivery succeeds, then exercise registration, restart persistence, password reset, and invite reuse rejection before opening the switch.
+
+When environment encryption keys are not supplied, persist and back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with SQLite. SMTP credentials are configured in the UI and encrypted with the system-secret key; the example `SMTP_*` environment names are not a configuration path for this application.
