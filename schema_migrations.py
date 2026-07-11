@@ -294,6 +294,36 @@ def _registration_identity_nfkc_v2(
     )
 
 
+def _direct_registration_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    cursor.executemany(
+        """
+        INSERT INTO system_settings (key, value, description)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (
+            (
+                "registration_user_limit",
+                "20",
+                "Maximum number of non-admin registered users",
+            ),
+            ("terms_version", "v2", "Current registration terms version"),
+            (
+                "registration_enabled",
+                "false",
+                "Whether public registration is enabled",
+            ),
+        ),
+    )
+    cursor.execute(
+        """
+        UPDATE auth_challenges
+        SET consumed_at = CAST(strftime('%s', 'now') AS REAL)
+        WHERE purpose = 'register_email' AND consumed_at IS NULL
+        """
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -303,6 +333,7 @@ MIGRATIONS: Sequence[Migration] = (
         "registration_identity_nfkc_v2",
         _registration_identity_nfkc_v2,
     ),
+    Migration("2026071103", "direct_registration_v1", _direct_registration_v1),
 )
 
 

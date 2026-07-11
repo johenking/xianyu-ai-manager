@@ -112,6 +112,9 @@
   "/api/admin/registration/invites/{invite_id}": [
     "DELETE"
   ],
+  "/api/admin/registration/limit": [
+    "PUT"
+  ],
   "/api/admin/registration/status": [
     "GET"
   ],
@@ -214,6 +217,9 @@
   ],
   "/api/settings/summary": [
     "GET"
+  ],
+  "/api/settings/verify/smtp/confirm": [
+    "POST"
   ],
   "/api/settings/verify/{section}": [
     "POST"

@@ -213,11 +213,12 @@ class SMTPVerificationPersistenceTests(unittest.TestCase):
             "",
         )
 
-    def test_readiness_requires_switch_verified_smtp_and_an_invite(self):
+    def test_readiness_requires_confirmed_smtp_support_email_and_capacity(self):
         settings = {
             **SMTP_SETTINGS,
             "registration_enabled": "true",
-            "terms_version": "v1",
+            "terms_version": "v2",
+            "registration_user_limit": "20",
         }
         fingerprint = smtp_configuration_fingerprint(
             settings,
@@ -228,26 +229,46 @@ class SMTPVerificationPersistenceTests(unittest.TestCase):
         ready = registration_readiness(
             settings,
             db_path=str(self.db_path),
-            active_invite_available=True,
+            user_count=19,
         )
         self.assertTrue(ready["enabled"])
         self.assertTrue(ready["ready"])
+        self.assertTrue(ready["requested"])
+        self.assertFalse(ready["invite_required"])
+        self.assertEqual(ready["remaining_slots"], 1)
 
-        no_invite = registration_readiness(
+        full = registration_readiness(
             settings,
             db_path=str(self.db_path),
-            active_invite_available=False,
+            user_count=20,
         )
-        self.assertFalse(no_invite["enabled"])
-        self.assertFalse(no_invite["ready"])
+        self.assertFalse(full["enabled"])
+        self.assertFalse(full["ready"])
+        self.assertEqual(full["remaining_slots"], 0)
+
+        invalid_support = registration_readiness(
+            {**settings, "support_email": "not-an-email"},
+            db_path=str(self.db_path),
+            user_count=0,
+        )
+        self.assertFalse(invalid_support["ready"])
 
         stale = registration_readiness(
             {**settings, "smtp_port": "465"},
             db_path=str(self.db_path),
-            active_invite_available=True,
+            user_count=0,
         )
         self.assertFalse(stale["enabled"])
         self.assertFalse(stale["smtp_verified"])
+
+        not_requested = registration_readiness(
+            {**settings, "registration_enabled": "false"},
+            db_path=str(self.db_path),
+            user_count=0,
+        )
+        self.assertTrue(not_requested["ready"])
+        self.assertFalse(not_requested["enabled"])
+        self.assertFalse(not_requested["requested"])
 
 
 if __name__ == "__main__":
