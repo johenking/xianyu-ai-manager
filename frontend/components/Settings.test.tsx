@@ -220,6 +220,55 @@ describe('Settings configuration sections', () => {
     expect(screen.queryByLabelText('SMTP 收件验证码')).not.toBeInTheDocument();
   });
 
+  it('rejects every section save while SMTP verification is pending', async () => {
+    vi.mocked(verifySettingsSection).mockImplementation(() => new Promise(() => undefined));
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    await waitFor(() => expect(verifySettingsSection).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: /AI 配置/ }));
+    fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'model-during-smtp-verify' } });
+    const saveButton = screen.getByRole('button', { name: '保存并折叠' });
+    expect(saveButton).toBeDisabled();
+    fireEvent.click(saveButton);
+
+    expect(saveSettingsSection).not.toHaveBeenCalled();
+  });
+
+  it('rejects SMTP verification and confirmation while another section save is pending', async () => {
+    vi.mocked(verifySettingsSection).mockResolvedValue({
+      success: true,
+      state: 'pending',
+      message: '验证邮件已发送',
+      challenge_id: 'smtp-before-basic-save',
+      expires_in: 600,
+      masked_recipient: 're***@example.com',
+    });
+    vi.mocked(saveSettingsSection).mockImplementation(() => new Promise(() => undefined));
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    await screen.findByLabelText('SMTP 收件验证码');
+
+    fireEvent.click(screen.getByRole('button', { name: /基础设置/ }));
+    fireEvent.click(screen.getByRole('switch', { name: '显示默认登录信息' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存并折叠' }));
+    await waitFor(() => expect(saveSettingsSection).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.change(screen.getByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
+    const verifyButton = screen.getByRole('button', { name: '验证连接' });
+    const confirmButton = screen.getByRole('button', { name: '确认收件码' });
+    expect(verifyButton).toBeDisabled();
+    expect(confirmButton).toBeDisabled();
+    fireEvent.click(verifyButton);
+    fireEvent.click(confirmButton);
+
+    expect(verifySettingsSection).toHaveBeenCalledTimes(1);
+    expect(confirmSmtpVerification).not.toHaveBeenCalled();
+  });
+
   it('locks SMTP-changing actions while receipt confirmation is pending', async () => {
     let resolveConfirmation: (result: Awaited<ReturnType<typeof confirmSmtpVerification>>) => void = () => undefined;
     vi.mocked(verifySettingsSection).mockResolvedValue({

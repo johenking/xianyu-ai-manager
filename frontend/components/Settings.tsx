@@ -43,6 +43,7 @@ const Settings: React.FC = () => {
   const [confirmingSmtp, setConfirmingSmtp] = useState(false);
   const smtpVerificationGeneration = useRef(0);
   const smtpOperationRef = useRef<SmtpOperation | null>(null);
+  const settingsSaveRef = useRef<SettingsSectionKey | null>(null);
   const [smtpOperation, setSmtpOperation] = useState<SmtpOperation | null>(null);
 
   const beginSmtpOperation = (operation: SmtpOperation) => {
@@ -129,10 +130,12 @@ const Settings: React.FC = () => {
   };
 
   const save = async (section: SettingsSectionKey) => {
+    if (smtpOperationRef.current || settingsSaveRef.current) return;
     if (section === 'smtp') {
       if (!beginSmtpOperation('save')) return;
       invalidateSmtpVerification();
     }
+    settingsSaveRef.current = section;
     setSaving(section);
     setNotice(null);
     try {
@@ -151,13 +154,14 @@ const Settings: React.FC = () => {
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '保存失败' });
     } finally {
+      if (settingsSaveRef.current === section) settingsSaveRef.current = null;
       setSaving(null);
       if (section === 'smtp') endSmtpOperation('save');
     }
   };
 
   const verify = async (section: 'ai' | 'smtp') => {
-    if (section === 'smtp' && !beginSmtpOperation('verify')) return;
+    if (section === 'smtp' && (settingsSaveRef.current || !beginSmtpOperation('verify'))) return;
     const smtpGeneration = section === 'smtp' ? invalidateSmtpVerification() : null;
     setVerifying(section);
     setVerificationState((current) => ({ ...current, [section]: { state: 'checking', label: '验证中' } }));
@@ -210,6 +214,7 @@ const Settings: React.FC = () => {
   };
 
   const confirmSmtp = async () => {
+    if (settingsSaveRef.current) return;
     if (!beginSmtpOperation('confirm')) return;
     if (!smtpChallenge || !/^\d{6}$/.test(smtpVerificationCode)) {
       setNotice({ tone: 'error', text: '请输入邮件中收到的 6 位验证码' });
@@ -332,14 +337,14 @@ const Settings: React.FC = () => {
             <p className="mt-1 text-xs text-blue-700">请检查该独立邮箱并输入 6 位收件码{smtpChallenge.expiresIn ? `，${Math.ceil(smtpChallenge.expiresIn / 60)} 分钟内有效` : ''}。</p>
             <div className="mt-3 flex flex-col gap-3 sm:flex-row">
               <label className="block flex-1 text-sm font-bold text-gray-800">SMTP 收件验证码<input aria-label="SMTP 收件验证码" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={smtpVerificationCode} onChange={(event) => setSmtpVerificationCode(event.target.value.replace(/\D/g, ''))} placeholder="6 位数字" disabled={smtpBusy} className="mt-2 h-10 w-full rounded-lg border border-blue-200 bg-white px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100 disabled:cursor-not-allowed disabled:bg-gray-100" /></label>
-              <button type="button" onClick={() => void confirmSmtp()} disabled={confirmingSmtp || !/^\d{6}$/.test(smtpVerificationCode)} className="mt-auto inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50">{confirmingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认收件码</button>
+              <button type="button" onClick={() => void confirmSmtp()} disabled={confirmingSmtp || saving !== null || !/^\d{6}$/.test(smtpVerificationCode)} className="mt-auto inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50">{confirmingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认收件码</button>
             </div>
           </div> : null}
         </div>}
 
         <div className="mt-7 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-          {(openSection === 'ai' || openSection === 'smtp') && <button onClick={() => void verify(openSection)} disabled={verifying === openSection || (openSection === 'smtp' && smtpBusy)} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-gray-100 px-5 text-sm font-bold text-gray-800 hover:bg-gray-200 disabled:cursor-not-allowed disabled:opacity-50">{verifying === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}验证连接</button>}
-          <button onClick={() => void save(openSection)} disabled={saving === openSection || !dirty[openSection] || (openSection === 'smtp' && smtpBusy)} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">{saving === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存并折叠</button>
+          {(openSection === 'ai' || openSection === 'smtp') && <button onClick={() => void verify(openSection)} disabled={verifying === openSection || (openSection === 'smtp' && (smtpBusy || saving !== null))} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-gray-100 px-5 text-sm font-bold text-gray-800 hover:bg-gray-200 disabled:cursor-not-allowed disabled:opacity-50">{verifying === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}验证连接</button>}
+          <button onClick={() => void save(openSection)} disabled={saving !== null || smtpBusy || !dirty[openSection]} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">{saving === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存并折叠</button>
         </div>
       </section>}
 
