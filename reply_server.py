@@ -3373,6 +3373,9 @@ def get_registration_admin_status(
 ):
     settings = db_manager.get_all_system_settings()
     state = _registration_state()
+    support_email = str(
+        settings.get('support_email') or settings.get('smtp_user') or ''
+    ).strip()
     invites = db_manager.registration_service.list_invites()
     invite_counts = {
         status_name: sum(
@@ -3392,9 +3395,8 @@ def get_registration_admin_status(
             'configured': state['smtp_configured'],
             'verified': state['smtp_verified'],
             'verified_at': settings.get('smtp_verified_at') or '',
-            'support_email': mask_email_for_log(
-                settings.get('support_email') or settings.get('smtp_user') or ''
-            ),
+            'support_email': mask_email_for_log(support_email)
+            if support_email else '',
         },
         'invites': invite_counts,
     }
@@ -3442,7 +3444,14 @@ def list_registration_users(
     limit: int = Query(50, ge=1, le=200),
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    users = db_manager.user_repository.list_recent(limit=limit)
+    users = [
+        user
+        for user in db_manager.user_repository.list_recent(
+            limit=min(200, limit + 1)
+        )
+        if str(user.get('username') or '').casefold()
+        != ADMIN_USERNAME.casefold()
+    ][:limit]
     return {
         'success': True,
         'users': [
@@ -3469,6 +3478,12 @@ def update_registration_user(
     request: UserActiveUpdate,
     _: Dict[str, Any] = Depends(require_admin),
 ):
+    target = db_manager.get_user_by_id(user_id)
+    if target and str(target.get('username') or '').casefold() == ADMIN_USERNAME.casefold():
+        raise RegistrationError(
+            "ADMIN_DEACTIVATION_FORBIDDEN",
+            "管理员账号不能通过注册管理修改",
+        )
     user = db_manager.auth_service.set_user_active(user_id, request.is_active)
     if not request.is_active:
         _drop_user_sessions_from_memory(user_id)

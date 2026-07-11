@@ -375,6 +375,15 @@ class LoginAndPasswordResetAPITests(RegistrationAPIFixture):
 
 
 class RegistrationAdminAPITests(RegistrationAPIFixture):
+    def test_admin_status_keeps_missing_support_email_empty(self):
+        response = self.client.get(
+            "/api/admin/registration/status",
+            headers=self.admin_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["smtp"]["support_email"], "")
+
     def test_settings_summary_never_exposes_smtp_secret_or_fingerprint(self):
         self.mark_smtp_verified()
         fingerprint = self.db.get_system_setting("smtp_verified_fingerprint")
@@ -423,6 +432,10 @@ class RegistrationAdminAPITests(RegistrationAPIFixture):
         users = self.client.get(
             "/api/admin/registration/users",
             headers=headers,
+        )
+        self.assertNotIn(
+            "admin",
+            [item["username"].casefold() for item in users.json()["users"]],
         )
         user = next(
             item for item in users.json()["users"] if item["username"] == "pilot-user"

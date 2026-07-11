@@ -1,13 +1,30 @@
 // @vitest-environment jsdom
+import '@testing-library/jest-dom/vitest';
+
 import React from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getAIProviders, getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
+import {
+  getAIProviders,
+  getRegistrationAdminStatus,
+  getSettingsSummary,
+  listRegistrationInvites,
+  listRegistrationUsers,
+  saveSettingsSection,
+  verifySettingsSection,
+} from '../services/api';
 import { SettingsSummary } from '../types';
 import Settings from './Settings';
 
 vi.mock('../services/api', () => ({
   getSettingsSummary: vi.fn(),
+  getRegistrationAdminStatus: vi.fn(),
+  listRegistrationInvites: vi.fn(),
+  listRegistrationUsers: vi.fn(),
+  createRegistrationInvites: vi.fn(),
+  revokeRegistrationInvite: vi.fn(),
+  setRegistrationEnabled: vi.fn(),
+  setRegistrationUserActive: vi.fn(),
   getAIProviders: vi.fn(),
   createAIProvider: vi.fn(),
   updateAIProvider: vi.fn(),
@@ -47,6 +64,14 @@ describe('Settings configuration sections', () => {
   beforeEach(() => {
     vi.mocked(getSettingsSummary).mockResolvedValue(summary);
     vi.mocked(getAIProviders).mockResolvedValue({ providers: [], presets: {} });
+    vi.mocked(getRegistrationAdminStatus).mockResolvedValue({
+      success: true,
+      registration: { enabled: false, ready: false, requested: false, terms_version: 'v1' },
+      smtp: { configured: false, verified: false, verified_at: '', support_email: '' },
+      invites: { active: 0, used: 0, expired: 0, revoked: 0 },
+    });
+    vi.mocked(listRegistrationInvites).mockResolvedValue({ success: true, invites: [] });
+    vi.mocked(listRegistrationUsers).mockResolvedValue({ success: true, users: [] });
     vi.mocked(saveSettingsSection).mockReset();
     vi.mocked(verifySettingsSection).mockReset();
   });
@@ -99,5 +124,15 @@ describe('Settings configuration sections', () => {
 
     await waitFor(() => expect(screen.getAllByText('不可用').length).toBeGreaterThan(0));
     expect(screen.getByText('连接超时')).toBeTruthy();
+  });
+
+  it('keeps registration controls in the dedicated gated management section', async () => {
+    render(<Settings />);
+
+    expect(await screen.findByRole('heading', { name: '注册管理' })).toBeInTheDocument();
+    expect(screen.queryByText('允许用户注册')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /SMTP 配置/ }));
+    expect(screen.getByLabelText('支持邮箱')).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: '开放邀请注册' })).toBeDisabled();
   });
 });

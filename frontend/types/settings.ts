@@ -21,6 +21,8 @@ export interface SystemSettings {
   smtp_from?: string;
   smtp_use_tls?: boolean;
   smtp_use_ssl?: boolean;
+  smtp_verified?: boolean;
+  support_email?: string;
   [key: string]: any;
 }
 
@@ -33,7 +35,16 @@ export interface SettingsSummary {
     label: string;
     configured: boolean;
     model?: string;
+    verified?: boolean;
   }>;
+  registration?: {
+    enabled: boolean;
+    ready: boolean;
+    requested: boolean;
+    smtp_verified: boolean;
+    active_invite_available: boolean;
+    terms_version?: string;
+  };
   runtime: {
     cookie_manager: boolean;
     account_count: number;
