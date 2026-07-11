@@ -25,8 +25,13 @@ from security_utils import (
     hash_user_password,
     token_digest,
 )
-from repositories.auth_repository import AuthSessionRepository, UserRepository
+from repositories.auth_repository import (
+    AuthSessionRepository,
+    UserRepository,
+    public_user_view,
+)
 from services.auth_service import AuthService
+from auth_registration_service import AuthRateLimiter, RegistrationService
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
@@ -777,7 +782,21 @@ class DBManager:
             self.backfill_cookie_identities()
             self.user_repository = UserRepository(self.conn)
             self.auth_session_repository = AuthSessionRepository(self.conn)
-            self.auth_service = AuthService(self.user_repository)
+            self.auth_service = AuthService(
+                self.user_repository,
+                self.auth_session_repository,
+                lock=self.lock,
+            )
+            self.registration_service = RegistrationService(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
+            self.auth_rate_limiter = AuthRateLimiter(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
@@ -4063,7 +4082,7 @@ class DBManager:
                 )
 
                 self.conn.commit()
-                logger.info(f"创建用户成功: {username} ({email})")
+                logger.info(f"创建用户成功: {username}")
                 return True
             except sqlite3.IntegrityError as e:
                 logger.error(f"创建用户失败，用户名或邮箱已存在: {e}")
@@ -5859,24 +5878,10 @@ class DBManager:
         """获取所有用户信息（管理员专用）"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                ORDER BY created_at DESC
-                ''')
-
-                users = []
-                for row in cursor.fetchall():
-                    users.append({
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    })
-
-                return users
+                return [
+                    public_user_view(user)
+                    for user in self.user_repository.list_recent(limit=200)
+                ]
             except Exception as e:
                 logger.error(f"获取所有用户失败: {e}")
                 return []
@@ -5885,23 +5890,8 @@ class DBManager:
         """根据ID获取用户信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                WHERE id = ?
-                ''', (user_id,))
-
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    }
-                return None
+                user = self.user_repository.get_by_id(user_id)
+                return public_user_view(user) if user else None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from repositories.auth_repository import UserRepository
+import threading
+
+from auth_registration_service import RegistrationError
+from repositories.auth_repository import (
+    AuthSessionRepository,
+    UserRepository,
+    public_user_view,
+)
 from security_utils import (
     PASSWORD_HASH_VERSION,
     hash_user_password,
@@ -12,11 +19,18 @@ from security_utils import (
 
 
 class AuthService:
-    def __init__(self, users: UserRepository):
+    def __init__(
+        self,
+        users: UserRepository,
+        sessions: AuthSessionRepository | None = None,
+        lock: threading.RLock | None = None,
+    ):
         self.users = users
+        self.sessions = sessions or AuthSessionRepository(users.connection)
+        self.lock = lock or threading.RLock()
 
     def verify_password(self, username: str, password: str) -> bool:
-        user = self.users.get_by_username(username)
+        user = self.users.get_by_identifier(username)
         if not user or not user["is_active"]:
             return False
         if user["password_hash_v2"]:
@@ -31,3 +45,30 @@ class AuthService:
         self.users.connection.commit()
         return True
 
+    def set_user_active(self, user_id: int, is_active: bool) -> dict:
+        connection = self.users.connection
+        with self.lock:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                user = self.users.get_by_id(user_id)
+                if user is None:
+                    raise RegistrationError("USER_NOT_FOUND", "用户不存在")
+                if not is_active and user["username_normalized"] == "admin":
+                    raise RegistrationError(
+                        "ADMIN_DEACTIVATION_FORBIDDEN",
+                        "管理员账号不能停用",
+                    )
+                if self.users.set_active(user_id, is_active) != 1:
+                    raise RegistrationError("USER_UPDATE_FAILED", "用户状态更新失败")
+                if not is_active:
+                    self.sessions.delete_by_user_id(user_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            updated = self.users.get_by_id(user_id)
+        if updated is None:
+            raise RegistrationError("USER_NOT_FOUND", "用户不存在")
+        return public_user_view(updated)
+
+    set_active = set_user_active
