@@ -5,9 +5,15 @@ import sqlite3
 import tempfile
 import unittest
 
+from loguru import logger
+
 from db_manager import DBManager
 from schema_migrations import Migration, MigrationRunner
-from security_utils import AccountCredentialCipher, token_digest
+from security_utils import (
+    SYSTEM_SECRET_PREFIX,
+    AccountCredentialCipher,
+    token_digest,
+)
 
 
 def create_legacy_database(path: Path) -> None:
@@ -224,6 +230,144 @@ class CredentialCompatibilityTests(unittest.TestCase):
         self.assertNotEqual(stored_token, "session-secret")
         self.assertEqual(stored_digest, token_digest("session-secret"))
         self.assertIsNotNone(self.db.get_auth_session("session-secret"))
+
+    def test_smtp_password_is_encrypted_at_rest_and_decrypted_for_internal_reads(self):
+        def stored_password() -> str:
+            return self.db.conn.execute(
+                "SELECT value FROM system_settings WHERE key = 'smtp_password'"
+            ).fetchone()[0]
+
+        self.assertTrue(
+            self.db.set_system_setting(
+                "smtp_password",
+                "synthetic-smtp-secret",
+                "SMTP credential",
+            )
+        )
+        first_ciphertext = stored_password()
+        self.assertTrue(first_ciphertext.startswith(SYSTEM_SECRET_PREFIX))
+        self.assertNotIn("synthetic-smtp-secret", first_ciphertext)
+        self.assertEqual(
+            self.db.get_system_setting("smtp_password"),
+            "synthetic-smtp-secret",
+        )
+        self.assertEqual(
+            self.db.get_all_system_settings()["smtp_password"],
+            "synthetic-smtp-secret",
+        )
+
+        self.assertTrue(
+            self.db.save_system_settings_section(
+                {
+                    "smtp_server": "smtp.example.test",
+                    "smtp_password": self.db.get_system_setting("smtp_password"),
+                }
+            )
+        )
+        self.assertEqual(stored_password(), first_ciphertext)
+
+        self.assertTrue(
+            self.db.set_system_setting("smtp_password", first_ciphertext)
+        )
+        self.assertEqual(stored_password(), first_ciphertext)
+        self.assertEqual(
+            self.db.get_system_setting("smtp_password"),
+            "synthetic-smtp-secret",
+        )
+
+        self.assertTrue(
+            self.db.save_system_settings_section(
+                {"smtp_password": "replacement-smtp-secret"}
+            )
+        )
+        replacement_ciphertext = stored_password()
+        self.assertTrue(replacement_ciphertext.startswith(SYSTEM_SECRET_PREFIX))
+        self.assertNotEqual(replacement_ciphertext, first_ciphertext)
+        self.assertEqual(
+            self.db.get_all_system_settings()["smtp_password"],
+            "replacement-smtp-secret",
+        )
+
+    def test_create_user_persists_normalized_identity_and_rejects_casefold_conflicts(self):
+        self.assertTrue(
+            self.db.create_user(
+                "Alice",
+                " Mixed.Email@Example.COM ",
+                "synthetic-password",
+            )
+        )
+        identity = self.db.conn.execute(
+            "SELECT username, email, username_normalized, email_normalized "
+            "FROM users WHERE username = 'Alice'"
+        ).fetchone()
+        self.assertEqual(
+            identity,
+            (
+                "Alice",
+                "mixed.email@example.com",
+                "alice",
+                "mixed.email@example.com",
+            ),
+        )
+        self.assertFalse(
+            self.db.create_user(
+                "alice",
+                "different@example.com",
+                "synthetic-password",
+            )
+        )
+        self.assertFalse(
+            self.db.create_user(
+                "different-user",
+                "MIXED.EMAIL@example.com",
+                "synthetic-password",
+            )
+        )
+
+        self.assertTrue(
+            self.db.create_user(
+                "Straße",
+                "street-one@example.com",
+                "synthetic-password",
+            )
+        )
+        self.assertFalse(
+            self.db.create_user(
+                "STRASSE",
+                "street-two@example.com",
+                "synthetic-password",
+            )
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM users "
+                "WHERE username_normalized IS NULL OR email_normalized IS NULL"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_registration_security_tables_redact_sql_parameters(self):
+        messages = []
+        sink_id = logger.add(messages.append, format="{message}", level="DEBUG")
+        try:
+            for table in (
+                "auth_challenges",
+                "registration_invites",
+                "auth_rate_events",
+            ):
+                marker = f"synthetic-{table}-digest"
+                self.db._log_sql(
+                    f"INSERT INTO {table} (secret_digest) VALUES (?)",
+                    (marker,),
+                )
+        finally:
+            logger.remove(sink_id)
+
+        output = "".join(str(message) for message in messages)
+        self.assertNotIn("synthetic-auth_challenges-digest", output)
+        self.assertNotIn("synthetic-registration_invites-digest", output)
+        self.assertNotIn("synthetic-auth_rate_events-digest", output)
+        self.assertGreaterEqual(output.count("[REDACTED]"), 3)
 
 
 if __name__ == "__main__":

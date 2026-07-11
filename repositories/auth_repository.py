@@ -47,10 +47,21 @@ class UserRepository:
         return _user_from_row(row)
 
     def create(self, username: str, email: str, password_hash_v2: str, version: int) -> None:
+        username = str(username)
+        email = str(email).strip().casefold()
         self.connection.execute(
-            "INSERT INTO users (username, email, password_hash, password_hash_v2, password_hash_version) "
-            "VALUES (?, ?, '', ?, ?)",
-            (username, email, password_hash_v2, version),
+            "INSERT INTO users "
+            "(username, username_normalized, email, email_normalized, password_hash, "
+            "password_hash_v2, password_hash_version) "
+            "VALUES (?, ?, ?, ?, '', ?, ?)",
+            (
+                username,
+                username.casefold(),
+                email,
+                email,
+                password_hash_v2,
+                version,
+            ),
         )
 
     def set_password(self, username: str, password_hash_v2: str, version: int) -> int:
@@ -124,4 +135,3 @@ class AuthSessionRepository:
 
     def cleanup_expired(self, now: float) -> None:
         self.connection.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
-

@@ -18,7 +18,9 @@ from schema_migrations import MigrationRunner, get_schema_version
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
     PASSWORD_HASH_VERSION,
+    SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
+    SystemSecretCipher,
     hash_user_password,
     token_digest,
 )
@@ -1574,6 +1576,9 @@ class DBManager:
         formatted_sql = ' '.join(sql.split())
         sensitive_sql_terms = (
             'auth_sessions',
+            'auth_challenges',
+            'registration_invites',
+            'auth_rate_events',
             'cookies',
             'password',
             'token',
@@ -3839,6 +3844,35 @@ class DBManager:
                 return False
 
     # -------------------- 系统设置操作 --------------------
+    def _decode_system_setting(self, key: str, value: str) -> str:
+        if key == 'smtp_password':
+            return SystemSecretCipher(self.db_path).decrypt(str(value or ''))
+        return value
+
+    def _encode_system_setting(self, cursor, key: str, value: Any) -> Any:
+        if key != 'smtp_password':
+            return value
+
+        plaintext = str(value if value is not None else '')
+        if not plaintext:
+            return ''
+
+        cipher = SystemSecretCipher(self.db_path)
+        existing_row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = 'smtp_password'"
+        ).fetchone()
+        if existing_row:
+            existing_value = str(existing_row[0] or '')
+            if existing_value.startswith(SYSTEM_SECRET_PREFIX):
+                try:
+                    existing_plaintext = cipher.decrypt(existing_value)
+                except ValueError:
+                    pass
+                else:
+                    if existing_plaintext == plaintext:
+                        return existing_value
+        return cipher.encrypt(plaintext)
+
     def get_system_setting(self, key: str) -> Optional[str]:
         """获取系统设置"""
         with self.lock:
@@ -3846,7 +3880,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM system_settings WHERE key = ?", (key,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return self._decode_system_setting(key, result[0]) if result else None
             except Exception as e:
                 logger.error(f"获取系统设置失败: {e}")
                 return None
@@ -3856,10 +3890,11 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                stored_value = self._encode_system_setting(cursor, key, value)
                 cursor.execute('''
                 INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
                 VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (key, value, description))
+                ''', (key, stored_value, description))
                 self.conn.commit()
                 logger.debug(f"设置系统设置: {key}")
                 return True
@@ -3879,6 +3914,9 @@ class DBManager:
                         stored_value = "true" if value else "false"
                     else:
                         stored_value = str(value if value is not None else "")
+                    stored_value = self._encode_system_setting(
+                        cursor, key, stored_value
+                    )
                     cursor.execute('''
                         INSERT INTO system_settings (key, value, description, updated_at)
                         VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
@@ -3902,7 +3940,7 @@ class DBManager:
 
                 settings = {}
                 for row in cursor.fetchall():
-                    settings[row[0]] = row[1]
+                    settings[row[0]] = self._decode_system_setting(row[0], row[1])
 
                 return settings
             except Exception as e:

@@ -1,9 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import sqlite3
 import stat
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from schema_migrations import MigrationRunner
 import security_utils
@@ -170,6 +173,64 @@ class RegistrationMigrationTests(unittest.TestCase):
         self.assertNotEqual(encrypted, plaintext)
         self.assertTrue(encrypted.startswith(security_utils.SYSTEM_SECRET_PREFIX))
         self.assertEqual(cipher.decrypt(encrypted), plaintext)
+
+    def test_system_secret_key_creation_is_atomic_across_threads(self):
+        real_open = os.open
+        first_opened = threading.Event()
+        release_first = threading.Event()
+        interception_lock = threading.Lock()
+        intercepted = False
+
+        def delay_first_exclusive_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal intercepted
+            if dir_fd is None:
+                descriptor = real_open(path, flags, mode)
+            else:
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            should_wait = False
+            if flags & os.O_EXCL and Path(path).parent == self.root:
+                with interception_lock:
+                    if not intercepted:
+                        intercepted = True
+                        should_wait = True
+            if should_wait:
+                first_opened.set()
+                release_first.wait(timeout=5)
+            return descriptor
+
+        def create_cipher():
+            try:
+                return security_utils.SystemSecretCipher(str(self.db_path))
+            except Exception as exc:  # Returned so the assertion reports both threads.
+                return exc
+
+        with mock.patch.object(security_utils.os, "open", delay_first_exclusive_open):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first_future = executor.submit(create_cipher)
+                self.assertTrue(first_opened.wait(timeout=2))
+                second_future = executor.submit(create_cipher)
+                try:
+                    second_result = second_future.result(timeout=2)
+                finally:
+                    release_first.set()
+                first_result = first_future.result(timeout=2)
+
+        results = (first_result, second_result)
+        self.assertTrue(
+            all(isinstance(result, security_utils.SystemSecretCipher) for result in results),
+            [type(result).__name__ for result in results],
+        )
+        first_cipher, second_cipher = results
+        first_token = first_cipher.encrypt("first-thread-secret")
+        second_token = second_cipher.encrypt("second-thread-secret")
+        self.assertEqual(second_cipher.decrypt(first_token), "first-thread-secret")
+        self.assertEqual(first_cipher.decrypt(second_token), "second-thread-secret")
+        self.assertTrue(self.system_key_path.read_text(encoding="ascii"))
+        self.assertEqual(stat.S_IMODE(self.system_key_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            list(self.root.glob(f"{self.system_key_path.name}.tmp-*")),
+            [],
+        )
 
     def test_v150_upgrade_adds_registration_schema_defaults_and_secure_backup(self):
         connection = sqlite3.connect(self.db_path)

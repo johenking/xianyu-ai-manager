@@ -8,6 +8,7 @@ import hmac
 import os
 from pathlib import Path
 import secrets
+import tempfile
 from typing import Optional
 
 import bcrypt
@@ -115,29 +116,44 @@ class SystemSecretCipher:
 
     def _local_secret(self) -> str:
         if self.key_path.exists():
-            os.chmod(self.key_path, 0o600)
-            secret = self.key_path.read_text(encoding="ascii").strip()
-            if not secret:
-                raise ValueError("系统秘密密钥文件为空")
-            return secret
+            return self._read_local_secret()
 
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
         secret = secrets.token_urlsafe(48)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{self.key_path.name}.tmp-",
+            dir=str(self.key_path.parent),
+        )
+        temporary_path = Path(temporary_name)
         try:
-            descriptor = os.open(
-                str(self.key_path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
-        except FileExistsError:
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="ascii",
+                    closefd=False,
+                ) as handle:
+                    handle.write(secret)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(descriptor)
+
+            try:
+                os.link(temporary_path, self.key_path)
+            except FileExistsError:
+                return self._read_local_secret()
             os.chmod(self.key_path, 0o600)
-            existing_secret = self.key_path.read_text(encoding="ascii").strip()
-            if not existing_secret:
-                raise ValueError("系统秘密密钥文件为空")
-            return existing_secret
-        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-            handle.write(secret)
+            return secret
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _read_local_secret(self) -> str:
         os.chmod(self.key_path, 0o600)
+        secret = self.key_path.read_text(encoding="ascii").strip()
+        if not secret:
+            raise ValueError("系统秘密密钥文件为空")
         return secret
 
     def encrypt(self, value: str) -> str:
