@@ -91,6 +91,8 @@ def create_registration_database(path: Path) -> sqlite3.Connection:
             consumed_at REAL,
             created_at INTEGER NOT NULL
         );
+        CREATE INDEX idx_auth_challenges_expiry
+            ON auth_challenges(expires_at, consumed_at);
         CREATE TABLE auth_rate_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type TEXT NOT NULL,
@@ -427,6 +429,109 @@ class ChallengeServiceTests(unittest.TestCase):
             ),
         )
 
+    def test_challenge_creation_cleans_only_old_records_in_a_bounded_batch(self):
+        cutoff = self.now - 86_400
+        batch_size = 100
+        old_rows = [
+            (
+                f"old-expired-{index}",
+                "captcha",
+                f"subject-{index}",
+                "",
+                f"secret-{index}",
+                0,
+                5,
+                cutoff - index - 1,
+                None,
+                int(cutoff - index - 601),
+            )
+            for index in range(batch_size + 2)
+        ]
+        retained_rows = (
+            (
+                "old-consumed",
+                "captcha",
+                "old-consumed-subject",
+                "",
+                "old-consumed-secret",
+                0,
+                5,
+                self.now + 600,
+                cutoff - 1,
+                int(cutoff - 700),
+            ),
+            (
+                "recent-expired",
+                "captcha",
+                "recent-expired-subject",
+                "",
+                "recent-expired-secret",
+                0,
+                5,
+                cutoff + 1,
+                None,
+                int(cutoff - 599),
+            ),
+            (
+                "recent-consumed",
+                "captcha",
+                "recent-consumed-subject",
+                "",
+                "recent-consumed-secret",
+                0,
+                5,
+                self.now + 600,
+                self.now - 1,
+                int(self.now - 10),
+            ),
+        )
+        self.connection.executemany(
+            "INSERT INTO auth_challenges ("
+            "challenge_id, purpose, subject_digest, context_digest, secret_digest, "
+            "attempt_count, max_attempts, expires_at, consumed_at, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*old_rows, *retained_rows),
+        )
+        self.connection.commit()
+
+        created = self.service.create_challenge(
+            purpose="captcha",
+            subject="current-session",
+            secret="N4W6",
+        )
+
+        remaining_old = self.connection.execute(
+            "SELECT COUNT(*) FROM auth_challenges WHERE challenge_id LIKE 'old-expired-%'"
+        ).fetchone()[0]
+        self.assertEqual(remaining_old, 2)
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT 1 FROM auth_challenges WHERE challenge_id = 'old-consumed'"
+            ).fetchone()
+        )
+
+        second = self.service.create_challenge(
+            purpose="captcha",
+            subject="second-current-session",
+            secret="P5X7",
+        )
+
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM auth_challenges WHERE challenge_id = 'old-consumed'"
+            ).fetchone()
+        )
+        retained = {
+            row[0]
+            for row in self.connection.execute(
+                "SELECT challenge_id FROM auth_challenges"
+            ).fetchall()
+        }
+        self.assertIn("recent-expired", retained)
+        self.assertIn("recent-consumed", retained)
+        self.assertIn(created["challenge_id"], retained)
+        self.assertIn(second["challenge_id"], retained)
+
 
 class RegistrationServiceFixture(unittest.TestCase):
     def setUp(self):
@@ -499,6 +604,118 @@ class RegistrationServiceFixture(unittest.TestCase):
         with self.assertRaises(RegistrationError) as raised:
             callback()
         self.assertEqual(raised.exception.code, code)
+
+
+class SMTPConfirmationTransactionTests(RegistrationServiceFixture):
+    def issue_confirmation(self, secret="538204"):
+        self.connection.execute(
+            "UPDATE system_settings SET value = 'support@example.com' "
+            "WHERE key = 'support_email'"
+        )
+        self.connection.commit()
+        settings = {
+            row[0]: row[1]
+            for row in self.connection.execute(
+                "SELECT key, value FROM system_settings"
+            ).fetchall()
+        }
+        fingerprint = smtp_configuration_fingerprint(
+            settings,
+            db_path=str(self.db_path),
+        )
+        self.connection.execute(
+            "UPDATE system_settings SET value = '' "
+            "WHERE key = 'smtp_verified_fingerprint'"
+        )
+        self.connection.commit()
+        challenge = self.service.create_challenge(
+            purpose="smtp_verify_email",
+            subject=settings["support_email"],
+            context=fingerprint,
+            secret=secret,
+        )
+        return challenge, secret, fingerprint
+
+    def test_concurrent_smtp_change_rolls_back_confirmation_and_allows_retry(self):
+        challenge, secret, original_fingerprint = self.issue_confirmation()
+        second_connection = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=10,
+        )
+        second_connection.execute("BEGIN IMMEDIATE")
+        second_connection.execute(
+            "UPDATE system_settings SET value = ? WHERE key = 'smtp_server'",
+            ("changed.smtp.example.test",),
+        )
+
+        def confirm():
+            return self.service.confirm_smtp_verification(
+                challenge_id=challenge["challenge_id"],
+                verification_code=secret,
+                verified_at="2026-07-11T16:30:00+08:00",
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(confirm)
+                second_connection.commit()
+                with self.assertRaises(RegistrationError) as raised:
+                    future.result()
+            self.assertEqual(
+                raised.exception.code,
+                "CHALLENGE_CONTEXT_MISMATCH",
+            )
+            consumed_at = self.connection.execute(
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
+            ).fetchone()[0]
+            self.assertIsNone(consumed_at)
+            self.assertNotEqual(
+                self.connection.execute(
+                    "SELECT value FROM system_settings "
+                    "WHERE key = 'smtp_verified_fingerprint'"
+                ).fetchone()[0],
+                original_fingerprint,
+            )
+
+            second_connection.execute(
+                "UPDATE system_settings SET value = ? WHERE key = 'smtp_server'",
+                ("smtp.example.test",),
+            )
+            second_connection.commit()
+            result = confirm()
+            self.assertEqual(result["fingerprint"], original_fingerprint)
+        finally:
+            second_connection.close()
+
+    def test_wrong_smtp_codes_persist_attempts_and_lock_at_five(self):
+        challenge, _, _ = self.issue_confirmation()
+
+        def confirm_wrong():
+            self.service.confirm_smtp_verification(
+                challenge_id=challenge["challenge_id"],
+                verification_code="000000",
+                verified_at="2026-07-11T16:31:00+08:00",
+            )
+
+        for expected_attempt in range(1, 5):
+            self.assert_error_code("CHALLENGE_SECRET_INVALID", confirm_wrong)
+            attempt_count = self.connection.execute(
+                "SELECT attempt_count FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
+            ).fetchone()[0]
+            self.assertEqual(attempt_count, expected_attempt)
+        self.assert_error_code("CHALLENGE_LOCKED", confirm_wrong)
+        self.assert_error_code("CHALLENGE_LOCKED", confirm_wrong)
+        attempt_count, consumed_at = self.connection.execute(
+            "SELECT attempt_count, consumed_at FROM auth_challenges "
+            "WHERE challenge_id = ?",
+            (challenge["challenge_id"],),
+        ).fetchone()
+        self.assertEqual(attempt_count, 5)
+        self.assertIsNone(consumed_at)
+
 
 class DirectRegistrationTransactionTests(RegistrationServiceFixture):
     smtp_settings = {

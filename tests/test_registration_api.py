@@ -347,7 +347,7 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
         events = []
         original_consume = self.db.registration_service.consume_challenge
         original_enforce = self.db.auth_rate_limiter.enforce_email_send
-        original_lookup = self.db.get_user_by_email
+        original_lookup = self.db.get_user_by_email_for_public_auth
 
         def consume_first(**kwargs):
             events.append("captcha")
@@ -373,7 +373,11 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
                 "enforce_email_send",
                 side_effect=rate_second,
             ),
-            patch.object(self.db, "get_user_by_email", side_effect=lookup_last),
+            patch.object(
+                self.db,
+                "get_user_by_email_for_public_auth",
+                side_effect=lookup_last,
+            ),
             patch.object(reply_server.SMTPEmailSender, "send", autospec=True),
         ):
             response = self.client.post(
@@ -598,6 +602,71 @@ class EmailEnumerationAPITests(RegistrationAPIFixture):
         self.assertIsNotNone(
             self.db.get_auth_session("synthetic-inactive-session")
         )
+
+    def test_public_email_lookup_uses_one_indexed_query_for_hits_and_misses(self):
+        cases = (
+            ("small-hit", "existing-target@example.com", "D401"),
+            ("small-miss", "small-missing@example.com", "D402"),
+            ("large-hit", "bulk-user-199@example.com", "D403"),
+            ("large-miss", "large-missing@example.com", "D404"),
+        )
+        query_shapes = []
+
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "enforce_email_send",
+        ):
+            for label, email, captcha_code in cases:
+                if label == "large-hit":
+                    self.db.conn.executemany(
+                        "INSERT INTO users ("
+                        "username, email, password_hash, username_normalized, "
+                        "email_normalized) VALUES (?, ?, '', ?, ?)",
+                        (
+                            (
+                                f"bulk-user-{index:03d}",
+                                f"bulk-user-{index:03d}@example.com",
+                                f"bulk-user-{index:03d}",
+                                f"bulk-user-{index:03d}@example.com",
+                            )
+                            for index in range(200)
+                        ),
+                    )
+                    self.db.conn.commit()
+                statements = []
+                self.db.conn.set_trace_callback(statements.append)
+                try:
+                    response, sender = self.request_code(
+                        purpose="password_reset",
+                        email=email,
+                        captcha_code=captcha_code,
+                    )
+                finally:
+                    self.db.conn.set_trace_callback(None)
+                with self.subTest(label=label):
+                    self.assertEqual(response.status_code, 200, response.text)
+                    sender.assert_called_once()
+                    user_selects = [
+                        " ".join(statement.split())
+                        for statement in statements
+                        if statement.lstrip().upper().startswith("SELECT ID, USERNAME")
+                        and " FROM users" in statement
+                    ]
+                    self.assertEqual(len(user_selects), 1)
+                    self.assertIn(
+                        "INDEXED BY idx_users_email_normalized",
+                        user_selects[0],
+                    )
+                    self.assertNotIn(" ORDER BY id", user_selects[0])
+                    query_shapes.append(
+                        re.sub(
+                            r"email_normalized = '[^']*'",
+                            "email_normalized = ?",
+                            user_selects[0],
+                        )
+                    )
+
+        self.assertTrue(all(shape == query_shapes[0] for shape in query_shapes))
 
 
 class LoginAndPasswordResetAPITests(RegistrationAPIFixture):
@@ -833,6 +902,69 @@ class RegistrationAdminAPITests(RegistrationAPIFixture):
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
         self.assertEqual(confirmed.json()["state"], "ready")
         self.assertTrue(self.db.get_system_setting("smtp_verified_fingerprint"))
+
+    def test_smtp_confirmation_write_failure_rolls_back_consumption_for_retry(self):
+        headers = self.admin_headers()
+        with patch.object(
+            reply_server.SMTPEmailSender,
+            "send",
+            autospec=True,
+        ) as sender:
+            pending = self.client.post(
+                "/api/settings/verify/smtp",
+                headers=headers,
+                json={
+                    "settings": SMTP_SETTINGS,
+                    "secret_actions": {"smtp_password": "set"},
+                },
+            )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        code = re.search(r"\b(\d{6})\b", sender.call_args.kwargs["text"]).group(1)
+        challenge_id = pending.json()["challenge_id"]
+        self.db.conn.executescript(
+            """
+            CREATE TRIGGER fail_smtp_verification_state_write
+            BEFORE UPDATE OF value ON system_settings
+            WHEN OLD.key = 'smtp_verified_fingerprint' AND NEW.value <> ''
+            BEGIN
+                SELECT RAISE(ABORT, 'synthetic-state-write-failure');
+            END;
+            """
+        )
+
+        failed = self.client.post(
+            "/api/settings/verify/smtp/confirm",
+            headers=headers,
+            json={
+                "challenge_id": challenge_id,
+                "verification_code": code,
+            },
+        )
+
+        self.assertEqual(failed.status_code, 503, failed.text)
+        self.assertEqual(failed.json()["code"], "SMTP_VERIFICATION_SAVE_FAILED")
+        self.assertNotIn("synthetic-state-write-failure", failed.text)
+        self.assertIsNone(
+            self.db.conn.execute(
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (challenge_id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(self.db.get_system_setting("smtp_verified_fingerprint"), "")
+
+        self.db.conn.execute("DROP TRIGGER fail_smtp_verification_state_write")
+        self.db.conn.commit()
+        retried = self.client.post(
+            "/api/settings/verify/smtp/confirm",
+            headers=headers,
+            json={
+                "challenge_id": challenge_id,
+                "verification_code": code,
+            },
+        )
+
+        self.assertEqual(retried.status_code, 200, retried.text)
+        self.assertEqual(retried.json()["state"], "ready")
 
     def test_smtp_confirmation_rejects_wrong_expired_and_changed_configuration(self):
         headers = self.admin_headers()

@@ -53,6 +53,8 @@ CHALLENGE_PURPOSES = frozenset(
 )
 DEFAULT_CHALLENGE_TTL_SECONDS = 600
 DEFAULT_CHALLENGE_MAX_ATTEMPTS = 5
+CHALLENGE_AUDIT_RETENTION_SECONDS = 86_400
+CHALLENGE_CLEANUP_BATCH_SIZE = 100
 RATE_IP_DIGEST_PURPOSE = "auth-rate-ip"
 RATE_EMAIL_DIGEST_PURPOSE = "auth-rate-email"
 RATE_ACCOUNT_DIGEST_PURPOSE = "auth-rate-account"
@@ -869,6 +871,25 @@ class RegistrationService:
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
+                cleanup_before = now - CHALLENGE_AUDIT_RETENTION_SECONDS
+                self.connection.execute(
+                    """
+                    DELETE FROM auth_challenges
+                    WHERE challenge_id IN (
+                        SELECT challenge_id
+                        FROM auth_challenges INDEXED BY idx_auth_challenges_expiry
+                        WHERE expires_at < ?
+                           OR (consumed_at IS NOT NULL AND consumed_at < ?)
+                        ORDER BY expires_at, consumed_at
+                        LIMIT ?
+                    )
+                    """,
+                    (
+                        cleanup_before,
+                        cleanup_before,
+                        CHALLENGE_CLEANUP_BATCH_SIZE,
+                    ),
+                )
                 self.connection.execute(
                     """
                     INSERT INTO auth_challenges (
@@ -969,6 +990,134 @@ class RegistrationService:
         if deferred_error is not None:
             raise deferred_error
         return True
+
+    def confirm_smtp_verification(
+        self,
+        *,
+        challenge_id: str,
+        verification_code: str,
+        verified_at: str,
+    ) -> dict[str, str]:
+        from auth_email_service import (
+            SMTP_CONFIGURATION_KEYS,
+            SMTPConfigurationError,
+            smtp_configuration_fingerprint,
+        )
+
+        if not str(verified_at or ""):
+            raise RegistrationError(
+                "SMTP_VERIFICATION_SAVE_FAILED",
+                "SMTP 确认状态保存失败，请重新验证",
+                http_status=503,
+            )
+        now = self.clock()
+        deferred_error: RegistrationError | None = None
+        fingerprint = ""
+
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                settings = {
+                    str(key): str(value or "")
+                    for key, value in self.connection.execute(
+                        "SELECT key, value FROM system_settings"
+                    ).fetchall()
+                    if key in SMTP_CONFIGURATION_KEYS
+                }
+                if settings.get("smtp_password"):
+                    settings["smtp_password"] = self.cipher.decrypt(
+                        settings["smtp_password"]
+                    )
+                recipient = normalize_email(
+                    settings.get("support_email", "")
+                ).normalized
+                try:
+                    fingerprint = smtp_configuration_fingerprint(
+                        settings,
+                        db_path=self.db_path,
+                    )
+                except SMTPConfigurationError as exc:
+                    raise RegistrationError(
+                        "SMTP_CONFIGURATION_INVALID",
+                        "当前 SMTP 配置不可验证",
+                    ) from exc
+
+                row = self._get_challenge(challenge_id)
+                self._validate_challenge_binding(
+                    row,
+                    purpose="smtp_verify_email",
+                    subject=recipient,
+                    context=fingerprint,
+                    now=now,
+                )
+                if not self._challenge_secret_matches(row, verification_code):
+                    next_attempt = min(int(row[5]) + 1, int(row[6]))
+                    self.connection.execute(
+                        """
+                        UPDATE auth_challenges
+                        SET attempt_count = attempt_count + 1
+                        WHERE challenge_id = ? AND consumed_at IS NULL
+                          AND attempt_count < max_attempts
+                        """,
+                        (challenge_id,),
+                    )
+                    self.connection.commit()
+                    if next_attempt >= int(row[6]):
+                        deferred_error = RegistrationError(
+                            "CHALLENGE_LOCKED",
+                            "验证码尝试次数过多，请重新获取",
+                        )
+                    else:
+                        deferred_error = RegistrationError(
+                            "CHALLENGE_SECRET_INVALID",
+                            "验证码错误",
+                        )
+                else:
+                    consumed = self.connection.execute(
+                        """
+                        UPDATE auth_challenges SET consumed_at = ?
+                        WHERE challenge_id = ? AND consumed_at IS NULL
+                          AND attempt_count < max_attempts AND expires_at > ?
+                        """,
+                        (now, challenge_id, now),
+                    )
+                    if consumed.rowcount != 1:
+                        raise RegistrationError(
+                            "CHALLENGE_UNAVAILABLE",
+                            "验证码已不可用",
+                        )
+                    self.connection.executemany(
+                        """
+                        INSERT INTO system_settings (
+                            key, value, description, updated_at
+                        ) VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            ("smtp_verified_fingerprint", fingerprint),
+                            ("smtp_verified_at", str(verified_at)),
+                        ),
+                    )
+                    self.connection.commit()
+            except RegistrationError:
+                if deferred_error is None:
+                    self.connection.rollback()
+                raise
+            except Exception as exc:
+                self.connection.rollback()
+                raise RegistrationError(
+                    "SMTP_VERIFICATION_SAVE_FAILED",
+                    "SMTP 确认状态保存失败，请重新验证",
+                    http_status=503,
+                ) from exc
+        if deferred_error is not None:
+            raise deferred_error
+        return {
+            "fingerprint": fingerprint,
+            "verified_at": str(verified_at),
+        }
 
     def verify_challenge(
         self,

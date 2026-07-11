@@ -4233,6 +4233,15 @@ class DBManager:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
 
+    def get_user_by_email_for_public_auth(
+        self,
+        email: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up normalized email using only the migration-backed index."""
+
+        with self.lock:
+            return self.user_repository.get_by_email_indexed(email)
+
     def verify_user_password(self, username: str, password: str) -> bool:
         """验证用户密码"""
         with self.lock:

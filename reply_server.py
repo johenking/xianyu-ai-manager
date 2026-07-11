@@ -1238,7 +1238,7 @@ async def send_auth_email_code(request: EmailCodeRequest, http_request: Request)
     _require_verified_smtp(settings)
 
     verification_code = f"{secrets.randbelow(1_000_000):06d}"
-    user = db_manager.get_user_by_email(email)
+    user = db_manager.get_user_by_email_for_public_auth(email)
     if request.purpose == 'register':
         actionable_target = user is None
     else:
@@ -3309,37 +3309,16 @@ def confirm_smtp_verification(
     request: SMTPVerificationConfirmRequest,
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    current = db_manager.get_all_system_settings()
-    recipient = normalize_email(
-        str(current.get('support_email') or '')
-    ).normalized
-    fingerprint = smtp_configuration_fingerprint(
-        current,
-        db_path=db_manager.db_path,
-    )
-    db_manager.registration_service.consume_challenge(
-        challenge_id=request.challenge_id,
-        purpose='smtp_verify_email',
-        subject=recipient,
-        context=fingerprint,
-        secret=request.verification_code,
-    )
     verified_at = datetime.now().astimezone().isoformat(timespec='seconds')
-    if not db_manager.save_verified_smtp_settings(
-        {},
-        fingerprint=fingerprint,
+    confirmation = db_manager.registration_service.confirm_smtp_verification(
+        challenge_id=request.challenge_id,
+        verification_code=request.verification_code,
         verified_at=verified_at,
-        expected_settings=current,
-    ):
-        raise RegistrationError(
-            "SMTP_VERIFICATION_SAVE_FAILED",
-            "SMTP 确认状态保存失败，请重新验证",
-            http_status=503,
-        )
+    )
     return {
         'success': True,
         'state': 'ready',
-        'verified_at': verified_at,
+        'verified_at': confirmation['verified_at'],
         'message': 'SMTP 配置已确认',
     }
 
