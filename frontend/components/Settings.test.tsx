@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getAIProviders,
@@ -177,5 +177,61 @@ describe('Settings configuration sections', () => {
       verification_code: '482615',
     }));
     expect(await screen.findByText('SMTP 实收验证成功')).toBeInTheDocument();
+  });
+
+  it('ignores an SMTP verification response after the configuration changes', async () => {
+    let resolveVerification: (result: Awaited<ReturnType<typeof verifySettingsSection>>) => void = () => undefined;
+    vi.mocked(verifySettingsSection).mockImplementation(() => new Promise((resolve) => {
+      resolveVerification = resolve;
+    }));
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    await waitFor(() => expect(verifySettingsSection).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.changed.example.com' } });
+    await act(async () => {
+      resolveVerification({
+        success: true,
+        state: 'pending',
+        message: '旧验证邮件已发送',
+        challenge_id: 'stale-smtp-challenge',
+        expires_in: 600,
+        masked_recipient: 'ol***@example.com',
+      });
+    });
+
+    expect(screen.queryByLabelText('SMTP 收件验证码')).not.toBeInTheDocument();
+    expect(screen.queryByText(/ol\*\*\*@example.com/)).not.toBeInTheDocument();
+    expect(screen.queryByText('旧验证邮件已发送')).not.toBeInTheDocument();
+  });
+
+  it('ignores an SMTP confirmation response after its challenge becomes stale', async () => {
+    let resolveConfirmation: (result: Awaited<ReturnType<typeof confirmSmtpVerification>>) => void = () => undefined;
+    vi.mocked(verifySettingsSection).mockResolvedValue({
+      success: true,
+      state: 'pending',
+      message: '验证邮件已发送',
+      challenge_id: 'smtp-challenge-before-edit',
+      expires_in: 600,
+      masked_recipient: 're***@example.com',
+    });
+    vi.mocked(confirmSmtpVerification).mockImplementation(() => new Promise((resolve) => {
+      resolveConfirmation = resolve;
+    }));
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    fireEvent.change(await screen.findByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
+    fireEvent.click(screen.getByRole('button', { name: '确认收件码' }));
+    await waitFor(() => expect(confirmSmtpVerification).toHaveBeenCalledTimes(1));
+
+    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.changed.example.com' } });
+    await act(async () => {
+      resolveConfirmation({ success: true, state: 'ready', message: '旧挑战确认成功' });
+    });
+
+    expect(screen.queryByText('旧挑战确认成功')).not.toBeInTheDocument();
+    expect(screen.queryByText('已验证')).not.toBeInTheDocument();
   });
 });
