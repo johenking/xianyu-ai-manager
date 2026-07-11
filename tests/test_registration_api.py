@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from loguru import logger
 
 from auth_email_service import (
     SMTPDeliveryError,
@@ -574,12 +575,11 @@ class EmailEnumerationAPITests(RegistrationAPIFixture):
                 )
             else:
                 response = self.client.post(
-                    "/api/auth/password-reset",
+                    "/api/auth/password-reset/verify-code",
                     json={
                         "email": email,
                         "challenge_id": challenge_id,
                         "verification_code": mailed_code,
-                        "new_password": "Decoy-reset-pass-2026!",
                     },
                 )
             errors.append(
@@ -767,6 +767,143 @@ class LoginAndPasswordResetAPITests(RegistrationAPIFixture):
             },
         )
         self.assertEqual(new_password.status_code, 200, new_password.text)
+
+    def test_progressive_password_reset_verifies_code_before_accepting_password(self):
+        old_login = self.client.post(
+            "/login",
+            json={
+                "identifier": "ordinary-user",
+                "password": "Original-pass-2026!",
+            },
+        ).json()
+        captcha = self.captcha(code="PR72")
+        email_result, email_code = self.email_code(
+            purpose="password_reset",
+            email="ordinary@example.com",
+            captcha=captcha,
+            captcha_code="PR72",
+        )
+
+        verified = self.client.post(
+            "/api/auth/password-reset/verify-code",
+            json={
+                "email": "ordinary@example.com",
+                "challenge_id": email_result["challenge_id"],
+                "verification_code": email_code,
+            },
+        )
+        self.assertEqual(verified.status_code, 200, verified.text)
+        grant = verified.json()
+        self.assertTrue(grant["reset_grant_id"])
+        self.assertTrue(grant["reset_grant_token"])
+        self.assertGreater(grant["expires_in"], 0)
+
+        old_still_valid = self.client.get(
+            "/verify",
+            headers={"Authorization": f"Bearer {old_login['token']}"},
+        )
+        self.assertTrue(old_still_valid.json()["authenticated"])
+
+        weak_password = self.client.post(
+            "/api/auth/password-reset",
+            json={
+                "email": "ordinary@example.com",
+                "reset_grant_id": grant["reset_grant_id"],
+                "reset_grant_token": grant["reset_grant_token"],
+                "new_password": "password",
+            },
+        )
+        self.assertEqual(weak_password.status_code, 400, weak_password.text)
+        self.assertEqual(weak_password.json()["code"], "PASSWORD_TOO_WEAK")
+        self.assertTrue(
+            self.client.get(
+                "/verify",
+                headers={"Authorization": f"Bearer {old_login['token']}"},
+            ).json()["authenticated"]
+        )
+
+        reset = self.client.post(
+            "/api/auth/password-reset",
+            json={
+                "email": "ordinary@example.com",
+                "reset_grant_id": grant["reset_grant_id"],
+                "reset_grant_token": grant["reset_grant_token"],
+                "new_password": "Progressive-pass-2026!",
+            },
+        )
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertFalse(
+            self.client.get(
+                "/verify",
+                headers={"Authorization": f"Bearer {old_login['token']}"},
+            ).json()["authenticated"]
+        )
+
+        replay = self.client.post(
+            "/api/auth/password-reset",
+            json={
+                "email": "ordinary@example.com",
+                "reset_grant_id": grant["reset_grant_id"],
+                "reset_grant_token": grant["reset_grant_token"],
+                "new_password": "Replay-pass-2026!",
+            },
+        )
+        self.assertEqual(replay.status_code, 400, replay.text)
+        self.assertEqual(replay.json()["code"], "CHALLENGE_CONSUMED")
+
+    def test_progressive_password_reset_logs_exclude_all_submitted_secrets(self):
+        email = "log-target@example.com"
+        password = "Log-safe-reset-pass-2026!"
+        self.assertTrue(
+            self.db.create_user(
+                "log-target",
+                email,
+                "Original-log-pass-2026!",
+            )
+        )
+        captcha = self.captcha(code="LG72")
+        email_result, email_code = self.email_code(
+            purpose="password_reset",
+            email=email,
+            captcha=captcha,
+            captcha_code="LG72",
+        )
+        messages = []
+        sink_id = logger.add(messages.append, format="{message}", level="DEBUG")
+        try:
+            verified = self.client.post(
+                "/api/auth/password-reset/verify-code",
+                json={
+                    "email": email,
+                    "challenge_id": email_result["challenge_id"],
+                    "verification_code": email_code,
+                },
+            )
+            self.assertEqual(verified.status_code, 200, verified.text)
+            grant = verified.json()
+            reset = self.client.post(
+                "/api/auth/password-reset",
+                json={
+                    "email": email,
+                    "reset_grant_id": grant["reset_grant_id"],
+                    "reset_grant_token": grant["reset_grant_token"],
+                    "new_password": password,
+                },
+            )
+            self.assertEqual(reset.status_code, 200, reset.text)
+        finally:
+            logger.remove(sink_id)
+
+        captured = "\n".join(messages)
+        for secret in (
+            email,
+            email_code,
+            email_result["challenge_id"],
+            grant["reset_grant_id"],
+            grant["reset_grant_token"],
+            password,
+        ):
+            self.assertNotIn(secret, captured)
 
 
 class RegistrationAdminAPITests(RegistrationAPIFixture):

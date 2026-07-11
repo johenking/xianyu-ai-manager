@@ -70,11 +70,34 @@ export interface RegistrationRequest {
   terms_accepted: boolean;
 }
 
-export interface PasswordResetRequest {
+export interface PasswordResetGrantRequest {
+  email: string;
+  reset_grant_id: string;
+  reset_grant_token: string;
+  new_password: string;
+}
+
+export interface LegacyPasswordResetRequest {
   email: string;
   challenge_id: string;
   verification_code: string;
   new_password: string;
+}
+
+export type PasswordResetRequest = PasswordResetGrantRequest | LegacyPasswordResetRequest;
+
+export interface PasswordResetVerifyRequest {
+  email: string;
+  challenge_id: string;
+  verification_code: string;
+}
+
+export interface PasswordResetVerifyResponse {
+  success: boolean;
+  reset_grant_id: string;
+  reset_grant_token: string;
+  expires_in: number;
+  message: string;
 }
 
 export interface RegistrationUser {

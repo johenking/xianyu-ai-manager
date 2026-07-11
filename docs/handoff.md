@@ -1,10 +1,10 @@
 # Handoff
 
-## Source State On 2026-07-11
+## Source State On 2026-07-12
 
-The `v1.7.1` source combines official Goofish session renewal, Skill Center automation, direct registration, and email password recovery with role-aware settings and dashboards. Ordinary users retain personal item-sync and AI configuration while administrator-only SMTP, registration, global security, and runtime controls remain hidden and protected. Passwords, Cookies, email codes, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
+The v1.7.2 release-candidate source keeps the v1.7.1 official Goofish session renewal, Skill Center automation, direct registration, role-aware settings, and dashboard behavior while updating the public authentication experience. Login, registration, password recovery, terms, and privacy now share the main application brand system through `BrandLockup`; displayed frontend versions come from `frontend/package.json` through Vite. Passwords, Cookies, email codes, reset grants, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
 
-Publishing source does not prove a running service was upgraded. Verify the process path, health response, migration version, frontend entry bundle, account listeners, and Skill scheduler before describing any deployment as running v1.7.1. Registration defaults closed and must not be opened on a new installation until the real SMTP receipt code and an end-to-end direct-registration acceptance test have both succeeded.
+Local v1.7.2 release gates are recorded below. GitHub CI and the running service are independent evidence: publishing or building this source does not prove a runtime was upgraded. v1.7.2 adds no database migration; the latest expected migration remains `2026071104`. Verify the process path, health response, migration version, frontend entry bundle and referenced asset, account listeners, and Skill scheduler before describing any deployment as running v1.7.2. Registration defaults closed and must not be opened on a new installation until the real SMTP receipt code and an end-to-end direct-registration acceptance test have both succeeded.
 
 ## Working Capabilities
 
@@ -20,8 +20,9 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram result delivery with `sent`, `partial`, and `failed` outcomes.
 - Cross-run result deduplication by task and item URL, falling back to platform item ID.
 - Expert prompts and real runtime, browser, AI, delivery, and account-listener diagnostics.
-- One-transaction direct registration with capacity recheck, image CAPTCHA, purpose-bound email code, `v2` terms acceptance, and automatic login.
-- Username-or-email login and email password recovery that revokes all older sessions after reset.
+- One-transaction direct registration with capacity recheck, image CAPTCHA, purpose-bound email code, `v2` terms acceptance, and automatic login; successful email delivery keeps the completed CAPTCHA state, while explicit resend requires a fresh CAPTCHA.
+- Username-or-email login and two-stage email password recovery: `POST /api/auth/password-reset/verify-code` issues a one-time grant held in frontend component memory, then `POST /api/auth/password-reset` consumes it and revokes all older sessions. The legacy reset payload remains temporarily compatible.
+- Shared `BrandLockup` presentation across the main sidebar and public login, registration, password-recovery, terms, and privacy views, with the frontend version injected from `frontend/package.json` at build time.
 - Administrator SMTP receipt confirmation, 1–1000 ordinary-user capacity, user enablement, and guarded registration switch controls.
 - Ordinary-user personal item-sync settings with per-field global inheritance, plus user-owned AI provider access without administrator settings calls.
 - One-request role-aware dashboard summaries, retryable error and empty states, deferred order details, and a separately loaded chart bundle.
@@ -42,7 +43,9 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - Registration defaults off and cannot be enabled without a receipt-confirmed current SMTP fingerprint and remaining ordinary-user capacity.
 - SMTP verification sends a six-digit code to the independent support mailbox and has no third-party fallback. Missing credentials, failed delivery, an unconfirmed code, database errors, or changed SMTP settings keep registration closed.
 - CAPTCHA, email, and SMTP challenges expire after 10 minutes and stop after five attempts. Historical invite data is retained, while legacy invite APIs return HTTP 410.
+- Password-reset grants are email-bound, expire after 10 minutes, and are single-use. The frontend keeps plaintext grant material only in component memory, and the backend stores only a purpose-isolated digest in the existing `auth_challenges` table.
 - The system-secret key is independent from the AI-provider and Xianyu-account keys; all three local key files must be restored with SQLite when environment keys are absent.
+- Authentication logs must not expose the default administrator password, OTPs, reset grants, full email addresses, or passwords.
 
 ## Verification Baseline
 
@@ -66,13 +69,14 @@ npm run verify:build
 
 Also run `git diff --check` and a secret scan over every tracked and prospective file. For deployment, back up SQLite, all three local encryption keys, browser profiles, and the previous static assets first.
 
-The automated suite covers official login modes, profile promotion and reuse, encrypted credential fallback, verification timeout and cancellation, account data retention, Skill scheduler lifecycle and locking, success/failure rescheduling, AI filtering, supported-channel filtering, multi-channel notification outcomes, cross-run deduplication, registration transactions and races, challenge expiry and attempts, rate limits, trusted proxies, SMTP failure behavior, session revocation, public auth views, and administrator registration interactions. Real platform acceptance still requires operator-owned Xianyu, AI provider, notification, and SMTP accounts.
+The automated suite covers official login modes, profile promotion and reuse, encrypted credential fallback, verification timeout and cancellation, account data retention, Skill scheduler lifecycle and locking, success/failure rescheduling, AI filtering, supported-channel filtering, multi-channel notification outcomes, cross-run deduplication, registration transactions and races, challenge expiry and attempts, rate limits, trusted proxies, SMTP failure behavior, progressive reset grants, session revocation, public auth views, and administrator registration interactions. Real platform acceptance still requires operator-owned Xianyu, AI provider, notification, and SMTP accounts.
 
-Verified on 2026-07-11 for the v1.7.1 branch: Ruff and explicit Python compilation passed, all 212 backend tests passed, all 17 frontend test files with 55 tests passed, Gitleaks found no leaks, and `npm audit --audit-level=high` reported zero vulnerabilities. Two production builds retained two generations of 29 assets with zero orphans; the 236,442-byte entry bundle is 72.7% below the 865,910-byte baseline, while the 402,730-byte Recharts bundle loads separately after summary cards. The favicon resolves at `/static/favicon.svg`.
+Verified locally on 2026-07-12 for the v1.7.2 release candidate: Ruff and explicit Python compilation passed, all 220 backend tests passed, and all 17 frontend test files with 65 tests passed. Gitleaks found no leaks in tracked changes or new source files, `npm audit --audit-level=high` reported zero vulnerabilities, and `git diff --check` passed. Two final production builds retained two generations of 29 assets with zero orphans; the 245,113-byte entry bundle is 71.7% below the 865,910-byte baseline, while the 402,730-byte chart bundle remains deferred. Transient Playwright checks at 1440x900, 390x844, and 320x800 found no horizontal overflow; the clean desktop and 390px runs had no console errors. The same checks verified real password-field focus and in-memory-only reset grants, and ended with no browser session or Chrome for Testing process. The favicon resolves at `/static/favicon.svg`.
 
 ## Next Acceptance Steps
 
-- Deploy the exact v1.7.1 source and clean static build, then verify migration `2026071104`, the ordinary/admin settings split, dashboard response time, account listeners, and Skill scheduler after restart.
-- Complete password-reset acceptance with two old sessions: reset through the registered mailbox, confirm both old sessions are rejected, confirm the old password fails, and verify the new password through both username and email login.
+- Require the GitHub `secrets` and `test` jobs to pass for the exact release commit; local evidence above does not replace CI.
+- Deploy the exact v1.7.2 source and clean static build only after backup, then verify migration remains `2026071104`, all five public views share the brand/version, email success does not refresh CAPTCHA, explicit resend requires a new CAPTCHA, the two-stage reset grant is single-use, and authentication logs contain none of the prohibited values.
+- Complete password-reset acceptance with two old sessions: verify the email code before entering a new password, consume the in-memory grant, confirm both old sessions are rejected, confirm replay and the old password fail, and verify the new password through both username and email login.
 - Keep Skill schedules default off and keep account-level scheduled Cookie refresh off unless an operator explicitly needs preventive renewal.
 - Keep monitoring official page, SMTP, AI-provider, and notification changes; do not weaken human verification, rate limits, or secret-handling boundaries to improve automation rates.

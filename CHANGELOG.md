@@ -2,6 +2,26 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.7.2] - 2026-07-11
+
+### Added
+
+- Add a shared `BrandLockup` for the authenticated sidebar and the public login, registration, password-recovery, terms, and privacy views.
+- Add `POST /api/auth/password-reset/verify-code` to consume a password-reset email code and issue a short-lived, one-time reset grant.
+
+### Changed
+
+- Move the public authentication and legal views onto the main application brand system, and derive the displayed frontend version from `frontend/package.json` through a Vite compile-time define instead of a hard-coded label.
+- Keep the successful email-send state without immediately refreshing CAPTCHA. An explicit resend after cooldown obtains and requires a fresh CAPTCHA.
+- Split the public password-reset flow into email verification followed by password entry. The frontend keeps the returned grant only in component memory, and `POST /api/auth/password-reset` consumes it when applying the new password.
+- Keep the legacy `challenge_id` plus `verification_code` reset payload temporarily compatible while clients migrate to the grant flow.
+- Reuse the existing `auth_challenges` table for reset-grant digests; v1.7.2 adds no database migration and leaves `2026071104` as the latest schema migration.
+
+### Security
+
+- Store only a purpose-isolated digest of each reset grant on the server and make the grant email-bound, expiring, and single-use.
+- Keep authentication logs free of the default administrator password, email OTPs, reset grants, full email addresses, and passwords.
+
 ## [1.7.1] - 2026-07-11
 
 ### Added

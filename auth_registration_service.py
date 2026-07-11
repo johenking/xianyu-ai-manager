@@ -48,6 +48,7 @@ CHALLENGE_PURPOSES = frozenset(
         "captcha",
         "register_email",
         "password_reset_email",
+        "password_reset_grant",
         "smtp_verify_email",
     }
 )
@@ -1325,6 +1326,186 @@ class RegistrationService:
             )
         return user_id
 
+    def verify_password_reset_code(
+        self,
+        *,
+        email: str,
+        challenge_id: str,
+        verification_code: str,
+    ) -> dict[str, Any]:
+        email_identity = normalize_email(email)
+        now = self.clock()
+        failed_challenge: RegistrationError | None = None
+        grant: dict[str, Any] | None = None
+
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                challenge = self._get_challenge(challenge_id)
+                self._validate_challenge_binding(
+                    challenge,
+                    purpose="password_reset_email",
+                    subject=email_identity.normalized,
+                    context="",
+                    now=now,
+                )
+                if not self._challenge_secret_matches(
+                    challenge,
+                    verification_code,
+                ):
+                    raise _WrongChallengeSecret
+
+                user = self.users.get_by_email(email_identity.normalized)
+                if not user or not user["is_active"]:
+                    raise RegistrationError(
+                        "PASSWORD_RESET_UNAVAILABLE",
+                        "密码重置请求不可用",
+                    )
+
+                consumed = self.connection.execute(
+                    """
+                    UPDATE auth_challenges SET consumed_at = ?
+                    WHERE challenge_id = ? AND consumed_at IS NULL
+                      AND attempt_count < max_attempts AND expires_at > ?
+                    """,
+                    (now, challenge_id, now),
+                )
+                if consumed.rowcount != 1:
+                    raise RegistrationError(
+                        "CHALLENGE_UNAVAILABLE",
+                        "验证码已不可用",
+                    )
+
+                grant_id = secrets.token_urlsafe(24)
+                grant_token = secrets.token_urlsafe(32)
+                expires_at = now + DEFAULT_CHALLENGE_TTL_SECONDS
+                self.connection.execute(
+                    """
+                    INSERT INTO auth_challenges (
+                        challenge_id, purpose, subject_digest, context_digest,
+                        secret_digest, attempt_count, max_attempts,
+                        expires_at, created_at
+                    ) VALUES (?, 'password_reset_grant', ?, '', ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        grant_id,
+                        self._challenge_subject_digest(
+                            "password_reset_grant",
+                            email_identity.normalized,
+                        ),
+                        self.cipher.digest(
+                            grant_token,
+                            purpose=self._challenge_secret_purpose(
+                                "password_reset_grant"
+                            ),
+                        ),
+                        DEFAULT_CHALLENGE_MAX_ATTEMPTS,
+                        expires_at,
+                        int(now),
+                    ),
+                )
+                self.connection.commit()
+                grant = {
+                    "grant_id": grant_id,
+                    "grant_token": grant_token,
+                    "expires_at": expires_at,
+                }
+            except _WrongChallengeSecret:
+                self.connection.rollback()
+                failed_challenge = self._record_failed_challenge_attempt(challenge_id)
+            except Exception:
+                self.connection.rollback()
+                raise
+        if failed_challenge is not None:
+            raise failed_challenge
+        if grant is None:
+            raise RegistrationError(
+                "PASSWORD_RESET_VERIFICATION_FAILED",
+                "邮箱验证失败，请重新获取验证码",
+            )
+        return grant
+
+    def reset_password_with_grant(
+        self,
+        *,
+        email: str,
+        new_password: str,
+        grant_id: str,
+        grant_token: str,
+    ) -> int:
+        email_identity = normalize_email(email)
+        now = self.clock()
+        failed_challenge: RegistrationError | None = None
+        user_id: int | None = None
+
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                grant = self._get_challenge(grant_id)
+                self._validate_challenge_binding(
+                    grant,
+                    purpose="password_reset_grant",
+                    subject=email_identity.normalized,
+                    context="",
+                    now=now,
+                )
+                if not self._challenge_secret_matches(grant, grant_token):
+                    raise _WrongChallengeSecret
+
+                user = self.users.get_by_email(email_identity.normalized)
+                if not user or not user["is_active"]:
+                    raise RegistrationError(
+                        "PASSWORD_RESET_UNAVAILABLE",
+                        "密码重置请求不可用",
+                    )
+                validate_password(
+                    new_password,
+                    username_normalized=user["username_normalized"],
+                )
+                password_hash = hash_user_password(new_password)
+                user_id = int(user["id"])
+                if (
+                    self.users.set_password_by_id(
+                        user_id,
+                        password_hash,
+                        PASSWORD_HASH_VERSION,
+                    )
+                    != 1
+                ):
+                    raise RegistrationError(
+                        "PASSWORD_RESET_FAILED",
+                        "密码重置失败，请稍后重试",
+                    )
+                self.sessions.delete_by_user_id(user_id)
+                consumed = self.connection.execute(
+                    """
+                    UPDATE auth_challenges SET consumed_at = ?
+                    WHERE challenge_id = ? AND consumed_at IS NULL
+                      AND attempt_count < max_attempts AND expires_at > ?
+                    """,
+                    (now, grant_id, now),
+                )
+                if consumed.rowcount != 1:
+                    raise RegistrationError(
+                        "CHALLENGE_UNAVAILABLE",
+                        "重置授权已不可用",
+                    )
+                self.connection.commit()
+            except _WrongChallengeSecret:
+                self.connection.rollback()
+                failed_challenge = self._record_failed_challenge_attempt(grant_id)
+            except Exception:
+                self.connection.rollback()
+                raise
+        if failed_challenge is not None:
+            raise failed_challenge
+        if user_id is None:
+            raise RegistrationError(
+                "PASSWORD_RESET_FAILED",
+                "密码重置失败，请稍后重试",
+            )
+        return user_id
+
     def _get_challenge(self, challenge_id: str) -> Any:
         row = self.connection.execute(
             """
@@ -1437,6 +1618,7 @@ class RegistrationService:
         if purpose in {
             "register_email",
             "password_reset_email",
+            "password_reset_grant",
             "smtp_verify_email",
         }:
             value = normalize_email(subject).normalized

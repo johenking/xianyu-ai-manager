@@ -26,7 +26,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | Capability | Routes |
 |---|---|
 | Health | `GET /health/live`, `GET /health/ready`, compatibility `GET /health` |
-| Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset` |
+| Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset/verify-code`, `POST /api/auth/password-reset` |
 | Registration administration | `/api/admin/registration/status`, `/limit`, `/users`, `/enabled`; legacy `/invites` returns 410 |
 | Settings | User-owned `GET /api/settings/user-summary`, `PUT /api/settings/user-basic`; administrator-only `/api/settings/summary`, `/sections/{section}`, `/verify/{section}`, `/verify/smtp/confirm` |
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
@@ -67,7 +67,7 @@ curl -sS -X POST "$BASE_URL/api/auth/email-code" \
   }'
 ```
 
-The email response returns a new `challenge_id`, a 10-minute expiry, and a 60-second resend cooldown. Complete registration with that email challenge:
+The email response returns a new `challenge_id`, a 10-minute expiry, and a 60-second resend cooldown. After a successful send, the public UI keeps the completed CAPTCHA state and does not request another CAPTCHA. When the cooldown ends, an explicit resend first requests a fresh CAPTCHA and requires its answer before another email is sent. Complete registration with the email challenge:
 
 ```bash
 curl -sS -X POST "$BASE_URL/register" \
@@ -85,20 +85,32 @@ curl -sS -X POST "$BASE_URL/register" \
 
 Success returns the same bearer-token shape as `/login`. The switch and capacity recheck, user insert, and email-challenge consumption commit together. Legacy clients may still send `invite_code`, but it is ignored. Usernames accept 3–24 Unicode letters or numbers plus `_` and `-`. Passwords require at least eight characters, must not contain the username or match the common-password denylist, and cannot exceed bcrypt's 72-byte UTF-8 input limit.
 
-Password recovery uses a fresh image CAPTCHA and `purpose: "password_reset"` in `/api/auth/email-code`; it does not accept a registration email challenge. Submit the resulting code to:
+Password recovery uses a fresh image CAPTCHA and `purpose: "password_reset"` in `/api/auth/email-code`; it does not accept a registration email challenge. The supported v1.7.2 flow verifies that code before asking for a new password:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/auth/password-reset/verify-code" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email":"person@example.com",
+    "challenge_id":"<reset-email-challenge-id>",
+    "verification_code":"<six-digit-code>"
+  }'
+```
+
+The response contains `reset_grant_id`, `reset_grant_token`, and `expires_in`. Treat both grant fields as secrets. The public frontend keeps them only in component memory, while the server stores only a purpose-isolated digest in the existing `auth_challenges` table. The grant is bound to the normalized email, expires after 10 minutes, and can be consumed once:
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/auth/password-reset" \
   -H 'Content-Type: application/json' \
   -d '{
     "email":"person@example.com",
-    "challenge_id":"<reset-email-challenge-id>",
-    "verification_code":"<six-digit-code>",
+    "reset_grant_id":"<reset-grant-id>",
+    "reset_grant_token":"<reset-grant-token>",
     "new_password":"<new-password>"
   }'
 ```
 
-A successful reset revokes every old session and returns the user to login. `/send-verification-code` is retired and returns HTTP 410 with migration guidance.
+A successful reset consumes the grant, revokes every old session, and returns the user to login. The legacy reset payload containing `challenge_id`, `verification_code`, and `new_password` remains temporarily accepted, but clients should migrate to the grant flow. `/send-verification-code` is retired and returns HTTP 410 with migration guidance.
 
 Authentication errors use a non-echoing structure:
 
@@ -113,6 +125,8 @@ Authentication errors use a non-echoing structure:
 ```
 
 HTTP 429 responses include `retry_after`. CAPTCHA issuance is limited by client IP; email delivery is limited by normalized email and client IP; login cooldown is tracked independently by account and IP. Forwarded headers affect these limits only when the direct peer is configured in `auth_trusted_proxies`.
+
+Do not log request bodies for these endpoints. Default administrator passwords, OTPs, reset grant IDs or tokens, full email addresses, and passwords must stay out of application logs, client diagnostics, screenshots, shell history, and support transcripts.
 
 Administrators can read readiness and capacity, set the 1–1000 ordinary-user limit, list recent ordinary users, enable or disable an ordinary user, and change the guarded registration switch:
 

@@ -1,5 +1,6 @@
 import React from 'react';
 import { LayoutDashboard, Users, ShoppingBag, CreditCard, Settings, LogOut, Box, Sparkles, MessageSquare, SlidersHorizontal, X } from 'lucide-react';
+import BrandLockup from './BrandLockup';
 
 interface SidebarProps {
   activeTab: string;
@@ -25,11 +26,8 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onPreloadTab
   return (
     <aside className={`w-64 h-screen fixed left-0 top-0 bg-white border-r border-gray-100 flex flex-col justify-between z-50 shadow-[4px_0_24px_rgba(0,0,0,0.08)] transition-transform duration-200 lg:translate-x-0 ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}`}>
       <div className="p-6">
-        <div className="flex items-center gap-3 mb-10 px-2">
-          <div className="w-10 h-10 bg-[#FFE815] rounded-xl flex items-center justify-center shadow-lg shadow-yellow-200 transform rotate-[-3deg]">
-            <span className="text-black font-extrabold text-xl">闲</span>
-          </div>
-          <h1 className="text-xl font-extrabold tracking-tight text-gray-900">闲鱼智控 <span className="text-xs bg-black text-[#FFE815] px-1.5 py-0.5 rounded ml-1">PRO</span></h1>
+        <div className="mb-10 flex items-center px-2">
+          <BrandLockup />
           <button type="button" onClick={onMobileClose} className="ml-auto p-2 rounded-lg hover:bg-gray-100 lg:hidden" aria-label="关闭导航">
             <X className="w-5 h-5" />
           </button>
