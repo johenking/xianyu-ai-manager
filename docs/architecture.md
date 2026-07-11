@@ -22,11 +22,11 @@ Backend users live in `users`. The initial `admin` password is read from `ADMIN_
 
 Usernames are NFKC-normalized and emails are lowercased for case-insensitive uniqueness. Ordinary users carry active state plus the accepted terms version and timestamp. `/login` resolves one identifier as either username or email. Disabling a user or resetting a password deletes all persisted sessions for that user and removes matching in-memory sessions.
 
-Invitation registration is fail-closed. `registration_enabled` defaults to false on new databases and is forced false by the registration migration. Readiness requires the exact current SMTP configuration fingerprint to have delivered a verification message and at least one active invite to exist. A registration transaction validates the invite, purpose-bound email challenge, normalized identities, password policy, and terms version before it creates the user and consumes both one-time records. Any failure rolls back the complete transaction.
+Direct registration is fail-closed. `registration_enabled` defaults to false and migration `2026071103` forces it false, sets agreement `v2`, installs a default ordinary-user limit of 20, and consumes invitation-era registration challenges. Readiness requires a valid support email, receipt-code confirmation for the exact current SMTP fingerprint, and remaining ordinary-user capacity. Disabled ordinary users count toward capacity; the administrator does not. A `BEGIN IMMEDIATE` registration transaction rechecks the switch and capacity, validates the purpose-bound email challenge, normalized identities, password policy, and terms version, then creates the user and consumes the challenge. Filling the last slot closes the switch in the same transaction.
 
-`registration_invites` stores only a purpose-isolated HMAC digest and a display hint; the raw invite is returned once at creation. `auth_challenges` stores digests for image CAPTCHA, registration email, and password-reset email secrets, with expiry, attempt, and consumption state. `auth_rate_events` stores HMAC digests for IP, email, and account dimensions. Forwarded client addresses are considered only when the direct peer is in the `auth_trusted_proxies` setting.
+`registration_invites` remains as historical, non-destructively retained data; runtime invite creation, listing, revocation, and consumption are retired. `auth_challenges` stores digests for image CAPTCHA, registration email, password-reset email, and SMTP receipt-code secrets, with expiry, attempt, and consumption state. `auth_rate_events` stores HMAC digests for IP, email, and account dimensions. Forwarded client addresses are considered only when the direct peer is in the `auth_trusted_proxies` setting.
 
-`auth_email_service.py` is the only registration-mail path. It sends through the configured SMTP server and has no third-party fallback. SMTP authorization codes are encrypted by `SystemSecretCipher`; the same independent system secret derives purpose-separated HMAC keys. Changing any SMTP field invalidates the stored verification fingerprint. An optimistic fingerprint check prevents an old verification result from marking concurrently changed settings as ready.
+`auth_email_service.py` is the only authentication-mail path. It sends through the configured SMTP server and has no third-party fallback. SMTP authorization codes are encrypted by `SystemSecretCipher`; the same independent system secret derives purpose-separated HMAC keys. SMTP verification first saves the configuration as unverified and sends a six-digit code to the support mailbox. Confirmation binds that code to the current fingerprint; changing any SMTP field invalidates verification, consumes pending SMTP challenges, and closes registration. Authentication-code delivery uses the same public response and SMTP path for eligible and decoy targets so account existence is not exposed.
 
 `schema_migrations` records ordered migrations. A pending migration backs up the SQLite database plus the AI-provider, Xianyu-account, and system-secret local keys before starting one transaction. The compatibility upgrader keeps database version `1.6` idempotent while ordered migrations add the registration security schema and normalized identity indexes. A case-insensitive identity conflict aborts migration instead of merging users. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider and system-secret keys; account detail and status APIs never return the plaintext or ciphertext.
 
@@ -76,14 +76,14 @@ Unknown or failed responses never overwrite a reliable stored status. Shipped, c
 
 `ai_provider_profiles` stores user-scoped provider profiles, encrypted API keys, the default model, cached model lists, and verification state. OpenAI-compatible providers use Chat Completions and `/models`; Gemini uses its native models list and `generateContent`. Accounts bind to a profile and select their own model. A provider/model change must generate a successful test reply before it can replace the active account configuration.
 
-System settings are split into basic, AI, and SMTP sections. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification sends a real test message to the configured support email, falling back to the sender address only when support email is empty. Successful delivery marks only that exact settings fingerprint as verified.
+System settings are split into basic, AI, and SMTP sections. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification requires a valid independent support email. Sending the test code does not verify SMTP; only confirming the six-digit receipt code marks that exact settings fingerprint as verified.
 
 ## Data Model
 
 Core tables:
 
 - `users`, `auth_sessions`: normalized backend identities, terms acceptance, active state, and persistent login sessions.
-- `registration_invites`, `auth_challenges`, `auth_rate_events`: one-time invitation state, purpose-bound authentication challenges, and persistent rate-limit events stored as digests.
+- `registration_invites`, `auth_challenges`, `auth_rate_events`: retained historical invite state, purpose-bound authentication and SMTP challenges, and persistent rate-limit events stored as digests.
 - `schema_migrations`: ordered, transactional database migration history.
 - `runtime_sessions`: safe ownership, status, TTL, and redacted errors for temporary operations.
 - `cookies`, `cookie_status`, `account_session_refresh_status`: Xianyu accounts, listener state, account-level scheduled refresh settings, and Cookie refresh state.
@@ -99,7 +99,7 @@ Core tables:
 
 - Public auth: `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset`, and username-or-email `POST /login`. The legacy `/send-verification-code` returns HTTP 410.
 - Auth sessions: `/logout`, `/verify`, `/change-password`, `/change-admin-password`.
-- Registration admin: `/api/admin/registration/status`, `/invites`, `/users`, and `/enabled`; invite creation returns raw codes only once and ordinary users can be enabled or disabled without destructive deletion.
+- Registration admin: `/api/admin/registration/status`, `/limit`, `/users`, and `/enabled`; ordinary users can be enabled or disabled without destructive deletion. Legacy `/invites` methods return HTTP 410.
 - Account binding: `/qr-login/*`, `POST /password-login`, `GET /password-login/check/{session_id}`, and `/cookies*`, including `PUT /cookies/{cid}/cookie-refresh-settings`. Password login accepts `account`, `password`, and `show_browser`; caller-supplied account IDs are not authoritative.
 - Session refresh: `/api/accounts/{cookie_id}/session-status`, `/session-refresh`, `/session-refresh/cancel`.
 - Diagnostics: `/api/diagnostics/auto-reply/{cookie_id}` and `/api/skills/ops/*`.
@@ -133,4 +133,4 @@ Python runtime requirements are declared in `requirements.in` and locked in `req
 
 Xianyu login remains environment-sensitive. Datacenter or overseas IPs can trigger Alibaba risk controls, and the official page currently rejects headless Chromium. Deployments that rely on automatic renewal must persist and back up `browser_data/` alongside SQLite and the account credential key. Human verification cannot be bypassed; local binding or a trusted domestic host is generally more reliable.
 
-Deployments that enable invitation registration must also preserve `data/.system_secret_key` when `SYSTEM_SECRET_ENCRYPTION_KEY` is not supplied. Registration stays closed until an operator verifies real SMTP delivery and creates an active invite; application health does not imply registration readiness.
+Deployments that enable direct registration must also preserve `data/.system_secret_key` when `SYSTEM_SECRET_ENCRYPTION_KEY` is not supplied. Registration stays closed until an operator confirms the real SMTP receipt code and capacity remains; application health does not imply registration readiness.

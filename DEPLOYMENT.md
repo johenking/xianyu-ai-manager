@@ -106,8 +106,8 @@ Then open `http://localhost:8091`.
 
 The official Goofish login flow requires headed Chromium; the current container command does not start a virtual display. Treat password login and automatic credential fallback as unsupported in Docker or cloud environments until a display/Xvfb setup and the human-verification path have been tested there. Persisting `browser_data/` is still required once that support exists.
 
-## Invitation Registration
+## Direct Registration
 
-Do not enable registration as part of an unattended deployment. Start with `registration_enabled=false`, configure SMTP and the public support email in the administrator UI, and verify delivery to a real mailbox. The verified fingerprint becomes stale after any SMTP change. Create a small batch of single-use invites only after delivery succeeds, then exercise registration, restart persistence, password reset, and invite reuse rejection before opening the switch.
+Do not enable registration as part of an unattended deployment. Start with `registration_enabled=false`, configure SMTP and an independent public support email in the administrator UI, send the six-digit SMTP receipt code, and enter the code from the real mailbox. The verified fingerprint becomes stale and registration closes after any SMTP change. Confirm the ordinary-user limit, then exercise direct registration, automatic login, restart persistence, username-or-email login, password reset, and old-session revocation before opening the switch. The default capacity is 20; disabled ordinary users still count, and the administrator does not.
 
 When environment encryption keys are not supplied, persist and back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with SQLite. SMTP credentials are configured in the UI and encrypted with the system-secret key; the example `SMTP_*` environment names are not a configuration path for this application.
