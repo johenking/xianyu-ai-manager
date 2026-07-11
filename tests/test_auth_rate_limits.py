@@ -174,6 +174,49 @@ class AuthRateLimiterTests(unittest.TestCase):
             0,
         )
 
+    def test_event_writes_cleanup_week_old_rows_at_most_once_per_hour(self):
+        def insert_stale(event_type):
+            self.connection.execute(
+                "INSERT INTO auth_rate_events (event_type, created_at) VALUES (?, ?)",
+                (event_type, int(self.now - 7 * 86_400 - 1)),
+            )
+            self.connection.commit()
+
+        insert_stale("stale-before-first-write")
+        self.limiter.record_event(
+            "synthetic-write",
+            ip="203.0.113.21",
+            success=True,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_rate_events "
+                "WHERE event_type = 'stale-before-first-write'"
+            ).fetchone()[0],
+            0,
+        )
+
+        insert_stale("stale-within-throttle")
+        self.now += 3599
+        self.limiter.enforce_captcha("203.0.113.22")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_rate_events "
+                "WHERE event_type = 'stale-within-throttle'"
+            ).fetchone()[0],
+            1,
+        )
+
+        self.now += 1
+        self.limiter.record_registration_failure("203.0.113.23")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_rate_events "
+                "WHERE event_type = 'stale-within-throttle'"
+            ).fetchone()[0],
+            0,
+        )
+
     def test_captcha_gate_allows_30_per_ip_per_hour(self):
         for _ in range(30):
             self.limiter.enforce_captcha("203.0.113.30")
@@ -267,6 +310,51 @@ class AuthRateLimiterTests(unittest.TestCase):
                 account="failed-final",
                 success=False,
             ),
+        )
+
+    def test_login_lockout_runs_for_15_minutes_from_spread_fifth_failure(self):
+        account = "spread-account"
+        base_time = self.now
+        for index, offset in enumerate((0, 200, 400, 600)):
+            self.now = base_time + offset
+            self.limiter.record_login_result(
+                ip=f"203.0.113.{100 + index}",
+                account=account,
+                success=False,
+            )
+
+        self.now = base_time + 899
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_ACCOUNT",
+            900,
+            lambda: self.limiter.record_login_result(
+                ip="203.0.113.110",
+                account=account,
+                success=False,
+            ),
+        )
+        lockout = self.connection.execute(
+            "SELECT account_digest, ip_digest, created_at "
+            "FROM auth_rate_events WHERE event_type = 'login_lockout'"
+        ).fetchone()
+        self.assertIsNotNone(lockout)
+        self.assertTrue(lockout[0])
+        self.assertTrue(lockout[1])
+        self.assertEqual(lockout[2], int(self.now))
+
+        self.now += 899
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_ACCOUNT",
+            1,
+            lambda: self.limiter.check_login_limit(
+                ip="203.0.113.111",
+                account=account,
+            ),
+        )
+        self.now += 1
+        self.limiter.check_login_limit(
+            ip="203.0.113.111",
+            account=account,
         )
 
     def test_tenth_registration_failure_starts_ip_cooldown(self):

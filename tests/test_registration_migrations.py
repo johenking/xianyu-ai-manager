@@ -492,6 +492,18 @@ class RegistrationConflictTests(unittest.TestCase):
             "username",
         )
 
+    def test_nfkc_compatibility_username_conflict_rolls_back(self):
+        fullwidth_username = "Ａｌｉｃｅ"
+        ascii_username = "Alice"
+        self.assert_conflict_rolls_back(
+            [
+                (fullwidth_username, "nfkc-one@example.com"),
+                (ascii_username, "nfkc-two@example.com"),
+            ],
+            "username",
+            (fullwidth_username, ascii_username),
+        )
+
     def test_normalized_email_conflict_is_redacted_and_rolls_back(self):
         email_one = "Secret.Address@Example.com"
         email_two = " secret.address@example.COM "
@@ -499,6 +511,22 @@ class RegistrationConflictTests(unittest.TestCase):
             [("first-user", email_one), ("second-user", email_two)],
             "email",
             (email_one, email_two, email_one.casefold()),
+        )
+
+    def test_nfkc_compatibility_email_conflict_is_redacted_and_rolls_back(self):
+        compatibility_email = "Ｓecret＠Example.com"
+        ascii_email = "secret@example.COM"
+        self.assert_conflict_rolls_back(
+            [
+                ("nfkc-email-one", compatibility_email),
+                ("nfkc-email-two", ascii_email),
+            ],
+            "email",
+            (
+                compatibility_email,
+                ascii_email,
+                "secret@example.com",
+            ),
         )
 
 

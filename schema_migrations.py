@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 from typing import Callable, Iterable, Optional, Sequence
+import unicodedata
 
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
@@ -114,8 +115,12 @@ def _normalized_users(cursor: sqlite3.Cursor) -> list[tuple[int, str, str]]:
     for user_id, username, email in cursor.execute(
         "SELECT id, username, email FROM users ORDER BY id"
     ).fetchall():
-        username_normalized = str(username).casefold()
-        email_normalized = str(email).strip().casefold()
+        username_normalized = unicodedata.normalize(
+            "NFKC", str(username)
+        ).casefold()
+        email_normalized = unicodedata.normalize(
+            "NFKC", str(email)
+        ).strip().casefold()
         if username_normalized in usernames:
             raise ValueError(
                 "normalized username conflict between user IDs "

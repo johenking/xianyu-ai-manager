@@ -168,6 +168,25 @@ class IdentityValidationTests(unittest.TestCase):
 
 
 class PasswordPolicyTests(unittest.TestCase):
+    def test_password_length_counts_unicode_characters_not_utf8_bytes(self):
+        seven_characters = "安全口令甲乙丙"
+        self.assertEqual(len(seven_characters), 7)
+        self.assertGreaterEqual(len(seven_characters.encode("utf-8")), 8)
+        with self.assertRaises(RegistrationError) as raised:
+            validate_password(
+                seven_characters,
+                username_normalized="different-user",
+            )
+        self.assertEqual(raised.exception.code, "PASSWORD_TOO_SHORT")
+
+        eight_characters = "安全口令甲乙丙丁"
+        self.assertEqual(len(eight_characters), 8)
+        self.assertLessEqual(len(eight_characters.encode("utf-8")), 72)
+        validate_password(
+            eight_characters,
+            username_normalized="different-user",
+        )
+
     def test_password_accepts_strong_value_at_bcrypt_limit(self):
         password = "安全Pass-" + ("x" * 61)
         self.assertEqual(len(password.encode("utf-8")), 72)
@@ -380,7 +399,6 @@ class ChallengeServiceTests(unittest.TestCase):
             subject="synthetic-session",
             context="login",
             secret="A7K9",
-            ttl_seconds=30,
         )
         consume = lambda **changes: self.service.consume_challenge(
             challenge_id=challenge["challenge_id"],
@@ -417,9 +435,8 @@ class ChallengeServiceTests(unittest.TestCase):
             purpose="captcha",
             subject="expiring-session",
             secret="Q2W4",
-            ttl_seconds=1,
         )
-        self.now += 2
+        self.now += 601
         self.assert_error_code(
             "CHALLENGE_EXPIRED",
             lambda: self.service.consume_challenge(
@@ -429,6 +446,19 @@ class ChallengeServiceTests(unittest.TestCase):
                 secret="Q2W4",
             ),
         )
+
+    def test_challenge_rejects_non_default_ttl(self):
+        for ttl_seconds in (599, 601):
+            with self.subTest(ttl_seconds=ttl_seconds):
+                self.assert_error_code(
+                    "CHALLENGE_TTL_INVALID",
+                    lambda: self.service.create_challenge(
+                        purpose="captcha",
+                        subject="fixed-ttl-session",
+                        secret="Q2W4",
+                        ttl_seconds=ttl_seconds,
+                    ),
+                )
 
     def test_fifth_wrong_secret_locks_challenge_without_consuming_it(self):
         challenge = self.service.create_challenge(

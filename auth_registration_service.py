@@ -54,6 +54,8 @@ DEFAULT_CHALLENGE_MAX_ATTEMPTS = 5
 RATE_IP_DIGEST_PURPOSE = "auth-rate-ip"
 RATE_EMAIL_DIGEST_PURPOSE = "auth-rate-email"
 RATE_ACCOUNT_DIGEST_PURPOSE = "auth-rate-account"
+RATE_EVENT_RETENTION_SECONDS = 7 * 86_400
+RATE_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 class RegistrationError(Exception):
@@ -229,6 +231,7 @@ class AuthRateLimiter:
         self.lock = lock or threading.RLock()
         self.clock = clock or time.time
         self.cipher = cipher or SystemSecretCipher(db_path)
+        self._last_cleanup_at: float | None = None
 
     def record_event(
         self,
@@ -243,6 +246,7 @@ class AuthRateLimiter:
         if not normalized_type:
             raise RegistrationError("RATE_EVENT_TYPE_REQUIRED", "认证事件类型不能为空")
         digests = self._event_digests(ip=ip, email=email, account=account)
+        self._opportunistic_cleanup()
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -292,7 +296,8 @@ class AuthRateLimiter:
     def cleanup_events(self, *, retention_days: int = 7) -> int:
         if retention_days <= 0:
             raise RegistrationError("RATE_RETENTION_INVALID", "认证事件保留时间无效")
-        cutoff = self.clock() - retention_days * 86_400
+        now = self.clock()
+        cutoff = now - retention_days * 86_400
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -304,10 +309,13 @@ class AuthRateLimiter:
             except Exception:
                 self.connection.rollback()
                 raise
+            if retention_days <= 7:
+                self._last_cleanup_at = now
         return cursor.rowcount
 
     def enforce_captcha(self, ip: str) -> None:
         ip_digest = self._ip_digest(ip)
+        self._opportunistic_cleanup()
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -331,6 +339,7 @@ class AuthRateLimiter:
     def enforce_email_send(self, ip: str, email: str) -> None:
         ip_digest = self._ip_digest(ip)
         email_digest = self._email_digest(email)
+        self._opportunistic_cleanup()
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -351,7 +360,7 @@ class AuthRateLimiter:
         ip_digest = self._ip_digest(ip)
         account_digest = self._account_digest(account)
         with self.lock:
-            error = self._login_limit_error(ip_digest, account_digest)
+            error = self._login_lockout_error(ip_digest, account_digest)
         if error is not None:
             raise error
 
@@ -365,11 +374,12 @@ class AuthRateLimiter:
         ip_digest = self._ip_digest(ip)
         account_digest = self._account_digest(account)
         deferred_error: RegistrationError | None = None
+        self._opportunistic_cleanup()
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 if not success:
-                    existing_error = self._login_limit_error(
+                    existing_error = self._login_lockout_error(
                         ip_digest,
                         account_digest,
                     )
@@ -381,10 +391,34 @@ class AuthRateLimiter:
                     success=success,
                 )
                 if not success:
-                    deferred_error = self._login_limit_error(
-                        ip_digest,
+                    account_failures = self._login_failure_count(
+                        "account_digest",
                         account_digest,
                     )
+                    ip_failures = self._login_failure_count(
+                        "ip_digest",
+                        ip_digest,
+                    )
+                    if account_failures >= 5 or ip_failures >= 5:
+                        lockout_at = int(self.clock())
+                        self._insert_event(
+                            "login_lockout",
+                            (ip_digest, "", account_digest),
+                            success=False,
+                            created_at=lockout_at,
+                        )
+                        if account_failures >= 5:
+                            code = "RATE_LIMIT_LOGIN_ACCOUNT"
+                            message = "登录失败次数过多，请稍后再试"
+                        else:
+                            code = "RATE_LIMIT_LOGIN_IP"
+                            message = "当前网络登录失败次数过多，请稍后再试"
+                        deferred_error = self._rate_error(
+                            code,
+                            message,
+                            float(lockout_at),
+                            900,
+                        )
                 self.connection.commit()
             except Exception:
                 self.connection.rollback()
@@ -411,6 +445,7 @@ class AuthRateLimiter:
     def record_registration_failure(self, ip: str) -> None:
         ip_digest = self._ip_digest(ip)
         deferred_error: RegistrationError | None = None
+        self._opportunistic_cleanup()
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
@@ -448,6 +483,27 @@ class AuthRateLimiter:
         if deferred_error is not None:
             raise deferred_error
 
+    def _opportunistic_cleanup(self) -> int:
+        now = self.clock()
+        with self.lock:
+            if (
+                self._last_cleanup_at is not None
+                and now - self._last_cleanup_at < RATE_CLEANUP_INTERVAL_SECONDS
+            ):
+                return 0
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self.connection.execute(
+                    "DELETE FROM auth_rate_events WHERE created_at <= ?",
+                    (now - RATE_EVENT_RETENTION_SECONDS,),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+            self._last_cleanup_at = now
+        return cursor.rowcount
+
     def _event_digests(
         self,
         *,
@@ -484,6 +540,7 @@ class AuthRateLimiter:
         digests: tuple[str, str, str],
         *,
         success: bool,
+        created_at: int | None = None,
     ) -> int:
         cursor = self.connection.execute(
             """
@@ -498,7 +555,7 @@ class AuthRateLimiter:
                 digests[1],
                 digests[2],
                 int(bool(success)),
-                int(self.clock()),
+                int(self.clock()) if created_at is None else created_at,
             ),
         )
         return int(cursor.lastrowid)
@@ -546,33 +603,50 @@ class AuthRateLimiter:
             success=True,
         )
 
-    def _login_limit_error(
+    def _login_lockout_error(
         self,
         ip_digest: str,
         account_digest: str,
     ) -> RegistrationError | None:
-        account_error = self._limit_error(
-            event_type="login",
-            column="account_digest",
-            digest=account_digest,
-            window_seconds=900,
-            limit=5,
-            code="RATE_LIMIT_LOGIN_ACCOUNT",
-            message="登录失败次数过多，请稍后再试",
-            success=False,
-        )
-        if account_error is not None:
-            return account_error
-        return self._limit_error(
-            event_type="login",
-            column="ip_digest",
-            digest=ip_digest,
-            window_seconds=900,
-            limit=5,
-            code="RATE_LIMIT_LOGIN_IP",
-            message="当前网络登录失败次数过多，请稍后再试",
-            success=False,
-        )
+        for column, digest, code, message in (
+            (
+                "account_digest",
+                account_digest,
+                "RATE_LIMIT_LOGIN_ACCOUNT",
+                "登录失败次数过多，请稍后再试",
+            ),
+            (
+                "ip_digest",
+                ip_digest,
+                "RATE_LIMIT_LOGIN_IP",
+                "当前网络登录失败次数过多，请稍后再试",
+            ),
+        ):
+            row = self.connection.execute(
+                "SELECT MAX(created_at) FROM auth_rate_events "
+                f"WHERE event_type = 'login_lockout' AND {column} = ? "
+                "AND created_at > ?",
+                (digest, self.clock() - 900),
+            ).fetchone()
+            if row[0] is not None:
+                return self._rate_error(
+                    code,
+                    message,
+                    float(row[0]),
+                    900,
+                )
+        return None
+
+    def _login_failure_count(self, column: str, digest: str) -> int:
+        if column not in {"ip_digest", "account_digest"}:
+            raise ValueError("unsupported login failure dimension")
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM auth_rate_events "
+            f"WHERE event_type = 'login' AND {column} = ? "
+            "AND success = 0 AND created_at > ?",
+            (digest, self.clock() - 900),
+        ).fetchone()
+        return int(row[0])
 
     def _limit_error(
         self,
@@ -799,12 +873,11 @@ class RegistrationService:
                 "CHALLENGE_PURPOSE_INVALID",
                 "验证码用途无效",
             )
-        if (
-            isinstance(ttl_seconds, bool)
-            or not isinstance(ttl_seconds, int)
-            or ttl_seconds <= 0
-        ):
-            raise RegistrationError("CHALLENGE_TTL_INVALID", "验证码有效期无效")
+        if ttl_seconds != DEFAULT_CHALLENGE_TTL_SECONDS:
+            raise RegistrationError(
+                "CHALLENGE_TTL_INVALID",
+                "验证码有效期固定为 600 秒",
+            )
         if max_attempts != DEFAULT_CHALLENGE_MAX_ATTEMPTS:
             raise RegistrationError(
                 "CHALLENGE_MAX_ATTEMPTS_INVALID",
