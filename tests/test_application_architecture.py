@@ -16,7 +16,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 199)
+        self.assertEqual(len(signatures), 210)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -38,6 +38,9 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("GET", "/api/accounts/{cookie_id}/session-status"), signatures)
         self.assertIn(("GET", "/health/live"), signatures)
         self.assertIn(("GET", "/health/ready"), signatures)
+        self.assertIn(("GET", "/api/auth/registration-config"), signatures)
+        self.assertIn(("POST", "/api/auth/password-reset"), signatures)
+        self.assertIn(("POST", "/api/admin/registration/invites"), signatures)
 
     async def test_lifespan_starts_and_stops_runtime_on_the_same_loop(self):
         app = create_app()

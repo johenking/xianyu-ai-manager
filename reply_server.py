@@ -3,8 +3,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import quote, unquote
 import hashlib
@@ -13,7 +14,6 @@ import time
 import json
 import os
 import re
-import smtplib
 import uvicorn
 import pandas as pd
 import io
@@ -62,6 +62,21 @@ from api_routers import (
     system_router,
 )
 from session_registry import get_session_registry
+from auth_registration_service import (
+    RegistrationError,
+    mask_email_for_log,
+    normalize_email,
+    resolve_client_ip,
+)
+from auth_email_service import (
+    SMTP_CONFIGURATION_KEYS,
+    SMTPConfigurationError,
+    SMTPDeliveryError,
+    SMTPEmailSender,
+    registration_readiness,
+    smtp_configuration_fingerprint,
+    smtp_configuration_status,
+)
 
 from loguru import logger
 
@@ -149,6 +164,7 @@ KEYWORDS_MAPPING = load_keywords()
 
 # 认证相关模型
 class LoginRequest(BaseModel):
+    identifier: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
     email: Optional[str] = None
@@ -175,15 +191,23 @@ class OrderSyncRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    invite_code: str
     username: str
     email: str
     password: str
+    challenge_id: str
     verification_code: str
+    terms_version: str
+    terms_accepted: bool
 
 
 class RegisterResponse(BaseModel):
     success: bool
     message: str
+    token: Optional[str] = None
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    is_admin: Optional[bool] = None
 
 
 class SendCodeRequest(BaseModel):
@@ -195,6 +219,35 @@ class SendCodeRequest(BaseModel):
 class SendCodeResponse(BaseModel):
     success: bool
     message: str
+
+
+class EmailCodeRequest(BaseModel):
+    purpose: Literal["register", "password_reset"]
+    email: str
+    invite_code: str = ""
+    captcha_challenge_id: str
+    captcha_code: str
+
+
+class PasswordResetRequest(BaseModel):
+    email: str
+    challenge_id: str
+    verification_code: str
+    new_password: str
+
+
+class InviteCreateRequest(BaseModel):
+    count: int = 1
+    valid_days: int = 7
+    note: str = ""
+
+
+class UserActiveUpdate(BaseModel):
+    is_active: bool
+
+
+class RegistrationSettingUpdate(BaseModel):
+    enabled: bool
 
 
 class CaptchaRequest(BaseModel):
@@ -248,6 +301,62 @@ def create_login_session(user: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return token, token_data
 
 
+def _drop_user_sessions_from_memory(user_id: int) -> None:
+    for token, data in list(SESSION_TOKENS.items()):
+        if int(data.get('user_id') or 0) == int(user_id):
+            SESSION_TOKENS.pop(token, None)
+
+
+def _masked_identifier(identifier: str) -> str:
+    value = str(identifier or '').strip()
+    if '@' in value:
+        return mask_email_for_log(value)
+    return f"{value[:2]}***" if value else "[空账号]"
+
+
+def _client_ip(request: Request) -> str:
+    peer_ip = request.client.host if request.client else "0.0.0.0"
+    trusted = db_manager.get_system_setting('auth_trusted_proxies') or ''
+    return resolve_client_ip(peer_ip, request.headers, trusted)
+
+
+def _registration_state() -> Dict[str, Any]:
+    settings = db_manager.get_all_system_settings()
+    return registration_readiness(
+        settings,
+        db_path=db_manager.db_path,
+        active_invite_available=db_manager.registration_service.has_active_invites(),
+    )
+
+
+def _require_registration_enabled() -> Dict[str, Any]:
+    try:
+        state = _registration_state()
+    except Exception as exc:
+        raise RegistrationError(
+            "REGISTRATION_UNAVAILABLE",
+            "注册服务暂不可用",
+            http_status=503,
+        ) from exc
+    if not state['enabled']:
+        raise RegistrationError(
+            "REGISTRATION_CLOSED",
+            "邀请注册暂未开放",
+            http_status=403,
+        )
+    return state
+
+
+def _require_verified_smtp(settings: Dict[str, Any]) -> None:
+    status = smtp_configuration_status(settings, db_path=db_manager.db_path)
+    if not status['smtp_verified']:
+        raise RegistrationError(
+            "SMTP_NOT_READY",
+            "邮件服务暂不可用",
+            http_status=503,
+        )
+
+
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
     """验证token并返回用户信息"""
     if not credentials:
@@ -264,6 +373,12 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
     # 检查token是否过期
     expires_at = token_data.get('expires_at', token_data.get('timestamp', 0) + TOKEN_EXPIRE_TIME)
     if time.time() > expires_at:
+        SESSION_TOKENS.pop(token, None)
+        db_manager.delete_auth_session(token)
+        return None
+
+    current_user = db_manager.get_user_by_id(token_data.get('user_id'))
+    if not current_user or not current_user.get('is_active'):
         SESSION_TOKENS.pop(token, None)
         db_manager.delete_auth_session(token)
         return None
@@ -434,6 +549,46 @@ async def log_requests(request, call_next):
     return response
 
 
+@app.exception_handler(RegistrationError)
+async def registration_error_with_request_id(request: Request, exc: RegistrationError):
+    headers = {}
+    if exc.retry_after is not None:
+        headers['Retry-After'] = str(exc.retry_after)
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={
+            "success": False,
+            "code": exc.code,
+            "message": exc.message,
+            "retry_after": exc.retry_after,
+            "request_id": getattr(request.state, "request_id", ""),
+        },
+        headers=headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_without_input(request: Request, exc: RequestValidationError):
+    errors = [
+        {
+            "location": [str(part) for part in error.get("loc", ())],
+            "message": error.get("msg", "输入无效"),
+            "type": error.get("type", "validation_error"),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "code": "REQUEST_VALIDATION_FAILED",
+            "message": "请求参数无效",
+            "errors": errors,
+            "request_id": getattr(request.state, "request_id", ""),
+        },
+    )
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_with_request_id(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -576,33 +731,6 @@ async def login_route():
 # 注册页面路由
 @frontend_router.get('/register.html', response_class=HTMLResponse)
 async def register_page():
-    # 检查注册是否开启
-    from db_manager import db_manager
-    registration_enabled = db_manager.get_system_setting('registration_enabled')
-    if registration_enabled != 'true':
-        return HTMLResponse('''
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>注册已关闭</title>
-            <meta charset="utf-8">
-            <style>
-                body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-                .message { color: #666; font-size: 18px; }
-                .back-link { margin-top: 20px; }
-                .back-link a { color: #007bff; text-decoration: none; }
-            </style>
-        </head>
-        <body>
-            <h2>🚫 注册功能已关闭</h2>
-            <p class="message">系统管理员已关闭用户注册功能</p>
-            <div class="back-link">
-                <a href="/">← 返回首页</a>
-            </div>
-        </body>
-        </html>
-        ''', status_code=403)
-
     return await serve_frontend()
 
 @frontend_router.get('/register', response_class=HTMLResponse)
@@ -619,106 +747,63 @@ async def register_route():
 
 # 登录接口
 @auth_router.post('/login')
-async def login(request: LoginRequest):
-    from db_manager import db_manager
+async def login(request: LoginRequest, http_request: Request):
+    identifier = str(
+        request.identifier or request.username or request.email or ''
+    ).strip()
+    if not identifier or not request.password:
+        raise RegistrationError(
+            "LOGIN_INPUT_REQUIRED",
+            "请输入用户名或邮箱及密码",
+        )
 
-    # 判断登录方式
-    if request.username and request.password:
-        # 用户名/密码登录
-        logger.info(f"【{request.username}】尝试用户名登录")
-
-        # 统一使用用户表验证（包括admin用户）
-        if db_manager.verify_user_password(request.username, request.password):
-            user = db_manager.get_user_by_username(request.username)
-            if user:
-                token, _ = create_login_session(user)
-
-                # 区分管理员和普通用户的日志
-                if user['username'] == ADMIN_USERNAME:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
-                else:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功")
-
-                return LoginResponse(
-                    success=True,
-                    token=token,
-                    message="登录成功",
-                    user_id=user['id'],
-                    username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
-                )
-
-        logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
-        return LoginResponse(
+    client_ip = _client_ip(http_request)
+    db_manager.auth_rate_limiter.check_login_limit(
+        ip=client_ip,
+        account=identifier,
+    )
+    verified = db_manager.verify_user_password(identifier, request.password)
+    if not verified:
+        logger.warning(f"登录失败 account={_masked_identifier(identifier)}")
+        db_manager.auth_rate_limiter.record_login_result(
+            ip=client_ip,
+            account=identifier,
             success=False,
-            message="用户名或密码错误"
+        )
+        raise RegistrationError(
+            "INVALID_CREDENTIALS",
+            "账号或密码错误",
+            http_status=401,
         )
 
-    elif request.email and request.password:
-        # 邮箱/密码登录
-        logger.info(f"【{request.email}】尝试邮箱密码登录")
-
-        user = db_manager.get_user_by_email(request.email)
-        if user and db_manager.verify_user_password(user['username'], request.password):
-            token, _ = create_login_session(user)
-
-            logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
-
-            return LoginResponse(
-                success=True,
-                token=token,
-                message="登录成功",
-                user_id=user['id'],
-                username=user['username'],
-                is_admin=(user['username'] == ADMIN_USERNAME)
-            )
-
-        logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
-        return LoginResponse(
+    user = db_manager.user_repository.get_by_identifier(identifier)
+    if not user or not user.get('is_active'):
+        db_manager.auth_rate_limiter.record_login_result(
+            ip=client_ip,
+            account=identifier,
             success=False,
-            message="邮箱或密码错误"
+        )
+        raise RegistrationError(
+            "INVALID_CREDENTIALS",
+            "账号或密码错误",
+            http_status=401,
         )
 
-    elif request.email and request.verification_code:
-        # 邮箱/验证码登录
-        logger.info(f"【{request.email}】尝试邮箱验证码登录")
-
-        # 验证邮箱验证码
-        if not db_manager.verify_email_code(request.email, request.verification_code, 'login'):
-            logger.warning(f"【{request.email}】验证码登录失败：验证码错误或已过期")
-            return LoginResponse(
-                success=False,
-                message="验证码错误或已过期"
-            )
-
-        # 获取用户信息
-        user = db_manager.get_user_by_email(request.email)
-        if not user:
-            logger.warning(f"【{request.email}】验证码登录失败：用户不存在")
-            return LoginResponse(
-                success=False,
-                message="用户不存在"
-            )
-
-        # 生成token
-        token, _ = create_login_session(user)
-
-        logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
-
-        return LoginResponse(
-            success=True,
-            token=token,
-            message="登录成功",
-            user_id=user['id'],
-            username=user['username'],
-            is_admin=(user['username'] == ADMIN_USERNAME)
-        )
-
-    else:
-        return LoginResponse(
-            success=False,
-            message="请提供有效的登录信息"
-        )
+    db_manager.auth_rate_limiter.record_login_result(
+        ip=client_ip,
+        account=identifier,
+        success=True,
+    )
+    token, _ = create_login_session(user)
+    logger.info(f"用户登录成功 user_id={user['id']}")
+    return LoginResponse(
+        success=True,
+        token=token,
+        message="登录成功",
+        user_id=user['id'],
+        username=user['username'],
+        is_admin=(user['username'] == ADMIN_USERNAME),
+    )
 
 
 # 验证token接口
@@ -1067,137 +1152,218 @@ async def geetest_validate(request: GeetestValidateRequest):
         )
 
 
-# 发送验证码接口（需要先验证图形验证码）
+@auth_router.get('/api/auth/registration-config')
+def get_registration_config():
+    try:
+        settings = db_manager.get_all_system_settings()
+        state = _registration_state()
+        support_email = str(settings.get('support_email') or '').strip()
+        if '\r' in support_email or '\n' in support_email:
+            support_email = ''
+        return {
+            "enabled": state['enabled'],
+            "ready": state['ready'],
+            "invite_required": True,
+            "terms_version": state['terms_version'] or 'v1',
+            "terms_url": "/terms",
+            "privacy_url": "/privacy",
+            "support_email": support_email,
+            "message": "邀请注册已开放" if state['enabled'] else "邀请注册暂未开放",
+        }
+    except Exception:
+        logger.warning("读取公开注册状态失败")
+        return {
+            "enabled": False,
+            "ready": False,
+            "invite_required": True,
+            "terms_version": "v1",
+            "terms_url": "/terms",
+            "privacy_url": "/privacy",
+            "support_email": "",
+            "message": "邀请注册暂未开放",
+        }
+
+
+@auth_router.post('/api/auth/captcha')
+def create_auth_captcha(http_request: Request):
+    client_ip = _client_ip(http_request)
+    db_manager.auth_rate_limiter.enforce_captcha(client_ip)
+    captcha_text, captcha_image = db_manager.generate_captcha()
+    if not captcha_text or not captcha_image:
+        raise RegistrationError(
+            "CAPTCHA_UNAVAILABLE",
+            "图形验证码暂不可用",
+            http_status=503,
+        )
+    challenge = db_manager.registration_service.create_challenge(
+        purpose="captcha",
+        subject=client_ip,
+        secret=captcha_text.upper(),
+    )
+    return {
+        "success": True,
+        "challenge_id": challenge['challenge_id'],
+        "captcha_image": captcha_image,
+        "expires_in": 600,
+    }
+
+
+@auth_router.post('/api/auth/email-code')
+async def send_auth_email_code(request: EmailCodeRequest, http_request: Request):
+    email = normalize_email(request.email).normalized
+    client_ip = _client_ip(http_request)
+    settings = db_manager.get_all_system_settings()
+    if request.purpose == 'register':
+        _require_registration_enabled()
+        if not request.invite_code or not db_manager.registration_service.active_invite_exists(
+            request.invite_code
+        ):
+            raise RegistrationError("INVITE_INVALID", "邀请码无效或不可用")
+        if db_manager.get_user_by_email(email):
+            raise RegistrationError("EMAIL_TAKEN", "邮箱已被使用")
+        challenge_purpose = 'register_email'
+        challenge_context = request.invite_code
+        subject = "闲鱼监控台注册验证码"
+    else:
+        _require_verified_smtp(settings)
+        user = db_manager.get_user_by_email(email)
+        if not user or not user.get('is_active'):
+            raise RegistrationError(
+                "PASSWORD_RESET_UNAVAILABLE",
+                "该账号暂不能重置密码",
+            )
+        challenge_purpose = 'password_reset_email'
+        challenge_context = ''
+        subject = "闲鱼监控台密码重置验证码"
+
+    db_manager.registration_service.consume_challenge(
+        challenge_id=request.captcha_challenge_id,
+        purpose="captcha",
+        subject=client_ip,
+        secret=request.captcha_code.upper(),
+    )
+    db_manager.auth_rate_limiter.enforce_email_send(client_ip, email)
+    _require_verified_smtp(settings)
+
+    verification_code = f"{secrets.randbelow(1_000_000):06d}"
+    text_content = (
+        f"您的验证码是 {verification_code}\n\n"
+        "验证码在 10 分钟内有效，最多可尝试 5 次。请勿向任何人泄露。\n"
+        "如非本人操作，请忽略此邮件。"
+    )
+    try:
+        await asyncio.to_thread(
+            SMTPEmailSender().send,
+            settings,
+            recipient=email,
+            subject=subject,
+            text=text_content,
+        )
+    except (SMTPConfigurationError, SMTPDeliveryError) as exc:
+        logger.warning(
+            f"认证邮件发送失败 type={type(exc).__name__} "
+            f"email={mask_email_for_log(email)}"
+        )
+        raise RegistrationError(
+            "EMAIL_SEND_FAILED",
+            "验证码邮件发送失败，请稍后重试",
+            http_status=502,
+        ) from exc
+
+    challenge = db_manager.registration_service.create_challenge(
+        purpose=challenge_purpose,
+        subject=email,
+        context=challenge_context,
+        secret=verification_code,
+    )
+    logger.info(
+        f"认证邮件已提交 email={mask_email_for_log(email)} "
+        f"purpose={request.purpose}"
+    )
+    return {
+        "success": True,
+        "challenge_id": challenge['challenge_id'],
+        "expires_in": 600,
+        "cooldown_seconds": 60,
+        "message": "验证码已发送，请查收邮件",
+    }
+
+
 @auth_router.post('/send-verification-code')
-async def send_verification_code(request: SendCodeRequest):
-    from db_manager import db_manager
-
-    try:
-        # 检查是否已验证图形验证码
-        # 通过检查数据库中是否存在已验证的图形验证码记录
-        with db_manager.lock:
-            cursor = db_manager.conn.cursor()
-            current_time = time.time()
-
-            # 查找最近5分钟内该session_id的验证记录
-            # 由于验证成功后验证码会被删除，我们需要另一种方式来跟踪验证状态
-            # 这里我们检查该session_id是否在最近验证过（通过检查是否有已删除的记录）
-
-            # 为了简化，我们要求前端在验证图形验证码成功后立即发送邮件验证码
-            # 或者我们可以在验证成功后设置一个临时标记
-            pass
-
-        # 根据验证码类型进行不同的检查
-        if request.type == 'register':
-            # 注册验证码：检查邮箱是否已注册
-            existing_user = db_manager.get_user_by_email(request.email)
-            if existing_user:
-                return SendCodeResponse(
-                    success=False,
-                    message="该邮箱已被注册"
-                )
-        elif request.type == 'login':
-            # 登录验证码：检查邮箱是否存在
-            existing_user = db_manager.get_user_by_email(request.email)
-            if not existing_user:
-                return SendCodeResponse(
-                    success=False,
-                    message="该邮箱未注册"
-                )
-
-        # 生成验证码
-        code = db_manager.generate_verification_code()
-
-        # 保存验证码到数据库
-        if not db_manager.save_verification_code(request.email, code, request.type):
-            return SendCodeResponse(
-                success=False,
-                message="验证码保存失败，请稍后重试"
-            )
-
-        # 发送验证码邮件
-        if await db_manager.send_verification_email(request.email, code):
-            return SendCodeResponse(
-                success=True,
-                message="验证码已发送到您的邮箱，请查收"
-            )
-        else:
-            return SendCodeResponse(
-                success=False,
-                message="验证码发送失败，请检查邮箱地址或稍后重试"
-            )
-
-    except Exception as e:
-        logger.error(f"发送验证码失败: {e}")
-        return SendCodeResponse(
-            success=False,
-            message="发送验证码失败，请稍后重试"
-        )
+async def send_verification_code(_request: SendCodeRequest):
+    raise RegistrationError(
+        "LEGACY_AUTH_ENDPOINT_REMOVED",
+        "此接口已停用，请改用 /api/auth/captcha 和 /api/auth/email-code",
+        http_status=410,
+    )
 
 
-# 用户注册接口
 @auth_router.post('/register')
-async def register(request: RegisterRequest):
-    from db_manager import db_manager
-
-    # 检查注册是否开启
-    registration_enabled = db_manager.get_system_setting('registration_enabled')
-    if registration_enabled != 'true':
-        logger.warning(f"【{request.username}】注册失败: 注册功能已关闭")
-        return RegisterResponse(
-            success=False,
-            message="注册功能已关闭，请联系管理员"
-        )
-
+async def register(request: RegisterRequest, http_request: Request):
+    if not request.terms_accepted:
+        raise RegistrationError("TERMS_NOT_ACCEPTED", "请先同意服务条款和隐私说明")
+    _require_registration_enabled()
+    client_ip = _client_ip(http_request)
+    db_manager.auth_rate_limiter.check_registration_limit(client_ip)
     try:
-        logger.info(f"【{request.username}】尝试注册，邮箱: {request.email}")
-
-        # 验证邮箱验证码
-        if not db_manager.verify_email_code(request.email, request.verification_code):
-            logger.warning(f"【{request.username}】注册失败: 验证码错误或已过期")
-            return RegisterResponse(
-                success=False,
-                message="验证码错误或已过期"
-            )
-
-        # 检查用户名是否已存在
-        existing_user = db_manager.get_user_by_username(request.username)
-        if existing_user:
-            logger.warning(f"【{request.username}】注册失败: 用户名已存在")
-            return RegisterResponse(
-                success=False,
-                message="用户名已存在"
-            )
-
-        # 检查邮箱是否已注册
-        existing_email = db_manager.get_user_by_email(request.email)
-        if existing_email:
-            logger.warning(f"【{request.username}】注册失败: 邮箱已被注册")
-            return RegisterResponse(
-                success=False,
-                message="该邮箱已被注册"
-            )
-
-        # 创建用户
-        if db_manager.create_user(request.username, request.email, request.password):
-            logger.info(f"【{request.username}】注册成功")
-            return RegisterResponse(
-                success=True,
-                message="注册成功，请登录"
-            )
-        else:
-            logger.error(f"【{request.username}】注册失败: 数据库操作失败")
-            return RegisterResponse(
-                success=False,
-                message="注册失败，请稍后重试"
-            )
-
-    except Exception as e:
-        logger.error(f"【{request.username}】注册异常: {e}")
-        return RegisterResponse(
-            success=False,
-            message="注册失败，请稍后重试"
+        user = db_manager.registration_service.register_user(
+            username=request.username,
+            email=request.email,
+            password=request.password,
+            invite_code=request.invite_code,
+            challenge_id=request.challenge_id,
+            verification_code=request.verification_code,
+            terms_version=request.terms_version,
         )
+    except RegistrationError:
+        db_manager.auth_rate_limiter.record_registration_failure(client_ip)
+        raise
+    except Exception as exc:
+        logger.error(f"注册事务失败 type={type(exc).__name__}")
+        raise RegistrationError(
+            "REGISTRATION_FAILED",
+            "注册失败，请稍后重试",
+            http_status=503,
+        ) from exc
+
+    token, _ = create_login_session(user)
+    logger.info(f"邀请注册成功 user_id={user['id']}")
+    return RegisterResponse(
+        success=True,
+        token=token,
+        message="注册成功",
+        user_id=user['id'],
+        username=user['username'],
+        is_admin=False,
+    )
+
+
+@auth_router.post('/api/auth/password-reset')
+async def reset_user_password(request: PasswordResetRequest):
+    settings = db_manager.get_all_system_settings()
+    _require_verified_smtp(settings)
+    try:
+        user_id = db_manager.registration_service.reset_password(
+            email=request.email,
+            new_password=request.new_password,
+            challenge_id=request.challenge_id,
+            verification_code=request.verification_code,
+        )
+    except RegistrationError:
+        raise
+    except Exception as exc:
+        logger.error(f"密码重置失败 type={type(exc).__name__}")
+        raise RegistrationError(
+            "PASSWORD_RESET_FAILED",
+            "密码重置失败，请稍后重试",
+            http_status=503,
+        ) from exc
+    _drop_user_sessions_from_memory(user_id)
+    logger.info(f"用户密码重置成功 user_id={user_id}")
+    return {
+        "success": True,
+        "message": "密码已重置，请重新登录",
+    }
 
 
 # ------------------------- 发送消息接口 -------------------------
@@ -2905,19 +3071,24 @@ def delete_message_notification(notification_id: int, _: None = Depends(require_
 @settings_router.get('/system-settings/public')
 def get_public_system_settings():
     """获取公开的系统设置（无需认证）"""
-    from db_manager import db_manager
     try:
         all_settings = db_manager.get_all_system_settings()
-        # 只返回公开的配置项
-        public_keys = {"registration_enabled", "show_default_login_info", "login_captcha_enabled"}
-        return {k: v for k, v in all_settings.items() if k in public_keys}
-    except Exception as e:
-        logger.error(f"获取公开系统设置失败: {e}")
-        # 返回默认值
+        state = _registration_state()
         return {
-            "registration_enabled": "true",
-            "show_default_login_info": "true",
-            "login_captcha_enabled": "true"
+            "registration_enabled": "true" if state['enabled'] else "false",
+            "show_default_login_info": all_settings.get(
+                "show_default_login_info", "false"
+            ),
+            "login_captcha_enabled": all_settings.get(
+                "login_captcha_enabled", "true"
+            ),
+        }
+    except Exception:
+        logger.warning("获取公开系统设置失败")
+        return {
+            "registration_enabled": "false",
+            "show_default_login_info": "false",
+            "login_captcha_enabled": "true",
         }
 
 
@@ -2976,8 +3147,21 @@ def _settings_summary() -> Dict[str, Any]:
     settings = normalize_system_settings(raw)
     ai_configured = bool(raw.get('ai_api_url') and raw.get('ai_model') and raw.get('ai_api_key'))
     smtp_values = [raw.get('smtp_server'), raw.get('smtp_user'), raw.get('smtp_password')]
-    smtp_configured = all(smtp_values)
+    smtp_status = smtp_configuration_status(raw, db_path=db_manager.db_path)
+    smtp_configured = smtp_status['smtp_configured']
+    smtp_verified = smtp_status['smtp_verified']
     smtp_partial = any(smtp_values) and not smtp_configured
+    try:
+        registration = _registration_state()
+    except Exception:
+        registration = {
+            'enabled': False,
+            'ready': False,
+            'requested': False,
+            'smtp_verified': False,
+            'active_invite_available': False,
+        }
+    settings['smtp_verified'] = smtp_verified
     return {
         'settings': settings,
         'sections': {
@@ -2989,11 +3173,13 @@ def _settings_summary() -> Dict[str, Any]:
                 'model': settings.get('ai_model') or '',
             },
             'smtp': {
-                'state': 'ready' if smtp_configured else ('warning' if smtp_partial else 'optional'),
-                'label': '已配置' if smtp_configured else ('配置不完整' if smtp_partial else '可选未配置'),
+                'state': 'ready' if smtp_verified else ('warning' if smtp_configured or smtp_partial else 'missing'),
+                'label': '已验证' if smtp_verified else ('待验证' if smtp_configured else ('配置不完整' if smtp_partial else '未配置')),
                 'configured': smtp_configured,
+                'verified': smtp_verified,
             },
         },
+        'registration': registration,
         'runtime': {
             'cookie_manager': cookie_manager.manager is not None,
             'account_count': len(getattr(cookie_manager.manager, 'cookies', {}) or {}),
@@ -3011,6 +3197,19 @@ def get_settings_summary(_: Dict[str, Any] = Depends(require_admin)):
 def save_settings_section(section: str, request: SystemSettingsSectionIn,
                           _: Dict[str, Any] = Depends(require_admin)):
     values = _prepare_settings_section(section, request)
+    if section == 'basic' and str(
+        values.get('registration_enabled', '')
+    ).strip().lower() in {'1', 'true', 'yes', 'on'}:
+        try:
+            ready = _registration_state()['ready']
+        except Exception:
+            ready = False
+        if not ready:
+            raise RegistrationError(
+                "REGISTRATION_NOT_READY",
+                "请先验证 SMTP 并创建至少一个有效邀请码",
+                http_status=409,
+            )
     if not db_manager.save_system_settings_section(values):
         raise HTTPException(status_code=500, detail='配置保存失败')
     return {
@@ -3049,43 +3248,80 @@ def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
                 kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
             client.chat.completions.create(**kwargs)
             return {'success': True, 'state': 'ready', 'message': 'AI连接可用'}
-
-        server = str(effective.get('smtp_server') or '').strip()
-        user = str(effective.get('smtp_user') or '').strip()
-        password = str(effective.get('smtp_password') or '')
-        port = int(effective.get('smtp_port') or 587)
-        if not server or not user or not password:
-            raise ValueError('SMTP配置不完整')
-        use_ssl = str(effective.get('smtp_use_ssl', 'false')).lower() == 'true'
-        use_tls = str(effective.get('smtp_use_tls', 'true')).lower() == 'true'
-        smtp = smtplib.SMTP_SSL(server, port, timeout=12) if use_ssl else smtplib.SMTP(server, port, timeout=12)
-        try:
-            if use_tls and not use_ssl:
-                smtp.starttls()
-            smtp.login(user, password)
-        finally:
-            smtp.quit()
-        return {'success': True, 'state': 'ready', 'message': 'SMTP连接与认证可用，未发送邮件'}
+        recipient = str(
+            effective.get('support_email') or effective.get('smtp_user') or ''
+        ).strip()
+        SMTPEmailSender().send(
+            effective,
+            recipient=recipient,
+            subject='闲鱼监控台 SMTP 配置验证',
+            text=(
+                '这是一封 SMTP 配置验证邮件。\n\n'
+                '收到此邮件表示服务器已接受本次投递。'
+            ),
+        )
+        fingerprint = smtp_configuration_fingerprint(
+            effective,
+            db_path=db_manager.db_path,
+        )
+        smtp_settings = {
+            key: effective.get(key, '') for key in SMTP_CONFIGURATION_KEYS
+        }
+        verified_at = datetime.now().astimezone().isoformat(timespec='seconds')
+        if not db_manager.save_verified_smtp_settings(
+            smtp_settings,
+            fingerprint=fingerprint,
+            verified_at=verified_at,
+            expected_settings=raw,
+        ):
+            raise RegistrationError(
+                "SMTP_VERIFICATION_SAVE_FAILED",
+                "SMTP 验证成功但状态保存失败，请重试",
+                http_status=503,
+            )
+        return {
+            'success': True,
+            'state': 'ready',
+            'message': f"验证邮件已发送至 {mask_email_for_log(recipient)}",
+            'verified_at': verified_at,
+        }
+    except (SMTPConfigurationError, SMTPDeliveryError) as e:
+        logger.warning(f"SMTP配置验证失败: {type(e).__name__}")
+        raise RegistrationError(
+            "SMTP_VERIFICATION_FAILED",
+            "SMTP 验证邮件发送失败，请检查配置",
+        ) from e
+    except RegistrationError:
+        raise
     except Exception as e:
         logger.warning(f"{section.upper()}配置验证失败: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"验证失败: {str(e)}")
 
 
 @settings_router.put('/system-settings/{key}')
-def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Depends(require_auth)):
+def update_system_setting(key: str, setting_data: SystemSettingIn,
+                          _: Dict[str, Any] = Depends(require_admin)):
     """更新系统设置"""
-    from db_manager import db_manager
     try:
         # 禁止直接修改密码哈希
         if key == 'admin_password_hash':
             raise HTTPException(status_code=400, detail='请使用密码修改接口')
+        if key in {'smtp_verified_fingerprint', 'smtp_verified_at'}:
+            raise HTTPException(status_code=400, detail='该设置只能由 SMTP 验证流程更新')
+        if key == 'registration_enabled' and setting_data.value.strip().lower() == 'true':
+            if not _registration_state()['ready']:
+                raise RegistrationError(
+                    "REGISTRATION_NOT_READY",
+                    "请先验证 SMTP 并创建至少一个有效邀请码",
+                    http_status=409,
+                )
 
         success = db_manager.set_system_setting(key, setting_data.value, setting_data.description)
         if success:
             return {'msg': 'system setting updated'}
         else:
             raise HTTPException(status_code=400, detail='更新失败')
-    except HTTPException:
+    except (HTTPException, RegistrationError):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -3093,31 +3329,191 @@ def update_system_setting(key: str, setting_data: SystemSettingIn, _: None = Dep
 
 # ------------------------- 注册设置接口 -------------------------
 
+
+def _update_registration_enabled(
+    enabled: bool,
+    admin_user: Dict[str, Any],
+) -> Dict[str, Any]:
+    if enabled:
+        try:
+            ready = _registration_state()['ready']
+        except Exception:
+            ready = False
+        if not ready:
+            raise RegistrationError(
+                "REGISTRATION_NOT_READY",
+                "请先验证 SMTP 并创建至少一个有效邀请码",
+                http_status=409,
+            )
+    if not db_manager.set_system_setting(
+        'registration_enabled',
+        'true' if enabled else 'false',
+        '是否开启用户注册',
+    ):
+        raise RegistrationError(
+            "REGISTRATION_SETTING_FAILED",
+            "注册开关保存失败",
+            http_status=503,
+        )
+    log_with_user(
+        'info',
+        f"更新注册设置: {'开启' if enabled else '关闭'}",
+        admin_user,
+    )
+    return {
+        'success': True,
+        'enabled': enabled,
+        'message': f"注册功能已{'开启' if enabled else '关闭'}",
+    }
+
+
+@admin_router.get('/api/admin/registration/status')
+def get_registration_admin_status(
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    settings = db_manager.get_all_system_settings()
+    state = _registration_state()
+    support_email = str(
+        settings.get('support_email') or settings.get('smtp_user') or ''
+    ).strip()
+    invites = db_manager.registration_service.list_invites()
+    invite_counts = {
+        status_name: sum(
+            1 for invite in invites if invite['status'] == status_name
+        )
+        for status_name in ('active', 'used', 'expired', 'revoked')
+    }
+    return {
+        'success': True,
+        'registration': {
+            'enabled': state['enabled'],
+            'ready': state['ready'],
+            'requested': state['requested'],
+            'terms_version': state['terms_version'],
+        },
+        'smtp': {
+            'configured': state['smtp_configured'],
+            'verified': state['smtp_verified'],
+            'verified_at': settings.get('smtp_verified_at') or '',
+            'support_email': mask_email_for_log(support_email)
+            if support_email else '',
+        },
+        'invites': invite_counts,
+    }
+
+
+@admin_router.post('/api/admin/registration/invites')
+def create_registration_invites(
+    request: InviteCreateRequest,
+    admin_user: Dict[str, Any] = Depends(require_admin),
+):
+    invites = db_manager.registration_service.create_invites(
+        count=request.count,
+        valid_days=request.valid_days,
+        note=request.note,
+        created_by_user_id=admin_user['user_id'],
+    )
+    return {
+        'success': True,
+        'invites': invites,
+        'message': '邀请码已创建，原始邀请码仅显示本次',
+    }
+
+
+@admin_router.get('/api/admin/registration/invites')
+def list_registration_invites(
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    return {
+        'success': True,
+        'invites': db_manager.registration_service.list_invites(),
+    }
+
+
+@admin_router.delete('/api/admin/registration/invites/{invite_id}')
+def revoke_registration_invite(
+    invite_id: int,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    invite = db_manager.registration_service.revoke_invite(invite_id)
+    return {'success': True, 'invite': invite}
+
+
+@admin_router.get('/api/admin/registration/users')
+def list_registration_users(
+    limit: int = Query(50, ge=1, le=200),
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    users = [
+        user
+        for user in db_manager.user_repository.list_recent(
+            limit=min(200, limit + 1)
+        )
+        if str(user.get('username') or '').casefold()
+        != ADMIN_USERNAME.casefold()
+    ][:limit]
+    return {
+        'success': True,
+        'users': [
+            {
+                key: user.get(key)
+                for key in (
+                    'id',
+                    'username',
+                    'email',
+                    'is_active',
+                    'created_at',
+                    'terms_version',
+                    'terms_accepted_at',
+                )
+            }
+            for user in users
+        ],
+    }
+
+
+@admin_router.put('/api/admin/registration/users/{user_id}')
+def update_registration_user(
+    user_id: int,
+    request: UserActiveUpdate,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    target = db_manager.get_user_by_id(user_id)
+    if target and str(target.get('username') or '').casefold() == ADMIN_USERNAME.casefold():
+        raise RegistrationError(
+            "ADMIN_DEACTIVATION_FORBIDDEN",
+            "管理员账号不能通过注册管理修改",
+        )
+    user = db_manager.auth_service.set_user_active(user_id, request.is_active)
+    if not request.is_active:
+        _drop_user_sessions_from_memory(user_id)
+    return {'success': True, 'user': user}
+
+
+@admin_router.put('/api/admin/registration/enabled')
+def update_registration_enabled(
+    request: RegistrationSettingUpdate,
+    admin_user: Dict[str, Any] = Depends(require_admin),
+):
+    return _update_registration_enabled(request.enabled, admin_user)
+
 @settings_router.get('/registration-status')
 def get_registration_status():
-    """获取注册开关状态（公开接口，无需认证）"""
-    from db_manager import db_manager
+    """兼容旧客户端的公开注册状态。"""
     try:
-        enabled_str = db_manager.get_system_setting('registration_enabled')
-        logger.info(f"从数据库获取的注册设置值: '{enabled_str}'")  # 调试信息
-
-        # 如果设置不存在，默认为开启
-        if enabled_str is None:
-            enabled_bool = True
-            message = '注册功能已开启'
-        else:
-            enabled_bool = enabled_str == 'true'
-            message = '注册功能已开启' if enabled_bool else '注册功能已关闭'
-
-        logger.info(f"解析后的注册状态: enabled={enabled_bool}, message='{message}'")  # 调试信息
-
+        state = _registration_state()
         return {
-            'enabled': enabled_bool,
-            'message': message
+            'enabled': state['enabled'],
+            'ready': state['ready'],
+            'message': '注册功能已开启' if state['enabled'] else '邀请注册暂未开放',
         }
-    except Exception as e:
-        logger.error(f"获取注册状态失败: {e}")
-        return {'enabled': True, 'message': '注册功能已开启'}  # 出错时默认开启
+    except Exception:
+        logger.warning("获取注册状态失败")
+        return {
+            'enabled': False,
+            'ready': False,
+            'message': '邀请注册暂未开放',
+        }
 
 
 @auth_router.get('/login-info-status')
@@ -3141,39 +3537,14 @@ def get_login_info_status():
         return {"enabled": True}
 
 
-class RegistrationSettingUpdate(BaseModel):
-    enabled: bool
-
-
 class LoginInfoSettingUpdate(BaseModel):
     enabled: bool
 
 
 @settings_router.put('/registration-settings')
 def update_registration_settings(setting_data: RegistrationSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):
-    """更新注册开关设置（仅管理员）"""
-    from db_manager import db_manager
-    try:
-        enabled = setting_data.enabled
-        success = db_manager.set_system_setting(
-            'registration_enabled',
-            'true' if enabled else 'false',
-            '是否开启用户注册'
-        )
-        if success:
-            log_with_user('info', f"更新注册设置: {'开启' if enabled else '关闭'}", admin_user)
-            return {
-                'success': True,
-                'enabled': enabled,
-                'message': f"注册功能已{'开启' if enabled else '关闭'}"
-            }
-        else:
-            raise HTTPException(status_code=500, detail='更新注册设置失败')
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"更新注册设置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """兼容旧客户端的管理员注册开关。"""
+    return _update_registration_enabled(setting_data.enabled, admin_user)
 
 @auth_router.put('/login-info-settings')
 def update_login_info_settings(setting_data: LoginInfoSettingUpdate, admin_user: Dict[str, Any] = Depends(require_admin)):

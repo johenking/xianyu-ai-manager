@@ -9,7 +9,7 @@ export BASE_URL=http://127.0.0.1:8091
 
 curl -sS -X POST "$BASE_URL/login" \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"<password>"}'
+  -d '{"identifier":"admin-or-email","password":"<password>"}'
 ```
 
 Pass the returned token to protected APIs:
@@ -25,7 +25,9 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 
 | Capability | Routes |
 |---|---|
-| Health | `GET /health` |
+| Health | `GET /health/live`, `GET /health/ready`, compatibility `GET /health` |
+| Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset` |
+| Registration administration | `/api/admin/registration/status`, `/invites`, `/users`, `/enabled` |
 | Settings | `GET /api/settings/summary`, `PUT /api/settings/sections/{section}`, `POST /api/settings/verify/{section}` |
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
@@ -36,7 +38,99 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | Orders | `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
 | Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
 
-All routes below require `Authorization: Bearer $TOKEN` unless stated otherwise.
+Routes below require `Authorization: Bearer $TOKEN` unless they are explicitly described as public.
+
+## Invitation Registration And Password Recovery
+
+The public registration status is deliberately narrow and fail-closed:
+
+```bash
+curl -sS "$BASE_URL/api/auth/registration-config"
+```
+
+It returns `enabled`, `ready`, `invite_required`, `terms_version`, local terms/privacy links, a public support email, and a user-facing message. It never returns SMTP configuration, verification fingerprints, or invite counts. Treat `enabled: false` as authoritative even when the service itself is healthy.
+
+Request a one-time image CAPTCHA, then submit it when requesting a registration email code:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/auth/captcha" \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+
+curl -sS -X POST "$BASE_URL/api/auth/email-code" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "purpose":"register",
+    "email":"person@example.com",
+    "invite_code":"<one-time-invite>",
+    "captcha_challenge_id":"<captcha-challenge-id>",
+    "captcha_code":"<captcha-answer>"
+  }'
+```
+
+The email response returns a new `challenge_id`, a 10-minute expiry, and a 60-second resend cooldown. Complete registration with that email challenge:
+
+```bash
+curl -sS -X POST "$BASE_URL/register" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "invite_code":"<one-time-invite>",
+    "email":"person@example.com",
+    "challenge_id":"<email-challenge-id>",
+    "verification_code":"<six-digit-code>",
+    "username":"invited-user",
+    "password":"<new-password>",
+    "terms_version":"v1",
+    "terms_accepted":true
+  }'
+```
+
+Success returns the same bearer-token shape as `/login`. The user insert, invite consumption, and email-challenge consumption commit together. Usernames accept 3–24 Unicode letters or numbers plus `_` and `-`. Passwords require at least eight characters, must not contain the username or match the common-password denylist, and cannot exceed bcrypt's 72-byte UTF-8 input limit.
+
+Password recovery uses a fresh image CAPTCHA and `purpose: "password_reset"` in `/api/auth/email-code`; it does not accept a registration email challenge. Submit the resulting code to:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/auth/password-reset" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email":"person@example.com",
+    "challenge_id":"<reset-email-challenge-id>",
+    "verification_code":"<six-digit-code>",
+    "new_password":"<new-password>"
+  }'
+```
+
+A successful reset revokes every old session and returns the user to login. `/send-verification-code` is retired and returns HTTP 410 with migration guidance.
+
+Authentication errors use a non-echoing structure:
+
+```json
+{
+  "success": false,
+  "code": "REGISTRATION_CLOSED",
+  "message": "邀请注册暂未开放",
+  "retry_after": null,
+  "request_id": "<request-id>"
+}
+```
+
+HTTP 429 responses include `retry_after`. CAPTCHA issuance is limited by client IP; email delivery is limited by normalized email and client IP; login cooldown is tracked independently by account and IP. Forwarded headers affect these limits only when the direct peer is configured in `auth_trusted_proxies`.
+
+Administrators can read readiness, create 1–20 invites, list only hints and state, revoke an unused invite, list recent ordinary users, enable or disable an ordinary user, and change the guarded registration switch:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/admin/registration/invites" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"count":5,"valid_days":7,"note":"small pilot"}'
+
+curl -sS -X PUT "$BASE_URL/api/admin/registration/enabled" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'
+```
+
+Raw invite codes appear only in the create response. Enabling returns HTTP 409 until SMTP is currently verified and at least one active invite exists. The user-management API intentionally excludes the administrator and provides no destructive delete action.
 
 ## Settings Sections
 
@@ -59,7 +153,7 @@ curl -sS -X PUT "$BASE_URL/api/settings/sections/ai" \
   }'
 ```
 
-Use `/api/settings/verify/ai` or `/api/settings/verify/smtp` to test unsaved values. SMTP verification connects and authenticates but does not send mail.
+Use `/api/settings/verify/ai` or `/api/settings/verify/smtp` to test unsaved values. SMTP verification sends a real test message to `support_email`, or to `smtp_user` when support email is empty. It saves the verified fingerprint only after delivery succeeds; changing any SMTP field invalidates that state.
 
 ## AI Provider Profiles
 

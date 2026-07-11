@@ -39,7 +39,14 @@ SETTINGS_SECTION_KEYS = {
         "smtp_from",
         "smtp_use_tls",
         "smtp_use_ssl",
+        "support_email",
     },
+}
+
+INTERNAL_SETTING_KEYS = {
+    "admin_password_hash",
+    "smtp_verified_fingerprint",
+    "auth_trusted_proxies",
 }
 
 
@@ -73,7 +80,7 @@ def normalize_system_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = _as_bool(value)
         elif key in INTEGER_SETTING_KEYS:
             result[key] = _as_int(value)
-        elif key != "admin_password_hash":
+        elif key not in INTERNAL_SETTING_KEYS:
             result[key] = value
 
     for key in SECRET_SETTING_KEYS:

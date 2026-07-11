@@ -6,9 +6,10 @@ import time
 import json
 import random
 import string
-import aiohttp
+import asyncio
 import io
 import base64
+import binascii
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
@@ -18,12 +19,31 @@ from schema_migrations import MigrationRunner, get_schema_version
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
     PASSWORD_HASH_VERSION,
+    SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
+    SystemSecretCipher,
     hash_user_password,
     token_digest,
 )
-from repositories.auth_repository import AuthSessionRepository, UserRepository
+from repositories.auth_repository import (
+    AuthSessionRepository,
+    UserRepository,
+    public_user_view,
+)
 from services.auth_service import AuthService
+from auth_registration_service import (
+    AuthRateLimiter,
+    RegistrationService,
+    mask_email_for_log,
+)
+from auth_email_service import (
+    SMTP_CONFIGURATION_KEYS,
+    SMTPConfigurationError,
+    SMTPDeliveryError,
+    SMTPEmailSender,
+    canonical_smtp_setting_value,
+    smtp_configuration_status,
+)
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
@@ -734,7 +754,7 @@ class DBManager:
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
-            ('registration_enabled', 'true', '是否开启用户注册'),
+            ('registration_enabled', 'false', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '登录滑动验证码开关'),
             ('smtp_server', '', 'SMTP服务器地址'),
@@ -744,6 +764,11 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('terms_version', 'v1', '当前注册条款版本'),
+            ('support_email', '', '公开支持邮箱'),
+            ('smtp_verified_fingerprint', '', '已验证SMTP配置指纹'),
+            ('smtp_verified_at', '', 'SMTP配置验证时间'),
+            ('auth_trusted_proxies', '', '认证可信代理列表'),
             ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
@@ -769,7 +794,21 @@ class DBManager:
             self.backfill_cookie_identities()
             self.user_repository = UserRepository(self.conn)
             self.auth_session_repository = AuthSessionRepository(self.conn)
-            self.auth_service = AuthService(self.user_repository)
+            self.auth_service = AuthService(
+                self.user_repository,
+                self.auth_session_repository,
+                lock=self.lock,
+            )
+            self.registration_service = RegistrationService(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
+            self.auth_rate_limiter = AuthRateLimiter(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
@@ -1569,6 +1608,9 @@ class DBManager:
         formatted_sql = ' '.join(sql.split())
         sensitive_sql_terms = (
             'auth_sessions',
+            'auth_challenges',
+            'registration_invites',
+            'auth_rate_events',
             'cookies',
             'password',
             'token',
@@ -3741,6 +3783,76 @@ class DBManager:
                 logger.error(f"导出备份失败: {e}")
                 raise
 
+    @staticmethod
+    def _looks_like_fernet_ciphertext(value: str) -> bool:
+        if not value.startswith('fernet:'):
+            return False
+        token = value.rsplit(':', 1)[-1]
+        try:
+            decoded = base64.b64decode(
+                token.encode('ascii'),
+                altchars=b'-_',
+                validate=True,
+            )
+        except (binascii.Error, UnicodeError, ValueError):
+            return False
+        return len(decoded) >= 73 and decoded[0] == 0x80
+
+    def _normalize_imported_smtp_password(self, value: Any) -> tuple[str, bool]:
+        imported_value = str(value if value is not None else '')
+        if not imported_value:
+            return '', False
+
+        cipher = SystemSecretCipher(self.db_path)
+        if imported_value.startswith(SYSTEM_SECRET_PREFIX):
+            try:
+                cipher.decrypt(imported_value)
+            except ValueError:
+                if self._looks_like_fernet_ciphertext(imported_value):
+                    return '', True
+                return cipher.encrypt(imported_value), False
+            return imported_value, False
+        if self._looks_like_fernet_ciphertext(imported_value):
+            return '', True
+        return cipher.encrypt(imported_value), False
+
+    def _prepare_imported_system_settings(
+        self,
+        columns: List[str],
+        rows: List[List[Any]],
+    ) -> tuple[List[List[Any]], bool, bool]:
+        try:
+            key_index = columns.index('key')
+            value_index = columns.index('value')
+        except ValueError as exc:
+            raise ValueError("系统设置备份缺少必要字段") from exc
+
+        prepared_rows = []
+        smtp_settings_imported = False
+        smtp_reconfiguration_required = False
+        for row in rows:
+            prepared_row = list(row)
+            key = str(prepared_row[key_index])
+            if key.startswith('smtp_'):
+                smtp_settings_imported = True
+            if key == 'smtp_password':
+                normalized, requires_reconfiguration = (
+                    self._normalize_imported_smtp_password(
+                        prepared_row[value_index]
+                    )
+                )
+                prepared_row[value_index] = normalized
+                smtp_reconfiguration_required |= requires_reconfiguration
+            elif key in {'smtp_verified_fingerprint', 'smtp_verified_at'}:
+                prepared_row[value_index] = ''
+            prepared_rows.append(prepared_row)
+
+        return (
+            prepared_rows,
+            smtp_settings_imported,
+            smtp_reconfiguration_required,
+        )
+
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
         """导入系统备份数据（支持用户隔离）"""
         with self.lock:
@@ -3788,6 +3900,8 @@ class DBManager:
 
                 # 导入数据
                 data = backup_data['data']
+                smtp_settings_imported = False
+                smtp_reconfiguration_required = False
                 for table_name, table_data in data.items():
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
@@ -3801,6 +3915,15 @@ class DBManager:
 
                     if not rows:
                         continue
+
+                    if table_name == 'system_settings':
+                        (
+                            rows,
+                            imported_smtp_settings,
+                            imported_smtp_reconfiguration,
+                        ) = self._prepare_imported_system_settings(columns, rows)
+                        smtp_settings_imported |= imported_smtp_settings
+                        smtp_reconfiguration_required |= imported_smtp_reconfiguration
 
                     # 如果是用户级导入，需要确保cookies表的user_id正确
                     if user_id is not None and table_name == 'cookies':
@@ -3817,14 +3940,34 @@ class DBManager:
 
                     if table_name == 'system_settings':
                         # 系统设置需要特殊处理，避免覆盖管理员密码
+                        key_index = columns.index('key')
                         for row in rows:
-                            if len(row) >= 1 and row[0] != 'admin_password_hash':
+                            if row[key_index] != 'admin_password_hash':
                                 cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
                     else:
                         cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
 
+                if smtp_settings_imported:
+                    cursor.executemany(
+                        """
+                        INSERT INTO system_settings (key, value, description, updated_at)
+                        VALUES (?, '', ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = '',
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            ('smtp_verified_fingerprint', 'SMTP verification fingerprint'),
+                            ('smtp_verified_at', 'SMTP verification time'),
+                        ),
+                    )
+
                 # 提交事务
                 self.conn.commit()
+                if smtp_reconfiguration_required:
+                    logger.warning(
+                        "导入的 SMTP 密码无法由当前系统密钥解密，已清空，请重新配置"
+                    )
                 logger.info("导入备份成功")
                 return True
 
@@ -3834,6 +3977,82 @@ class DBManager:
                 return False
 
     # -------------------- 系统设置操作 --------------------
+    def _decode_system_setting(self, key: str, value: str) -> str:
+        if key == 'smtp_password':
+            return SystemSecretCipher(self.db_path).decrypt(str(value or ''))
+        return value
+
+    def _encode_system_setting(self, cursor, key: str, value: Any) -> Any:
+        if key != 'smtp_password':
+            return value
+
+        plaintext = str(value if value is not None else '')
+        if not plaintext:
+            return ''
+
+        cipher = SystemSecretCipher(self.db_path)
+        existing_row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = 'smtp_password'"
+        ).fetchone()
+        if existing_row:
+            existing_value = str(existing_row[0] or '')
+            if existing_value.startswith(SYSTEM_SECRET_PREFIX):
+                try:
+                    existing_plaintext = cipher.decrypt(existing_value)
+                except ValueError:
+                    pass
+                else:
+                    if existing_plaintext == plaintext:
+                        return existing_value
+        return cipher.encrypt(plaintext)
+
+    def _system_setting_value(self, cursor, key: str) -> str:
+        row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(self._decode_system_setting(key, row[0]) or "")
+
+    def _smtp_configuration_changed(self, cursor, settings: Dict[str, Any]) -> bool:
+        for key in SMTP_CONFIGURATION_KEYS.intersection(settings):
+            current = canonical_smtp_setting_value(
+                key,
+                self._system_setting_value(cursor, key),
+            )
+            candidate = canonical_smtp_setting_value(key, settings[key])
+            if current != candidate:
+                return True
+        return False
+
+    def _write_system_settings(self, cursor, settings: Dict[str, Any]) -> None:
+        for key, value in settings.items():
+            if isinstance(value, bool):
+                stored_value = "true" if value else "false"
+            else:
+                stored_value = str(value if value is not None else "")
+            stored_value = self._encode_system_setting(cursor, key, stored_value)
+            cursor.execute(
+                """
+                INSERT INTO system_settings (key, value, description, updated_at)
+                VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, stored_value),
+            )
+
+    def _clear_smtp_verification(self, cursor) -> None:
+        self._write_system_settings(
+            cursor,
+            {
+                "smtp_verified_fingerprint": "",
+                "smtp_verified_at": "",
+            },
+        )
+
     def get_system_setting(self, key: str) -> Optional[str]:
         """获取系统设置"""
         with self.lock:
@@ -3841,7 +4060,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM system_settings WHERE key = ?", (key,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return self._decode_system_setting(key, result[0]) if result else None
             except Exception as e:
                 logger.error(f"获取系统设置失败: {e}")
                 return None
@@ -3851,10 +4070,24 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (key, value, description))
+                smtp_changed = self._smtp_configuration_changed(
+                    cursor,
+                    {key: value},
+                )
+                stored_value = self._encode_system_setting(cursor, key, value)
+                cursor.execute(
+                    """
+                    INSERT INTO system_settings (key, value, description, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        description = COALESCE(excluded.description, system_settings.description),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, stored_value, description),
+                )
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 logger.debug(f"设置系统设置: {key}")
                 return True
@@ -3869,22 +4102,58 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute("BEGIN")
-                for key, value in settings.items():
-                    if isinstance(value, bool):
-                        stored_value = "true" if value else "false"
-                    else:
-                        stored_value = str(value if value is not None else "")
-                    cursor.execute('''
-                        INSERT INTO system_settings (key, value, description, updated_at)
-                        VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = excluded.value,
-                            updated_at = CURRENT_TIMESTAMP
-                    ''', (key, stored_value))
+                smtp_changed = self._smtp_configuration_changed(cursor, settings)
+                self._write_system_settings(cursor, settings)
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 return True
             except Exception as e:
                 logger.error(f"分区保存系统设置失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def save_verified_smtp_settings(
+        self,
+        settings: Dict[str, Any],
+        *,
+        fingerprint: str,
+        verified_at: str,
+        expected_settings: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Atomically save SMTP settings and mark that exact configuration verified."""
+        if not str(fingerprint or "") or not str(verified_at or ""):
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN")
+                if expected_settings is not None:
+                    expected = {
+                        key: value
+                        for key, value in expected_settings.items()
+                        if key in SMTP_CONFIGURATION_KEYS
+                    }
+                    if self._smtp_configuration_changed(cursor, expected):
+                        self.conn.rollback()
+                        return False
+                allowed = {
+                    key: value
+                    for key, value in settings.items()
+                    if key in SMTP_CONFIGURATION_KEYS
+                }
+                self._write_system_settings(cursor, allowed)
+                self._write_system_settings(
+                    cursor,
+                    {
+                        "smtp_verified_fingerprint": fingerprint,
+                        "smtp_verified_at": verified_at,
+                    },
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存 SMTP 验证状态失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 
@@ -3897,7 +4166,7 @@ class DBManager:
 
                 settings = {}
                 for row in cursor.fetchall():
-                    settings[row[0]] = row[1]
+                    settings[row[0]] = self._decode_system_setting(row[0], row[1])
 
                 return settings
             except Exception as e:
@@ -3918,7 +4187,7 @@ class DBManager:
                 )
 
                 self.conn.commit()
-                logger.info(f"创建用户成功: {username} ({email})")
+                logger.info(f"创建用户成功: {username}")
                 return True
             except sqlite3.IntegrityError as e:
                 logger.error(f"创建用户失败，用户名或邮箱已存在: {e}")
@@ -4089,7 +4358,7 @@ class DBManager:
                     logger.debug(f"图形验证码验证成功: {session_id}")
                     return True
                 else:
-                    logger.warning(f"图形验证码验证失败: {session_id} - {user_input}")
+                    logger.warning(f"兼容图形验证码验证失败: {session_id}")
                     return False
             except Exception as e:
                 logger.error(f"验证图形验证码失败: {e}")
@@ -4108,7 +4377,10 @@ class DBManager:
                 ''', (email, code, code_type, expires_at))
 
                 self.conn.commit()
-                logger.info(f"保存验证码成功: {email} ({code_type})")
+                logger.info(
+                    f"保存兼容验证码成功: {mask_email_for_log(email)} "
+                    f"({code_type})"
+                )
                 return True
             except Exception as e:
                 logger.error(f"保存验证码失败: {e}")
@@ -4136,140 +4408,48 @@ class DBManager:
                     UPDATE email_verifications SET used = TRUE WHERE id = ?
                     ''', (row[0],))
                     self.conn.commit()
-                    logger.info(f"验证码验证成功: {email} ({code_type})")
+                    logger.info(
+                        f"兼容验证码验证成功: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return True
                 else:
-                    logger.warning(f"验证码验证失败: {email} - {code} ({code_type})")
+                    logger.warning(
+                        f"兼容验证码验证失败: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return False
             except Exception as e:
                 logger.error(f"验证邮箱验证码失败: {e}")
                 return False
 
     async def send_verification_email(self, email: str, code: str) -> bool:
-        """发送验证码邮件（支持SMTP和API两种方式）"""
+        """Compatibility wrapper that sends only through verified SMTP."""
         try:
-            subject = "闲鱼自动回复系统 - 邮箱验证码"
-            # 使用简单的纯文本邮件内容
-            text_content = f"""【闲鱼自动回复系统】邮箱验证码
-
-您好！
-
-感谢您使用闲鱼自动回复系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
-
-验证码：{code}
-
-重要提醒：
-• 验证码有效期为 10 分钟，请及时使用
-• 请勿将验证码分享给任何人
-• 如非本人操作，请忽略此邮件
-• 系统不会主动索要您的验证码
-
-如果您在使用过程中遇到任何问题，请联系我们的技术支持团队。
-感谢您选择闲鱼自动回复系统！
-
----
-此邮件由系统自动发送，请勿直接回复
-© 2025 闲鱼自动回复系统"""
-
-            # 从系统设置读取SMTP配置
-            try:
-                smtp_server = self.get_system_setting('smtp_server') or ''
-                smtp_port = int(self.get_system_setting('smtp_port') or 0)
-                smtp_user = self.get_system_setting('smtp_user') or ''
-                smtp_password = self.get_system_setting('smtp_password') or ''
-                smtp_from = (self.get_system_setting('smtp_from') or '').strip() or smtp_user
-                smtp_use_tls = (self.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
-                smtp_use_ssl = (self.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
-            except Exception as e:
-                logger.error(f"读取SMTP系统设置失败: {e}")
-                # 如果读取配置失败，使用API方式
-                return await self._send_email_via_api(email, subject, text_content)
-
-            # 检查SMTP配置是否完整
-            if smtp_server and smtp_port and smtp_user and smtp_password:
-                # 配置完整，使用SMTP方式发送
-                logger.info(f"使用SMTP方式发送验证码邮件: {email}")
-                return await self._send_email_via_smtp(email, subject, text_content,
-                                                     smtp_server, smtp_port, smtp_user,
-                                                     smtp_password, smtp_from, smtp_use_tls, smtp_use_ssl)
-            else:
-                # 配置不完整，使用API方式发送
-                logger.info(f"SMTP配置不完整，使用API方式发送验证码邮件: {email}")
-                return await self._send_email_via_api(email, subject, text_content)
-
-        except Exception as e:
-            logger.error(f"发送验证码邮件异常: {e}")
-            return False
-
-    async def _send_email_via_smtp(self, email: str, subject: str, text_content: str,
-                                 smtp_server: str, smtp_port: int, smtp_user: str,
-                                 smtp_password: str, smtp_from: str, smtp_use_tls: bool, smtp_use_ssl: bool) -> bool:
-        """使用SMTP方式发送邮件"""
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-
-            msg = MIMEMultipart()
-            msg['Subject'] = subject
-            msg['From'] = smtp_from
-            msg['To'] = email
-
-            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
-
-            if smtp_use_ssl:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port)
-
-            server.ehlo()
-            if smtp_use_tls and not smtp_use_ssl:
-                server.starttls()
-                server.ehlo()
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, [email], msg.as_string())
-            server.quit()
-
-            logger.info(f"验证码邮件发送成功(SMTP): {email}")
+            settings = self.get_all_system_settings()
+            status = smtp_configuration_status(settings, db_path=self.db_path)
+            if not status['smtp_verified']:
+                logger.warning("SMTP 未验证，拒绝发送兼容验证码邮件")
+                return False
+            await asyncio.to_thread(
+                SMTPEmailSender().send,
+                settings,
+                recipient=email,
+                subject="闲鱼监控台邮箱验证码",
+                text=(
+                    f"您的验证码是 {code}\n\n"
+                    "验证码在 10 分钟内有效，请勿向任何人泄露。"
+                ),
+            )
+            logger.info(
+                f"兼容验证码邮件已提交 email={mask_email_for_log(email)}"
+            )
             return True
+        except (SMTPConfigurationError, SMTPDeliveryError) as e:
+            logger.warning(f"兼容验证码邮件发送失败 type={type(e).__name__}")
+            return False
         except Exception as e:
-            logger.error(f"SMTP发送验证码邮件失败: {e}")
-            # SMTP发送失败，尝试使用API方式
-            logger.info(f"SMTP发送失败，尝试使用API方式发送: {email}")
-            return await self._send_email_via_api(email, subject, text_content)
-
-    async def _send_email_via_api(self, email: str, subject: str, text_content: str) -> bool:
-        """使用API方式发送邮件"""
-        try:
-            import aiohttp
-
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
-            params = {
-                'subject': subject,
-                'receiveUser': email,
-                'sendHtml': text_content
-            }
-
-            async with aiohttp.ClientSession() as session:
-                try:
-                    logger.info(f"使用API发送验证码邮件: {email}")
-                    async with session.get(api_url, params=params, timeout=15) as response:
-                        response_text = await response.text()
-                        logger.info(f"邮件API响应: {response.status}")
-
-                        if response.status == 200:
-                            logger.info(f"验证码邮件发送成功(API): {email}")
-                            return True
-                        else:
-                            logger.error(f"API发送验证码邮件失败: {email}, 状态码: {response.status}, 响应: {response_text[:200]}")
-                            return False
-                except Exception as e:
-                    logger.error(f"API邮件发送异常: {email}, 错误: {e}")
-                    return False
-        except Exception as e:
-            logger.error(f"API邮件发送方法异常: {e}")
+            logger.error(f"兼容验证码邮件异常 type={type(e).__name__}")
             return False
 
     # ==================== 卡券管理方法 ====================
@@ -5714,24 +5894,10 @@ class DBManager:
         """获取所有用户信息（管理员专用）"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                ORDER BY created_at DESC
-                ''')
-
-                users = []
-                for row in cursor.fetchall():
-                    users.append({
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    })
-
-                return users
+                return [
+                    public_user_view(user)
+                    for user in self.user_repository.list_recent(limit=200)
+                ]
             except Exception as e:
                 logger.error(f"获取所有用户失败: {e}")
                 return []
@@ -5740,23 +5906,8 @@ class DBManager:
         """根据ID获取用户信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                WHERE id = ?
-                ''', (user_id,))
-
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    }
-                return None
+                user = self.user_repository.get_by_id(user_id)
+                return public_user_view(user) if user else None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None

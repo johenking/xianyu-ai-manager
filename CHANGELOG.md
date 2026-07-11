@@ -2,6 +2,29 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.6.0] - 2026-07-11
+
+### Added
+
+- Add fail-closed invitation registration with one-time codes, image CAPTCHA challenges, purpose-bound email codes, agreement version tracking, and automatic login after a successful transaction.
+- Add username-or-email login, password recovery by verified email, and revocation of every previous session after a password reset.
+- Add public `/login`, `/register`, `/forgot-password`, `/terms`, and `/privacy` views with History API navigation and mobile layouts.
+- Add administrator registration management for SMTP readiness, one-time invite creation and revocation, ordinary-user enablement, and the guarded registration switch.
+- Add persistent authentication rate events for IP, email, and account dimensions, including trusted-proxy-aware client address resolution.
+
+### Changed
+
+- Make new and migrated installations keep registration disabled until the current SMTP fingerprint has delivered a verification message and at least one active invite exists.
+- Send authentication mail only through the configured SMTP service; remove the legacy third-party mail fallback and retire `/send-verification-code` with HTTP 410.
+- Normalize usernames with NFKC and emails case-insensitively before uniqueness checks. Registration accepts 3–24 Unicode letters, numbers, `_`, and `-` for usernames.
+- Make SMTP configuration changes invalidate verification and require another real delivery before registration can reopen.
+
+### Security
+
+- Store invite codes, CAPTCHA answers, email codes, and network identifiers as purpose-isolated HMAC digests rather than plaintext.
+- Encrypt SMTP authorization codes with an independent system-secret key and include that key in pre-migration backups.
+- Reject weak passwords and passwords longer than bcrypt's 72-byte input limit, redact authentication validation inputs, and keep registration failures free of passwords, codes, invites, and full email addresses.
+
 ## [1.5.0] - 2026-07-11
 
 ### Added

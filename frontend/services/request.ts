@@ -1,5 +1,57 @@
 type QueryParams = Record<string, string | number | boolean | null | undefined>;
 
+type ErrorPayload = Record<string, unknown>;
+
+export class ApiRequestError extends Error {
+  readonly code?: string;
+  readonly status: number;
+  readonly retryAfter?: number;
+  readonly requestId?: string;
+
+  constructor(message: string, options: {
+    code?: string;
+    status: number;
+    retryAfter?: number;
+    requestId?: string;
+  }) {
+    super(message);
+    this.name = 'ApiRequestError';
+    this.code = options.code;
+    this.status = options.status;
+    this.retryAfter = options.retryAfter;
+    this.requestId = options.requestId;
+  }
+}
+
+const asPayload = (value: unknown): ErrorPayload | null => (
+  typeof value === 'object' && value !== null ? value as ErrorPayload : null
+);
+
+const asOptionalString = (value: unknown): string | undefined => (
+  typeof value === 'string' && value.trim() ? value.trim() : undefined
+);
+
+const parseRequestError = (data: unknown, status: number): ApiRequestError => {
+  const payload = asPayload(data);
+  const detail = payload?.detail;
+  const detailPayload = asPayload(detail);
+  const message = asOptionalString(detailPayload?.message)
+    || asOptionalString(payload?.message)
+    || asOptionalString(detail)
+    || `Request failed with status ${status}`;
+  const retryValue = detailPayload?.retry_after ?? payload?.retry_after;
+  const retryAfter = typeof retryValue === 'number' && Number.isFinite(retryValue)
+    ? retryValue
+    : undefined;
+
+  return new ApiRequestError(message, {
+    code: asOptionalString(detailPayload?.code) || asOptionalString(payload?.code),
+    status,
+    retryAfter,
+    requestId: asOptionalString(payload?.request_id),
+  });
+};
+
 const buildUrl = (path: string, params?: QueryParams) => {
   const search = new URLSearchParams();
 
@@ -52,14 +104,7 @@ const request = async <T>(
       window.dispatchEvent(new Event('auth:logout'));
     }
 
-    const message =
-      typeof data === 'object' && data !== null && 'detail' in data
-        ? String((data as { detail: unknown }).detail)
-        : typeof data === 'object' && data !== null && 'message' in data
-          ? String((data as { message: unknown }).message)
-          : `Request failed with status ${response.status}`;
-
-    throw new Error(message);
+    throw parseRequestError(data, response.status);
   }
 
   return data as T;

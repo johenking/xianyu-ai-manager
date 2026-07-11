@@ -5,17 +5,18 @@ import { SettingsSectionKey, SettingsSummary, SystemSettings } from '../types';
 import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import AIProviderManager from './AIProviderManager';
+import RegistrationManagement from './RegistrationManagement';
 
 const sectionFields: Record<SettingsSectionKey, string[]> = {
-  basic: ['registration_enabled', 'show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages'],
+  basic: ['show_default_login_info', 'login_captcha_enabled', 'item_sync_enabled', 'item_sync_interval', 'item_sync_max_pages'],
   ai: ['ai_api_url', 'ai_model', 'default_reply', 'ai_api_key'],
-  smtp: ['smtp_server', 'smtp_port', 'smtp_user', 'smtp_password', 'smtp_from', 'smtp_use_tls', 'smtp_use_ssl'],
+  smtp: ['smtp_server', 'smtp_port', 'smtp_user', 'smtp_password', 'smtp_from', 'smtp_use_tls', 'smtp_use_ssl', 'support_email'],
 };
 
 const sectionMeta = {
-  basic: { title: '基础设置', detail: '注册、登录与商品同步', icon: Database },
+  basic: { title: '基础设置', detail: '登录与商品同步', icon: Database },
   ai: { title: 'AI 配置', detail: '模型、地址与全局密钥', icon: Bot },
-  smtp: { title: 'SMTP 配置', detail: '可选的邮件验证服务', icon: Mail },
+  smtp: { title: 'SMTP 配置', detail: '注册验证与账号找回邮件', icon: Mail },
 };
 
 const pickSection = (settings: SystemSettings, section: SettingsSectionKey) => sectionFields[section].reduce<Record<string, unknown>>((result, key) => {
@@ -34,6 +35,7 @@ const Settings: React.FC = () => {
   const [verificationState, setVerificationState] = useState<Partial<Record<SettingsSectionKey, { state: string; label: string }>>>({});
   const [notice, setNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [showSecret, setShowSecret] = useState<Record<string, boolean>>({});
+  const [registrationRefreshKey, setRegistrationRefreshKey] = useState(0);
 
   const load = async () => {
     setNotice(null);
@@ -78,6 +80,7 @@ const Settings: React.FC = () => {
       setSecretActions({ ai_api_key: 'keep', smtp_password: 'keep' });
       setVerificationState((current) => ({ ...current, [section]: undefined }));
       setNotice({ tone: 'success', text: `${sectionMeta[section].title}已保存并确认（${result.saved_at.replace('T', ' ')}）` });
+      if (section === 'smtp') setRegistrationRefreshKey((value) => value + 1);
       setOpenSection(null);
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '保存失败' });
@@ -95,6 +98,7 @@ const Settings: React.FC = () => {
       const result = await verifySettingsSection(section, pickSection(draft, section) as Partial<SystemSettings>, actions);
       setVerificationState((current) => ({ ...current, [section]: { state: 'ready', label: '可用' } }));
       setNotice({ tone: 'success', text: result.message });
+      if (section === 'smtp') setRegistrationRefreshKey((value) => value + 1);
     } catch (error) {
       setVerificationState((current) => ({ ...current, [section]: { state: 'error', label: '不可用' } }));
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '验证失败' });
@@ -135,7 +139,6 @@ const Settings: React.FC = () => {
         <div className="mb-6 flex items-center justify-between"><div><h3 className="text-lg font-extrabold text-gray-900">{sectionMeta[openSection].title}</h3><p className="mt-1 text-sm text-gray-500">{dirty[openSection] ? '有尚未保存的修改' : '当前内容与数据库一致'}</p></div><StatusBadge state={dirty[openSection] ? 'dirty' : (verificationState[openSection]?.state || summary.sections[openSection].state)} label={dirty[openSection] ? '未保存' : (verificationState[openSection]?.label || summary.sections[openSection].label)} /></div>
 
         {openSection === 'basic' && <div className="space-y-4">
-          <ToggleRow label="允许用户注册" detail="允许新用户创建后台账号" checked={Boolean(draft.registration_enabled)} onChange={(v) => update('registration_enabled', v)} />
           <ToggleRow label="显示默认登录信息" detail="登录页显示默认账号提示" checked={Boolean(draft.show_default_login_info)} onChange={(v) => update('show_default_login_info', v)} />
           <ToggleRow label="登录滑动验证码" detail="账号密码登录时启用验证流程" checked={Boolean(draft.login_captcha_enabled)} onChange={(v) => update('login_captcha_enabled', v)} />
           <ToggleRow label="商品自动同步" detail="定时同步当前账号的商品资料" checked={Boolean(draft.item_sync_enabled)} onChange={(v) => update('item_sync_enabled', v)} />
@@ -152,9 +155,10 @@ const Settings: React.FC = () => {
         </div>}
 
         {openSection === 'smtp' && <div className="space-y-4">
-          <InlineNotice>SMTP 是可选功能，只用于注册验证码等邮件场景。</InlineNotice>
+          <InlineNotice>注册和账号找回依赖已验证的 SMTP。修改任何连接配置后都需要重新验证，验证失败时公开注册保持关闭。</InlineNotice>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_140px]"><Field label="SMTP 服务器" value={draft.smtp_server || ''} onChange={(v) => update('smtp_server', v)} placeholder="smtp.qq.com" /><Field label="端口" type="number" value={draft.smtp_port || 587} onChange={(v) => update('smtp_port', Number(v))} /></div>
           <Field label="发件邮箱" value={draft.smtp_user || ''} onChange={(v) => update('smtp_user', v)} placeholder="name@example.com" />
+          <Field label="支持邮箱" value={draft.support_email || ''} onChange={(v) => update('support_email', v)} placeholder="用于协议页联系与 SMTP 送达验证" />
           <SecretField label="邮箱授权码" name="smtp_password" configured={Boolean(saved.smtp_password_configured)} masked={saved.smtp_password_masked || ''} value={draft.smtp_password || ''} show={Boolean(showSecret.smtp_password)} onToggle={() => setShowSecret((s) => ({ ...s, smtp_password: !s.smtp_password }))} onChange={(v) => { update('smtp_password', v); setSecretActions((s) => ({ ...s, smtp_password: v ? 'set' : 'keep' })); }} onClear={() => { update('smtp_password', ''); setSecretActions((s) => ({ ...s, smtp_password: 'clear' })); }} />
           <Field label="发件人显示名" value={draft.smtp_from || ''} onChange={(v) => update('smtp_from', v)} placeholder="闲鱼商品管理" />
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2"><ToggleRow label="STARTTLS" detail="常用于587端口" checked={Boolean(draft.smtp_use_tls ?? true)} onChange={(v) => update('smtp_use_tls', v)} /><ToggleRow label="SSL" detail="常用于465端口" checked={Boolean(draft.smtp_use_ssl)} onChange={(v) => update('smtp_use_ssl', v)} /></div>
@@ -165,6 +169,8 @@ const Settings: React.FC = () => {
           <button onClick={() => void save(openSection)} disabled={saving === openSection || !dirty[openSection]} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">{saving === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存并折叠</button>
         </div>
       </section>}
+
+      <RegistrationManagement refreshKey={registrationRefreshKey} />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3"><Metric label="账号管理器" value={summary.runtime.cookie_manager ? '运行中' : '未就绪'} /><Metric label="账号数量" value={`${summary.runtime.account_count}`} /><Metric label="监听任务" value={`${summary.runtime.active_tasks}`} /></div>
     </div>
