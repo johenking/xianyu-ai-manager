@@ -32,6 +32,10 @@ from repositories.auth_repository import (
 )
 from services.auth_service import AuthService
 from auth_registration_service import AuthRateLimiter, RegistrationService
+from auth_email_service import (
+    SMTP_CONFIGURATION_KEYS,
+    canonical_smtp_setting_value,
+)
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
@@ -3994,6 +3998,53 @@ class DBManager:
                         return existing_value
         return cipher.encrypt(plaintext)
 
+    def _system_setting_value(self, cursor, key: str) -> str:
+        row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(self._decode_system_setting(key, row[0]) or "")
+
+    def _smtp_configuration_changed(self, cursor, settings: Dict[str, Any]) -> bool:
+        for key in SMTP_CONFIGURATION_KEYS.intersection(settings):
+            current = canonical_smtp_setting_value(
+                key,
+                self._system_setting_value(cursor, key),
+            )
+            candidate = canonical_smtp_setting_value(key, settings[key])
+            if current != candidate:
+                return True
+        return False
+
+    def _write_system_settings(self, cursor, settings: Dict[str, Any]) -> None:
+        for key, value in settings.items():
+            if isinstance(value, bool):
+                stored_value = "true" if value else "false"
+            else:
+                stored_value = str(value if value is not None else "")
+            stored_value = self._encode_system_setting(cursor, key, stored_value)
+            cursor.execute(
+                """
+                INSERT INTO system_settings (key, value, description, updated_at)
+                VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, stored_value),
+            )
+
+    def _clear_smtp_verification(self, cursor) -> None:
+        self._write_system_settings(
+            cursor,
+            {
+                "smtp_verified_fingerprint": "",
+                "smtp_verified_at": "",
+            },
+        )
+
     def get_system_setting(self, key: str) -> Optional[str]:
         """获取系统设置"""
         with self.lock:
@@ -4011,11 +4062,24 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                smtp_changed = self._smtp_configuration_changed(
+                    cursor,
+                    {key: value},
+                )
                 stored_value = self._encode_system_setting(cursor, key, value)
-                cursor.execute('''
-                INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (key, stored_value, description))
+                cursor.execute(
+                    """
+                    INSERT INTO system_settings (key, value, description, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        description = COALESCE(excluded.description, system_settings.description),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, stored_value, description),
+                )
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 logger.debug(f"设置系统设置: {key}")
                 return True
@@ -4030,25 +4094,48 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute("BEGIN")
-                for key, value in settings.items():
-                    if isinstance(value, bool):
-                        stored_value = "true" if value else "false"
-                    else:
-                        stored_value = str(value if value is not None else "")
-                    stored_value = self._encode_system_setting(
-                        cursor, key, stored_value
-                    )
-                    cursor.execute('''
-                        INSERT INTO system_settings (key, value, description, updated_at)
-                        VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = excluded.value,
-                            updated_at = CURRENT_TIMESTAMP
-                    ''', (key, stored_value))
+                smtp_changed = self._smtp_configuration_changed(cursor, settings)
+                self._write_system_settings(cursor, settings)
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 return True
             except Exception as e:
                 logger.error(f"分区保存系统设置失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def save_verified_smtp_settings(
+        self,
+        settings: Dict[str, Any],
+        *,
+        fingerprint: str,
+        verified_at: str,
+    ) -> bool:
+        """Atomically save SMTP settings and mark that exact configuration verified."""
+        if not str(fingerprint or "") or not str(verified_at or ""):
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN")
+                allowed = {
+                    key: value
+                    for key, value in settings.items()
+                    if key in SMTP_CONFIGURATION_KEYS
+                }
+                self._write_system_settings(cursor, allowed)
+                self._write_system_settings(
+                    cursor,
+                    {
+                        "smtp_verified_fingerprint": fingerprint,
+                        "smtp_verified_at": verified_at,
+                    },
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存 SMTP 验证状态失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 

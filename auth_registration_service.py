@@ -821,6 +821,19 @@ class RegistrationService:
         now = self.clock()
         return [self._invite_from_row(row, now) for row in rows]
 
+    def has_active_invites(self) -> bool:
+        now = self.clock()
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT 1 FROM registration_invites
+                WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+        return row is not None
+
     def active_invite_exists(self, code: str) -> bool:
         digest = self._invite_digest(str(code))
         now = self.clock()

@@ -593,6 +593,24 @@ class RegistrationServiceFixture(unittest.TestCase):
         self.assertIsNone(challenge[0])
 
 
+class RegistrationInviteAvailabilityTests(RegistrationServiceFixture):
+    def test_active_invite_availability_ignores_revoked_and_expired_rows(self):
+        self.assertFalse(self.service.has_active_invites())
+        active = self.service.create_invites(count=1, valid_days=7)[0]
+        self.assertTrue(self.service.has_active_invites())
+
+        self.service.revoke_invite(active["id"])
+        self.assertFalse(self.service.has_active_invites())
+
+        expired = self.service.create_invites(count=1, valid_days=1)[0]
+        self.connection.execute(
+            "UPDATE registration_invites SET expires_at = ? WHERE id = ?",
+            (self.now - 1, expired["id"]),
+        )
+        self.connection.commit()
+        self.assertFalse(self.service.has_active_invites())
+
+
 class RegistrationTransactionTests(RegistrationServiceFixture):
     def test_invalid_registration_credentials_do_not_run_bcrypt(self):
         invite, challenge, _secret = self.issue_registration_challenge(
