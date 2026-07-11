@@ -178,6 +178,9 @@
   "/api/check-default-password": [
     "GET"
   ],
+  "/api/dashboard/summary": [
+    "GET"
+  ],
   "/api/default-reply/{cid}": [
     "DELETE",
     "GET",
@@ -216,6 +219,12 @@
     "PUT"
   ],
   "/api/settings/summary": [
+    "GET"
+  ],
+  "/api/settings/user-basic": [
+    "PUT"
+  ],
+  "/api/settings/user-summary": [
     "GET"
   ],
   "/api/settings/verify/smtp/confirm": [

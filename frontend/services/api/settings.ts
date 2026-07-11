@@ -1,5 +1,12 @@
 import { get, post, put } from '../request';
-import type { ApiResponse, SettingsSectionKey, SettingsSummary, SystemSettings } from '../../types';
+import type {
+  ApiResponse,
+  SettingsSectionKey,
+  SettingsSummary,
+  SystemSettings,
+  UserBasicSettings,
+  UserSettingsSummary,
+} from '../../types';
 
 // Settings
 export const getSystemSettings = async (): Promise<SystemSettings> => {
@@ -9,6 +16,16 @@ export const getSystemSettings = async (): Promise<SystemSettings> => {
 export const getSettingsSummary = async (): Promise<SettingsSummary> => {
   const result = await get<{ success: boolean } & SettingsSummary>('/api/settings/summary');
   return result;
+};
+
+export const getUserSettingsSummary = async (): Promise<UserSettingsSummary> => {
+  return get('/api/settings/user-summary');
+};
+
+export const saveUserBasicSettings = async (
+  settings: Partial<UserBasicSettings>,
+): Promise<ApiResponse & UserSettingsSummary> => {
+  return put('/api/settings/user-basic', settings);
 };
 
 export const saveSettingsSection = async (

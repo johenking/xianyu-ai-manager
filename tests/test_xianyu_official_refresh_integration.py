@@ -92,6 +92,28 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(database.updates[-1][1]["state"], "success")
 
+    async def test_token_failure_does_not_open_browser_when_auto_refresh_is_disabled(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookie_refresh_enabled = False
+        database = FakeRefreshDatabase()
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FakeOfficialRefreshService,
+            ),
+        ):
+            success = await live._try_password_login_refresh("令牌/Session过期")
+
+        self.assertFalse(success)
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
+        self.assertEqual(
+            database.updates[-1][1]["error_code"],
+            "automatic_refresh_disabled",
+        )
+
     async def test_scheduled_refresh_calls_the_same_official_refresh_path(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"

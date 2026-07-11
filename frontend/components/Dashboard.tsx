@@ -1,780 +1,250 @@
-import React, { useEffect, useState } from 'react';
-import { AdminStats, OrderAnalytics, Order, OrderStatus, Item } from '../types';
-import { getAdminStats, getOrderAnalytics, getValidOrders, getItems } from '../services/api';
-import { TrendingUp, Users, ShoppingCart, AlertCircle, DollarSign, Activity, Package, ArrowUpRight, Calendar, X, BarChart3, PackageCheck, ExternalLink, Eye, Edit } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, Legend } from 'recharts';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  AlertCircle,
+  DollarSign,
+  ExternalLink,
+  Package,
+  PackageCheck,
+  RefreshCw,
+  ShoppingCart,
+  TrendingUp,
+  Users,
+} from 'lucide-react';
+import type { DashboardSummary, Order, OrderStatus } from '../types';
+import { getDashboardSummary, getValidOrders } from '../services/api';
 
-// 状态徽章组件
-const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
-  const styles = {
-    processing: 'bg-yellow-100 text-yellow-800',
-    pending_ship: 'bg-[#FFE815] text-black',
-    shipped: 'bg-blue-100 text-blue-700',
-    completed: 'bg-green-100 text-green-700',
-    cancelled: 'bg-gray-100 text-gray-500',
-    refunding: 'bg-red-100 text-red-600',
-  };
+const DashboardCharts = lazy(() => import('./DashboardCharts'));
 
-  const labels = {
-    processing: '处理中',
-    pending_ship: '待发货',
-    shipped: '已发货',
-    completed: '已完成',
-    cancelled: '已取消',
-    refunding: '退款中',
-  };
+type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
 
-  return (
-    <span className={`px-3 py-1.5 rounded-lg text-xs font-bold ${styles[status] || styles.cancelled}`}>
-      {labels[status] || status}
-    </span>
-  );
+const TIME_RANGES: Array<{ key: TimeRange; label: string }> = [
+  { key: 'today', label: '今天' },
+  { key: 'yesterday', label: '昨天' },
+  { key: '3days', label: '三天内' },
+  { key: '7days', label: '7天内' },
+  { key: '30days', label: '一个月内' },
+  { key: 'custom', label: '自定义' },
+];
+
+const STATUS_STYLES: Record<string, string> = {
+  processing: 'bg-yellow-100 text-yellow-800',
+  pending_ship: 'bg-[#FFE815] text-black',
+  shipped: 'bg-blue-100 text-blue-700',
+  completed: 'bg-green-100 text-green-700',
+  cancelled: 'bg-gray-100 text-gray-500',
+  refunding: 'bg-red-100 text-red-600',
 };
 
-const StatCard: React.FC<{ title: string; value: string | number; icon: React.ElementType; colorClass: string; trend?: string }> = ({ title, value, icon: Icon, colorClass, trend }) => (
-  <div className="ios-card p-5 sm:p-6 rounded-2xl flex flex-col justify-between transition-shadow duration-300 h-full border border-gray-100">
-    <div className="flex justify-between items-start mb-6">
-      <div className={`p-4 rounded-2xl ${colorClass} bg-opacity-10 backdrop-blur-sm`}>
-        <Icon className={`w-6 h-6 ${colorClass.replace('bg-', 'text-')}`} />
-      </div>
-      {trend && <span className="text-xs font-bold text-black bg-[#FFE815] px-3 py-1.5 rounded-full flex items-center gap-1 shadow-sm">
-        <TrendingUp className="w-3 h-3" /> {trend}
-      </span>}
+const STATUS_LABELS: Record<string, string> = {
+  processing: '处理中',
+  pending_ship: '待发货',
+  shipped: '已发货',
+  completed: '已完成',
+  cancelled: '已取消',
+  refunding: '退款中',
+};
+
+const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => (
+  <span className={`inline-flex rounded-md px-2.5 py-1 text-xs font-bold ${STATUS_STYLES[status] || STATUS_STYLES.cancelled}`}>
+    {STATUS_LABELS[status] || status}
+  </span>
+);
+
+const StatCard: React.FC<{
+  title: string;
+  value: string | number;
+  icon: React.ElementType;
+  colorClass: string;
+  trend?: string;
+}> = ({ title, value, icon: Icon, colorClass, trend }) => (
+  <div className="ios-card flex min-h-40 flex-col justify-between rounded-2xl border border-gray-100 p-5 sm:p-6">
+    <div className="flex items-start justify-between">
+      <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${colorClass}`}><Icon className="h-5 w-5" /></div>
+      {trend && <span className="flex items-center gap-1 rounded-full bg-[#FFE815] px-2.5 py-1 text-xs font-bold"><TrendingUp className="h-3 w-3" />{trend}</span>}
     </div>
-    <div className="relative z-10">
-      <h3 className="text-3xl font-extrabold text-gray-900 tracking-tight font-feature-settings-tnum">{value}</h3>
-      <p className="text-gray-500 text-sm font-medium mt-1">{title}</p>
+    <div>
+      <h3 className="text-3xl font-extrabold text-gray-900">{value}</h3>
+      <p className="mt-1 text-sm font-medium text-gray-500">{title}</p>
     </div>
   </div>
 );
 
-type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
-
 const Dashboard: React.FC = () => {
-  const [stats, setStats] = useState<AdminStats | null>(null);
-  const [analytics, setAnalytics] = useState<OrderAnalytics | null>(null);
+  const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [timeRange, setTimeRange] = useState<TimeRange>('7days');
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
-  const [previousAnalytics, setPreviousAnalytics] = useState<OrderAnalytics | null>(null); // 用于计算趋势
-
-  // 搜索词
-  const [searchTerm, setSearchTerm] = useState('');
-  // 参与统计的订单列表
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
   const [validOrders, setValidOrders] = useState<Order[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
-  // 商品列表
-  const [items, setItems] = useState<Item[]>([]);
-  const [itemNames, setItemNames] = useState<Record<string, string>>({});
+  const [searchTerm, setSearchTerm] = useState('');
+  const summaryRequestGeneration = useRef(0);
 
-  // 颜色配置
-  const COLORS = ['#FFE815', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
-
-  const loadAnalytics = (range: TimeRange) => {
-    // 使用本地时间而不是UTC时间
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    const todayStr = `${year}-${month}-${day}`;
-
-    let params: { start_date: string; end_date: string };
-
-    switch (range) {
-      case 'today':
-        // 今天：从今天00:00:00到今天23:59:59
-        params = {
-          start_date: todayStr,
-          end_date: todayStr
-        };
-        break;
-      case 'yesterday':
-        // 昨天：从昨天00:00:00到昨天23:59:59
-        const yesterday = new Date(now);
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yYear = yesterday.getFullYear();
-        const yMonth = String(yesterday.getMonth() + 1).padStart(2, '0');
-        const yDay = String(yesterday.getDate()).padStart(2, '0');
-        const yesterdayStr = `${yYear}-${yMonth}-${yDay}`;
-        params = {
-          start_date: yesterdayStr,
-          end_date: yesterdayStr
-        };
-        break;
-      case '3days':
-        // 3天：从3天前到今天
-        const threeDaysAgo = new Date(now);
-        threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
-        const tdYear = threeDaysAgo.getFullYear();
-        const tdMonth = String(threeDaysAgo.getMonth() + 1).padStart(2, '0');
-        const tdDay = String(threeDaysAgo.getDate()).padStart(2, '0');
-        params = {
-          start_date: `${tdYear}-${tdMonth}-${tdDay}`,
-          end_date: todayStr
-        };
-        break;
-      case '7days':
-        // 7天：从7天前到今天
-        const sevenDaysAgo = new Date(now);
-        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-        const sdYear = sevenDaysAgo.getFullYear();
-        const sdMonth = String(sevenDaysAgo.getMonth() + 1).padStart(2, '0');
-        const sdDay = String(sevenDaysAgo.getDate()).padStart(2, '0');
-        params = {
-          start_date: `${sdYear}-${sdMonth}-${sdDay}`,
-          end_date: todayStr
-        };
-        break;
-      case '30days':
-        // 30天：从30天前到今天
-        const thirtyDaysAgo = new Date(now);
-        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-        const tdYear2 = thirtyDaysAgo.getFullYear();
-        const tdMonth2 = String(thirtyDaysAgo.getMonth() + 1).padStart(2, '0');
-        const tdDay2 = String(thirtyDaysAgo.getDate()).padStart(2, '0');
-        params = {
-          start_date: `${tdYear2}-${tdMonth2}-${tdDay2}`,
-          end_date: todayStr
-        };
-        break;
-      case 'custom':
-        // 自定义范围
-        if (customStartDate && customEndDate) {
-          params = {
-            start_date: customStartDate,
-            end_date: customEndDate
-          };
-        } else {
-          // 默认7天
-          const defaultDaysAgo = new Date(now);
-          defaultDaysAgo.setDate(defaultDaysAgo.getDate() - 7);
-          const ddYear = defaultDaysAgo.getFullYear();
-          const ddMonth = String(defaultDaysAgo.getMonth() + 1).padStart(2, '0');
-          const ddDay = String(defaultDaysAgo.getDate()).padStart(2, '0');
-          params = {
-            start_date: `${ddYear}-${ddMonth}-${ddDay}`,
-            end_date: todayStr
-          };
-        }
-        break;
-      default:
-        // 默认7天
-        const defaultStart = new Date(now);
-        defaultStart.setDate(defaultStart.getDate() - 7);
-        const dsYear = defaultStart.getFullYear();
-        const dsMonth = String(defaultStart.getMonth() + 1).padStart(2, '0');
-        const dsDay = String(defaultStart.getDate()).padStart(2, '0');
-        params = {
-          start_date: `${dsYear}-${dsMonth}-${dsDay}`,
-          end_date: todayStr
-        };
-    }
-
-    // 同时获取上一个周期的数据用于趋势对比
-    const previousParams = getPreviousPeriodParams(range, now);
-    if (previousParams) {
-      getOrderAnalytics(previousParams).then(setPreviousAnalytics).catch(console.error);
-    }
-
-    getOrderAnalytics(params).then(setAnalytics).catch(console.error);
-  };
-
-  // 获取上一个时间段的参数
-  const getPreviousPeriodParams = (range: TimeRange, now: Date) => {
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-
-    switch (range) {
-      case 'today':
-        // 今天对比昨天
-        const yesterday = new Date(now);
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yYear = yesterday.getFullYear();
-        const yMonth = String(yesterday.getMonth() + 1).padStart(2, '0');
-        const yDay = String(yesterday.getDate()).padStart(2, '0');
-        return {
-          start_date: `${yYear}-${yMonth}-${yDay}`,
-          end_date: `${yYear}-${yMonth}-${yDay}`
-        };
-      case 'yesterday':
-        // 昨天对比前天
-        const dayBefore = new Date(now);
-        dayBefore.setDate(dayBefore.getDate() - 2);
-        const dbYear = dayBefore.getFullYear();
-        const dbMonth = String(dayBefore.getMonth() + 1).padStart(2, '0');
-        const dbDay = String(dayBefore.getDate()).padStart(2, '0');
-        return {
-          start_date: `${dbYear}-${dbMonth}-${dbDay}`,
-          end_date: `${dbYear}-${dbMonth}-${dbDay}`
-        };
-      case '7days':
-        // 7天对比上一个7天
-        const prev7DaysEnd = new Date(now);
-        prev7DaysEnd.setDate(prev7DaysEnd.getDate() - 7);
-        const prev7DaysStart = new Date(prev7DaysEnd);
-        prev7DaysStart.setDate(prev7DaysStart.getDate() - 7);
-        return {
-          start_date: `${prev7DaysStart.getFullYear()}-${String(prev7DaysStart.getMonth() + 1).padStart(2, '0')}-${String(prev7DaysStart.getDate()).padStart(2, '0')}`,
-          end_date: `${prev7DaysEnd.getFullYear()}-${String(prev7DaysEnd.getMonth() + 1).padStart(2, '0')}-${String(prev7DaysEnd.getDate()).padStart(2, '0')}`
-        };
-      case '30days':
-        // 30天对比上一个30天
-        const prev30DaysEnd = new Date(now);
-        prev30DaysEnd.setDate(prev30DaysEnd.getDate() - 30);
-        const prev30DaysStart = new Date(prev30DaysEnd);
-        prev30DaysStart.setDate(prev30DaysStart.getDate() - 30);
-        return {
-          start_date: `${prev30DaysStart.getFullYear()}-${String(prev30DaysStart.getMonth() + 1).padStart(2, '0')}-${String(prev30DaysStart.getDate()).padStart(2, '0')}`,
-          end_date: `${prev30DaysEnd.getFullYear()}-${String(prev30DaysEnd.getMonth() + 1).padStart(2, '0')}-${String(prev30DaysEnd.getDate()).padStart(2, '0')}`
-        };
-      default:
-        return null;
-    }
-  };
-
-  // 计算趋势百分比
-  const getTrendPercent = () => {
-    if (!analytics || !previousAnalytics) return null;
-
-    const currentAmount = analytics.revenue_stats.total_amount;
-    const previousAmount = previousAnalytics.revenue_stats.total_amount;
-
-    if (previousAmount === 0) {
-      return currentAmount > 0 ? '+100%' : '0%';
-    }
-
-    const percent = ((currentAmount - previousAmount) / previousAmount) * 100;
-    const sign = percent >= 0 ? '+' : '';
-    return `${sign}${percent.toFixed(1)}%`;
-  };
-
-  useEffect(() => {
-    getAdminStats().then(setStats).catch(console.error);
-    loadAnalytics(timeRange);
-    // 获取商品列表
-    getItems().then(items => {
-      setItems(items);
-      // 建立 item_id 到 item_title 的映射
-      const nameMap: Record<string, string> = {};
-      items.forEach(item => {
-        nameMap[item.item_id] = item.item_title || item.item_id;
+  const loadSummary = useCallback(async (range: TimeRange = timeRange) => {
+    if (range === 'custom' && (!customStartDate || !customEndDate)) return;
+    const generation = summaryRequestGeneration.current + 1;
+    summaryRequestGeneration.current = generation;
+    setLoading(true);
+    setError('');
+    try {
+      const result = await getDashboardSummary({
+        range,
+        ...(range === 'custom' ? { start_date: customStartDate, end_date: customEndDate } : {}),
       });
-      setItemNames(nameMap);
-    }).catch(console.error);
-  }, [timeRange]);
-
-  // 加载订单列表
-  useEffect(() => {
-    const { startDate, endDate } = getDatesForRange(timeRange);
-
-    // 获取参与统计的订单列表
-    setOrdersLoading(true);
-    getValidOrders({ start_date: startDate, end_date: endDate })
-      .then(orders => {
-        setValidOrders(orders);
-      })
-      .catch(console.error)
-      .finally(() => setOrdersLoading(false));
-  }, [timeRange]);
-
-  // 辅助函数：获取时间范围的日期
-  const getDatesForRange = (range: TimeRange) => {
-    const now = new Date();
-    const endDate = now.toISOString().split('T')[0];
-    let startDate = endDate;
-
-    if (range === '7days') {
-      const sevenDaysAgo = new Date(now);
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-      startDate = sevenDaysAgo.toISOString().split('T')[0];
-    } else if (range === '30days') {
-      const thirtyDaysAgo = new Date(now);
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-      startDate = thirtyDaysAgo.toISOString().split('T')[0];
+      if (summaryRequestGeneration.current === generation) setSummary(result);
+    } catch (loadError) {
+      if (summaryRequestGeneration.current === generation) {
+        setSummary(null);
+        setError(loadError instanceof Error ? loadError.message : '仪表盘加载失败');
+      }
+    } finally {
+      if (summaryRequestGeneration.current === generation) setLoading(false);
     }
-    // 其他范围类似处理...
+  }, [customEndDate, customStartDate, timeRange]);
 
-    return { startDate, endDate };
-  };
+  useEffect(() => {
+    if (timeRange !== 'custom') void loadSummary(timeRange);
+  }, [loadSummary, timeRange]);
 
-  if (!stats || !analytics) return <div className="p-8 flex justify-center text-gray-400"><Activity className="w-8 h-8 animate-spin text-[#FFE815]" /></div>;
+  useEffect(() => {
+    if (!summary) return undefined;
+    setOrdersLoading(true);
+    let cancelled = false;
+    const loadOrders = () => {
+      void getValidOrders({
+        start_date: summary.range.start_date,
+        end_date: summary.range.end_date,
+      }).then((orders) => {
+        if (!cancelled) setValidOrders(orders);
+      }).catch(() => {
+        if (!cancelled) setValidOrders([]);
+      }).finally(() => {
+        if (!cancelled) setOrdersLoading(false);
+      });
+    };
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const handle = idleWindow.requestIdleCallback
+      ? idleWindow.requestIdleCallback(loadOrders)
+      : window.setTimeout(loadOrders, 0);
+    return () => {
+      cancelled = true;
+      if (idleWindow.cancelIdleCallback) idleWindow.cancelIdleCallback(handle);
+      else window.clearTimeout(handle);
+    };
+  }, [summary]);
 
-  const chartData = analytics.daily_stats?.map(d => ({
-      name: d.date.slice(5), // MM-DD
-      amount: d.amount,
-      orders: d.order_count,
-      avgAmount: d.order_count > 0 ? (d.amount / d.order_count).toFixed(2) : 0
-  })) || [];
+  const trend = useMemo(() => {
+    if (!summary) return undefined;
+    const current = summary.current.revenue_stats.total_amount;
+    const previous = summary.previous.revenue_stats.total_amount;
+    if (previous === 0) return current > 0 ? '+100%' : '0%';
+    const value = ((current - previous) / previous) * 100;
+    return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
+  }, [summary]);
 
-  // 计算图表数据（在渲染时直接计算）
-  const itemStats = analytics.item_stats || [];
-  const totalOrders = analytics.revenue_stats.total_orders || 0;
-  const totalAmount = analytics.revenue_stats.total_amount || 0;
+  const filteredOrders = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return validOrders;
+    return validOrders.filter((order) => [order.order_id, order.item_id, order.buyer_id]
+      .some((value) => String(value || '').toLowerCase().includes(term)));
+  }, [searchTerm, validOrders]);
 
-  // 1. 商品销量排行：按订单数量排序
-  const productSalesData = itemStats.length > 0 ? itemStats
-    .map(item => ({
-      name: (itemNames[item.item_id] || item.item_id).length > 12
-        ? (itemNames[item.item_id] || item.item_id).substring(0, 12) + '...'
-        : (itemNames[item.item_id] || item.item_id),
-      sales: item.order_count
-    }))
-    .sort((a, b) => b.sales - a.sales)
-    .slice(0, 10) : [];
+  if (loading && !summary) {
+    return <div className="flex min-h-[50vh] items-center justify-center text-gray-400" role="status" aria-label="仪表盘加载中"><Activity className="h-8 w-8 animate-spin text-[#D6B500]" /></div>;
+  }
 
-  // 2. 商品下单占比：每个商品的订单数占总订单数的百分比
-  const sourceDataData = itemStats.length > 0 ? itemStats
-    .map(item => ({
-      name: (itemNames[item.item_id] || item.item_id).length > 10
-        ? (itemNames[item.item_id] || item.item_id).substring(0, 10) + '...'
-        : (itemNames[item.item_id] || item.item_id),
-      value: item.order_count,
-      percent: totalOrders > 0 ? (item.order_count / totalOrders) * 100 : 0
-    }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 6)
-    .map((item, index) => ({
-      ...item,
-      color: COLORS[index % COLORS.length]
-    })) : [];
+  if (error || !summary) {
+    return (
+      <div className="mx-auto flex min-h-[50vh] max-w-lg flex-col items-center justify-center text-center">
+        <AlertCircle className="mb-4 h-10 w-10 text-red-500" />
+        <h2 className="text-xl font-bold text-gray-900">仪表盘暂时不可用</h2>
+        <p className="mt-2 text-sm text-gray-500">{error || '未能读取统计数据'}</p>
+        <button type="button" onClick={() => void loadSummary(timeRange)} className="mt-5 inline-flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-bold text-white"><RefreshCw className="h-4 w-4" />重试</button>
+      </div>
+    );
+  }
 
-  // 3. 商品金额分析：按金额排序，取前5
-  const categoryDataData = itemStats.length > 0 ? itemStats
-    .map(item => ({
-      name: (itemNames[item.item_id] || item.item_id).length > 12
-        ? (itemNames[item.item_id] || item.item_id).substring(0, 12) + '...'
-        : (itemNames[item.item_id] || item.item_id),
-      value: item.total_amount,
-      orderCount: item.order_count,
-      percentage: totalAmount > 0
-        ? (item.total_amount / totalAmount) * 100
-        : 0
-    }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 5)
-    .map((item, index) => ({
-      ...item,
-      color: COLORS[index % COLORS.length],
-      percentage: item.percentage.toFixed(1)
-    })) : [];
-
-  const timeRangeOptions = [
-    { key: 'today' as TimeRange, label: '今天' },
-    { key: 'yesterday' as TimeRange, label: '昨天' },
-    { key: '3days' as TimeRange, label: '三天内' },
-    { key: '7days' as TimeRange, label: '7天内' },
-    { key: '30days' as TimeRange, label: '一个月内' },
-    { key: 'custom' as TimeRange, label: '自定义' },
-  ];
+  const isEmpty = summary.stats.total_cookies === 0
+    && summary.current.revenue_stats.total_orders === 0;
 
   return (
-    <div className="space-y-8 animate-fade-in">
-      <div className="flex flex-col md:flex-row justify-between md:items-end gap-4">
+    <div className="space-y-6 animate-fade-in">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">运营概览</h2>
-          <p className="text-gray-500 mt-2 text-base">欢迎回来，以下是闲鱼店铺的实时经营数据。</p>
+          <h2 className="text-2xl font-extrabold text-gray-900 sm:text-3xl">运营概览</h2>
+          <p className="mt-1 text-sm text-gray-500">{summary.scope === 'system' ? '系统业务汇总' : '你的闲鱼业务数据'}</p>
         </div>
-        <div className="flex items-center gap-3">
-          <div className="text-sm font-bold text-gray-700 bg-white px-5 py-2.5 rounded-full shadow-sm border border-gray-100 flex items-center gap-2">
-            <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse"></span>
-            系统正常运行
-          </div>
-        </div>
-      </div>
+        <span className="w-fit rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs font-bold text-gray-600">
+          {summary.range.start_date} 至 {summary.range.end_date}
+        </span>
+      </header>
 
-      {/* Time Range Selector */}
-      <div className="flex flex-wrap gap-2 p-2 bg-gray-100/50 rounded-2xl">
-        {timeRangeOptions.map((option) => (
-          <button
-            key={option.key}
-            onClick={() => setTimeRange(option.key)}
-            className={`px-5 py-2.5 rounded-xl text-sm font-bold transition-all ${
-              timeRange === option.key
-                ? 'bg-[#FFE815] text-black shadow-md'
-                : 'bg-white text-gray-600 hover:text-black hover:bg-gray-50'
-            }`}
-          >
+      <div className="flex flex-wrap gap-2 rounded-xl bg-gray-100/70 p-2">
+        {TIME_RANGES.map((option) => (
+          <button key={option.key} type="button" onClick={() => setTimeRange(option.key)} className={`rounded-lg px-4 py-2 text-sm font-bold ${timeRange === option.key ? 'bg-[#FFE815] text-black shadow-sm' : 'bg-white text-gray-600'}`}>
             {option.label}
           </button>
         ))}
         {timeRange === 'custom' && (
-          <>
-            <input
-              type="date"
-              value={customStartDate}
-              onChange={(e) => setCustomStartDate(e.target.value)}
-              className="px-3 py-2 rounded-xl text-sm border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#FFE815]"
-            />
-            <span className="self-center text-gray-400">-</span>
-            <input
-              type="date"
-              value={customEndDate}
-              onChange={(e) => setCustomEndDate(e.target.value)}
-              className="px-3 py-2 rounded-xl text-sm border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#FFE815]"
-            />
-            <button
-              onClick={() => loadAnalytics('custom')}
-              className="px-4 py-2 rounded-xl text-sm font-bold bg-black text-white hover:bg-gray-800 transition-colors"
-            >
-              应用
-            </button>
-          </>
+          <div className="flex flex-wrap items-center gap-2">
+            <input aria-label="开始日期" type="date" value={customStartDate} onChange={(event) => setCustomStartDate(event.target.value)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm" />
+            <input aria-label="结束日期" type="date" value={customEndDate} onChange={(event) => setCustomEndDate(event.target.value)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm" />
+            <button type="button" onClick={() => void loadSummary('custom')} disabled={!customStartDate || !customEndDate} className="rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white disabled:opacity-40">应用</button>
+          </div>
         )}
       </div>
 
-      {/* Stats Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <StatCard
-          title="累计营收 (CNY)"
-          value={`¥${analytics.revenue_stats.total_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}`}
-          icon={DollarSign}
-          colorClass="bg-yellow-400"
-          trend={getTrendPercent() || undefined}
-        />
-        <StatCard
-          title="活跃账号 / 总数"
-          value={`${stats.active_cookies} / ${stats.total_cookies}`}
-          icon={Users}
-          colorClass="bg-blue-500"
-        />
-        <StatCard
-          title="订单数"
-          value={analytics.revenue_stats.total_orders.toLocaleString()}
-          icon={ShoppingCart}
-          colorClass="bg-orange-500"
-        />
-        <StatCard
-          title="库存卡密余量"
-          value={stats.total_cards}
-          icon={Package}
-          colorClass="bg-purple-500"
-        />
+      {isEmpty && (
+        <div className="rounded-xl border border-dashed border-gray-300 bg-white px-5 py-6 text-center">
+          <p className="font-bold text-gray-800">还没有经营数据</p>
+          <p className="mt-1 text-sm text-gray-500">添加闲鱼账号后，订单和营收会显示在这里。</p>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard title="累计营收 (CNY)" value={`¥${summary.current.revenue_stats.total_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}`} icon={DollarSign} colorClass="bg-yellow-100 text-yellow-700" trend={trend} />
+        <StatCard title="活跃账号 / 总数" value={`${summary.stats.active_cookies} / ${summary.stats.total_cookies}`} icon={Users} colorClass="bg-blue-100 text-blue-700" />
+        <StatCard title="订单数" value={summary.current.revenue_stats.total_orders.toLocaleString()} icon={ShoppingCart} colorClass="bg-orange-100 text-orange-700" />
+        <StatCard title="库存卡密" value={summary.stats.total_cards} icon={Package} colorClass="bg-rose-100 text-rose-700" />
       </div>
 
-      {/* Main Chart Section */}
-      <div className="ios-card p-8 rounded-[2rem]">
-        <div className="mb-10">
-          <h3 className="text-xl font-bold text-gray-900">营收趋势分析</h3>
-          <p className="text-sm text-gray-400 mt-1">最近7天的销售额走势</p>
+      <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">图表加载中...</div>}>
+        <DashboardCharts analytics={summary.current} itemNames={summary.item_names} />
+      </Suspense>
+
+      <section className="ios-card overflow-hidden rounded-2xl bg-white">
+        <div className="flex flex-col gap-3 border-b border-gray-100 bg-gray-50/70 p-5 sm:flex-row sm:items-center sm:justify-between">
+          <h3 className="font-bold text-gray-900">参与统计的订单</h3>
+          <input aria-label="搜索统计订单" placeholder="搜索订单号、商品或买家" value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:border-yellow-400 sm:w-64" />
         </div>
-        <div className="h-[350px] w-full">
-          {chartData.length === 0 || analytics.revenue_stats.total_amount === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-gray-400">
-              <ShoppingCart className="w-16 h-16 mb-4 opacity-20" />
-              <p className="text-lg font-medium">暂无营收数据</p>
-              <p className="text-sm mt-2">所选时间范围内暂无订单记录</p>
-            </div>
-          ) : chartData.length <= 2 ? (
-            // 数据点少于等于2个时使用美化柱状图
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData} margin={{ top: 30, right: 20, left: -20, bottom: 30 }} barCategoryGap={30}>
-                <XAxis
-                  dataKey="name"
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{fill: '#374151', fontSize: 14, fontWeight: 600}}
-                  dy={10}
-                />
-                <YAxis
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{fill: '#9CA3AF', fontSize: 13, fontWeight: 500}}
-                  tickFormatter={(value) => `¥${value}`}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: '#1F2937',
-                    borderRadius: '16px',
-                    border: 'none',
-                    boxShadow: '0 20px 40px rgba(0, 0, 0, 0.3)',
-                    padding: '12px 16px'
-                  }}
-                  itemStyle={{ color: '#FFE815', fontWeight: 600 }}
-                  formatter={(value) => {
-                    const num = Number(value);
-                    return `营收: ¥${num.toFixed(2)}`;
-                  }}
-                />
-                <Bar
-                  dataKey="amount"
-                  fill="#FFE815"
-                  radius={[12, 12, 0, 0]}
-                  stroke="#000000"
-                  strokeWidth={0}
-                >
-                  {chartData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={['#FFE815', '#FCD34D', '#FBBF24'][index % 3]} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+        <div className="max-h-[420px] overflow-auto">
+          {ordersLoading ? (
+            <div className="flex items-center justify-center py-16 text-sm text-gray-400"><Activity className="mr-2 h-5 w-5 animate-spin" />加载订单明细...</div>
+          ) : filteredOrders.length === 0 ? (
+            <div className="py-16 text-center text-sm text-gray-400">暂无订单明细</div>
           ) : (
-            // 数据点多于2个时使用折线图
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="colorAmount" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#FFE815" stopOpacity={0.5}/>
-                    <stop offset="95%" stopColor="#FFE815" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <XAxis
-                  dataKey="name"
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{fill: '#9CA3AF', fontSize: 13, fontWeight: 500}}
-                  dy={15}
-                />
-                <YAxis
-                  axisLine={false}
-                  tickLine={false}
-                  tick={{fill: '#9CA3AF', fontSize: 13, fontWeight: 500}}
-                />
-                <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
-                <Tooltip
-                  contentStyle={{ background: '#1A1A1A', borderRadius: '16px', border: 'none', boxShadow: '0 10px 40px rgba(0,0,0,0.2)' }}
-                  itemStyle={{ color: '#FFE815', fontWeight: 600 }}
-                  labelStyle={{ color: '#888' }}
-                  cursor={{ stroke: '#FFE815', strokeWidth: 2, strokeDasharray: '4 4' }}
-                />
-                <Area type="monotone" dataKey="amount" stroke="#FACC15" strokeWidth={4} fillOpacity={1} fill="url(#colorAmount)" activeDot={{ r: 8, fill: '#1A1A1A', stroke: "#FFE815", strokeWidth: 2 }} />
-              </AreaChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-      </div>
-
-      {/* 商品销量排行和订单来源分布 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* 商品销量排行 */}
-        <div className="ios-card p-6 rounded-[2rem]">
-          <h3 className="font-bold text-lg text-gray-900 mb-6">商品销量排行</h3>
-          <div className="h-[280px]">
-            {productSalesData.length === 0 ? (
-              <div className="flex items-center justify-center h-full text-gray-400">暂无数据</div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={productSalesData} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} stroke="#f0f0f0" />
-                  <XAxis
-                    type="number"
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{ fill: '#9CA3AF', fontSize: 12 }}
-                  />
-                  <YAxis
-                    type="category"
-                    dataKey="name"
-                    axisLine={false}
-                    tickLine={false}
-                    tick={{ fill: '#6B7280', fontSize: 12 }}
-                    width={100}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: '#fff',
-                      border: '1px solid #e5e7eb',
-                      borderRadius: '12px',
-                      boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
-                    }}
-                  />
-                  <Bar dataKey="sales" fill="#000000" radius={[0, 8, 8, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </div>
-
-        {/* 商品下单占比 */}
-        <div className="ios-card p-6 rounded-[2rem]">
-          <h3 className="font-bold text-lg text-gray-900 mb-6">商品下单占比</h3>
-          <div className="h-[280px]">
-            {sourceDataData.length === 0 ? (
-              <div className="flex items-center justify-center h-full text-gray-400">暂无数据</div>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={sourceDataData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={60}
-                    outerRadius={90}
-                    paddingAngle={2}
-                    dataKey="value"
-                    label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-                    labelLine={false}
-                  >
-                    {sourceDataData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                  <Legend
-                    verticalAlign="bottom"
-                    height={36}
-                    iconType="circle"
-                    formatter={(value) => <span style={{ color: '#6B7280', fontWeight: 500 }}>{value}</span>}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* 收支明细和品类营收 */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* 参与统计的订单列表 */}
-        <div className="lg:col-span-2 ios-card p-0 rounded-[2rem] border-0 bg-white overflow-hidden flex flex-col">
-          <div className="p-6 border-b border-gray-50 flex justify-between items-center bg-[#FAFAFA]">
-            <h3 className="font-bold text-lg text-gray-900">参与统计的订单</h3>
-            <div className="relative">
-              <input
-                placeholder="搜索订单号/商品/买家..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="pl-4 pr-4 py-2 rounded-xl bg-white border border-gray-100 text-sm focus:border-yellow-400 outline-none w-48"
-                type="text"
-              />
-            </div>
-          </div>
-          <div className="overflow-x-auto flex-1 max-h-[400px]">
-            {ordersLoading ? (
-              <div className="flex items-center justify-center py-20 text-gray-400">
-                <Activity className="w-6 h-6 animate-spin mr-2" />
-                加载中...
-              </div>
-            ) : validOrders.filter((order) =>
-              order.order_id?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-              order.item_id?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-              order.buyer_id?.toLowerCase().includes(searchTerm.toLowerCase())
-            ).length === 0 ? (
-              <div className="flex items-center justify-center py-20 text-gray-400">
-                暂无订单数据
-              </div>
-            ) : (
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="bg-white text-gray-400 text-xs font-bold uppercase tracking-wider border-b border-gray-50">
-                    <th className="px-6 py-4">订单信息</th>
-                    <th className="px-6 py-4">买家信息</th>
-                    <th className="px-6 py-4">金额</th>
-                    <th className="px-6 py-4">状态</th>
-                    <th className="px-6 py-4 text-right">操作</th>
+            <table className="w-full min-w-[720px] text-left text-sm">
+              <thead className="sticky top-0 bg-white text-xs text-gray-400"><tr><th className="px-5 py-3">订单</th><th className="px-5 py-3">买家</th><th className="px-5 py-3">金额</th><th className="px-5 py-3">状态</th><th className="px-5 py-3 text-right">详情</th></tr></thead>
+              <tbody className="divide-y divide-gray-100">
+                {filteredOrders.map((order) => (
+                  <tr key={order.order_id}>
+                    <td className="px-5 py-4"><div className="flex items-center gap-3"><PackageCheck className="h-8 w-8 rounded-lg bg-gray-100 p-1.5 text-gray-400" /><div><p className="font-bold text-gray-900">{order.item_title || summary.item_names[order.item_id] || order.item_id || '未知商品'}</p><p className="mt-0.5 font-mono text-xs text-gray-400">{order.order_id}</p></div></div></td>
+                    <td className="px-5 py-4 text-gray-700">{order.buyer_id}</td>
+                    <td className="px-5 py-4 font-bold text-gray-900">¥{order.amount || '0.00'}</td>
+                    <td className="px-5 py-4"><StatusBadge status={order.status || order.order_status || 'unknown'} /></td>
+                    <td className="px-5 py-4 text-right"><a href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`} target="_blank" rel="noopener noreferrer" title="查看闲鱼订单" className="inline-flex rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-900"><ExternalLink className="h-4 w-4" /></a></td>
                   </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {validOrders
-                    .filter((order) =>
-                      order.order_id?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                      order.item_id?.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                      order.buyer_id?.toLowerCase().includes(searchTerm.toLowerCase())
-                    )
-                    .map((order) => (
-                      <tr key={order.order_id} className="hover:bg-[#FFFDE7]/50 transition-colors group">
-                        <td className="px-6 py-4">
-                          <div className="flex items-center gap-3">
-                            <div className="w-12 h-12 rounded-xl bg-gray-100 overflow-hidden shadow-sm border border-gray-100 flex-shrink-0">
-                              <PackageCheck className="w-full h-full text-gray-300 p-2" />
-                            </div>
-                            <div className="min-w-0">
-                              <div className="font-bold text-gray-900 text-sm line-clamp-1">
-                                {order.item_title || order.item_id || '未知商品'}
-                              </div>
-                              <div className="text-xs text-gray-500 mt-1 font-mono">{order.order_id}</div>
-                              <div className="text-xs text-gray-400 mt-0.5">数量: {order.quantity || 1}</div>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className="text-sm font-bold text-gray-800">{order.buyer_id}</div>
-                          {order.created_at && (
-                            <div className="text-xs text-gray-400 mt-1">{order.created_at}</div>
-                          )}
-                        </td>
-                        <td className="px-6 py-4 text-base font-extrabold text-gray-900 font-feature-settings-tnum">
-                          ¥{order.amount || '0.00'}
-                        </td>
-                        <td className="px-6 py-4">
-                          <StatusBadge status={order.status || order.order_status || 'unknown'} />
-                        </td>
-                        <td className="px-6 py-4 text-right">
-                          <a
-                            href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex text-gray-400 hover:text-amber-600 p-2 rounded-xl hover:bg-amber-50 transition-colors"
-                            title="查看闲鱼详情"
-                          >
-                            <ExternalLink className="w-4 h-4" />
-                          </a>
-                        </td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        </div>
-
-        {/* 商品金额分析 */}
-        <div className="ios-card p-6 rounded-[2rem] bg-white">
-          <h3 className="font-bold text-lg text-gray-900 mb-6">商品金额分析 (TOP5)</h3>
-          {categoryDataData.length === 0 ? (
-            <div className="flex items-center justify-center h-[300px] text-gray-400">暂无数据</div>
-          ) : (
-            <>
-              <div className="h-[300px] relative">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={categoryDataData}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={60}
-                      outerRadius={100}
-                      paddingAngle={2}
-                      dataKey="value"
-                      label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-                    >
-                      {categoryDataData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color || COLORS[index % COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: '#fff',
-                        border: '1px solid #e5e7eb',
-                        borderRadius: '12px',
-                        boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)'
-                      }}
-                      formatter={(value: number) => `¥${value.toLocaleString()}`}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="space-y-3 mt-4">
-                {categoryDataData.map((cat) => (
-                  <div key={cat.name} className="flex justify-between items-center text-sm">
-                    <div className="flex items-center gap-2">
-                      <div
-                        className="w-3 h-3 rounded-full"
-                        style={{ backgroundColor: cat.color || COLORS[categoryDataData.indexOf(cat) % COLORS.length] }}
-                      ></div>
-                      <span className="text-gray-600 font-medium">{cat.name}</span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="font-bold text-gray-900">¥{cat.value.toLocaleString()}</span>
-                      <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded">{cat.percentage}%</span>
-                    </div>
-                  </div>
                 ))}
-              </div>
-            </>
+              </tbody>
+            </table>
           )}
         </div>
-      </div>
+      </section>
     </div>
   );
 };

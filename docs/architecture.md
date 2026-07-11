@@ -12,7 +12,7 @@ Main runtime path:
 4. `db_manager.py` retains the compatibility persistence facade. New domain SQL starts in `repositories/`, while domain decisions live in `services/`; authentication is the first extracted boundary.
 5. `cookie_manager.py` starts one `XianyuAutoAsync.XianyuLive` task per enabled account and exposes an awaited shutdown path.
 6. `ai_reply_engine.py` assembles product-scoped context, calls the selected provider, audits rules, and optionally regenerates once.
-7. `frontend/` lazy-loads business pages, exposes domain API/type modules through compatibility barrels, and builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
+7. `frontend/` lazy-loads business pages and dashboard charts, exposes domain API/type modules through compatibility barrels, and builds React assets into `static/`; FastAPI serves the SPA and `/static/*`.
 
 The deployment model is intentionally one process, one Uvicorn worker, one asyncio event loop, and SQLite. It does not claim horizontal multi-worker support.
 
@@ -28,17 +28,17 @@ Direct registration is fail-closed. `registration_enabled` defaults to false and
 
 `auth_email_service.py` is the only authentication-mail path. It sends through the configured SMTP server and has no third-party fallback. SMTP authorization codes are encrypted by `SystemSecretCipher`; the same independent system secret derives purpose-separated HMAC keys. SMTP verification first saves the configuration as unverified and sends a six-digit code to the support mailbox. Confirmation binds that code to the current fingerprint; changing any SMTP field invalidates verification, consumes pending SMTP challenges, and closes registration. Authentication-code delivery uses the same public response and SMTP path for eligible and decoy targets so account existence is not exposed.
 
-`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database plus the AI-provider, Xianyu-account, and system-secret local keys before starting one transaction. The compatibility upgrader keeps database version `1.6` idempotent while ordered migrations add the registration security schema and normalized identity indexes. A case-insensitive identity conflict aborts migration instead of merging users. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider and system-secret keys; account detail and status APIs never return the plaintext or ciphertext.
+`schema_migrations` records ordered migrations. A pending migration backs up the SQLite database plus the AI-provider, Xianyu-account, and system-secret local keys before starting one transaction. The compatibility upgrader keeps database version `1.6` idempotent while ordered migrations add the registration security schema, normalized identity indexes, and `2026071104` order-analysis indexes. A case-insensitive identity conflict aborts migration instead of merging users. Xianyu login passwords use an account-specific Fernet key that is separate from the AI provider and system-secret keys; account detail and status APIs never return the plaintext or ciphertext.
 
 Xianyu accounts live in `cookies`. `cookies.xianyu_unb` stores the stable Xianyu identity extracted from the Cookie and is unique within a backend user. Re-login and Cookie updates use `(user_id, xianyu_unb)` to update the existing row instead of replacing its primary key. This preserves account-scoped AI settings, rules, knowledge, products, orders, and delivery data. Deleting an account remains destructive and is not a session-refresh mechanism.
 
 `utils/xianyu_official_login.py` owns official browser authentication. Initial password login uses a temporary `.login_<uuid>` profile, switches the embedded official page from SMS to password mode, confirms the agreement and keep-login prompts, and accepts success only when login and security surfaces disappear while both `unb` and a session Cookie exist. The profile is then promoted to `browser_data/user_<unb>`; an existing target is backed up and restored if replacement fails.
 
-Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Manual refresh, scheduled refresh, Token failure, and repeated connection-failure recovery all call the same official service. It first opens the canonical `unb` profile and seeds the current Cookie when needed, then falls back to encrypted credentials only if the official profile has logged out. A returned `unb` must match the expected account before CookieManager is updated once.
+Cookie refresh state is persisted in `account_session_refresh_status` with states such as `idle`, `refreshing`, `verification_required`, `success`, `failed`, `timeout`, and `cancelled`. Manual refresh, scheduled refresh, Token failure, and repeated connection-failure recovery all call the same official service when automatic refresh is enabled. With automatic refresh disabled, non-manual failures record `automatic_refresh_disabled` without launching Chromium; manual refresh still opens the canonical `unb` profile. The service seeds the current Cookie when needed, then falls back to encrypted credentials only if the official profile has logged out. A returned `unb` must match the expected account before CookieManager is updated once.
 
 Goofish rejects Chromium headless mode as an illegal browser. Background renewal therefore uses a normal headed browser positioned off-screen. If Alibaba requires human verification, the service reopens the same profile visibly, stores only a safe verification screenshot, and waits up to 15 minutes. The account page reads the persisted status and image; verification URLs are not exposed and verification is never treated as bypassed.
 
-Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. The password-login task receives credentials only as its background-task arguments; the password is not stored in the login-session dictionaries or registry. Cookies, Tokens, verification URLs, Playwright objects, and AI conversation content are also excluded. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
+Temporary QR login, password login, AI training, and Cookie refresh operations share a Session Registry. `runtime_sessions` stores only session type, owner, account identifier, state, redacted error, and TTL. Polling another user's password or QR session returns HTTP 403. The password-login task receives credentials only as its background-task arguments; the password is not stored in the login-session dictionaries or registry. Cookies, Tokens, verification URLs, Playwright objects, and AI conversation content are also excluded. On restart, active browser-backed records become `interrupted` and the UI must ask the operator to start again.
 
 ## AI Context Flow
 
@@ -76,7 +76,9 @@ Unknown or failed responses never overwrite a reliable stored status. Shipped, c
 
 `ai_provider_profiles` stores user-scoped provider profiles, encrypted API keys, the default model, cached model lists, and verification state. OpenAI-compatible providers use Chat Completions and `/models`; Gemini uses its native models list and `generateContent`. Accounts bind to a profile and select their own model. A provider/model change must generate a successful test reply before it can replace the active account configuration.
 
-System settings are split into basic, AI, and SMTP sections. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification requires a valid independent support email. Sending the test code does not verify SMTP; only confirming the six-digit receipt code marks that exact settings fingerprint as verified.
+Administrator settings are split into global basic, AI, and SMTP sections. Ordinary users do not call the administrator summary: they read and update only `item_sync_enabled`, `item_sync_interval`, and `item_sync_max_pages` through typed user endpoints, with values stored in `user_settings` and global values used as defaults. AI provider profiles remain user-owned for every role. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification requires a valid independent support email. Sending the test code does not verify SMTP; only confirming the six-digit receipt code marks that exact settings fingerprint as verified.
+
+The dashboard first calls one role-aware summary endpoint. Ordinary users receive only rows joined through their owned `cookies`; administrators receive system scope. The response combines counters, current and previous analytics periods, and product names. Order detail loading starts after the summary cards render, and the Recharts dependency lives in a separate lazy chunk. Analytics use timestamp boundaries instead of wrapping `created_at` in `DATE()` so SQLite can use the migration indexes.
 
 ## Data Model
 
@@ -103,12 +105,12 @@ Core tables:
 - Account binding: `/qr-login/*`, `POST /password-login`, `GET /password-login/check/{session_id}`, and `/cookies*`, including `PUT /cookies/{cid}/cookie-refresh-settings`. Password login accepts `account`, `password`, and `show_browser`; caller-supplied account IDs are not authoritative.
 - Session refresh: `/api/accounts/{cookie_id}/session-status`, `/session-refresh`, `/session-refresh/cancel`.
 - Diagnostics: `/api/diagnostics/auto-reply/{cookie_id}` and `/api/skills/ops/*`.
-- Settings: `/api/settings/summary`, `/api/settings/sections/{section}`, `/api/settings/verify/{section}`.
+- Settings: administrator-only `/api/settings/summary`, `/api/settings/sections/{section}`, `/api/settings/verify/{section}`, and user-owned `/api/settings/user-summary`, `/api/settings/user-basic`.
 - AI providers: `/api/ai/providers*`, including model refresh and generated-reply tests.
 - AI training: `/ai-reply-lab/*`, `/ai-training-rules/*`.
 - Product knowledge: `/ai-item-knowledge/{cookie_id}/{item_id}/*`.
 - Replies and inventory: `/keywords*`, `/default-replies*`, `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`.
-- Orders and analytics: `POST /api/orders/sync`, `/api/orders*`, `/analytics/orders*`.
+- Orders and analytics: role-aware `GET /api/dashboard/summary`, `POST /api/orders/sync`, `/api/orders*`, `/analytics/orders*`.
 - Skill Center: `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*`.
 
 ## Skill Center Boundary

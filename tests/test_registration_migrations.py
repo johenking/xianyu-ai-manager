@@ -18,6 +18,9 @@ OLD_MIGRATIONS = (
 )
 
 
+EXPECTED_LATEST_MIGRATION = "2026071104"
+
+
 def create_v150_database(
     path: Path,
     *,
@@ -115,6 +118,42 @@ class RegistrationMigrationTests(unittest.TestCase):
         os.environ.pop("SYSTEM_SECRET_ENCRYPTION_KEY", None)
         self.ai_key_path.write_text("synthetic-ai-provider-key", encoding="ascii")
         create_v150_database(self.db_path)
+
+    def test_latest_migration_adds_order_analysis_indexes_idempotently(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.executescript(
+            """
+            CREATE TABLE cookies (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL
+            );
+            CREATE TABLE orders (
+                order_id TEXT PRIMARY KEY,
+                cookie_id TEXT,
+                order_status TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        runner = MigrationRunner(connection, str(self.db_path), backup_enabled=False)
+        runner.run()
+        runner.run()
+
+        applied = {
+            row[0]
+            for row in connection.execute("SELECT version FROM schema_migrations")
+        }
+        order_indexes = table_indexes(connection, "orders")
+        self.assertIn(EXPECTED_LATEST_MIGRATION, applied)
+        self.assertEqual(
+            order_indexes["idx_orders_cookie_created_at"][1],
+            ("cookie_id", "created_at"),
+        )
+        self.assertEqual(
+            order_indexes["idx_orders_status_created_at"][1],
+            ("order_status", "created_at"),
+        )
+        connection.close()
 
     def tearDown(self):
         for key, previous in self.previous_environment.items():
@@ -238,7 +277,7 @@ class RegistrationMigrationTests(unittest.TestCase):
 
         self.assertEqual(
             runner.run(),
-            ["2026071101", "2026071102", "2026071103"],
+            ["2026071101", "2026071102", "2026071103", "2026071104"],
         )
         self.assertEqual(
             table_columns(connection, "users")
@@ -427,7 +466,7 @@ class RegistrationMigrationTests(unittest.TestCase):
             str(self.db_path),
             backup_enabled=False,
         )
-        self.assertEqual(runner.run(), ["2026071102", "2026071103"])
+        self.assertEqual(runner.run(), ["2026071102", "2026071103", "2026071104"])
         self.assertEqual(
             connection.execute(
                 "SELECT username_normalized, email_normalized FROM users"
@@ -480,7 +519,7 @@ class RegistrationMigrationTests(unittest.TestCase):
             str(self.db_path),
             backup_enabled=False,
         )
-        self.assertEqual(migrated.run(), ["2026071103"])
+        self.assertEqual(migrated.run(), ["2026071103", "2026071104"])
         settings = dict(connection.execute("SELECT key, value FROM system_settings"))
         self.assertEqual(settings["registration_enabled"], "false")
         self.assertEqual(settings["registration_user_limit"], "20")

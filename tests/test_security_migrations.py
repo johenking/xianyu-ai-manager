@@ -113,6 +113,7 @@ class SchemaMigrationTests(unittest.TestCase):
                 "2026071101",
                 "2026071102",
                 "2026071103",
+                "2026071104",
             ],
         )
         self.assertIsNotNone(runner.last_backup_dir)
@@ -121,7 +122,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            5,
+            6,
         )
 
         password, encrypted, version = connection.execute(

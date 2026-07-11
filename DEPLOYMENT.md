@@ -14,6 +14,8 @@ This project is a long-running FastAPI application with SQLite data, WebSocket/b
 
 The account listeners and Skill Center scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
 
+After upgrading to v1.7.1, verify schema migration `2026071104`, the role-aware `/api/dashboard/summary`, and ordinary-user `/api/settings/user-summary`. Global settings, SMTP, registration administration, and runtime metrics must remain administrator-only. Accounts with scheduled Cookie refresh disabled must not start Chrome after Token failure; manual immediate refresh remains supported.
+
 ## Recommended Platforms
 
 Use a Docker web service platform instead:

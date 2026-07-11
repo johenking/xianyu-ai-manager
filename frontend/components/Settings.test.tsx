@@ -8,7 +8,9 @@ import {
   getAIProviders,
   getRegistrationAdminStatus,
   getSettingsSummary,
+  getUserSettingsSummary,
   listRegistrationUsers,
+  saveUserBasicSettings,
   saveSettingsSection,
   confirmSmtpVerification,
   verifySettingsSection,
@@ -18,6 +20,7 @@ import Settings from './Settings';
 
 vi.mock('../services/api', () => ({
   getSettingsSummary: vi.fn(),
+  getUserSettingsSummary: vi.fn(),
   getRegistrationAdminStatus: vi.fn(),
   listRegistrationUsers: vi.fn(),
   setRegistrationEnabled: vi.fn(),
@@ -30,6 +33,7 @@ vi.mock('../services/api', () => ({
   refreshAIProviderModels: vi.fn(),
   testAIProvider: vi.fn(),
   saveSettingsSection: vi.fn(),
+  saveUserBasicSettings: vi.fn(),
   confirmSmtpVerification: vi.fn(),
   verifySettingsSection: vi.fn(),
 }));
@@ -81,7 +85,7 @@ describe('Settings configuration sections', () => {
   afterEach(() => cleanup());
 
   const openAndEditAi = async () => {
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /AI 配置/ }));
     fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'model-b' } });
   };
@@ -117,7 +121,7 @@ describe('Settings configuration sections', () => {
     vi.mocked(verifySettingsSection).mockImplementation(() => new Promise((_, reject) => {
       rejectVerification = reject;
     }));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /AI 配置/ }));
 
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
@@ -129,7 +133,7 @@ describe('Settings configuration sections', () => {
   });
 
   it('keeps registration controls in the dedicated gated management section', async () => {
-    render(<Settings />);
+    render(<Settings isAdmin />);
 
     expect(await screen.findByRole('heading', { name: '注册管理' })).toBeInTheDocument();
     expect(screen.queryByText('允许用户注册')).not.toBeInTheDocument();
@@ -139,7 +143,7 @@ describe('Settings configuration sections', () => {
   });
 
   it('applies the QQ Mail preset without filling an authorization code', async () => {
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: 'QQ 邮箱预设' }));
 
@@ -164,7 +168,7 @@ describe('Settings configuration sections', () => {
       state: 'verified',
       message: 'SMTP 实收验证成功',
     });
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
 
@@ -185,7 +189,7 @@ describe('Settings configuration sections', () => {
     vi.mocked(verifySettingsSection).mockImplementation(() => new Promise((resolve) => {
       resolveVerification = resolve;
     }));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.before-verify.example.com' } });
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
@@ -222,7 +226,7 @@ describe('Settings configuration sections', () => {
 
   it('rejects every section save while SMTP verification is pending', async () => {
     vi.mocked(verifySettingsSection).mockImplementation(() => new Promise(() => undefined));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
     await waitFor(() => expect(verifySettingsSection).toHaveBeenCalledTimes(1));
@@ -246,7 +250,7 @@ describe('Settings configuration sections', () => {
       masked_recipient: 're***@example.com',
     });
     vi.mocked(saveSettingsSection).mockImplementation(() => new Promise(() => undefined));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
     await screen.findByLabelText('SMTP 收件验证码');
@@ -282,7 +286,7 @@ describe('Settings configuration sections', () => {
     vi.mocked(confirmSmtpVerification).mockImplementation(() => new Promise((resolve) => {
       resolveConfirmation = resolve;
     }));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
     fireEvent.change(await screen.findByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
@@ -318,7 +322,7 @@ describe('Settings configuration sections', () => {
       expires_in: 600,
       masked_recipient: 're***@example.com',
     });
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.persisted.example.com' } });
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
@@ -332,7 +336,7 @@ describe('Settings configuration sections', () => {
 
   it('synchronizes persisted state after SMTP verification delivery fails', async () => {
     vi.mocked(verifySettingsSection).mockRejectedValue(new Error('SMTP 验证邮件发送失败'));
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
 
@@ -355,7 +359,7 @@ describe('Settings configuration sections', () => {
       state: 'ready',
       message: 'SMTP 配置已确认',
     });
-    render(<Settings />);
+    render(<Settings isAdmin />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
     fireEvent.change(await screen.findByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
@@ -364,5 +368,125 @@ describe('Settings configuration sections', () => {
     expect(await screen.findByText('SMTP 配置已确认')).toBeInTheDocument();
     await waitFor(() => expect(getSettingsSummary).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(getRegistrationAdminStatus).toHaveBeenCalledTimes(3));
+  });
+});
+
+const userSummary = {
+  success: true,
+  settings: {
+    item_sync_enabled: true,
+    item_sync_interval: 600,
+    item_sync_max_pages: 5,
+  },
+  sources: {
+    item_sync_enabled: 'global' as const,
+    item_sync_interval: 'global' as const,
+    item_sync_max_pages: 'user' as const,
+  },
+  inherited: false,
+};
+
+describe('ordinary user settings', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getUserSettingsSummary).mockResolvedValue(userSummary);
+    vi.mocked(getAIProviders).mockResolvedValue({ providers: [], presets: {} });
+  });
+
+  afterEach(() => cleanup());
+
+  it('loads only personal settings and keeps admin-only controls and APIs unavailable', async () => {
+    render(<Settings isAdmin={false} />);
+
+    expect(await screen.findByRole('heading', { name: '商品自动同步' })).toBeInTheDocument();
+    expect(getUserSettingsSummary).toHaveBeenCalledTimes(1);
+    expect(getSettingsSummary).not.toHaveBeenCalled();
+    expect(getRegistrationAdminStatus).not.toHaveBeenCalled();
+    expect(listRegistrationUsers).not.toHaveBeenCalled();
+    expect(saveSettingsSection).not.toHaveBeenCalled();
+    expect(verifySettingsSection).not.toHaveBeenCalled();
+    expect(confirmSmtpVerification).not.toHaveBeenCalled();
+    expect(screen.getAllByText('继承系统默认')).toHaveLength(2);
+    expect(screen.getByText('个人设置')).toBeInTheDocument();
+    expect(screen.queryByText('SMTP 配置')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '注册管理' })).not.toBeInTheDocument();
+    expect(screen.queryByText('显示默认登录信息')).not.toBeInTheDocument();
+    expect(screen.queryByText('登录滑动验证码')).not.toBeInTheDocument();
+    expect(screen.queryByText('账号管理器')).not.toBeInTheDocument();
+    expect(screen.queryByText('监听任务')).not.toBeInTheDocument();
+    expect(getAIProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it('validates and saves editable personal sync settings in seconds', async () => {
+    vi.mocked(saveUserBasicSettings).mockResolvedValue({
+      success: true,
+      message: '个人设置已保存',
+      settings: {
+        item_sync_enabled: false,
+        item_sync_interval: 3600,
+        item_sync_max_pages: 12,
+      },
+      sources: {
+        item_sync_enabled: 'user',
+        item_sync_interval: 'user',
+        item_sync_max_pages: 'user',
+      },
+      inherited: false,
+    });
+    render(<Settings isAdmin={false} />);
+
+    fireEvent.click(await screen.findByRole('switch', { name: '商品自动同步' }));
+    fireEvent.change(screen.getByLabelText('同步间隔（秒）'), { target: { value: '59' } });
+    fireEvent.change(screen.getByLabelText('最多同步页数'), { target: { value: '51' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    expect(await screen.findByText('同步间隔需为 60 到 86400 秒')).toBeInTheDocument();
+    expect(screen.getByText('最多同步页数需为 1 到 50')).toBeInTheDocument();
+    expect(saveUserBasicSettings).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText('同步间隔（秒）'), { target: { value: '3600' } });
+    fireEvent.change(screen.getByLabelText('最多同步页数'), { target: { value: '12' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }));
+
+    await waitFor(() => expect(saveUserBasicSettings).toHaveBeenCalledWith({
+      item_sync_enabled: false,
+      item_sync_interval: 3600,
+      item_sync_max_pages: 12,
+    }));
+    expect(await screen.findByText('个人设置已保存')).toBeInTheDocument();
+  });
+
+  it('submits only changed fields so untouched values keep inheriting defaults', async () => {
+    vi.mocked(saveUserBasicSettings).mockResolvedValue({
+      ...userSummary,
+      message: '个人设置已保存',
+      settings: { ...userSummary.settings, item_sync_interval: 1800 },
+      sources: { ...userSummary.sources, item_sync_interval: 'user' },
+    });
+    render(<Settings isAdmin={false} />);
+
+    const saveButton = await screen.findByRole('button', { name: '保存设置' });
+    expect(saveButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('同步间隔（秒）'), { target: { value: '1800' } });
+    expect(saveButton).toBeEnabled();
+    fireEvent.click(saveButton);
+
+    await waitFor(() => expect(saveUserBasicSettings).toHaveBeenCalledWith({
+      item_sync_interval: 1800,
+    }));
+  });
+
+  it('shows load errors and retries the personal endpoint', async () => {
+    vi.mocked(getUserSettingsSummary)
+      .mockRejectedValueOnce(new Error('个人设置读取失败'))
+      .mockResolvedValueOnce(userSummary);
+    render(<Settings isAdmin={false} />);
+
+    expect(await screen.findByText('个人设置读取失败')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '重试' }));
+
+    expect(await screen.findByRole('heading', { name: '商品自动同步' })).toBeInTheDocument();
+    expect(getUserSettingsSummary).toHaveBeenCalledTimes(2);
+    expect(getSettingsSummary).not.toHaveBeenCalled();
   });
 });

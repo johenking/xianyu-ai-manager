@@ -11,6 +11,7 @@ import type {
   RegistrationConfig,
   RegistrationRequest,
   RegistrationUser,
+  VerifyResponse,
 } from '../../types';
 
 // Auth
@@ -18,7 +19,7 @@ export const login = async (data: LoginRequest): Promise<LoginResponse> => {
   return post('/login', data);
 };
 
-export const verifyToken = async (): Promise<{ authenticated: boolean; user_id?: number; username?: string }> => {
+export const verifyToken = async (): Promise<VerifyResponse> => {
   return get('/verify');
 };
 

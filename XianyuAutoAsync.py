@@ -2171,6 +2171,21 @@ class XianyuLive:
         from db_manager import db_manager
         from utils.xianyu_official_login import OfficialLoginWorker, XianyuOfficialLoginService
 
+        manual_refresh = trigger_reason == "手动立即刷新"
+        if not manual_refresh and not bool(getattr(self, "cookie_refresh_enabled", False)):
+            logger.info(
+                f"【{self.cookie_id}】自动 Cookie 刷新已关闭，"
+                f"跳过由{trigger_reason}触发的官方浏览器会话"
+            )
+            db_manager.update_account_session_refresh(
+                self.cookie_id,
+                state="failed",
+                trigger=trigger_reason,
+                message="自动 Cookie 刷新已关闭，未启动官方浏览器",
+                error_code="automatic_refresh_disabled",
+            )
+            return False
+
         logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备复用闲鱼官方浏览器档案...")
         if reuse_active_registration:
             if not active_refresh_registry.is_active(self.cookie_id):
@@ -5590,14 +5605,24 @@ class XianyuLive:
 
                     # 从数据库读取最新配置（支持动态更新）
                     from db_manager import db_manager
-                    item_sync_enabled_str = db_manager.get_system_setting('item_sync_enabled')
-                    item_sync_interval_str = db_manager.get_system_setting('item_sync_interval')
-                    item_sync_max_pages_str = db_manager.get_system_setting('item_sync_max_pages')
+                    from settings_service import resolve_user_basic_settings
 
-                    # 使用数据库配置，如果不存在则使用实例变量（从global_config.yml读取的默认值）
-                    item_sync_enabled = item_sync_enabled_str == 'true' if item_sync_enabled_str is not None else self.item_sync_enabled
-                    item_sync_interval = int(item_sync_interval_str) if item_sync_interval_str is not None else self.item_sync_interval
-                    item_sync_max_pages = int(item_sync_max_pages_str) if item_sync_max_pages_str is not None else self.item_sync_max_pages
+                    global_sync_settings = {
+                        'item_sync_enabled': db_manager.get_system_setting('item_sync_enabled'),
+                        'item_sync_interval': db_manager.get_system_setting('item_sync_interval'),
+                        'item_sync_max_pages': db_manager.get_system_setting('item_sync_max_pages'),
+                    }
+                    personal_sync_settings = (
+                        db_manager.get_user_settings(self.user_id)
+                        if self.user_id is not None else {}
+                    )
+                    effective_sync = resolve_user_basic_settings(
+                        global_sync_settings,
+                        personal_sync_settings,
+                    )['settings']
+                    item_sync_enabled = effective_sync['item_sync_enabled']
+                    item_sync_interval = effective_sync['item_sync_interval']
+                    item_sync_max_pages = effective_sync['item_sync_max_pages']
 
                     # 检查是否启用了商品同步功能
                     if not item_sync_enabled:
