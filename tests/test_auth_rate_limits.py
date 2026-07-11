@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import auth_registration_service as registration
 
@@ -460,7 +461,7 @@ class AuthRateLimiterTests(unittest.TestCase):
             account=final_account,
         )
 
-    def test_simultaneous_account_and_ip_thresholds_create_separate_lockouts(self):
+    def test_same_account_and_ip_thresholds_create_separate_lockouts(self):
         ip = "198.51.100.40"
         account = "same-target"
         for _ in range(4):
@@ -488,6 +489,59 @@ class AuthRateLimiterTests(unittest.TestCase):
             {(bool(ip_digest), bool(account_digest)) for ip_digest, account_digest in lockouts},
             {(False, True), (True, False)},
         )
+
+    def test_concurrent_failures_are_serialized_without_lost_events(self):
+        ip = "198.51.100.41"
+        account = "concurrent-target"
+        barrier = threading.Barrier(5)
+
+        def record_failure(_index):
+            connection = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                timeout=10,
+            )
+            limiter = AuthRateLimiter(
+                connection,
+                str(self.db_path),
+                lock=threading.RLock(),
+                clock=lambda: self.now,
+            )
+            try:
+                barrier.wait(timeout=10)
+                try:
+                    limiter.record_login_result(
+                        ip=ip,
+                        account=account,
+                        success=False,
+                    )
+                    return "recorded"
+                except RegistrationError as exc:
+                    return exc.code
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(record_failure, range(5)))
+
+        self.assertEqual(results.count("recorded"), 4)
+        self.assertEqual(results.count("RATE_LIMIT_LOGIN_ACCOUNT"), 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_rate_events "
+                "WHERE event_type = 'login' AND success = 0"
+            ).fetchone()[0],
+            5,
+        )
+        lockouts = self.connection.execute(
+            "SELECT ip_digest, account_digest FROM auth_rate_events "
+            "WHERE event_type = 'login_lockout' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            {(bool(ip_digest), bool(account_digest)) for ip_digest, account_digest in lockouts},
+            {(False, True), (True, False)},
+        )
+        self.assertEqual(len(lockouts), 2)
 
     def test_tenth_registration_failure_starts_ip_cooldown(self):
         ip = "203.0.113.90"

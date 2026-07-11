@@ -30,20 +30,46 @@ class AuthService:
         self.lock = lock or threading.RLock()
 
     def verify_password(self, username: str, password: str) -> bool:
-        user = self.users.get_by_identifier(username)
-        if not user or not user["is_active"]:
-            return False
-        if user["password_hash_v2"]:
-            return verify_user_password_hash(password, user["password_hash_v2"])
-        if not verify_legacy_sha256(password, user["password_hash"]):
-            return False
-        self.users.upgrade_password(
-            user["id"],
-            hash_user_password(password),
-            PASSWORD_HASH_VERSION,
-        )
-        self.users.connection.commit()
-        return True
+        connection = self.users.connection
+        with self.lock:
+            user = self.users.get_by_identifier(username)
+            if not user or not user["is_active"]:
+                return False
+            if user["password_hash_v2"]:
+                return verify_user_password_hash(password, user["password_hash_v2"])
+            legacy_hash = user["password_hash"]
+            if not verify_legacy_sha256(password, legacy_hash):
+                return False
+
+            owned_transaction = not connection.in_transaction
+            try:
+                updated = self.users.upgrade_password(
+                    user["id"],
+                    hash_user_password(password),
+                    PASSWORD_HASH_VERSION,
+                    expected_legacy_hash=legacy_hash,
+                )
+                if updated == 1:
+                    if owned_transaction:
+                        connection.commit()
+                    return True
+                if owned_transaction:
+                    connection.rollback()
+            except Exception:
+                if owned_transaction:
+                    connection.rollback()
+                raise
+
+            current = self.users.get_by_id(user["id"])
+            return bool(
+                current
+                and current["is_active"]
+                and current["password_hash_v2"]
+                and verify_user_password_hash(
+                    password,
+                    current["password_hash_v2"],
+                )
+            )
 
     def set_user_active(self, user_id: int, is_active: bool) -> dict:
         connection = self.users.connection

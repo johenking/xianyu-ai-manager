@@ -211,12 +211,27 @@ class UserRepository:
 
     get_recent_users = list_recent
 
-    def upgrade_password(self, user_id: int, password_hash_v2: str, version: int) -> None:
-        self.connection.execute(
-            "UPDATE users SET password_hash_v2 = ?, password_hash_version = ?, "
-            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (password_hash_v2, version, user_id),
+    def upgrade_password(
+        self,
+        user_id: int,
+        password_hash_v2: str,
+        version: int,
+        *,
+        expected_legacy_hash: str,
+    ) -> int:
+        cursor = self.connection.execute(
+            "UPDATE users SET password_hash = '', password_hash_v2 = ?, "
+            "password_hash_version = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ? AND password_hash = ? "
+            "AND COALESCE(password_hash_v2, '') = ''",
+            (
+                password_hash_v2,
+                version,
+                user_id,
+                expected_legacy_hash,
+            ),
         )
+        return cursor.rowcount
 
 
 class AuthSessionRepository:

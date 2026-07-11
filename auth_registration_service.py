@@ -1057,7 +1057,6 @@ class RegistrationService:
             password,
             username_normalized=username_identity.normalized,
         )
-        password_hash = hash_user_password(password)
         invite_digest = self._invite_digest(str(invite_code))
         now = self.clock()
         failed_challenge: RegistrationError | None = None
@@ -1092,6 +1091,7 @@ class RegistrationService:
                 if self.users.get_by_email(email_identity.normalized) is not None:
                     raise RegistrationError("EMAIL_TAKEN", "邮箱已被使用")
 
+                password_hash = hash_user_password(password)
                 user_id = self.users.create(
                     username_identity.value,
                     email_identity.value,
@@ -1169,7 +1169,6 @@ class RegistrationService:
             new_password,
             username_normalized=initial_user["username_normalized"],
         )
-        password_hash = hash_user_password(new_password)
         now = self.clock()
         failed_challenge: RegistrationError | None = None
         user_id = int(initial_user["id"])
@@ -1200,6 +1199,7 @@ class RegistrationService:
                 ):
                     raise _WrongChallengeSecret
 
+                password_hash = hash_user_password(new_password)
                 user_id = int(user["id"])
                 if (
                     self.users.set_password_by_id(

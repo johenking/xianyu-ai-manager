@@ -216,7 +216,7 @@ class CredentialCompatibilityTests(unittest.TestCase):
             "SELECT password_hash, password_hash_v2, password_hash_version "
             "FROM users WHERE username = 'legacy-user'"
         ).fetchone()
-        self.assertEqual(legacy, legacy_hash)
+        self.assertEqual(legacy, "")
         self.assertTrue(upgraded.startswith("$2"))
         self.assertEqual(version, 2)
 

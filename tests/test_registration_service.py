@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -8,10 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import textwrap
+from unittest.mock import patch
 
 import auth_registration_service as registration
 from repositories.auth_repository import AuthSessionRepository, UserRepository
-from security_utils import verify_user_password_hash
+from security_utils import hash_user_password, verify_user_password_hash
 from services.auth_service import AuthService
 
 
@@ -592,6 +594,43 @@ class RegistrationServiceFixture(unittest.TestCase):
 
 
 class RegistrationTransactionTests(RegistrationServiceFixture):
+    def test_invalid_registration_credentials_do_not_run_bcrypt(self):
+        invite, challenge, _secret = self.issue_registration_challenge(
+            "no-hash@example.com"
+        )
+
+        with patch.object(
+            registration,
+            "hash_user_password",
+            side_effect=AssertionError("bcrypt must not run"),
+        ) as password_hasher:
+            self.assert_error_code(
+                "INVITE_INVALID",
+                lambda: self.service.register_user(
+                    username="no-hash-user",
+                    email="no-hash@example.com",
+                    password="Strong-pass-2026!",
+                    invite_code="REG-NOT-A-REAL-INVITE",
+                    challenge_id=challenge["challenge_id"],
+                    verification_code="482615",
+                    terms_version="v1",
+                ),
+            )
+            self.assert_error_code(
+                "CHALLENGE_SECRET_INVALID",
+                lambda: self.service.register_user(
+                    username="no-hash-user",
+                    email="no-hash@example.com",
+                    password="Strong-pass-2026!",
+                    invite_code=invite["code"],
+                    challenge_id=challenge["challenge_id"],
+                    verification_code="000000",
+                    terms_version="v1",
+                ),
+            )
+
+        password_hasher.assert_not_called()
+
     def test_registration_commits_user_invite_and_challenge_together(self):
         self.assertTrue(
             hasattr(self.service, "register_user"),
@@ -952,6 +991,84 @@ class PasswordResetAndAccountStateTests(RegistrationServiceFixture):
             ).fetchone()[0],
             1,
         )
+
+    def test_invalid_reset_code_does_not_run_bcrypt(self):
+        self.create_user()
+        challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+
+        with patch.object(
+            registration,
+            "hash_user_password",
+            side_effect=AssertionError("bcrypt must not run"),
+        ) as password_hasher:
+            self.assert_error_code(
+                "CHALLENGE_SECRET_INVALID",
+                lambda: self.service.reset_password(
+                    email="reset@example.com",
+                    new_password="Another-pass-2026!",
+                    challenge_id=challenge["challenge_id"],
+                    verification_code="000000",
+                ),
+            )
+
+        password_hasher.assert_not_called()
+
+    def test_legacy_upgrade_cannot_overwrite_a_concurrent_password_reset(self):
+        legacy_password = "legacy-pass"
+        legacy_hash = hashlib.sha256(legacy_password.encode("utf-8")).hexdigest()
+        self.connection.execute(
+            "INSERT INTO users ("
+            "username, username_normalized, email, email_normalized, password_hash"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                "legacy-race",
+                "legacy-race",
+                "legacy-race@example.com",
+                "legacy-race@example.com",
+                legacy_hash,
+            ),
+        )
+        self.connection.commit()
+        reset_hash = hash_user_password("Reset-pass-2026!")
+        candidate_upgrade = hash_user_password(legacy_password)
+        second_connection = sqlite3.connect(self.db_path, timeout=10)
+        auth = AuthService(
+            UserRepository(self.connection),
+            AuthSessionRepository(self.connection),
+            lock=threading.RLock(),
+        )
+
+        def reset_before_upgrade(_password):
+            second_connection.execute(
+                "UPDATE users SET password_hash = '', password_hash_v2 = ?, "
+                "password_hash_version = 2 WHERE username_normalized = ?",
+                (reset_hash, "legacy-race"),
+            )
+            second_connection.commit()
+            return candidate_upgrade
+
+        try:
+            with patch(
+                "services.auth_service.hash_user_password",
+                side_effect=reset_before_upgrade,
+            ):
+                self.assertFalse(
+                    auth.verify_password("legacy-race", legacy_password)
+                )
+        finally:
+            second_connection.close()
+
+        stored_legacy, stored_v2 = self.connection.execute(
+            "SELECT password_hash, password_hash_v2 FROM users "
+            "WHERE username_normalized = 'legacy-race'"
+        ).fetchone()
+        self.assertEqual(stored_legacy, "")
+        self.assertEqual(stored_v2, reset_hash)
+        self.assertTrue(verify_user_password_hash("Reset-pass-2026!", stored_v2))
 
     def test_account_service_deactivation_revokes_sessions_and_protects_admin(self):
         user = self.create_user(username="ordinary-user", email="ordinary@example.com")
