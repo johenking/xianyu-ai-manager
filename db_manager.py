@@ -9,6 +9,7 @@ import string
 import aiohttp
 import io
 import base64
+import binascii
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
@@ -3751,6 +3752,76 @@ class DBManager:
                 logger.error(f"导出备份失败: {e}")
                 raise
 
+    @staticmethod
+    def _looks_like_fernet_ciphertext(value: str) -> bool:
+        if not value.startswith('fernet:'):
+            return False
+        token = value.rsplit(':', 1)[-1]
+        try:
+            decoded = base64.b64decode(
+                token.encode('ascii'),
+                altchars=b'-_',
+                validate=True,
+            )
+        except (binascii.Error, UnicodeError, ValueError):
+            return False
+        return len(decoded) >= 73 and decoded[0] == 0x80
+
+    def _normalize_imported_smtp_password(self, value: Any) -> tuple[str, bool]:
+        imported_value = str(value if value is not None else '')
+        if not imported_value:
+            return '', False
+
+        cipher = SystemSecretCipher(self.db_path)
+        if imported_value.startswith(SYSTEM_SECRET_PREFIX):
+            try:
+                cipher.decrypt(imported_value)
+            except ValueError:
+                if self._looks_like_fernet_ciphertext(imported_value):
+                    return '', True
+                return cipher.encrypt(imported_value), False
+            return imported_value, False
+        if self._looks_like_fernet_ciphertext(imported_value):
+            return '', True
+        return cipher.encrypt(imported_value), False
+
+    def _prepare_imported_system_settings(
+        self,
+        columns: List[str],
+        rows: List[List[Any]],
+    ) -> tuple[List[List[Any]], bool, bool]:
+        try:
+            key_index = columns.index('key')
+            value_index = columns.index('value')
+        except ValueError as exc:
+            raise ValueError("系统设置备份缺少必要字段") from exc
+
+        prepared_rows = []
+        smtp_settings_imported = False
+        smtp_reconfiguration_required = False
+        for row in rows:
+            prepared_row = list(row)
+            key = str(prepared_row[key_index])
+            if key.startswith('smtp_'):
+                smtp_settings_imported = True
+            if key == 'smtp_password':
+                normalized, requires_reconfiguration = (
+                    self._normalize_imported_smtp_password(
+                        prepared_row[value_index]
+                    )
+                )
+                prepared_row[value_index] = normalized
+                smtp_reconfiguration_required |= requires_reconfiguration
+            elif key in {'smtp_verified_fingerprint', 'smtp_verified_at'}:
+                prepared_row[value_index] = ''
+            prepared_rows.append(prepared_row)
+
+        return (
+            prepared_rows,
+            smtp_settings_imported,
+            smtp_reconfiguration_required,
+        )
+
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
         """导入系统备份数据（支持用户隔离）"""
         with self.lock:
@@ -3798,6 +3869,8 @@ class DBManager:
 
                 # 导入数据
                 data = backup_data['data']
+                smtp_settings_imported = False
+                smtp_reconfiguration_required = False
                 for table_name, table_data in data.items():
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
@@ -3811,6 +3884,15 @@ class DBManager:
 
                     if not rows:
                         continue
+
+                    if table_name == 'system_settings':
+                        (
+                            rows,
+                            imported_smtp_settings,
+                            imported_smtp_reconfiguration,
+                        ) = self._prepare_imported_system_settings(columns, rows)
+                        smtp_settings_imported |= imported_smtp_settings
+                        smtp_reconfiguration_required |= imported_smtp_reconfiguration
 
                     # 如果是用户级导入，需要确保cookies表的user_id正确
                     if user_id is not None and table_name == 'cookies':
@@ -3827,14 +3909,34 @@ class DBManager:
 
                     if table_name == 'system_settings':
                         # 系统设置需要特殊处理，避免覆盖管理员密码
+                        key_index = columns.index('key')
                         for row in rows:
-                            if len(row) >= 1 and row[0] != 'admin_password_hash':
+                            if row[key_index] != 'admin_password_hash':
                                 cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
                     else:
                         cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
 
+                if smtp_settings_imported:
+                    cursor.executemany(
+                        """
+                        INSERT INTO system_settings (key, value, description, updated_at)
+                        VALUES (?, '', ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = '',
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            ('smtp_verified_fingerprint', 'SMTP verification fingerprint'),
+                            ('smtp_verified_at', 'SMTP verification time'),
+                        ),
+                    )
+
                 # 提交事务
                 self.conn.commit()
+                if smtp_reconfiguration_required:
+                    logger.warning(
+                        "导入的 SMTP 密码无法由当前系统密钥解密，已清空，请重新配置"
+                    )
                 logger.info("导入备份成功")
                 return True
 

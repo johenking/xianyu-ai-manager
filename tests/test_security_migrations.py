@@ -12,6 +12,7 @@ from schema_migrations import Migration, MigrationRunner
 from security_utils import (
     SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
+    SystemSecretCipher,
     token_digest,
 )
 
@@ -180,6 +181,23 @@ class CredentialCompatibilityTests(unittest.TestCase):
         else:
             os.environ["SYSTEM_SECRET_ENCRYPTION_KEY"] = self.previous_system_key
         self.tempdir.cleanup()
+
+    def import_system_settings(self, settings: list[tuple[str, str]]) -> bool:
+        rows = [
+            [key, value, f"Imported {key}", None]
+            for key, value in settings
+        ]
+        return self.db.import_backup(
+            {
+                "version": "synthetic-test",
+                "data": {
+                    "system_settings": {
+                        "columns": ["key", "value", "description", "updated_at"],
+                        "rows": rows,
+                    }
+                },
+            }
+        )
 
     def test_legacy_user_login_upgrades_to_bcrypt(self):
         legacy_hash = hashlib.sha256(b"legacy-pass").hexdigest()
@@ -368,6 +386,118 @@ class CredentialCompatibilityTests(unittest.TestCase):
         self.assertNotIn("synthetic-registration_invites-digest", output)
         self.assertNotIn("synthetic-auth_rate_events-digest", output)
         self.assertGreaterEqual(output.count("[REDACTED]"), 3)
+
+    def test_imported_smtp_password_is_normalized_without_plaintext_at_rest(self):
+        cipher = SystemSecretCipher(str(self.db_path))
+        current_ciphertext = cipher.encrypt("current-instance-smtp-secret")
+        cases = (
+            ("empty", "", "", ""),
+            (
+                "current ciphertext",
+                current_ciphertext,
+                current_ciphertext,
+                "current-instance-smtp-secret",
+            ),
+            (
+                "legacy plaintext",
+                "legacy-smtp-secret",
+                None,
+                "legacy-smtp-secret",
+            ),
+            (
+                "legacy prefix plaintext",
+                "fernet:v0:legacy-smtp-secret",
+                None,
+                "fernet:v0:legacy-smtp-secret",
+            ),
+            (
+                "current prefix plaintext",
+                SYSTEM_SECRET_PREFIX + "legacy-smtp-secret",
+                None,
+                SYSTEM_SECRET_PREFIX + "legacy-smtp-secret",
+            ),
+        )
+
+        for label, imported_value, exact_storage, expected_plaintext in cases:
+            with self.subTest(label=label):
+                self.assertTrue(
+                    self.import_system_settings(
+                        [
+                            ("smtp_server", "smtp.example.test"),
+                            ("smtp_password", imported_value),
+                            ("smtp_verified_fingerprint", "stale-fingerprint"),
+                            ("smtp_verified_at", "2000-01-01T00:00:00"),
+                        ]
+                    )
+                )
+                stored = dict(
+                    self.db.conn.execute(
+                        "SELECT key, value FROM system_settings"
+                    ).fetchall()
+                )
+                if exact_storage is None:
+                    self.assertTrue(
+                        stored["smtp_password"].startswith(SYSTEM_SECRET_PREFIX)
+                    )
+                    self.assertNotEqual(stored["smtp_password"], imported_value)
+                else:
+                    self.assertEqual(stored["smtp_password"], exact_storage)
+                self.assertEqual(
+                    self.db.get_system_setting("smtp_password"),
+                    expected_plaintext,
+                )
+                self.assertEqual(stored["smtp_verified_fingerprint"], "")
+                self.assertEqual(stored["smtp_verified_at"], "")
+
+    def test_imported_foreign_smtp_ciphertext_is_cleared_and_requires_reconfiguration(self):
+        foreign_cipher = SystemSecretCipher(
+            str(self.root / "foreign.db"),
+            secret="synthetic-foreign-instance-key",
+        )
+        foreign_plaintext = "foreign-instance-smtp-secret"
+        foreign_values = (
+            ("current prefix", foreign_cipher.encrypt(foreign_plaintext)),
+            (
+                "legacy prefix",
+                "fernet:v0:"
+                + foreign_cipher.fernet.encrypt(
+                    foreign_plaintext.encode("utf-8")
+                ).decode("ascii"),
+            ),
+        )
+        for label, foreign_ciphertext in foreign_values:
+            with self.subTest(label=label):
+                messages = []
+                sink_id = logger.add(
+                    messages.append,
+                    format="{message}",
+                    level="WARNING",
+                )
+                try:
+                    imported = self.import_system_settings(
+                        [
+                            ("smtp_password", foreign_ciphertext),
+                            ("smtp_verified_fingerprint", "foreign-fingerprint"),
+                            ("smtp_verified_at", "2000-01-01T00:00:00"),
+                        ]
+                    )
+                finally:
+                    logger.remove(sink_id)
+
+                self.assertTrue(imported)
+                stored = dict(
+                    self.db.conn.execute(
+                        "SELECT key, value FROM system_settings"
+                    ).fetchall()
+                )
+                self.assertEqual(stored["smtp_password"], "")
+                self.assertEqual(self.db.get_system_setting("smtp_password"), "")
+                self.assertEqual(stored["smtp_verified_fingerprint"], "")
+                self.assertEqual(stored["smtp_verified_at"], "")
+                output = "".join(str(message) for message in messages)
+                self.assertIn("重新配置", output)
+                self.assertNotIn(foreign_plaintext, output)
+                self.assertNotIn(foreign_ciphertext, output)
 
 
 if __name__ == "__main__":
