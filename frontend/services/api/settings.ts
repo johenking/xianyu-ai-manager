@@ -23,8 +23,23 @@ export const verifySettingsSection = async (
   section: 'ai' | 'smtp',
   settings: Partial<SystemSettings>,
   secretActions: Record<string, 'keep' | 'set' | 'clear'> = {},
-): Promise<{ success: boolean; state: string; message: string }> => {
+): Promise<{
+  success: boolean;
+  state: string;
+  message: string;
+  challenge_id?: string;
+  expires_in?: number;
+  recipient?: string;
+  masked_recipient?: string;
+}> => {
   return post(`/api/settings/verify/${section}`, { settings, secret_actions: secretActions });
+};
+
+export const confirmSmtpVerification = async (data: {
+  challenge_id: string;
+  verification_code: string;
+}): Promise<{ success: boolean; state: string; message: string }> => {
+  return post('/api/settings/verify/smtp/confirm', data);
 };
 
 export const updateSystemSettings = async (settings: Partial<SystemSettings>): Promise<ApiResponse> => {

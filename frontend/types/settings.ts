@@ -42,7 +42,9 @@ export interface SettingsSummary {
     ready: boolean;
     requested: boolean;
     smtp_verified: boolean;
-    active_invite_available: boolean;
+    user_limit: number;
+    user_count: number;
+    remaining_slots: number;
     terms_version?: string;
   };
   runtime: {

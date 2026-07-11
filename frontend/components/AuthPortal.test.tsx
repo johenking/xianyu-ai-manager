@@ -25,12 +25,12 @@ vi.mock('../services/api', () => ({
 const readyConfig = {
   enabled: true,
   ready: true,
-  invite_required: true,
-  terms_version: 'v1',
+  invite_required: false,
+  terms_version: 'v2',
   terms_url: '/terms',
   privacy_url: '/privacy',
   support_email: 'support@example.com',
-  message: '邀请注册已开放',
+  message: '注册已开放',
 };
 
 describe('AuthPortal', () => {
@@ -90,7 +90,8 @@ describe('AuthPortal', () => {
     render(<AuthPortal onAuthenticated={onAuthenticated} />);
 
     expect(await screen.findByAltText('图形验证码')).toHaveAttribute('src', expect.stringContaining('data:image/png'));
-    fireEvent.change(screen.getByLabelText('邀请码'), { target: { value: 'INVITE-ONE' } });
+    expect(screen.queryByLabelText('邀请码')).not.toBeInTheDocument();
+    expect(screen.queryByText(/邀请/)).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'Pilot@Example.com' } });
     fireEvent.change(screen.getByLabelText('图形验证码'), { target: { value: 'AB12' } });
     fireEvent.click(screen.getByRole('button', { name: '发送邮件验证码' }));
@@ -98,7 +99,6 @@ describe('AuthPortal', () => {
     await waitFor(() => expect(sendAuthEmailCode).toHaveBeenCalledWith({
       purpose: 'register',
       email: 'Pilot@Example.com',
-      invite_code: 'INVITE-ONE',
       captcha_challenge_id: 'captcha-1',
       captcha_code: 'AB12',
     }));
@@ -112,13 +112,12 @@ describe('AuthPortal', () => {
     fireEvent.click(screen.getByRole('button', { name: '完成注册' }));
 
     await waitFor(() => expect(registerAccount).toHaveBeenCalledWith({
-      invite_code: 'INVITE-ONE',
       email: 'Pilot@Example.com',
       challenge_id: 'email-1',
       verification_code: '482615',
       username: 'pilot-user',
       password: 'Pilot-pass-2026!',
-      terms_version: 'v1',
+      terms_version: 'v2',
       terms_accepted: true,
     }));
     await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith('register-token'));
@@ -130,12 +129,12 @@ describe('AuthPortal', () => {
       ...readyConfig,
       enabled: false,
       ready: false,
-      message: '邀请注册暂未开放',
+      message: '注册暂未开放',
     });
 
     render(<AuthPortal onAuthenticated={vi.fn()} />);
 
-    expect(await screen.findByText('邀请注册暂未开放')).toBeInTheDocument();
+    expect(await screen.findByText('注册暂未开放')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '发送邮件验证码' })).toBeDisabled();
     expect(createAuthCaptcha).not.toHaveBeenCalled();
   });
@@ -168,9 +167,9 @@ describe('AuthPortal', () => {
   it('supports direct legal routes and history navigation between auth views', async () => {
     render(<AuthPortal onAuthenticated={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole('button', { name: '邀请注册' }));
+    fireEvent.click(screen.getByRole('button', { name: '注册账号' }));
     expect(window.location.pathname).toBe('/register');
-    expect(await screen.findByRole('heading', { name: '创建受邀账号' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '创建账号' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '忘记密码' }));
     expect(window.location.pathname).toBe('/forgot-password');

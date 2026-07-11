@@ -11,7 +11,6 @@ import {
   Mail,
   RefreshCw,
   ShieldCheck,
-  TicketCheck,
   User,
 } from 'lucide-react';
 import {
@@ -31,12 +30,12 @@ const USERNAME_PATTERN = /^[\p{L}\p{N}_-]{3,24}$/u;
 const FALLBACK_CONFIG: RegistrationConfig = {
   enabled: false,
   ready: false,
-  invite_required: true,
-  terms_version: 'v1',
+  invite_required: false,
+  terms_version: 'v2',
   terms_url: '/terms',
   privacy_url: '/privacy',
   support_email: '',
-  message: '邀请注册暂未开放',
+  message: '注册暂未开放',
 };
 
 const currentAuthPath = (): PublicAuthPath => {
@@ -78,7 +77,6 @@ interface EmailChallengeState {
 
 const useEmailChallenge = (
   purpose: 'register' | 'password_reset',
-  inviteCode: string,
   enabled: boolean,
 ): EmailChallengeState => {
   const [email, setEmail] = useState('');
@@ -117,7 +115,7 @@ const useEmailChallenge = (
   useEffect(() => {
     setEmailChallengeId('');
     setNotice('');
-  }, [email, inviteCode]);
+  }, [email]);
 
   useEffect(() => {
     if (cooldown <= 0) return undefined;
@@ -138,10 +136,6 @@ const useEmailChallenge = (
       setError('请输入有效邮箱');
       return;
     }
-    if (purpose === 'register' && !inviteCode.trim()) {
-      setError('请输入邀请码');
-      return;
-    }
     if (!captchaChallengeId || !captchaCode.trim()) {
       setError('请输入图形验证码');
       return;
@@ -152,7 +146,6 @@ const useEmailChallenge = (
       const response = await sendAuthEmailCode({
         purpose,
         email: email.trim(),
-        invite_code: purpose === 'register' ? inviteCode.trim() : '',
         captcha_challenge_id: captchaChallengeId,
         captcha_code: captchaCode.trim(),
       });
@@ -349,7 +342,6 @@ const RegistrationForm: React.FC<{
   loadingConfig: boolean;
   onAuthenticated: (token: string) => void;
 }> = ({ config, loadingConfig, onAuthenticated }) => {
-  const [inviteCode, setInviteCode] = useState('');
   const [verificationCode, setVerificationCode] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -357,13 +349,12 @@ const RegistrationForm: React.FC<{
   const [accepted, setAccepted] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const verification = useEmailChallenge('register', inviteCode, config.enabled);
+  const verification = useEmailChallenge('register', config.enabled);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setError('');
-    if (!config.enabled) return setError(config.message || '邀请注册暂未开放');
-    if (!inviteCode.trim()) return setError('请输入邀请码');
+    if (!config.enabled) return setError(config.message || '注册暂未开放');
     if (!verification.emailChallengeId || !/^\d{6}$/.test(verificationCode)) return setError('请先完成邮箱验证');
     if (!USERNAME_PATTERN.test(username)) return setError('用户名需为 3–24 位字母、数字、下划线或短横线');
     const passwordError = validatePassword(password, username);
@@ -374,7 +365,6 @@ const RegistrationForm: React.FC<{
     setSubmitting(true);
     try {
       const response = await registerAccount({
-        invite_code: inviteCode.trim(),
         email: verification.email.trim(),
         challenge_id: verification.emailChallengeId,
         verification_code: verificationCode,
@@ -395,11 +385,10 @@ const RegistrationForm: React.FC<{
   return (
     <form onSubmit={submit} className="space-y-5">
       <div>
-        <h1 className="text-2xl font-extrabold text-gray-950">创建受邀账号</h1>
-        <p className="mt-1.5 text-sm text-gray-500">单次邀请码与邮箱验证码共同确认身份</p>
+        <h1 className="text-2xl font-extrabold text-gray-950">创建账号</h1>
+        <p className="mt-1.5 text-sm text-gray-500">通过邮箱验证码确认身份</p>
       </div>
-      {loadingConfig ? <Notice>正在检查注册状态...</Notice> : !config.enabled ? <Notice tone="error">{config.message}</Notice> : <Notice tone="success">邀请注册已开放，邀请码成功使用后立即失效。</Notice>}
-      <InputField label="邀请码" value={inviteCode} onChange={setInviteCode} autoComplete="off" placeholder="输入管理员提供的邀请码" icon={TicketCheck} />
+      {loadingConfig ? <Notice>正在检查注册状态...</Notice> : !config.enabled ? <Notice tone="error">{config.message}</Notice> : <Notice tone="success">注册已开放，请完成邮箱验证。</Notice>}
       <VerificationFields state={verification} verificationCode={verificationCode} onVerificationCodeChange={setVerificationCode} disabled={!config.enabled} />
       <InputField label="用户名" value={username} onChange={setUsername} autoComplete="username" placeholder="3–24 位字母、数字、_ 或 -" icon={User} maxLength={24} />
       <div className="grid gap-4 sm:grid-cols-2">
@@ -424,7 +413,7 @@ const PasswordResetForm: React.FC<{ onComplete: (message: string) => void }> = (
   const [confirmPassword, setConfirmPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
-  const verification = useEmailChallenge('password_reset', '', true);
+  const verification = useEmailChallenge('password_reset', true);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -486,7 +475,7 @@ const LegalPage: React.FC<{
       </div>
       {kind === 'terms' ? (
         <>
-          <section><h2 className="font-extrabold text-gray-950">账号与使用</h2><p>账号仅供获邀用户使用。用户应妥善保管登录凭据，不得尝试绕过闲鱼平台风控、冒用他人身份或将系统用于违法用途。</p></section>
+          <section><h2 className="font-extrabold text-gray-950">账号与使用</h2><p>用户应妥善保管登录凭据，不得尝试绕过闲鱼平台风控、冒用他人身份或将系统用于违法用途。</p></section>
           <section><h2 className="font-extrabold text-gray-950">自动化边界</h2><p>系统会按用户配置执行监听、回复、通知和 Cookie 续期。平台要求短信、扫码、人脸或其他人工验证时，用户必须自行完成，系统不承诺持续绕过或永久免验证。</p></section>
           <section><h2 className="font-extrabold text-gray-950">账号处置</h2><p>管理员可在安全、滥用或运营需要下停用普通账号。密码重置会撤销该账号的全部旧登录会话。</p></section>
         </>
@@ -530,7 +519,7 @@ const AuthPortal: React.FC<{ onAuthenticated: (token: string) => void }> = ({ on
   useEffect(() => {
     const labels: Record<PublicAuthPath, string> = {
       '/login': '登录',
-      '/register': '邀请注册',
+      '/register': '注册',
       '/forgot-password': '找回密码',
       '/terms': '服务条款',
       '/privacy': '隐私说明',
@@ -569,7 +558,7 @@ const AuthPortal: React.FC<{ onAuthenticated: (token: string) => void }> = ({ on
       <div className={`mx-auto w-full ${panelWidth}`}>
         <header className="mb-5 flex items-center justify-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-[#FFE815] text-xl font-extrabold shadow-sm">闲</div>
-          <div><div className="text-lg font-extrabold">闲鱼智控</div><div className="text-xs text-gray-500">邀请制自动化控制台</div></div>
+          <div><div className="text-lg font-extrabold">闲鱼智控</div><div className="text-xs text-gray-500">自动化控制台</div></div>
         </header>
 
         <main className="rounded-lg border border-gray-200 bg-white p-5 shadow-[0_16px_45px_rgba(0,0,0,0.06)] sm:p-7">
@@ -577,7 +566,7 @@ const AuthPortal: React.FC<{ onAuthenticated: (token: string) => void }> = ({ on
             <nav aria-label="认证方式" className="mb-7 grid grid-cols-3 rounded-lg bg-gray-100 p-1">
               {([
                 ['/login', '账号登录'],
-                ['/register', '邀请注册'],
+                ['/register', '注册账号'],
                 ['/forgot-password', '忘记密码'],
               ] as const).map(([target, label]) => (
                 <button
@@ -595,7 +584,7 @@ const AuthPortal: React.FC<{ onAuthenticated: (token: string) => void }> = ({ on
           {content}
         </main>
 
-        <footer className="mt-4 text-center text-xs text-gray-400">Xianyu AI Manager v1.6.0</footer>
+        <footer className="mt-4 text-center text-xs text-gray-400">Xianyu AI Manager v1.7.0</footer>
       </div>
     </div>
   );

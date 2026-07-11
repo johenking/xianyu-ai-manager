@@ -8,9 +8,9 @@ import {
   getAIProviders,
   getRegistrationAdminStatus,
   getSettingsSummary,
-  listRegistrationInvites,
   listRegistrationUsers,
   saveSettingsSection,
+  confirmSmtpVerification,
   verifySettingsSection,
 } from '../services/api';
 import { SettingsSummary } from '../types';
@@ -19,11 +19,9 @@ import Settings from './Settings';
 vi.mock('../services/api', () => ({
   getSettingsSummary: vi.fn(),
   getRegistrationAdminStatus: vi.fn(),
-  listRegistrationInvites: vi.fn(),
   listRegistrationUsers: vi.fn(),
-  createRegistrationInvites: vi.fn(),
-  revokeRegistrationInvite: vi.fn(),
   setRegistrationEnabled: vi.fn(),
+  setRegistrationLimit: vi.fn(),
   setRegistrationUserActive: vi.fn(),
   getAIProviders: vi.fn(),
   createAIProvider: vi.fn(),
@@ -32,6 +30,7 @@ vi.mock('../services/api', () => ({
   refreshAIProviderModels: vi.fn(),
   testAIProvider: vi.fn(),
   saveSettingsSection: vi.fn(),
+  confirmSmtpVerification: vi.fn(),
   verifySettingsSection: vi.fn(),
 }));
 
@@ -66,14 +65,16 @@ describe('Settings configuration sections', () => {
     vi.mocked(getAIProviders).mockResolvedValue({ providers: [], presets: {} });
     vi.mocked(getRegistrationAdminStatus).mockResolvedValue({
       success: true,
-      registration: { enabled: false, ready: false, requested: false, terms_version: 'v1' },
+      registration: { enabled: false, ready: false, requested: false, terms_version: 'v2' },
       smtp: { configured: false, verified: false, verified_at: '', support_email: '' },
-      invites: { active: 0, used: 0, expired: 0, revoked: 0 },
+      user_limit: 20,
+      user_count: 0,
+      remaining_slots: 20,
     });
-    vi.mocked(listRegistrationInvites).mockResolvedValue({ success: true, invites: [] });
     vi.mocked(listRegistrationUsers).mockResolvedValue({ success: true, users: [] });
     vi.mocked(saveSettingsSection).mockReset();
     vi.mocked(verifySettingsSection).mockReset();
+    vi.mocked(confirmSmtpVerification).mockReset();
   });
 
   afterEach(() => cleanup());
@@ -133,6 +134,48 @@ describe('Settings configuration sections', () => {
     expect(screen.queryByText('允许用户注册')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /SMTP 配置/ }));
     expect(screen.getByLabelText('支持邮箱')).toBeInTheDocument();
-    expect(screen.getByRole('switch', { name: '开放邀请注册' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: '开放注册' })).toBeDisabled();
+  });
+
+  it('applies the QQ Mail preset without filling an authorization code', async () => {
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'QQ 邮箱预设' }));
+
+    expect(screen.getByLabelText('SMTP 服务器')).toHaveValue('smtp.qq.com');
+    expect(screen.getByLabelText('端口')).toHaveValue(465);
+    expect(screen.getByRole('switch', { name: 'SSL' })).toBeChecked();
+    expect(screen.getByRole('switch', { name: 'STARTTLS' })).not.toBeChecked();
+    expect(screen.getByLabelText('邮箱授权码')).toHaveValue('');
+  });
+
+  it('requires the six-digit receipt code before SMTP is marked verified', async () => {
+    vi.mocked(verifySettingsSection).mockResolvedValue({
+      success: true,
+      state: 'challenge_sent',
+      message: '验证邮件已发送',
+      challenge_id: 'smtp-challenge-1',
+      expires_in: 600,
+      masked_recipient: 're***@example.com',
+    });
+    vi.mocked(confirmSmtpVerification).mockResolvedValue({
+      success: true,
+      state: 'verified',
+      message: 'SMTP 实收验证成功',
+    });
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+
+    expect(await screen.findByText(/re\*\*\*@example.com/)).toBeInTheDocument();
+    expect(screen.queryByText('已验证')).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
+    fireEvent.click(screen.getByRole('button', { name: '确认收件码' }));
+
+    await waitFor(() => expect(confirmSmtpVerification).toHaveBeenCalledWith({
+      challenge_id: 'smtp-challenge-1',
+      verification_code: '482615',
+    }));
+    expect(await screen.findByText('SMTP 实收验证成功')).toBeInTheDocument();
   });
 });

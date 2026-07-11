@@ -36,7 +36,6 @@ export interface AuthCaptchaResponse {
 export interface EmailCodeRequest {
   purpose: 'register' | 'password_reset';
   email: string;
-  invite_code: string;
   captcha_challenge_id: string;
   captcha_code: string;
 }
@@ -50,7 +49,6 @@ export interface EmailCodeResponse {
 }
 
 export interface RegistrationRequest {
-  invite_code: string;
   email: string;
   challenge_id: string;
   verification_code: string;
@@ -65,22 +63,6 @@ export interface PasswordResetRequest {
   challenge_id: string;
   verification_code: string;
   new_password: string;
-}
-
-export type RegistrationInviteStatus = 'active' | 'used' | 'expired' | 'revoked';
-
-export interface RegistrationInvite {
-  id: number;
-  code?: string;
-  hint: string;
-  note: string;
-  created_at: number;
-  expires_at: number;
-  used_at: number | null;
-  used_by_user_id: number | null;
-  revoked_at: number | null;
-  created_by_user_id: number | null;
-  status: RegistrationInviteStatus;
 }
 
 export interface RegistrationUser {
@@ -107,5 +89,7 @@ export interface RegistrationAdminStatus {
     verified_at: string;
     support_email: string;
   };
-  invites: Record<RegistrationInviteStatus, number>;
+  user_limit: number;
+  user_count: number;
+  remaining_slots: number;
 }

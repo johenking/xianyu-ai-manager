@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Bot, ChevronDown, Database, Eye, EyeOff, Loader2, Mail, RefreshCw, Save, Settings as SettingsIcon, TestTube2 } from 'lucide-react';
-import { getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
+import { confirmSmtpVerification, getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
 import { SettingsSectionKey, SettingsSummary, SystemSettings } from '../types';
 import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
@@ -36,6 +36,9 @@ const Settings: React.FC = () => {
   const [notice, setNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [showSecret, setShowSecret] = useState<Record<string, boolean>>({});
   const [registrationRefreshKey, setRegistrationRefreshKey] = useState(0);
+  const [smtpChallenge, setSmtpChallenge] = useState<{ id: string; recipient: string; expiresIn?: number } | null>(null);
+  const [smtpVerificationCode, setSmtpVerificationCode] = useState('');
+  const [confirmingSmtp, setConfirmingSmtp] = useState(false);
 
   const load = async () => {
     setNotice(null);
@@ -46,6 +49,8 @@ const Settings: React.FC = () => {
       setDraft({ ...next.settings, ai_api_key: '', smtp_password: '' });
       setSecretActions({ ai_api_key: 'keep', smtp_password: 'keep' });
       setVerificationState({});
+      setSmtpChallenge(null);
+      setSmtpVerificationCode('');
       setOpenSection(getInitialOpenSection(next.sections));
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '配置加载失败' });
@@ -63,7 +68,11 @@ const Settings: React.FC = () => {
   const update = (key: string, value: unknown) => {
     setDraft((current) => ({ ...current, [key]: value }));
     const section = (Object.keys(sectionFields) as SettingsSectionKey[]).find((candidate) => sectionFields[candidate].includes(key));
-    if (section) setVerificationState((current) => ({ ...current, [section]: undefined }));
+    if (section) setVerificationState((current) => ({ ...current, [section]: section === 'smtp' ? { state: 'missing', label: '待重新验证' } : undefined }));
+    if (section === 'smtp') {
+      setSmtpChallenge(null);
+      setSmtpVerificationCode('');
+    }
   };
 
   const save = async (section: SettingsSectionKey) => {
@@ -79,6 +88,10 @@ const Settings: React.FC = () => {
       setDraft({ ...result.settings, ai_api_key: '', smtp_password: '' });
       setSecretActions({ ai_api_key: 'keep', smtp_password: 'keep' });
       setVerificationState((current) => ({ ...current, [section]: undefined }));
+      if (section === 'smtp') {
+        setSmtpChallenge(null);
+        setSmtpVerificationCode('');
+      }
       setNotice({ tone: 'success', text: `${sectionMeta[section].title}已保存并确认（${result.saved_at.replace('T', ' ')}）` });
       if (section === 'smtp') setRegistrationRefreshKey((value) => value + 1);
       setOpenSection(null);
@@ -96,15 +109,61 @@ const Settings: React.FC = () => {
     try {
       const actions = section === 'ai' ? { ai_api_key: secretActions.ai_api_key || 'keep' } : { smtp_password: secretActions.smtp_password || 'keep' };
       const result = await verifySettingsSection(section, pickSection(draft, section) as Partial<SystemSettings>, actions);
-      setVerificationState((current) => ({ ...current, [section]: { state: 'ready', label: '可用' } }));
-      setNotice({ tone: 'success', text: result.message });
-      if (section === 'smtp') setRegistrationRefreshKey((value) => value + 1);
+      if (section === 'smtp') {
+        if (!result.challenge_id) throw new Error(result.message || '服务器未返回 SMTP 验证挑战');
+        setSmtpChallenge({ id: result.challenge_id, recipient: result.recipient || result.masked_recipient || '独立收件邮箱', expiresIn: result.expires_in });
+        setSmtpVerificationCode('');
+        setVerificationState((current) => ({ ...current, smtp: { state: 'checking', label: '待确认收件' } }));
+        setNotice({ tone: 'info', text: result.message });
+      } else {
+        setVerificationState((current) => ({ ...current, ai: { state: 'ready', label: '可用' } }));
+        setNotice({ tone: 'success', text: result.message });
+      }
     } catch (error) {
       setVerificationState((current) => ({ ...current, [section]: { state: 'error', label: '不可用' } }));
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '验证失败' });
     } finally {
       setVerifying(null);
     }
+  };
+
+  const confirmSmtp = async () => {
+    if (!smtpChallenge || !/^\d{6}$/.test(smtpVerificationCode)) {
+      setNotice({ tone: 'error', text: '请输入邮件中收到的 6 位验证码' });
+      return;
+    }
+    setConfirmingSmtp(true);
+    setNotice(null);
+    try {
+      const result = await confirmSmtpVerification({
+        challenge_id: smtpChallenge.id,
+        verification_code: smtpVerificationCode,
+      });
+      if (!result.success) throw new Error(result.message || 'SMTP 实收验证失败');
+      setVerificationState((current) => ({ ...current, smtp: { state: 'ready', label: '已验证' } }));
+      setSmtpChallenge(null);
+      setSmtpVerificationCode('');
+      setNotice({ tone: 'success', text: result.message });
+      setRegistrationRefreshKey((value) => value + 1);
+    } catch (error) {
+      setVerificationState((current) => ({ ...current, smtp: { state: 'error', label: '确认失败' } }));
+      setNotice({ tone: 'error', text: error instanceof Error ? error.message : 'SMTP 实收验证失败' });
+    } finally {
+      setConfirmingSmtp(false);
+    }
+  };
+
+  const applyQqMailPreset = () => {
+    setDraft((current) => ({
+      ...current,
+      smtp_server: 'smtp.qq.com',
+      smtp_port: 465,
+      smtp_use_ssl: true,
+      smtp_use_tls: false,
+    }));
+    setVerificationState((current) => ({ ...current, smtp: { state: 'missing', label: '待重新验证' } }));
+    setSmtpChallenge(null);
+    setSmtpVerificationCode('');
   };
 
   if (!summary) return <div className="p-8 text-center text-gray-500">{notice ? <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice> : '加载配置中...'}</div>;
@@ -155,13 +214,22 @@ const Settings: React.FC = () => {
         </div>}
 
         {openSection === 'smtp' && <div className="space-y-4">
-          <InlineNotice>注册和账号找回依赖已验证的 SMTP。修改任何连接配置后都需要重新验证，验证失败时公开注册保持关闭。</InlineNotice>
+          <InlineNotice>注册和账号找回依赖已验证的 SMTP。支持邮箱必须是独立、可收信的地址，并实际收到邮件后输入验证码确认。修改任何连接配置后都需要重新验证。</InlineNotice>
+          <button type="button" onClick={applyQqMailPreset} className="inline-flex h-10 items-center justify-center rounded-lg border border-gray-300 bg-white px-4 text-sm font-bold text-gray-800 hover:bg-gray-50">QQ 邮箱预设</button>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-[1fr_140px]"><Field label="SMTP 服务器" value={draft.smtp_server || ''} onChange={(v) => update('smtp_server', v)} placeholder="smtp.qq.com" /><Field label="端口" type="number" value={draft.smtp_port || 587} onChange={(v) => update('smtp_port', Number(v))} /></div>
           <Field label="发件邮箱" value={draft.smtp_user || ''} onChange={(v) => update('smtp_user', v)} placeholder="name@example.com" />
           <Field label="支持邮箱" value={draft.support_email || ''} onChange={(v) => update('support_email', v)} placeholder="用于协议页联系与 SMTP 送达验证" />
           <SecretField label="邮箱授权码" name="smtp_password" configured={Boolean(saved.smtp_password_configured)} masked={saved.smtp_password_masked || ''} value={draft.smtp_password || ''} show={Boolean(showSecret.smtp_password)} onToggle={() => setShowSecret((s) => ({ ...s, smtp_password: !s.smtp_password }))} onChange={(v) => { update('smtp_password', v); setSecretActions((s) => ({ ...s, smtp_password: v ? 'set' : 'keep' })); }} onClear={() => { update('smtp_password', ''); setSecretActions((s) => ({ ...s, smtp_password: 'clear' })); }} />
           <Field label="发件人显示名" value={draft.smtp_from || ''} onChange={(v) => update('smtp_from', v)} placeholder="闲鱼商品管理" />
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2"><ToggleRow label="STARTTLS" detail="常用于587端口" checked={Boolean(draft.smtp_use_tls ?? true)} onChange={(v) => update('smtp_use_tls', v)} /><ToggleRow label="SSL" detail="常用于465端口" checked={Boolean(draft.smtp_use_ssl)} onChange={(v) => update('smtp_use_ssl', v)} /></div>
+          {smtpChallenge ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
+            <p className="text-sm font-bold text-blue-900">验证邮件已发送至 {smtpChallenge.recipient}</p>
+            <p className="mt-1 text-xs text-blue-700">请检查该独立邮箱并输入 6 位收件码{smtpChallenge.expiresIn ? `，${Math.ceil(smtpChallenge.expiresIn / 60)} 分钟内有效` : ''}。</p>
+            <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+              <label className="block flex-1 text-sm font-bold text-gray-800">SMTP 收件验证码<input aria-label="SMTP 收件验证码" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={smtpVerificationCode} onChange={(event) => setSmtpVerificationCode(event.target.value.replace(/\D/g, ''))} placeholder="6 位数字" className="mt-2 h-10 w-full rounded-lg border border-blue-200 bg-white px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" /></label>
+              <button type="button" onClick={() => void confirmSmtp()} disabled={confirmingSmtp || !/^\d{6}$/.test(smtpVerificationCode)} className="mt-auto inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50">{confirmingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认收件码</button>
+            </div>
+          </div> : null}
         </div>}
 
         <div className="mt-7 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
