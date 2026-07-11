@@ -8,7 +8,7 @@ import threading
 import unittest
 from unittest import mock
 
-from schema_migrations import MigrationRunner
+from schema_migrations import MIGRATIONS, MigrationRunner
 import security_utils
 
 
@@ -236,7 +236,7 @@ class RegistrationMigrationTests(unittest.TestCase):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
 
-        self.assertEqual(runner.run(), ["2026071101"])
+        self.assertEqual(runner.run(), ["2026071101", "2026071102"])
         self.assertEqual(
             table_columns(connection, "users")
             & {
@@ -390,6 +390,47 @@ class RegistrationMigrationTests(unittest.TestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual("\n".join(connection.iterdump()), before_second_run)
         self.assertEqual(len(list((self.root / "backups").iterdir())), backup_count)
+        connection.close()
+
+    def test_upgrade_after_recorded_1101_repairs_non_nfkc_normalized_values(self):
+        connection = sqlite3.connect(self.db_path)
+        migrations_through_1101 = tuple(
+            migration
+            for migration in MIGRATIONS
+            if migration.version <= "2026071101"
+        )
+        legacy_runner = MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=migrations_through_1101,
+            backup_enabled=False,
+        )
+        self.assertEqual(legacy_runner.run(), ["2026071101"])
+        connection.execute(
+            "UPDATE users SET username = ?, email = ?, "
+            "username_normalized = ?, email_normalized = ?",
+            (
+                "Ａｌｉｃｅ",
+                " Ｕｓｅｒ＠Ｅxample.COM ",
+                "ａｌｉｃｅ",
+                "ｕｓｅｒ＠ｅxample.com",
+            ),
+        )
+        connection.commit()
+
+        runner = MigrationRunner(
+            connection,
+            str(self.db_path),
+            backup_enabled=False,
+        )
+        self.assertEqual(runner.run(), ["2026071102"])
+        self.assertEqual(
+            connection.execute(
+                "SELECT username_normalized, email_normalized FROM users"
+            ).fetchone(),
+            ("alice", "user@example.com"),
+        )
+        self.assertEqual(runner.run(), [])
         connection.close()
 
 

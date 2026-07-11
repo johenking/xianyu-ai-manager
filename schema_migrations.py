@@ -277,10 +277,32 @@ def _registration_security_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
             )
 
 
+def _registration_identity_nfkc_v2(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    normalized_users = _normalized_users(cursor)
+    cursor.execute(
+        "UPDATE users SET username_normalized = NULL, email_normalized = NULL"
+    )
+    cursor.executemany(
+        "UPDATE users SET username_normalized = ?, email_normalized = ? WHERE id = ?",
+        (
+            (username_normalized, email_normalized, user_id)
+            for user_id, username_normalized, email_normalized in normalized_users
+        ),
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
     Migration("2026071101", "registration_security_v1", _registration_security_v1),
+    Migration(
+        "2026071102",
+        "registration_identity_nfkc_v2",
+        _registration_identity_nfkc_v2,
+    ),
 )
 
 

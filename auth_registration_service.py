@@ -399,15 +399,25 @@ class AuthRateLimiter:
                         "ip_digest",
                         ip_digest,
                     )
-                    if account_failures >= 5 or ip_failures >= 5:
-                        lockout_at = int(self.clock())
-                        self._insert_event(
-                            "login_lockout",
-                            (ip_digest, "", account_digest),
-                            success=False,
-                            created_at=lockout_at,
-                        )
-                        if account_failures >= 5:
+                    account_locked = account_failures >= 5
+                    ip_locked = ip_failures >= 5
+                    if account_locked or ip_locked:
+                        lockout_at = self.clock()
+                        if account_locked:
+                            self._insert_event(
+                                "login_lockout",
+                                ("", "", account_digest),
+                                success=False,
+                                created_at=lockout_at,
+                            )
+                        if ip_locked:
+                            self._insert_event(
+                                "login_lockout",
+                                (ip_digest, "", ""),
+                                success=False,
+                                created_at=lockout_at,
+                            )
+                        if account_locked:
                             code = "RATE_LIMIT_LOGIN_ACCOUNT"
                             message = "登录失败次数过多，请稍后再试"
                         else:
@@ -416,7 +426,7 @@ class AuthRateLimiter:
                         deferred_error = self._rate_error(
                             code,
                             message,
-                            float(lockout_at),
+                            lockout_at,
                             900,
                         )
                 self.connection.commit()
@@ -540,7 +550,7 @@ class AuthRateLimiter:
         digests: tuple[str, str, str],
         *,
         success: bool,
-        created_at: int | None = None,
+        created_at: float | None = None,
     ) -> int:
         cursor = self.connection.execute(
             """
@@ -555,7 +565,7 @@ class AuthRateLimiter:
                 digests[1],
                 digests[2],
                 int(bool(success)),
-                int(self.clock()) if created_at is None else created_at,
+                self.clock() if created_at is None else created_at,
             ),
         )
         return int(cursor.lastrowid)

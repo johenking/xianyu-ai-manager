@@ -339,8 +339,8 @@ class AuthRateLimiterTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(lockout)
         self.assertTrue(lockout[0])
-        self.assertTrue(lockout[1])
-        self.assertEqual(lockout[2], int(self.now))
+        self.assertEqual(lockout[1], "")
+        self.assertEqual(lockout[2], self.now)
 
         self.now += 899
         self.assert_rate_error(
@@ -355,6 +355,138 @@ class AuthRateLimiterTests(unittest.TestCase):
         self.limiter.check_login_limit(
             ip="203.0.113.111",
             account=account,
+        )
+
+    def test_fractional_login_lockout_preserves_full_15_minute_cooldown(self):
+        self.now += 0.25
+        account = "fractional-account"
+        for index in range(4):
+            self.limiter.record_login_result(
+                ip=f"198.51.100.{10 + index}",
+                account=account,
+                success=False,
+            )
+
+        lockout_at = self.now
+        with self.assertRaises(RegistrationError) as raised:
+            self.limiter.record_login_result(
+                ip="198.51.100.14",
+                account=account,
+                success=False,
+            )
+        self.assertEqual(raised.exception.code, "RATE_LIMIT_LOGIN_ACCOUNT")
+        self.assertGreaterEqual(raised.exception.retry_after, 900)
+        stored_at, storage_type = self.connection.execute(
+            "SELECT created_at, typeof(created_at) FROM auth_rate_events "
+            "WHERE event_type = 'login_lockout'"
+        ).fetchone()
+        self.assertEqual(stored_at, lockout_at)
+        self.assertEqual(storage_type, "real")
+
+        self.now = lockout_at + 899.9
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_ACCOUNT",
+            1,
+            lambda: self.limiter.check_login_limit(
+                ip="198.51.100.15",
+                account=account,
+            ),
+        )
+        self.now = lockout_at + 900
+        self.limiter.check_login_limit(
+            ip="198.51.100.15",
+            account=account,
+        )
+
+    def test_account_lockout_does_not_lock_the_last_source_ip(self):
+        account = "target-account"
+        final_ip = "198.51.100.25"
+        for index in range(4):
+            self.limiter.record_login_result(
+                ip=f"198.51.100.{20 + index}",
+                account=account,
+                success=False,
+            )
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_ACCOUNT",
+            900,
+            lambda: self.limiter.record_login_result(
+                ip=final_ip,
+                account=account,
+                success=False,
+            ),
+        )
+
+        lockouts = self.connection.execute(
+            "SELECT ip_digest, account_digest FROM auth_rate_events "
+            "WHERE event_type = 'login_lockout'"
+        ).fetchall()
+        self.assertEqual(len(lockouts), 1)
+        self.assertEqual(lockouts[0][0], "")
+        self.assertTrue(lockouts[0][1])
+        self.limiter.check_login_limit(
+            ip=final_ip,
+            account="unrelated-account",
+        )
+
+    def test_ip_lockout_does_not_lock_the_last_target_account(self):
+        shared_ip = "198.51.100.30"
+        final_account = "target-final"
+        for index in range(4):
+            self.limiter.record_login_result(
+                ip=shared_ip,
+                account=f"target-{index}",
+                success=False,
+            )
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_IP",
+            900,
+            lambda: self.limiter.record_login_result(
+                ip=shared_ip,
+                account=final_account,
+                success=False,
+            ),
+        )
+
+        lockouts = self.connection.execute(
+            "SELECT ip_digest, account_digest FROM auth_rate_events "
+            "WHERE event_type = 'login_lockout'"
+        ).fetchall()
+        self.assertEqual(len(lockouts), 1)
+        self.assertTrue(lockouts[0][0])
+        self.assertEqual(lockouts[0][1], "")
+        self.limiter.check_login_limit(
+            ip="198.51.100.31",
+            account=final_account,
+        )
+
+    def test_simultaneous_account_and_ip_thresholds_create_separate_lockouts(self):
+        ip = "198.51.100.40"
+        account = "same-target"
+        for _ in range(4):
+            self.limiter.record_login_result(
+                ip=ip,
+                account=account,
+                success=False,
+            )
+        self.assert_rate_error(
+            "RATE_LIMIT_LOGIN_ACCOUNT",
+            900,
+            lambda: self.limiter.record_login_result(
+                ip=ip,
+                account=account,
+                success=False,
+            ),
+        )
+
+        lockouts = self.connection.execute(
+            "SELECT ip_digest, account_digest FROM auth_rate_events "
+            "WHERE event_type = 'login_lockout' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(lockouts), 2)
+        self.assertEqual(
+            {(bool(ip_digest), bool(account_digest)) for ip_digest, account_digest in lockouts},
+            {(False, True), (True, False)},
         )
 
     def test_tenth_registration_failure_starts_ip_cooldown(self):
