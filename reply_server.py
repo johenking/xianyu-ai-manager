@@ -191,7 +191,7 @@ class OrderSyncRequest(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    invite_code: str
+    invite_code: str = ""
     username: str
     email: str
     password: str
@@ -236,18 +236,21 @@ class PasswordResetRequest(BaseModel):
     new_password: str
 
 
-class InviteCreateRequest(BaseModel):
-    count: int = 1
-    valid_days: int = 7
-    note: str = ""
-
-
 class UserActiveUpdate(BaseModel):
     is_active: bool
 
 
 class RegistrationSettingUpdate(BaseModel):
     enabled: bool
+
+
+class RegistrationLimitUpdate(BaseModel):
+    limit: int
+
+
+class SMTPVerificationConfirmRequest(BaseModel):
+    challenge_id: str
+    verification_code: str
 
 
 class CaptchaRequest(BaseModel):
@@ -322,10 +325,11 @@ def _client_ip(request: Request) -> str:
 
 def _registration_state() -> Dict[str, Any]:
     settings = db_manager.get_all_system_settings()
+    capacity = db_manager.registration_service.registration_capacity()
     return registration_readiness(
         settings,
         db_path=db_manager.db_path,
-        active_invite_available=db_manager.registration_service.has_active_invites(),
+        user_count=capacity['user_count'],
     )
 
 
@@ -341,7 +345,7 @@ def _require_registration_enabled() -> Dict[str, Any]:
     if not state['enabled']:
         raise RegistrationError(
             "REGISTRATION_CLOSED",
-            "邀请注册暂未开放",
+            "注册暂未开放",
             http_status=403,
         )
     return state
@@ -1163,24 +1167,24 @@ def get_registration_config():
         return {
             "enabled": state['enabled'],
             "ready": state['ready'],
-            "invite_required": True,
-            "terms_version": state['terms_version'] or 'v1',
+            "invite_required": False,
+            "terms_version": state['terms_version'] or 'v2',
             "terms_url": "/terms",
             "privacy_url": "/privacy",
             "support_email": support_email,
-            "message": "邀请注册已开放" if state['enabled'] else "邀请注册暂未开放",
+            "message": "注册已开放" if state['enabled'] else "注册暂未开放",
         }
     except Exception:
         logger.warning("读取公开注册状态失败")
         return {
             "enabled": False,
             "ready": False,
-            "invite_required": True,
-            "terms_version": "v1",
+            "invite_required": False,
+            "terms_version": "v2",
             "terms_url": "/terms",
             "privacy_url": "/privacy",
             "support_email": "",
-            "message": "邀请注册暂未开放",
+            "message": "注册暂未开放",
         }
 
 
@@ -1215,23 +1219,11 @@ async def send_auth_email_code(request: EmailCodeRequest, http_request: Request)
     settings = db_manager.get_all_system_settings()
     if request.purpose == 'register':
         _require_registration_enabled()
-        if not request.invite_code or not db_manager.registration_service.active_invite_exists(
-            request.invite_code
-        ):
-            raise RegistrationError("INVITE_INVALID", "邀请码无效或不可用")
-        if db_manager.get_user_by_email(email):
-            raise RegistrationError("EMAIL_TAKEN", "邮箱已被使用")
         challenge_purpose = 'register_email'
-        challenge_context = request.invite_code
+        challenge_context = ''
         subject = "闲鱼监控台注册验证码"
     else:
         _require_verified_smtp(settings)
-        user = db_manager.get_user_by_email(email)
-        if not user or not user.get('is_active'):
-            raise RegistrationError(
-                "PASSWORD_RESET_UNAVAILABLE",
-                "该账号暂不能重置密码",
-            )
         challenge_purpose = 'password_reset_email'
         challenge_context = ''
         subject = "闲鱼监控台密码重置验证码"
@@ -1246,6 +1238,17 @@ async def send_auth_email_code(request: EmailCodeRequest, http_request: Request)
     _require_verified_smtp(settings)
 
     verification_code = f"{secrets.randbelow(1_000_000):06d}"
+    user = db_manager.get_user_by_email_for_public_auth(email)
+    if request.purpose == 'register':
+        actionable_target = user is None
+    else:
+        actionable_target = bool(user and user.get('is_active'))
+    decoy_secret = secrets.token_urlsafe(32)
+    challenge_secret = (
+        verification_code
+        if actionable_target
+        else decoy_secret
+    )
     text_content = (
         f"您的验证码是 {verification_code}\n\n"
         "验证码在 10 分钟内有效，最多可尝试 5 次。请勿向任何人泄露。\n"
@@ -1274,12 +1277,9 @@ async def send_auth_email_code(request: EmailCodeRequest, http_request: Request)
         purpose=challenge_purpose,
         subject=email,
         context=challenge_context,
-        secret=verification_code,
+        secret=challenge_secret,
     )
-    logger.info(
-        f"认证邮件已提交 email={mask_email_for_log(email)} "
-        f"purpose={request.purpose}"
-    )
+    logger.info(f"认证验证码请求已处理 purpose={request.purpose}")
     return {
         "success": True,
         "challenge_id": challenge['challenge_id'],
@@ -1310,10 +1310,10 @@ async def register(request: RegisterRequest, http_request: Request):
             username=request.username,
             email=request.email,
             password=request.password,
-            invite_code=request.invite_code,
             challenge_id=request.challenge_id,
             verification_code=request.verification_code,
             terms_version=request.terms_version,
+            invite_code=request.invite_code,
         )
     except RegistrationError:
         db_manager.auth_rate_limiter.record_registration_failure(client_ip)
@@ -1327,7 +1327,7 @@ async def register(request: RegisterRequest, http_request: Request):
         ) from exc
 
     token, _ = create_login_session(user)
-    logger.info(f"邀请注册成功 user_id={user['id']}")
+    logger.info(f"注册成功 user_id={user['id']}")
     return RegisterResponse(
         success=True,
         token=token,
@@ -3159,7 +3159,9 @@ def _settings_summary() -> Dict[str, Any]:
             'ready': False,
             'requested': False,
             'smtp_verified': False,
-            'active_invite_available': False,
+            'user_limit': 0,
+            'user_count': 0,
+            'remaining_slots': 0,
         }
     settings['smtp_verified'] = smtp_verified
     return {
@@ -3207,7 +3209,7 @@ def save_settings_section(section: str, request: SystemSettingsSectionIn,
         if not ready:
             raise RegistrationError(
                 "REGISTRATION_NOT_READY",
-                "请先验证 SMTP 并创建至少一个有效邀请码",
+                "请先确认 SMTP、支持邮箱和注册容量",
                 http_status=409,
             )
     if not db_manager.save_system_settings_section(values):
@@ -3248,42 +3250,46 @@ def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
                 kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
             client.chat.completions.create(**kwargs)
             return {'success': True, 'state': 'ready', 'message': 'AI连接可用'}
-        recipient = str(
-            effective.get('support_email') or effective.get('smtp_user') or ''
-        ).strip()
-        SMTPEmailSender().send(
-            effective,
-            recipient=recipient,
-            subject='闲鱼监控台 SMTP 配置验证',
-            text=(
-                '这是一封 SMTP 配置验证邮件。\n\n'
-                '收到此邮件表示服务器已接受本次投递。'
-            ),
-        )
-        fingerprint = smtp_configuration_fingerprint(
-            effective,
-            db_path=db_manager.db_path,
-        )
+        recipient = normalize_email(
+            str(effective.get('support_email') or '')
+        ).normalized
         smtp_settings = {
             key: effective.get(key, '') for key in SMTP_CONFIGURATION_KEYS
         }
-        verified_at = datetime.now().astimezone().isoformat(timespec='seconds')
-        if not db_manager.save_verified_smtp_settings(
-            smtp_settings,
-            fingerprint=fingerprint,
-            verified_at=verified_at,
-            expected_settings=raw,
-        ):
+        if not db_manager.save_unverified_smtp_settings(smtp_settings):
             raise RegistrationError(
                 "SMTP_VERIFICATION_SAVE_FAILED",
-                "SMTP 验证成功但状态保存失败，请重试",
+                "SMTP 待验证配置保存失败，请重试",
                 http_status=503,
             )
+        current = db_manager.get_all_system_settings()
+        fingerprint = smtp_configuration_fingerprint(
+            current,
+            db_path=db_manager.db_path,
+        )
+        verification_code = f"{secrets.randbelow(1_000_000):06d}"
+        SMTPEmailSender().send(
+            current,
+            recipient=recipient,
+            subject='闲鱼监控台 SMTP 验证码',
+            text=(
+                f'您的 SMTP 验证码是 {verification_code}\n\n'
+                '验证码在 10 分钟内有效，最多可尝试 5 次。'
+            ),
+        )
+        challenge = db_manager.registration_service.create_challenge(
+            purpose='smtp_verify_email',
+            subject=recipient,
+            context=fingerprint,
+            secret=verification_code,
+        )
         return {
             'success': True,
-            'state': 'ready',
-            'message': f"验证邮件已发送至 {mask_email_for_log(recipient)}",
-            'verified_at': verified_at,
+            'state': 'pending',
+            'challenge_id': challenge['challenge_id'],
+            'expires_in': 600,
+            'masked_recipient': mask_email_for_log(recipient),
+            'message': '验证邮件已发送',
         }
     except (SMTPConfigurationError, SMTPDeliveryError) as e:
         logger.warning(f"SMTP配置验证失败: {type(e).__name__}")
@@ -3296,6 +3302,25 @@ def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
     except Exception as e:
         logger.warning(f"{section.upper()}配置验证失败: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"验证失败: {str(e)}")
+
+
+@settings_router.post('/api/settings/verify/smtp/confirm')
+def confirm_smtp_verification(
+    request: SMTPVerificationConfirmRequest,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    verified_at = datetime.now().astimezone().isoformat(timespec='seconds')
+    confirmation = db_manager.registration_service.confirm_smtp_verification(
+        challenge_id=request.challenge_id,
+        verification_code=request.verification_code,
+        verified_at=verified_at,
+    )
+    return {
+        'success': True,
+        'state': 'ready',
+        'verified_at': confirmation['verified_at'],
+        'message': 'SMTP 配置已确认',
+    }
 
 
 @settings_router.put('/system-settings/{key}')
@@ -3312,7 +3337,7 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
             if not _registration_state()['ready']:
                 raise RegistrationError(
                     "REGISTRATION_NOT_READY",
-                    "请先验证 SMTP 并创建至少一个有效邀请码",
+                    "请先确认 SMTP、支持邮箱和注册容量",
                     http_status=409,
                 )
 
@@ -3342,7 +3367,7 @@ def _update_registration_enabled(
         if not ready:
             raise RegistrationError(
                 "REGISTRATION_NOT_READY",
-                "请先验证 SMTP 并创建至少一个有效邀请码",
+                "请先确认 SMTP、支持邮箱和注册容量",
                 http_status=409,
             )
     if not db_manager.set_system_setting(
@@ -3376,15 +3401,11 @@ def get_registration_admin_status(
     support_email = str(
         settings.get('support_email') or settings.get('smtp_user') or ''
     ).strip()
-    invites = db_manager.registration_service.list_invites()
-    invite_counts = {
-        status_name: sum(
-            1 for invite in invites if invite['status'] == status_name
-        )
-        for status_name in ('active', 'used', 'expired', 'revoked')
-    }
     return {
         'success': True,
+        'user_limit': state['user_limit'],
+        'user_count': state['user_count'],
+        'remaining_slots': state['remaining_slots'],
         'registration': {
             'enabled': state['enabled'],
             'ready': state['ready'],
@@ -3398,36 +3419,30 @@ def get_registration_admin_status(
             'support_email': mask_email_for_log(support_email)
             if support_email else '',
         },
-        'invites': invite_counts,
     }
 
 
 @admin_router.post('/api/admin/registration/invites')
 def create_registration_invites(
-    request: InviteCreateRequest,
-    admin_user: Dict[str, Any] = Depends(require_admin),
+    _request: Dict[str, Any] = Body(default_factory=dict),
+    _: Dict[str, Any] = Depends(require_admin),
 ):
-    invites = db_manager.registration_service.create_invites(
-        count=request.count,
-        valid_days=request.valid_days,
-        note=request.note,
-        created_by_user_id=admin_user['user_id'],
+    raise RegistrationError(
+        "INVITATION_REGISTRATION_REMOVED",
+        "邀请注册已移除，请使用直接注册配置",
+        http_status=410,
     )
-    return {
-        'success': True,
-        'invites': invites,
-        'message': '邀请码已创建，原始邀请码仅显示本次',
-    }
 
 
 @admin_router.get('/api/admin/registration/invites')
 def list_registration_invites(
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    return {
-        'success': True,
-        'invites': db_manager.registration_service.list_invites(),
-    }
+    raise RegistrationError(
+        "INVITATION_REGISTRATION_REMOVED",
+        "邀请注册已移除，请使用直接注册配置",
+        http_status=410,
+    )
 
 
 @admin_router.delete('/api/admin/registration/invites/{invite_id}')
@@ -3435,8 +3450,30 @@ def revoke_registration_invite(
     invite_id: int,
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    invite = db_manager.registration_service.revoke_invite(invite_id)
-    return {'success': True, 'invite': invite}
+    del invite_id
+    raise RegistrationError(
+        "INVITATION_REGISTRATION_REMOVED",
+        "邀请注册已移除，请使用直接注册配置",
+        http_status=410,
+    )
+
+
+@admin_router.put('/api/admin/registration/limit')
+def update_registration_limit(
+    request: RegistrationLimitUpdate,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    capacity = db_manager.registration_service.update_registration_limit(
+        request.limit
+    )
+    state = _registration_state()
+    return {
+        'success': True,
+        **capacity,
+        'enabled': state['enabled'],
+        'requested': state['requested'],
+        'message': '注册用户上限已更新',
+    }
 
 
 @admin_router.get('/api/admin/registration/users')
@@ -3505,14 +3542,14 @@ def get_registration_status():
         return {
             'enabled': state['enabled'],
             'ready': state['ready'],
-            'message': '注册功能已开启' if state['enabled'] else '邀请注册暂未开放',
+            'message': '注册功能已开启' if state['enabled'] else '注册暂未开放',
         }
     except Exception:
         logger.warning("获取注册状态失败")
         return {
             'enabled': False,
             'ready': False,
-            'message': '邀请注册暂未开放',
+            'message': '注册暂未开放',
         }
 
 

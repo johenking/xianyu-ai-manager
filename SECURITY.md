@@ -15,7 +15,7 @@ Include the affected version, reproduction steps, impact and a minimal redacted 
 - Set a strong `ADMIN_PASSWORD` and a random `JWT_SECRET_KEY`.
 - Use independent AI-provider, Xianyu-account, and system-secret encryption keys, or preserve all three generated key files with SQLite backups.
 - Keep the service behind HTTPS and restrict network access where possible.
-- Keep public registration disabled until the current SMTP configuration has delivered a real verification message and an active single-use invite exists.
+- Keep public registration disabled until the current SMTP configuration has delivered a receipt code to the independent support mailbox, that code has been confirmed, and ordinary-user capacity remains.
 - Trust forwarded client-IP headers only from explicitly configured proxy IPs or CIDRs.
 - Never commit `data/`, `.env`, logs, browser profiles or uploaded files.
 - Rotate any credential that has appeared in terminal output, logs or issue attachments.

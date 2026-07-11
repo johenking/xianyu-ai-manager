@@ -101,19 +101,20 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 
 Do not commit secrets. Put deployment tokens, model keys, SMTP credentials, and Xianyu Cookies in platform secret stores or the Web UI.
 
-## Invitation Registration Rollout
+## Direct Registration Rollout
 
-Registration is disabled on new installations and is forced disabled by the v1.6.0 registration migration. Keep it closed while configuring the system:
+Registration is disabled on new installations and is forced disabled by migration `2026071103`. Keep it closed while configuring the system:
 
-1. In “系统与 AI”, save the SMTP server, port, sender address, authorization code, TLS/SSL mode, and public support email.
-2. Run SMTP verification. This sends a real test message to the support email, or to the sender address when support email is empty. Connection success without message delivery is not acceptance.
-3. Confirm the message arrived in a real mailbox, then create a small batch of single-use invites. Raw invite codes are visible only in that create response.
-4. Open registration only after the status card reports both verified SMTP and at least one active invite.
-5. Complete one real registration, automatic login, service-restart session restore, password reset, and second-use invite rejection before distributing the remaining codes.
+1. In “系统与 AI”, use the QQ preset or enter the SMTP server, port, sender address, authorization code, TLS/SSL mode, and an independent public support email. QQ uses `smtp.qq.com:465`, SSL on, STARTTLS off.
+2. Start SMTP verification. This saves the candidate configuration as unverified and sends a six-digit code to the support email.
+3. Read the code from that real mailbox and enter it in the settings page within 10 minutes. Connection or send success alone is not acceptance.
+4. Confirm the ordinary-user limit. The default is 20; the administrator is excluded and disabled ordinary users still count.
+5. Open registration only after the status card reports receipt-confirmed SMTP and remaining capacity.
+6. Complete one real registration, automatic login, service-restart session restore, username-or-email login, password reset, and old-session rejection before leaving registration open.
 
-Changing any SMTP field invalidates the verified fingerprint. The backend refuses to reopen registration until the new configuration delivers another verification message. SMTP errors never generate a usable email challenge, and there is no third-party mail fallback.
+Changing any SMTP field invalidates the verified fingerprint, consumes pending SMTP challenges, and closes registration. The final available slot also closes registration automatically; increasing the limit requires a manual reopen. SMTP errors never generate a usable authentication challenge, and there is no third-party mail fallback.
 
-The default authentication limits are 30 image CAPTCHAs per IP per hour; one email send per email per 60 seconds, five per email per hour, and 20 per IP per hour; five attempts per 10-minute challenge; five failed logins per account or IP in 15 minutes followed by a 15-minute cooldown; and 10 registration or invite failures per IP per hour. HTTP 429 responses include `retry_after`.
+The default authentication limits are 30 image CAPTCHAs per IP per hour; one email send per email per 60 seconds, five per email per hour, and 20 per IP per hour; five attempts per 10-minute challenge; five failed logins per account or IP in 15 minutes followed by a 15-minute cooldown; and 10 registration failures per IP per hour. HTTP 429 responses include `retry_after`.
 
 `CF-Connecting-IP`, `X-Forwarded-For`, and `X-Real-IP` are ignored unless the direct peer belongs to the comma-separated IP/CIDR list in the `auth_trusted_proxies` system setting. Configure only proxies you operate; leaving the setting empty is safer than trusting arbitrary forwarded headers. Database rate events contain HMAC digests rather than raw addresses, emails, or account identifiers.
 

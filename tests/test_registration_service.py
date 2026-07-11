@@ -12,6 +12,7 @@ import textwrap
 from unittest.mock import patch
 
 import auth_registration_service as registration
+from auth_email_service import smtp_configuration_fingerprint
 from repositories.auth_repository import AuthSessionRepository, UserRepository
 from security_utils import hash_user_password, verify_user_password_hash
 from services.auth_service import AuthService
@@ -90,6 +91,8 @@ def create_registration_database(path: Path) -> sqlite3.Connection:
             consumed_at REAL,
             created_at INTEGER NOT NULL
         );
+        CREATE INDEX idx_auth_challenges_expiry
+            ON auth_challenges(expires_at, consumed_at);
         CREATE TABLE auth_rate_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_type TEXT NOT NULL,
@@ -230,103 +233,6 @@ class PasswordPolicyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "PASSWORD_CONTAINS_USERNAME")
 
 
-class InvitationServiceTests(unittest.TestCase):
-    def setUp(self):
-        if RegistrationService is None:
-            self.fail("RegistrationService must implement invitation persistence")
-        self.tempdir = tempfile.TemporaryDirectory()
-        self.root = Path(self.tempdir.name)
-        self.previous_key_file = os.environ.get("SYSTEM_SECRET_KEY_FILE")
-        os.environ["SYSTEM_SECRET_KEY_FILE"] = str(self.root / ".system-key")
-        self.db_path = self.root / "registration.db"
-        self.connection = create_registration_database(self.db_path)
-        self.lock = threading.RLock()
-        self.now = 1_800_000_000.0
-        self.service = RegistrationService(
-            self.connection,
-            str(self.db_path),
-            lock=self.lock,
-            clock=lambda: self.now,
-        )
-
-    def tearDown(self):
-        if hasattr(self, "connection"):
-            self.connection.close()
-        if self.previous_key_file is None:
-            os.environ.pop("SYSTEM_SECRET_KEY_FILE", None)
-        else:
-            os.environ["SYSTEM_SECRET_KEY_FILE"] = self.previous_key_file
-        self.tempdir.cleanup()
-
-    def assert_error_code(self, code, callback):
-        with self.assertRaises(RegistrationError) as raised:
-            callback()
-        self.assertEqual(raised.exception.code, code)
-        self.assertTrue(raised.exception.message)
-
-    def test_create_and_list_invites_never_leaks_raw_or_digest(self):
-        created = self.service.create_invites(
-            count=2,
-            valid_days=30,
-            note="synthetic onboarding batch",
-            created_by_user_id=1,
-        )
-
-        self.assertEqual(len(created), 2)
-        raw_codes = [item["code"] for item in created]
-        self.assertEqual(len(set(raw_codes)), 2)
-        for item in created:
-            self.assertEqual(item["status"], "active")
-            self.assertGreaterEqual(len(item["code"]), 24)
-            self.assertFalse(set(item["code"]) & set("0O1IL"))
-            self.assertNotIn("digest", repr(item).lower())
-
-        listed = self.service.list_invites()
-        self.assertEqual(len(listed), 2)
-        for item in listed:
-            self.assertNotIn("code", item)
-            self.assertNotIn("code_digest", item)
-            self.assertNotIn("digest", repr(item).lower())
-        for code in raw_codes:
-            self.assertNotIn(code, repr(listed))
-            stored = self.connection.execute(
-                "SELECT code_digest FROM registration_invites WHERE code_hint = ?",
-                (created[raw_codes.index(code)]["hint"],),
-            ).fetchone()[0]
-            self.assertNotEqual(stored, code)
-            self.assertEqual(len(stored), 64)
-
-    def test_invite_batch_and_metadata_boundaries_have_stable_errors(self):
-        cases = (
-            ("INVITE_COUNT_INVALID", lambda: self.service.create_invites(count=0)),
-            ("INVITE_COUNT_INVALID", lambda: self.service.create_invites(count=21)),
-            ("INVITE_VALID_DAYS_INVALID", lambda: self.service.create_invites(valid_days=0)),
-            ("INVITE_VALID_DAYS_INVALID", lambda: self.service.create_invites(valid_days=366)),
-            ("INVITE_NOTE_TOO_LONG", lambda: self.service.create_invites(note="n" * 201)),
-        )
-        for code, callback in cases:
-            with self.subTest(code=code):
-                self.assert_error_code(code, callback)
-
-    def test_expired_and_revoked_invites_are_not_active(self):
-        expiring = self.service.create_invites(valid_days=1)[0]
-        revoked = self.service.create_invites(valid_days=30)[0]
-
-        self.assertTrue(self.service.active_invite_exists(expiring["code"]))
-        self.service.revoke_invite(revoked["id"])
-        self.assertFalse(self.service.active_invite_exists(revoked["code"]))
-        self.assert_error_code(
-            "INVITE_REVOKED",
-            lambda: self.service.revoke_invite(revoked["id"]),
-        )
-
-        self.now += 86_401
-        self.assertFalse(self.service.active_invite_exists(expiring["code"]))
-        statuses = {item["id"]: item["status"] for item in self.service.list_invites()}
-        self.assertEqual(statuses[expiring["id"]], "expired")
-        self.assertEqual(statuses[revoked["id"]], "revoked")
-
-
 class ChallengeServiceTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -361,14 +267,13 @@ class ChallengeServiceTests(unittest.TestCase):
             hasattr(self.service, "create_challenge"),
             "RegistrationService must implement challenge persistence",
         )
-        invite = self.service.create_invites()[0]
         email = " Mixed.User@Example.COM "
         secret = "246810"
 
         challenge = self.service.create_challenge(
             purpose="register_email",
             subject=email,
-            context=invite["code"],
+            context="",
             secret=secret,
         )
 
@@ -387,13 +292,8 @@ class ChallengeServiceTests(unittest.TestCase):
         self.assertEqual(row[4:7], (0, 5, self.now + 600))
         stored_text = repr(row)
         self.assertNotIn(email.strip().lower(), stored_text.lower())
-        self.assertNotIn(invite["code"], stored_text)
         self.assertNotIn(secret, stored_text)
-        invite_digest = self.connection.execute(
-            "SELECT code_digest FROM registration_invites WHERE id = ?",
-            (invite["id"],),
-        ).fetchone()[0]
-        self.assertEqual(row[2], invite_digest)
+        self.assertEqual(row[2], "")
 
     def test_challenge_enforces_purpose_subject_context_expiry_and_one_time_use(self):
         challenge = self.service.create_challenge(
@@ -495,7 +395,7 @@ class ChallengeServiceTests(unittest.TestCase):
         first = self.service.create_challenge(
             purpose="register_email",
             subject="isolated@example.com",
-            context=self.service.create_invites()[0]["code"],
+            context="",
             secret="314159",
         )
         second = self.service.create_challenge(
@@ -529,6 +429,109 @@ class ChallengeServiceTests(unittest.TestCase):
             ),
         )
 
+    def test_challenge_creation_cleans_only_old_records_in_a_bounded_batch(self):
+        cutoff = self.now - 86_400
+        batch_size = 100
+        old_rows = [
+            (
+                f"old-expired-{index}",
+                "captcha",
+                f"subject-{index}",
+                "",
+                f"secret-{index}",
+                0,
+                5,
+                cutoff - index - 1,
+                None,
+                int(cutoff - index - 601),
+            )
+            for index in range(batch_size + 2)
+        ]
+        retained_rows = (
+            (
+                "old-consumed",
+                "captcha",
+                "old-consumed-subject",
+                "",
+                "old-consumed-secret",
+                0,
+                5,
+                self.now + 600,
+                cutoff - 1,
+                int(cutoff - 700),
+            ),
+            (
+                "recent-expired",
+                "captcha",
+                "recent-expired-subject",
+                "",
+                "recent-expired-secret",
+                0,
+                5,
+                cutoff + 1,
+                None,
+                int(cutoff - 599),
+            ),
+            (
+                "recent-consumed",
+                "captcha",
+                "recent-consumed-subject",
+                "",
+                "recent-consumed-secret",
+                0,
+                5,
+                self.now + 600,
+                self.now - 1,
+                int(self.now - 10),
+            ),
+        )
+        self.connection.executemany(
+            "INSERT INTO auth_challenges ("
+            "challenge_id, purpose, subject_digest, context_digest, secret_digest, "
+            "attempt_count, max_attempts, expires_at, consumed_at, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*old_rows, *retained_rows),
+        )
+        self.connection.commit()
+
+        created = self.service.create_challenge(
+            purpose="captcha",
+            subject="current-session",
+            secret="N4W6",
+        )
+
+        remaining_old = self.connection.execute(
+            "SELECT COUNT(*) FROM auth_challenges WHERE challenge_id LIKE 'old-expired-%'"
+        ).fetchone()[0]
+        self.assertEqual(remaining_old, 2)
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT 1 FROM auth_challenges WHERE challenge_id = 'old-consumed'"
+            ).fetchone()
+        )
+
+        second = self.service.create_challenge(
+            purpose="captcha",
+            subject="second-current-session",
+            secret="P5X7",
+        )
+
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM auth_challenges WHERE challenge_id = 'old-consumed'"
+            ).fetchone()
+        )
+        retained = {
+            row[0]
+            for row in self.connection.execute(
+                "SELECT challenge_id FROM auth_challenges"
+            ).fetchall()
+        }
+        self.assertIn("recent-expired", retained)
+        self.assertIn("recent-consumed", retained)
+        self.assertIn(created["challenge_id"], retained)
+        self.assertIn(second["challenge_id"], retained)
+
 
 class RegistrationServiceFixture(unittest.TestCase):
     def setUp(self):
@@ -545,6 +548,29 @@ class RegistrationServiceFixture(unittest.TestCase):
             lock=threading.RLock(),
             clock=lambda: self.now,
         )
+        settings = {
+            "smtp_server": "smtp.example.test",
+            "smtp_port": "587",
+            "smtp_user": "sender@example.test",
+            "smtp_password": "synthetic-smtp-secret",
+            "smtp_from": "Xianyu Manager",
+            "smtp_use_tls": "true",
+            "smtp_use_ssl": "false",
+            "support_email": "support@example.test",
+            "registration_enabled": "true",
+            "registration_user_limit": "20",
+            "terms_version": "v2",
+        }
+        settings["smtp_verified_fingerprint"] = smtp_configuration_fingerprint(
+            settings,
+            db_path=str(self.db_path),
+        )
+        self.connection.executemany(
+            "INSERT INTO system_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            settings.items(),
+        )
+        self.connection.commit()
 
     def tearDown(self):
         self.connection.close()
@@ -555,21 +581,20 @@ class RegistrationServiceFixture(unittest.TestCase):
         self.tempdir.cleanup()
 
     def issue_registration_challenge(self, email, *, invite=None, secret="482615"):
-        invite = invite or self.service.create_invites()[0]
         challenge = self.service.create_challenge(
             purpose="register_email",
             subject=email,
-            context=invite["code"],
+            context="",
             secret=secret,
         )
         return invite, challenge, secret
 
-    def register(self, *, username, email, invite, challenge, secret, terms="v1"):
+    def register(self, *, username, email, invite, challenge, secret, terms="v2"):
         return self.service.register_user(
             username=username,
             email=email,
             password="Strong-pass-2026!",
-            invite_code=invite["code"],
+            invite_code="ignored" if invite is None else str(invite),
             challenge_id=challenge["challenge_id"],
             verification_code=secret,
             terms_version=terms,
@@ -580,278 +605,284 @@ class RegistrationServiceFixture(unittest.TestCase):
             callback()
         self.assertEqual(raised.exception.code, code)
 
-    def assert_unconsumed(self, invite_id, challenge_id):
-        invite = self.connection.execute(
-            "SELECT used_at, used_by_user_id FROM registration_invites WHERE id = ?",
-            (invite_id,),
-        ).fetchone()
-        challenge = self.connection.execute(
-            "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
-            (challenge_id,),
-        ).fetchone()
-        self.assertEqual(invite, (None, None))
-        self.assertIsNone(challenge[0])
 
-
-class RegistrationInviteAvailabilityTests(RegistrationServiceFixture):
-    def test_active_invite_availability_ignores_revoked_and_expired_rows(self):
-        self.assertFalse(self.service.has_active_invites())
-        active = self.service.create_invites(count=1, valid_days=7)[0]
-        self.assertTrue(self.service.has_active_invites())
-
-        self.service.revoke_invite(active["id"])
-        self.assertFalse(self.service.has_active_invites())
-
-        expired = self.service.create_invites(count=1, valid_days=1)[0]
+class SMTPConfirmationTransactionTests(RegistrationServiceFixture):
+    def issue_confirmation(self, secret="538204"):
         self.connection.execute(
-            "UPDATE registration_invites SET expires_at = ? WHERE id = ?",
-            (self.now - 1, expired["id"]),
+            "UPDATE system_settings SET value = 'support@example.com' "
+            "WHERE key = 'support_email'"
         )
         self.connection.commit()
-        self.assertFalse(self.service.has_active_invites())
-
-
-class RegistrationTransactionTests(RegistrationServiceFixture):
-    def test_invalid_registration_credentials_do_not_run_bcrypt(self):
-        invite, challenge, _secret = self.issue_registration_challenge(
-            "no-hash@example.com"
+        settings = {
+            row[0]: row[1]
+            for row in self.connection.execute(
+                "SELECT key, value FROM system_settings"
+            ).fetchall()
+        }
+        fingerprint = smtp_configuration_fingerprint(
+            settings,
+            db_path=str(self.db_path),
         )
-
-        with patch.object(
-            registration,
-            "hash_user_password",
-            side_effect=AssertionError("bcrypt must not run"),
-        ) as password_hasher:
-            self.assert_error_code(
-                "INVITE_INVALID",
-                lambda: self.service.register_user(
-                    username="no-hash-user",
-                    email="no-hash@example.com",
-                    password="Strong-pass-2026!",
-                    invite_code="REG-NOT-A-REAL-INVITE",
-                    challenge_id=challenge["challenge_id"],
-                    verification_code="482615",
-                    terms_version="v1",
-                ),
-            )
-            self.assert_error_code(
-                "CHALLENGE_SECRET_INVALID",
-                lambda: self.service.register_user(
-                    username="no-hash-user",
-                    email="no-hash@example.com",
-                    password="Strong-pass-2026!",
-                    invite_code=invite["code"],
-                    challenge_id=challenge["challenge_id"],
-                    verification_code="000000",
-                    terms_version="v1",
-                ),
-            )
-
-        password_hasher.assert_not_called()
-
-    def test_registration_commits_user_invite_and_challenge_together(self):
-        self.assertTrue(
-            hasattr(self.service, "register_user"),
-            "RegistrationService must implement registration transaction",
+        self.connection.execute(
+            "UPDATE system_settings SET value = '' "
+            "WHERE key = 'smtp_verified_fingerprint'"
         )
-        email = " New.User@Example.COM "
-        invite, challenge, secret = self.issue_registration_challenge(email)
-
-        user = self.register(
-            username="Ａlice_用户",
-            email=email,
-            invite=invite,
-            challenge=challenge,
+        self.connection.commit()
+        challenge = self.service.create_challenge(
+            purpose="smtp_verify_email",
+            subject=settings["support_email"],
+            context=fingerprint,
             secret=secret,
         )
+        return challenge, secret, fingerprint
 
-        self.assertEqual(user["username"], "Alice_用户")
-        self.assertEqual(user["username_normalized"], "alice_用户")
-        self.assertEqual(user["email"], "new.user@example.com")
-        self.assertEqual(user["email_normalized"], "new.user@example.com")
-        self.assertTrue(user["is_active"])
-        self.assertEqual(user["terms_version"], "v1")
-        self.assertEqual(user["terms_accepted_at"], self.now)
-        self.assertFalse(any("password" in key or "hash" in key for key in user))
-        stored = self.connection.execute(
-            "SELECT password_hash, password_hash_v2, password_hash_version "
-            "FROM users WHERE id = ?",
-            (user["id"],),
-        ).fetchone()
-        self.assertEqual(stored[0], "")
-        self.assertTrue(verify_user_password_hash("Strong-pass-2026!", stored[1]))
-        self.assertEqual(stored[2], 2)
-        used_at, used_by = self.connection.execute(
-            "SELECT used_at, used_by_user_id FROM registration_invites WHERE id = ?",
-            (invite["id"],),
-        ).fetchone()
-        consumed_at = self.connection.execute(
-            "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+    def test_concurrent_smtp_change_rolls_back_confirmation_and_allows_retry(self):
+        challenge, secret, original_fingerprint = self.issue_confirmation()
+        second_connection = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=10,
+        )
+        second_connection.execute("BEGIN IMMEDIATE")
+        second_connection.execute(
+            "UPDATE system_settings SET value = ? WHERE key = 'smtp_server'",
+            ("changed.smtp.example.test",),
+        )
+
+        def confirm():
+            return self.service.confirm_smtp_verification(
+                challenge_id=challenge["challenge_id"],
+                verification_code=secret,
+                verified_at="2026-07-11T16:30:00+08:00",
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(confirm)
+                second_connection.commit()
+                with self.assertRaises(RegistrationError) as raised:
+                    future.result()
+            self.assertEqual(
+                raised.exception.code,
+                "CHALLENGE_CONTEXT_MISMATCH",
+            )
+            consumed_at = self.connection.execute(
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
+            ).fetchone()[0]
+            self.assertIsNone(consumed_at)
+            self.assertNotEqual(
+                self.connection.execute(
+                    "SELECT value FROM system_settings "
+                    "WHERE key = 'smtp_verified_fingerprint'"
+                ).fetchone()[0],
+                original_fingerprint,
+            )
+
+            second_connection.execute(
+                "UPDATE system_settings SET value = ? WHERE key = 'smtp_server'",
+                ("smtp.example.test",),
+            )
+            second_connection.commit()
+            result = confirm()
+            self.assertEqual(result["fingerprint"], original_fingerprint)
+        finally:
+            second_connection.close()
+
+    def test_wrong_smtp_codes_persist_attempts_and_lock_at_five(self):
+        challenge, _, _ = self.issue_confirmation()
+
+        def confirm_wrong():
+            self.service.confirm_smtp_verification(
+                challenge_id=challenge["challenge_id"],
+                verification_code="000000",
+                verified_at="2026-07-11T16:31:00+08:00",
+            )
+
+        for expected_attempt in range(1, 5):
+            self.assert_error_code("CHALLENGE_SECRET_INVALID", confirm_wrong)
+            attempt_count = self.connection.execute(
+                "SELECT attempt_count FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
+            ).fetchone()[0]
+            self.assertEqual(attempt_count, expected_attempt)
+        self.assert_error_code("CHALLENGE_LOCKED", confirm_wrong)
+        self.assert_error_code("CHALLENGE_LOCKED", confirm_wrong)
+        attempt_count, consumed_at = self.connection.execute(
+            "SELECT attempt_count, consumed_at FROM auth_challenges "
+            "WHERE challenge_id = ?",
             (challenge["challenge_id"],),
-        ).fetchone()[0]
-        self.assertEqual((used_at, used_by, consumed_at), (self.now, user["id"], self.now))
+        ).fetchone()
+        self.assertEqual(attempt_count, 5)
+        self.assertIsNone(consumed_at)
 
-    def test_identity_conflicts_and_terms_change_roll_back_all_objects(self):
-        first_invite, first_challenge, first_secret = self.issue_registration_challenge(
-            "first@example.com"
-        )
-        self.register(
-            username="Straße",
-            email="first@example.com",
-            invite=first_invite,
-            challenge=first_challenge,
-            secret=first_secret,
-        )
 
-        username_invite, username_challenge, username_secret = (
-            self.issue_registration_challenge("second@example.com")
-        )
-        self.assert_error_code(
-            "USERNAME_TAKEN",
-            lambda: self.register(
-                username="STRASSE",
-                email="second@example.com",
-                invite=username_invite,
-                challenge=username_challenge,
-                secret=username_secret,
-            ),
-        )
-        self.assert_unconsumed(username_invite["id"], username_challenge["challenge_id"])
+class DirectRegistrationTransactionTests(RegistrationServiceFixture):
+    smtp_settings = {
+        "smtp_server": "smtp.example.test",
+        "smtp_port": "587",
+        "smtp_user": "sender@example.test",
+        "smtp_password": "synthetic-smtp-secret",
+        "smtp_from": "Xianyu Manager",
+        "smtp_use_tls": "true",
+        "smtp_use_ssl": "false",
+        "support_email": "support@example.test",
+    }
 
-        email_invite, email_challenge, email_secret = self.issue_registration_challenge(
-            "FIRST@EXAMPLE.COM"
+    def setUp(self):
+        super().setUp()
+        settings = {
+            **self.smtp_settings,
+            "registration_enabled": "true",
+            "registration_user_limit": "20",
+            "terms_version": "v2",
+        }
+        fingerprint = smtp_configuration_fingerprint(
+            settings,
+            db_path=str(self.db_path),
         )
-        self.assert_error_code(
-            "EMAIL_TAKEN",
-            lambda: self.register(
-                username="different-user",
-                email="FIRST@EXAMPLE.COM",
-                invite=email_invite,
-                challenge=email_challenge,
-                secret=email_secret,
-            ),
-        )
-        self.assert_unconsumed(email_invite["id"], email_challenge["challenge_id"])
-
-        terms_invite, terms_challenge, terms_secret = self.issue_registration_challenge(
-            "terms@example.com"
-        )
-        self.connection.execute(
-            "UPDATE system_settings SET value = 'v2' WHERE key = 'terms_version'"
+        settings["smtp_verified_fingerprint"] = fingerprint
+        self.connection.executemany(
+            "INSERT INTO system_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            settings.items(),
         )
         self.connection.commit()
-        self.assert_error_code(
-            "TERMS_VERSION_MISMATCH",
-            lambda: self.register(
-                username="terms-user",
-                email="terms@example.com",
-                invite=terms_invite,
-                challenge=terms_challenge,
-                secret=terms_secret,
-                terms="v1",
-            ),
+
+    def issue_direct_challenge(self, email, secret="482615"):
+        challenge = self.service.create_challenge(
+            purpose="register_email",
+            subject=email,
+            context="",
+            secret=secret,
         )
-        self.assert_unconsumed(terms_invite["id"], terms_challenge["challenge_id"])
+        return challenge, secret
+
+    def direct_register(self, username, email, challenge, secret, invite_code=""):
+        return self.service.register_user(
+            username=username,
+            email=email,
+            password="Strong-pass-2026!",
+            invite_code=invite_code,
+            challenge_id=challenge["challenge_id"],
+            verification_code=secret,
+            terms_version="v2",
+        )
+
+    def test_direct_registration_ignores_legacy_invite_field_and_consumes_empty_context_code(self):
+        challenge, secret = self.issue_direct_challenge("direct@example.com")
+
+        user = self.direct_register(
+            "direct-user",
+            "direct@example.com",
+            challenge,
+            secret,
+            invite_code="legacy-client-value",
+        )
+
+        self.assertEqual(user["terms_version"], "v2")
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM users WHERE username_normalized = 'terms-user'"
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
             ).fetchone()[0],
+            self.now,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM registration_invites").fetchone()[0],
             0,
         )
 
-    def test_wrong_registration_code_only_persists_attempt_audit(self):
-        invite, challenge, _secret = self.issue_registration_challenge(
-            "wrong-code@example.com"
+    def test_capacity_excludes_admin_and_includes_disabled_users(self):
+        self.connection.execute(
+            "INSERT INTO users "
+            "(username, email, password_hash, username_normalized, email_normalized, is_active) "
+            "VALUES ('disabled-user', 'disabled@example.test', 'legacy', "
+            "'disabled-user', 'disabled@example.test', 0)"
         )
-        self.assert_error_code(
-            "CHALLENGE_SECRET_INVALID",
-            lambda: self.register(
-                username="wrong-code-user",
-                email="wrong-code@example.com",
-                invite=invite,
-                challenge=challenge,
-                secret="000000",
-            ),
-        )
+        self.connection.commit()
 
-        self.assert_unconsumed(invite["id"], challenge["challenge_id"])
-        attempts = self.connection.execute(
-            "SELECT attempt_count FROM auth_challenges WHERE challenge_id = ?",
-            (challenge["challenge_id"],),
-        ).fetchone()[0]
-        self.assertEqual(attempts, 1)
+        capacity = self.service.registration_capacity()
+
+        self.assertEqual(capacity["user_count"], 1)
+        self.assertEqual(capacity["user_limit"], 20)
+        self.assertEqual(capacity["remaining_slots"], 19)
+
+    def test_lowering_limit_closes_registration_and_raising_never_reopens_it(self):
+        for invalid_limit in (0, 1001, True):
+            with self.subTest(invalid_limit=invalid_limit):
+                with self.assertRaises(RegistrationError) as raised:
+                    self.service.update_registration_limit(invalid_limit)
+                self.assertEqual(
+                    raised.exception.code,
+                    "REGISTRATION_USER_LIMIT_INVALID",
+                )
+        self.connection.execute(
+            "INSERT INTO users "
+            "(username, email, password_hash, username_normalized, email_normalized) "
+            "VALUES ('existing-user', 'existing@example.test', 'legacy', "
+            "'existing-user', 'existing@example.test')"
+        )
+        self.connection.commit()
+
+        lowered = self.service.update_registration_limit(1)
+        self.assertEqual(lowered["remaining_slots"], 0)
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            2,
+        )
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM users WHERE username_normalized = 'wrong-code-user'"
+                "SELECT value FROM system_settings WHERE key = 'registration_enabled'"
             ).fetchone()[0],
-            0,
+            "false",
+        )
+        raised_limit = self.service.update_registration_limit(2)
+        self.assertEqual(raised_limit["remaining_slots"], 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT value FROM system_settings WHERE key = 'registration_enabled'"
+            ).fetchone()[0],
+            "false",
         )
 
-    def test_expired_revoked_and_reused_invites_are_rejected(self):
-        expired, expired_challenge, expired_secret = self.issue_registration_challenge(
-            "expired@example.com"
+    def test_direct_registration_requires_terms_v2_even_if_setting_regresses(self):
+        self.connection.execute(
+            "UPDATE system_settings SET value = 'v1' WHERE key = 'terms_version'"
         )
-        self.now = expired["expires_at"] + 1
-        self.assert_error_code(
-            "INVITE_EXPIRED",
-            lambda: self.register(
-                username="expired-user",
-                email="expired@example.com",
-                invite=expired,
-                challenge=expired_challenge,
-                secret=expired_secret,
-            ),
-        )
+        self.connection.commit()
+        challenge, secret = self.issue_direct_challenge("terms-v2@example.com")
 
-        self.now = 1_800_200_000.0
-        revoked, revoked_challenge, revoked_secret = self.issue_registration_challenge(
-            "revoked@example.com"
-        )
-        self.service.revoke_invite(revoked["id"])
-        self.assert_error_code(
-            "INVITE_REVOKED",
-            lambda: self.register(
-                username="revoked-user",
-                email="revoked@example.com",
-                invite=revoked,
-                challenge=revoked_challenge,
-                secret=revoked_secret,
-            ),
-        )
+        with self.assertRaises(RegistrationError) as raised:
+            self.service.register_user(
+                username="terms-v2-user",
+                email="terms-v2@example.com",
+                password="Strong-pass-2026!",
+                challenge_id=challenge["challenge_id"],
+                verification_code=secret,
+                terms_version="v1",
+            )
 
-        shared = self.service.create_invites()[0]
-        one = self.issue_registration_challenge("one@example.com", invite=shared)
-        two = self.issue_registration_challenge("two@example.com", invite=shared)
-        self.register(
-            username="invite-user-one",
-            email="one@example.com",
-            invite=one[0],
-            challenge=one[1],
-            secret=one[2],
-        )
-        self.assert_error_code(
-            "INVITE_ALREADY_USED",
-            lambda: self.register(
-                username="invite-user-two",
-                email="two@example.com",
-                invite=two[0],
-                challenge=two[1],
-                secret=two[2],
-            ),
-        )
+        self.assertEqual(raised.exception.code, "REGISTRATION_CLOSED")
         self.assertIsNone(
             self.connection.execute(
                 "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
-                (two[1]["challenge_id"],),
+                (challenge["challenge_id"],),
             ).fetchone()[0]
         )
 
-    def test_concurrent_registration_with_one_invite_has_one_winner(self):
-        shared = self.service.create_invites()[0]
-        first = self.issue_registration_challenge("race-one@example.com", invite=shared)
-        second = self.issue_registration_challenge("race-two@example.com", invite=shared)
+    def test_concurrent_last_slot_allows_exactly_one_registration(self):
+        self.service.update_registration_limit(1)
+        self.connection.execute(
+            "UPDATE system_settings SET value = 'true' WHERE key = 'registration_enabled'"
+        )
+        self.connection.commit()
+        first = self.issue_direct_challenge("race-one@example.com")
+        second = self.issue_direct_challenge("race-two@example.com")
         second_connection = sqlite3.connect(
-            self.db_path, check_same_thread=False, timeout=10
+            self.db_path,
+            check_same_thread=False,
+            timeout=10,
         )
         second_connection.execute("PRAGMA foreign_keys = ON")
         second_service = RegistrationService(
@@ -869,14 +900,14 @@ class RegistrationTransactionTests(RegistrationServiceFixture):
                     username=username,
                     email=email,
                     password="Race-safe-pass-2026!",
-                    invite_code=shared["code"],
+                    invite_code="ignored",
                     challenge_id=challenge["challenge_id"],
                     verification_code=secret,
-                    terms_version="v1",
+                    terms_version="v2",
                 )
-                return ("ok", user["id"])
+                return "ok", user["id"]
             except RegistrationError as exc:
-                return ("error", exc.code)
+                return "error", exc.code
 
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
@@ -888,15 +919,15 @@ class RegistrationTransactionTests(RegistrationServiceFixture):
                                 self.service,
                                 "race-user-one",
                                 "race-one@example.com",
+                                first[0],
                                 first[1],
-                                first[2],
                             ),
                             (
                                 second_service,
                                 "race-user-two",
                                 "race-two@example.com",
+                                second[0],
                                 second[1],
-                                second[2],
                             ),
                         ),
                     )
@@ -907,10 +938,15 @@ class RegistrationTransactionTests(RegistrationServiceFixture):
         self.assertEqual([result[0] for result in results].count("ok"), 1)
         self.assertEqual([result[0] for result in results].count("error"), 1)
         self.assertEqual(
+            [result[1] for result in results if result[0] == "error"],
+            ["REGISTRATION_CLOSED"],
+        )
+        self.assertEqual(self.service.registration_capacity()["user_count"], 1)
+        self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM users WHERE username_normalized LIKE 'race-user-%'"
+                "SELECT value FROM system_settings WHERE key = 'registration_enabled'"
             ).fetchone()[0],
-            1,
+            "false",
         )
 
 
@@ -1137,7 +1173,7 @@ class PasswordResetAndAccountStateTests(RegistrationServiceFixture):
         self.assertTrue(
             auth.verify_password("REPO@EXAMPLE.COM", "Strong-pass-2026!")
         )
-        self.assertEqual(users.get_by_id(user["id"])["terms_version"], "v1")
+        self.assertEqual(users.get_by_id(user["id"])["terms_version"], "v2")
         self.assertEqual(users.list_recent(limit=1)[0]["id"], user["id"])
         self.assertEqual(users.set_password_by_id(user["id"], "synthetic-hash", 2), 1)
         self.assertEqual(users.set_active(user["id"], False), 1)

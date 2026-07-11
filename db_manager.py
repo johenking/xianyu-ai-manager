@@ -764,7 +764,8 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
-            ('terms_version', 'v1', '当前注册条款版本'),
+            ('terms_version', 'v2', '当前注册条款版本'),
+            ('registration_user_limit', '20', '非管理员注册用户上限'),
             ('support_email', '', '公开支持邮箱'),
             ('smtp_verified_fingerprint', '', '已验证SMTP配置指纹'),
             ('smtp_verified_at', '', 'SMTP配置验证时间'),
@@ -3948,19 +3949,7 @@ class DBManager:
                         cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
 
                 if smtp_settings_imported:
-                    cursor.executemany(
-                        """
-                        INSERT INTO system_settings (key, value, description, updated_at)
-                        VALUES (?, '', ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = '',
-                            updated_at = CURRENT_TIMESTAMP
-                        """,
-                        (
-                            ('smtp_verified_fingerprint', 'SMTP verification fingerprint'),
-                            ('smtp_verified_at', 'SMTP verification time'),
-                        ),
-                    )
+                    self._clear_smtp_verification(cursor)
 
                 # 提交事务
                 self.conn.commit()
@@ -4050,7 +4039,15 @@ class DBManager:
             {
                 "smtp_verified_fingerprint": "",
                 "smtp_verified_at": "",
+                "registration_enabled": "false",
             },
+        )
+        cursor.execute(
+            """
+            UPDATE auth_challenges
+            SET consumed_at = CAST(strftime('%s', 'now') AS REAL)
+            WHERE purpose = 'smtp_verify_email' AND consumed_at IS NULL
+            """
         )
 
     def get_system_setting(self, key: str) -> Optional[str]:
@@ -4110,6 +4107,26 @@ class DBManager:
                 return True
             except Exception as e:
                 logger.error(f"分区保存系统设置失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def save_unverified_smtp_settings(self, settings: Dict[str, Any]) -> bool:
+        """Persist an SMTP candidate and force a fresh email confirmation."""
+        allowed = {
+            key: value
+            for key, value in settings.items()
+            if key in SMTP_CONFIGURATION_KEYS
+        }
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                self._write_system_settings(cursor, allowed)
+                self._clear_smtp_verification(cursor)
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存待验证 SMTP 配置失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 
@@ -4215,6 +4232,15 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
+
+    def get_user_by_email_for_public_auth(
+        self,
+        email: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up normalized email using only the migration-backed index."""
+
+        with self.lock:
+            return self.user_repository.get_by_email_indexed(email)
 
     def verify_user_password(self, username: str, password: str) -> bool:
         """验证用户密码"""

@@ -1,4 +1,4 @@
-"""Invitation registration, credential recovery, and auth abuse controls."""
+"""Direct registration, credential recovery, and auth abuse controls."""
 
 from __future__ import annotations
 
@@ -43,14 +43,18 @@ COMMON_WEAK_PASSWORDS = frozenset(
         "welcome1",
     }
 )
-INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-INVITE_DIGEST_PURPOSE = "registration-invite-code"
-MAX_INVITE_NOTE_LENGTH = 200
 CHALLENGE_PURPOSES = frozenset(
-    {"captcha", "register_email", "password_reset_email"}
+    {
+        "captcha",
+        "register_email",
+        "password_reset_email",
+        "smtp_verify_email",
+    }
 )
 DEFAULT_CHALLENGE_TTL_SECONDS = 600
 DEFAULT_CHALLENGE_MAX_ATTEMPTS = 5
+CHALLENGE_AUDIT_RETENTION_SECONDS = 86_400
+CHALLENGE_CLEANUP_BATCH_SIZE = 100
 RATE_IP_DIGEST_PURPOSE = "auth-rate-ip"
 RATE_EMAIL_DIGEST_PURPOSE = "auth-rate-email"
 RATE_ACCOUNT_DIGEST_PURPOSE = "auth-rate-account"
@@ -732,153 +736,88 @@ class RegistrationService:
         self.users = UserRepository(connection)
         self.sessions = AuthSessionRepository(connection)
 
-    def create_invites(
-        self,
-        *,
-        count: int = 1,
-        valid_days: int = 30,
-        note: str = "",
-        created_by_user_id: int | None = None,
-    ) -> list[dict[str, Any]]:
-        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 20:
-            raise RegistrationError(
-                "INVITE_COUNT_INVALID",
-                "每次只能创建 1 至 20 个邀请码",
-            )
-        if (
-            isinstance(valid_days, bool)
-            or not isinstance(valid_days, int)
-            or not 1 <= valid_days <= 365
-        ):
-            raise RegistrationError(
-                "INVITE_VALID_DAYS_INVALID",
-                "邀请码有效天数必须为 1 至 365 天",
-            )
-        normalized_note = str(note or "")
-        if len(normalized_note) > MAX_INVITE_NOTE_LENGTH:
-            raise RegistrationError(
-                "INVITE_NOTE_TOO_LONG",
-                f"邀请码备注不能超过 {MAX_INVITE_NOTE_LENGTH} 个字符",
-            )
+    def registration_capacity(self) -> dict[str, int]:
+        with self.lock:
+            return self._registration_capacity_locked()
 
-        now = self.clock()
-        expires_at = now + valid_days * 86_400
-        created: list[dict[str, Any]] = []
+    def update_registration_limit(self, limit: int) -> dict[str, int]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise RegistrationError(
+                "REGISTRATION_USER_LIMIT_INVALID",
+                "注册用户上限必须为 1 至 1000",
+            )
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                for _ in range(count):
-                    code = self._generate_invite_code()
-                    digest = self._invite_digest(code)
-                    hint = self._invite_hint(code)
-                    cursor = self.connection.execute(
-                        """
-                        INSERT INTO registration_invites (
-                            code_digest, code_hint, note, expires_at,
-                            created_by_user_id, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            digest,
-                            hint,
-                            normalized_note,
-                            expires_at,
-                            created_by_user_id,
-                            int(now),
-                        ),
-                    )
-                    created.append(
-                        {
-                            "id": int(cursor.lastrowid),
-                            "code": code,
-                            "hint": hint,
-                            "note": normalized_note,
-                            "created_at": int(now),
-                            "expires_at": expires_at,
-                            "used_at": None,
-                            "used_by_user_id": None,
-                            "revoked_at": None,
-                            "created_by_user_id": created_by_user_id,
-                            "status": "active",
-                        }
-                    )
-                self.connection.commit()
-            except Exception:
-                self.connection.rollback()
-                raise
-        return created
-
-    def list_invites(self) -> list[dict[str, Any]]:
-        with self.lock:
-            rows = self.connection.execute(
-                """
-                SELECT id, code_hint, note, expires_at, used_at,
-                       used_by_user_id, revoked_at, created_by_user_id, created_at
-                FROM registration_invites
-                ORDER BY id DESC
-                """
-            ).fetchall()
-        now = self.clock()
-        return [self._invite_from_row(row, now) for row in rows]
-
-    def has_active_invites(self) -> bool:
-        now = self.clock()
-        with self.lock:
-            row = self.connection.execute(
-                """
-                SELECT 1 FROM registration_invites
-                WHERE used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-                LIMIT 1
-                """,
-                (now,),
-            ).fetchone()
-        return row is not None
-
-    def active_invite_exists(self, code: str) -> bool:
-        digest = self._invite_digest(str(code))
-        now = self.clock()
-        with self.lock:
-            row = self.connection.execute(
-                """
-                SELECT 1 FROM registration_invites
-                WHERE code_digest = ? AND used_at IS NULL AND revoked_at IS NULL
-                  AND expires_at > ?
-                LIMIT 1
-                """,
-                (digest, now),
-            ).fetchone()
-        return row is not None
-
-    def revoke_invite(self, invite_id: int) -> dict[str, Any]:
-        now = self.clock()
-        with self.lock:
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                row = self.connection.execute(
-                    """
-                    SELECT id, code_hint, note, expires_at, used_at,
-                           used_by_user_id, revoked_at, created_by_user_id, created_at
-                    FROM registration_invites WHERE id = ?
-                    """,
-                    (invite_id,),
-                ).fetchone()
-                if row is None:
-                    raise RegistrationError("INVITE_NOT_FOUND", "邀请码不存在")
-                if row[4] is not None:
-                    raise RegistrationError("INVITE_ALREADY_USED", "已使用的邀请码不能吊销")
-                if row[6] is not None:
-                    raise RegistrationError("INVITE_REVOKED", "邀请码已被吊销")
                 self.connection.execute(
-                    "UPDATE registration_invites SET revoked_at = ? WHERE id = ?",
-                    (now, invite_id),
+                    """
+                    INSERT INTO system_settings (key, value, description)
+                    VALUES ('registration_user_limit', ?, 'Maximum number of non-admin registered users')
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (str(limit),),
                 )
+                capacity = self._registration_capacity_locked()
+                if capacity["user_count"] >= limit:
+                    self._set_registration_enabled_locked(False)
                 self.connection.commit()
             except Exception:
                 self.connection.rollback()
                 raise
-        updated = list(row)
-        updated[6] = now
-        return self._invite_from_row(updated, now)
+        return capacity
+
+    def _registration_capacity_locked(self) -> dict[str, int]:
+        row = self.connection.execute(
+            "SELECT value FROM system_settings WHERE key = 'registration_user_limit'"
+        ).fetchone()
+        try:
+            user_limit = int(row[0]) if row is not None else 0
+        except (TypeError, ValueError):
+            user_limit = 0
+        user_count = int(
+            self.connection.execute(
+                """
+                SELECT COUNT(*) FROM users
+                WHERE COALESCE(username_normalized, lower(username)) <> 'admin'
+                """
+            ).fetchone()[0]
+        )
+        remaining_slots = (
+            max(0, user_limit - user_count) if 1 <= user_limit <= 1000 else 0
+        )
+        return {
+            "user_limit": user_limit,
+            "user_count": user_count,
+            "remaining_slots": remaining_slots,
+        }
+
+    def _registration_state_locked(self) -> dict[str, Any]:
+        from auth_email_service import registration_readiness
+
+        settings = {
+            str(key): str(value or "")
+            for key, value in self.connection.execute(
+                "SELECT key, value FROM system_settings"
+            ).fetchall()
+        }
+        if settings.get("smtp_password"):
+            settings["smtp_password"] = self.cipher.decrypt(settings["smtp_password"])
+        capacity = self._registration_capacity_locked()
+        return registration_readiness(
+            settings,
+            db_path=self.db_path,
+            user_count=capacity["user_count"],
+        )
+
+    def _set_registration_enabled_locked(self, enabled: bool) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO system_settings (key, value, description)
+            VALUES ('registration_enabled', ?, 'Whether public registration is enabled')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            ("true" if enabled else "false",),
+        )
 
     def create_challenge(
         self,
@@ -917,14 +856,11 @@ class RegistrationService:
             normalized_purpose,
             context,
         )
-        if normalized_purpose == "register_email":
-            if not context:
-                raise RegistrationError(
-                    "INVITE_REQUIRED",
-                    "注册邮件验证码必须绑定邀请码",
-                )
-            if not self.active_invite_exists(context):
-                raise RegistrationError("INVITE_INVALID", "邀请码无效或不可用")
+        if normalized_purpose == "register_email" and context:
+            raise RegistrationError(
+                "CHALLENGE_CONTEXT_INVALID",
+                "注册邮件验证码不接受附加场景",
+            )
         secret_digest = self.cipher.digest(
             str(secret),
             purpose=self._challenge_secret_purpose(normalized_purpose),
@@ -935,6 +871,25 @@ class RegistrationService:
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
+                cleanup_before = now - CHALLENGE_AUDIT_RETENTION_SECONDS
+                self.connection.execute(
+                    """
+                    DELETE FROM auth_challenges
+                    WHERE challenge_id IN (
+                        SELECT challenge_id
+                        FROM auth_challenges INDEXED BY idx_auth_challenges_expiry
+                        WHERE expires_at < ?
+                           OR (consumed_at IS NOT NULL AND consumed_at < ?)
+                        ORDER BY expires_at, consumed_at
+                        LIMIT ?
+                    )
+                    """,
+                    (
+                        cleanup_before,
+                        cleanup_before,
+                        CHALLENGE_CLEANUP_BATCH_SIZE,
+                    ),
+                )
                 self.connection.execute(
                     """
                     INSERT INTO auth_challenges (
@@ -1036,6 +991,134 @@ class RegistrationService:
             raise deferred_error
         return True
 
+    def confirm_smtp_verification(
+        self,
+        *,
+        challenge_id: str,
+        verification_code: str,
+        verified_at: str,
+    ) -> dict[str, str]:
+        from auth_email_service import (
+            SMTP_CONFIGURATION_KEYS,
+            SMTPConfigurationError,
+            smtp_configuration_fingerprint,
+        )
+
+        if not str(verified_at or ""):
+            raise RegistrationError(
+                "SMTP_VERIFICATION_SAVE_FAILED",
+                "SMTP 确认状态保存失败，请重新验证",
+                http_status=503,
+            )
+        now = self.clock()
+        deferred_error: RegistrationError | None = None
+        fingerprint = ""
+
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                settings = {
+                    str(key): str(value or "")
+                    for key, value in self.connection.execute(
+                        "SELECT key, value FROM system_settings"
+                    ).fetchall()
+                    if key in SMTP_CONFIGURATION_KEYS
+                }
+                if settings.get("smtp_password"):
+                    settings["smtp_password"] = self.cipher.decrypt(
+                        settings["smtp_password"]
+                    )
+                recipient = normalize_email(
+                    settings.get("support_email", "")
+                ).normalized
+                try:
+                    fingerprint = smtp_configuration_fingerprint(
+                        settings,
+                        db_path=self.db_path,
+                    )
+                except SMTPConfigurationError as exc:
+                    raise RegistrationError(
+                        "SMTP_CONFIGURATION_INVALID",
+                        "当前 SMTP 配置不可验证",
+                    ) from exc
+
+                row = self._get_challenge(challenge_id)
+                self._validate_challenge_binding(
+                    row,
+                    purpose="smtp_verify_email",
+                    subject=recipient,
+                    context=fingerprint,
+                    now=now,
+                )
+                if not self._challenge_secret_matches(row, verification_code):
+                    next_attempt = min(int(row[5]) + 1, int(row[6]))
+                    self.connection.execute(
+                        """
+                        UPDATE auth_challenges
+                        SET attempt_count = attempt_count + 1
+                        WHERE challenge_id = ? AND consumed_at IS NULL
+                          AND attempt_count < max_attempts
+                        """,
+                        (challenge_id,),
+                    )
+                    self.connection.commit()
+                    if next_attempt >= int(row[6]):
+                        deferred_error = RegistrationError(
+                            "CHALLENGE_LOCKED",
+                            "验证码尝试次数过多，请重新获取",
+                        )
+                    else:
+                        deferred_error = RegistrationError(
+                            "CHALLENGE_SECRET_INVALID",
+                            "验证码错误",
+                        )
+                else:
+                    consumed = self.connection.execute(
+                        """
+                        UPDATE auth_challenges SET consumed_at = ?
+                        WHERE challenge_id = ? AND consumed_at IS NULL
+                          AND attempt_count < max_attempts AND expires_at > ?
+                        """,
+                        (now, challenge_id, now),
+                    )
+                    if consumed.rowcount != 1:
+                        raise RegistrationError(
+                            "CHALLENGE_UNAVAILABLE",
+                            "验证码已不可用",
+                        )
+                    self.connection.executemany(
+                        """
+                        INSERT INTO system_settings (
+                            key, value, description, updated_at
+                        ) VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            ("smtp_verified_fingerprint", fingerprint),
+                            ("smtp_verified_at", str(verified_at)),
+                        ),
+                    )
+                    self.connection.commit()
+            except RegistrationError:
+                if deferred_error is None:
+                    self.connection.rollback()
+                raise
+            except Exception as exc:
+                self.connection.rollback()
+                raise RegistrationError(
+                    "SMTP_VERIFICATION_SAVE_FAILED",
+                    "SMTP 确认状态保存失败，请重新验证",
+                    http_status=503,
+                ) from exc
+        if deferred_error is not None:
+            raise deferred_error
+        return {
+            "fingerprint": fingerprint,
+            "verified_at": str(verified_at),
+        }
+
     def verify_challenge(
         self,
         *,
@@ -1059,32 +1142,32 @@ class RegistrationService:
         username: str,
         email: str,
         password: str,
-        invite_code: str,
         challenge_id: str,
         verification_code: str,
         terms_version: str,
+        invite_code: str = "",
     ) -> dict[str, Any]:
-        username_identity = normalize_username(username)
-        email_identity = normalize_email(email)
-        validate_password(
-            password,
-            username_normalized=username_identity.normalized,
-        )
-        invite_digest = self._invite_digest(str(invite_code))
         now = self.clock()
         failed_challenge: RegistrationError | None = None
 
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                invite = self._get_invite_for_use(invite_digest)
-                self._validate_invite_for_use(invite, now)
+                state = self._registration_state_locked()
+                if not state["enabled"]:
+                    raise RegistrationError(
+                        "REGISTRATION_CLOSED",
+                        "注册暂未开放",
+                        http_status=403,
+                    )
+                username_identity = normalize_username(username)
+                email_identity = normalize_email(email)
                 challenge = self._get_challenge(challenge_id)
                 self._validate_challenge_binding(
                     challenge,
                     purpose="register_email",
                     subject=email_identity.normalized,
-                    context=invite_code,
+                    context="",
                     now=now,
                 )
                 if not self._challenge_secret_matches(
@@ -1103,6 +1186,10 @@ class RegistrationService:
                     raise RegistrationError("USERNAME_TAKEN", "用户名已被使用")
                 if self.users.get_by_email(email_identity.normalized) is not None:
                     raise RegistrationError("EMAIL_TAKEN", "邮箱已被使用")
+                validate_password(
+                    password,
+                    username_normalized=username_identity.normalized,
+                )
 
                 password_hash = hash_user_password(password)
                 user_id = self.users.create(
@@ -1116,15 +1203,6 @@ class RegistrationService:
                     terms_accepted_at=now,
                     is_active=True,
                 )
-                invite_cursor = self.connection.execute(
-                    """
-                    UPDATE registration_invites
-                    SET used_at = ?, used_by_user_id = ?
-                    WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL
-                      AND expires_at > ?
-                    """,
-                    (now, user_id, invite[0], now),
-                )
                 challenge_cursor = self.connection.execute(
                     """
                     UPDATE auth_challenges SET consumed_at = ?
@@ -1133,16 +1211,14 @@ class RegistrationService:
                     """,
                     (now, challenge_id, now),
                 )
-                if invite_cursor.rowcount != 1:
-                    raise RegistrationError(
-                        "INVITE_UNAVAILABLE",
-                        "邀请码已不可用",
-                    )
                 if challenge_cursor.rowcount != 1:
                     raise RegistrationError(
                         "CHALLENGE_UNAVAILABLE",
                         "验证码已不可用",
                     )
+                capacity = self._registration_capacity_locked()
+                if capacity["user_count"] >= capacity["user_limit"]:
+                    self._set_registration_enabled_locked(False)
                 user = self.users.get_by_id(user_id)
                 self.connection.commit()
             except _WrongChallengeSecret:
@@ -1174,30 +1250,13 @@ class RegistrationService:
         verification_code: str,
     ) -> int:
         email_identity = normalize_email(email)
-        with self.lock:
-            initial_user = self.users.get_by_email(email_identity.normalized)
-        if initial_user is None:
-            raise RegistrationError("USER_NOT_FOUND", "用户不存在")
-        validate_password(
-            new_password,
-            username_normalized=initial_user["username_normalized"],
-        )
         now = self.clock()
         failed_challenge: RegistrationError | None = None
-        user_id = int(initial_user["id"])
+        user_id: int | None = None
 
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                user = self.users.get_by_email(email_identity.normalized)
-                if user is None:
-                    raise RegistrationError("USER_NOT_FOUND", "用户不存在")
-                if not user["is_active"]:
-                    raise RegistrationError("USER_INACTIVE", "用户已停用")
-                validate_password(
-                    new_password,
-                    username_normalized=user["username_normalized"],
-                )
                 challenge = self._get_challenge(challenge_id)
                 self._validate_challenge_binding(
                     challenge,
@@ -1212,6 +1271,16 @@ class RegistrationService:
                 ):
                     raise _WrongChallengeSecret
 
+                user = self.users.get_by_email(email_identity.normalized)
+                if not user or not user["is_active"]:
+                    raise RegistrationError(
+                        "PASSWORD_RESET_UNAVAILABLE",
+                        "密码重置请求不可用",
+                    )
+                validate_password(
+                    new_password,
+                    username_normalized=user["username_normalized"],
+                )
                 password_hash = hash_user_password(new_password)
                 user_id = int(user["id"])
                 if (
@@ -1249,6 +1318,11 @@ class RegistrationService:
                 raise
         if failed_challenge is not None:
             raise failed_challenge
+        if user_id is None:
+            raise RegistrationError(
+                "PASSWORD_RESET_FAILED",
+                "密码重置失败，请稍后重试",
+            )
         return user_id
 
     def _get_challenge(self, challenge_id: str) -> Any:
@@ -1312,37 +1386,16 @@ class RegistrationService:
             purpose=self._challenge_secret_purpose(row[1]),
         )
 
-    def _get_invite_for_use(self, digest: str) -> Any:
-        row = self.connection.execute(
-            """
-            SELECT id, expires_at, used_at, revoked_at
-            FROM registration_invites WHERE code_digest = ?
-            """,
-            (digest,),
-        ).fetchone()
-        if row is None:
-            raise RegistrationError("INVITE_INVALID", "邀请码无效或不可用")
-        return row
-
-    @staticmethod
-    def _validate_invite_for_use(row: Any, now: float) -> None:
-        if row[2] is not None:
-            raise RegistrationError("INVITE_ALREADY_USED", "邀请码已被使用")
-        if row[3] is not None:
-            raise RegistrationError("INVITE_REVOKED", "邀请码已被吊销")
-        if float(row[1]) <= now:
-            raise RegistrationError("INVITE_EXPIRED", "邀请码已过期")
-
     def _current_terms_version(self) -> str:
         row = self.connection.execute(
             "SELECT value FROM system_settings WHERE key = 'terms_version'"
         ).fetchone()
-        if row is None or not str(row[0]):
+        if row is None or str(row[0]) != "v2":
             raise RegistrationError(
                 "TERMS_VERSION_UNAVAILABLE",
                 "当前注册条款不可用",
             )
-        return str(row[0])
+        return "v2"
 
     def _validate_challenge_binding(
         self,
@@ -1381,7 +1434,11 @@ class RegistrationService:
             )
 
     def _challenge_subject_digest(self, purpose: str, subject: str) -> str:
-        if purpose in {"register_email", "password_reset_email"}:
+        if purpose in {
+            "register_email",
+            "password_reset_email",
+            "smtp_verify_email",
+        }:
             value = normalize_email(subject).normalized
         else:
             value = str(subject)
@@ -1397,8 +1454,6 @@ class RegistrationService:
 
     def _challenge_context_digest(self, purpose: str, context: str) -> str:
         value = str(context or "")
-        if purpose == "register_email":
-            return self._invite_digest(value) if value else ""
         if not value:
             return ""
         return self.cipher.digest(
@@ -1409,37 +1464,3 @@ class RegistrationService:
     @staticmethod
     def _challenge_secret_purpose(purpose: str) -> str:
         return f"auth-challenge-secret:{purpose}"
-
-    def _generate_invite_code(self) -> str:
-        body = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(24))
-        return f"REG-{body}"
-
-    def _invite_digest(self, code: str) -> str:
-        return self.cipher.digest(code, purpose=INVITE_DIGEST_PURPOSE)
-
-    @staticmethod
-    def _invite_hint(code: str) -> str:
-        return f"{code[:7]}...{code[-4:]}"
-
-    @staticmethod
-    def _invite_from_row(row: Any, now: float) -> dict[str, Any]:
-        if row[4] is not None:
-            status = "used"
-        elif row[6] is not None:
-            status = "revoked"
-        elif float(row[3]) <= now:
-            status = "expired"
-        else:
-            status = "active"
-        return {
-            "id": int(row[0]),
-            "hint": row[1],
-            "note": row[2],
-            "expires_at": row[3],
-            "used_at": row[4],
-            "used_by_user_id": row[5],
-            "revoked_at": row[6],
-            "created_by_user_id": row[7],
-            "created_at": row[8],
-            "status": status,
-        }

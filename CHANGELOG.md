@@ -2,6 +2,27 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.7.0] - 2026-07-11
+
+### Added
+
+- Add direct registration without invite codes, guarded by the administrator switch, image CAPTCHA, purpose-bound email codes, and a configurable 1–1000 ordinary-user capacity with a default of 20.
+- Add two-step SMTP verification: sending a six-digit receipt code persists an unverified configuration, and only entering the code from the real support mailbox verifies the current configuration fingerprint.
+- Add a QQ Mail preset for `smtp.qq.com:465` with SSL enabled and STARTTLS disabled, plus administrator capacity and remaining-slot controls.
+
+### Changed
+
+- Upgrade the agreement version to `v2`, consume pending invitation-era registration challenges, and force registration closed during migration `2026071103`.
+- Count disabled ordinary users toward capacity while excluding the administrator. Filling the final slot closes registration automatically; raising the limit does not reopen it.
+- Keep legacy invite fields compatible but ignored. Retained invite administration routes now return HTTP 410, while historical invite rows remain untouched.
+- Send authentication mail through the same path for eligible and decoy targets so the public email endpoint does not reveal whether an address is registered.
+
+### Security
+
+- Require the SMTP receipt code to match the current configuration fingerprint before registration can become ready, and invalidate pending confirmation challenges after SMTP changes.
+- Serialize frontend SMTP verification, confirmation, settings saves, and reloads so stale requests cannot overwrite newer configuration state.
+- Keep decoy registration and password-reset challenges unusable even though their public responses and delivery behavior match eligible accounts.
+
 ## [1.6.0] - 2026-07-11
 
 ### Added

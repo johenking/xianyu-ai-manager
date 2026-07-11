@@ -27,8 +27,8 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 |---|---|
 | Health | `GET /health/live`, `GET /health/ready`, compatibility `GET /health` |
 | Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset` |
-| Registration administration | `/api/admin/registration/status`, `/invites`, `/users`, `/enabled` |
-| Settings | `GET /api/settings/summary`, `PUT /api/settings/sections/{section}`, `POST /api/settings/verify/{section}` |
+| Registration administration | `/api/admin/registration/status`, `/limit`, `/users`, `/enabled`; legacy `/invites` returns 410 |
+| Settings | `GET /api/settings/summary`, `PUT /api/settings/sections/{section}`, `POST /api/settings/verify/{section}`, `POST /api/settings/verify/smtp/confirm` |
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
@@ -40,7 +40,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 
 Routes below require `Authorization: Bearer $TOKEN` unless they are explicitly described as public.
 
-## Invitation Registration And Password Recovery
+## Direct Registration And Password Recovery
 
 The public registration status is deliberately narrow and fail-closed:
 
@@ -48,7 +48,7 @@ The public registration status is deliberately narrow and fail-closed:
 curl -sS "$BASE_URL/api/auth/registration-config"
 ```
 
-It returns `enabled`, `ready`, `invite_required`, `terms_version`, local terms/privacy links, a public support email, and a user-facing message. It never returns SMTP configuration, verification fingerprints, or invite counts. Treat `enabled: false` as authoritative even when the service itself is healthy.
+It returns `enabled`, `ready`, `invite_required: false`, `terms_version`, local terms/privacy links, a public support email, and a user-facing message. It never returns SMTP configuration, verification fingerprints, user counts, or capacity. Treat `enabled: false` as authoritative even when the service itself is healthy.
 
 Request a one-time image CAPTCHA, then submit it when requesting a registration email code:
 
@@ -62,7 +62,6 @@ curl -sS -X POST "$BASE_URL/api/auth/email-code" \
   -d '{
     "purpose":"register",
     "email":"person@example.com",
-    "invite_code":"<one-time-invite>",
     "captcha_challenge_id":"<captcha-challenge-id>",
     "captcha_code":"<captcha-answer>"
   }'
@@ -74,18 +73,17 @@ The email response returns a new `challenge_id`, a 10-minute expiry, and a 60-se
 curl -sS -X POST "$BASE_URL/register" \
   -H 'Content-Type: application/json' \
   -d '{
-    "invite_code":"<one-time-invite>",
     "email":"person@example.com",
     "challenge_id":"<email-challenge-id>",
     "verification_code":"<six-digit-code>",
-    "username":"invited-user",
+    "username":"new-user",
     "password":"<new-password>",
-    "terms_version":"v1",
+    "terms_version":"v2",
     "terms_accepted":true
   }'
 ```
 
-Success returns the same bearer-token shape as `/login`. The user insert, invite consumption, and email-challenge consumption commit together. Usernames accept 3–24 Unicode letters or numbers plus `_` and `-`. Passwords require at least eight characters, must not contain the username or match the common-password denylist, and cannot exceed bcrypt's 72-byte UTF-8 input limit.
+Success returns the same bearer-token shape as `/login`. The switch and capacity recheck, user insert, and email-challenge consumption commit together. Legacy clients may still send `invite_code`, but it is ignored. Usernames accept 3–24 Unicode letters or numbers plus `_` and `-`. Passwords require at least eight characters, must not contain the username or match the common-password denylist, and cannot exceed bcrypt's 72-byte UTF-8 input limit.
 
 Password recovery uses a fresh image CAPTCHA and `purpose: "password_reset"` in `/api/auth/email-code`; it does not accept a registration email challenge. Submit the resulting code to:
 
@@ -108,7 +106,7 @@ Authentication errors use a non-echoing structure:
 {
   "success": false,
   "code": "REGISTRATION_CLOSED",
-  "message": "邀请注册暂未开放",
+  "message": "注册暂未开放",
   "retry_after": null,
   "request_id": "<request-id>"
 }
@@ -116,13 +114,13 @@ Authentication errors use a non-echoing structure:
 
 HTTP 429 responses include `retry_after`. CAPTCHA issuance is limited by client IP; email delivery is limited by normalized email and client IP; login cooldown is tracked independently by account and IP. Forwarded headers affect these limits only when the direct peer is configured in `auth_trusted_proxies`.
 
-Administrators can read readiness, create 1–20 invites, list only hints and state, revoke an unused invite, list recent ordinary users, enable or disable an ordinary user, and change the guarded registration switch:
+Administrators can read readiness and capacity, set the 1–1000 ordinary-user limit, list recent ordinary users, enable or disable an ordinary user, and change the guarded registration switch:
 
 ```bash
-curl -sS -X POST "$BASE_URL/api/admin/registration/invites" \
+curl -sS -X PUT "$BASE_URL/api/admin/registration/limit" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"count":5,"valid_days":7,"note":"small pilot"}'
+  -d '{"limit":20}'
 
 curl -sS -X PUT "$BASE_URL/api/admin/registration/enabled" \
   -H "Authorization: Bearer $TOKEN" \
@@ -130,7 +128,7 @@ curl -sS -X PUT "$BASE_URL/api/admin/registration/enabled" \
   -d '{"enabled":true}'
 ```
 
-Raw invite codes appear only in the create response. Enabling returns HTTP 409 until SMTP is currently verified and at least one active invite exists. The user-management API intentionally excludes the administrator and provides no destructive delete action.
+The administrator status includes `user_limit`, `user_count`, and `remaining_slots`. Disabled ordinary users still count; the administrator does not. Lowering the limit to the current count or below closes registration without deleting users, and raising it does not reopen registration. Enabling returns HTTP 409 until SMTP is currently receipt-confirmed and capacity remains. The user-management API intentionally excludes the administrator and provides no destructive delete action. Legacy invite create/list/revoke endpoints return HTTP 410.
 
 ## Settings Sections
 
@@ -153,7 +151,7 @@ curl -sS -X PUT "$BASE_URL/api/settings/sections/ai" \
   }'
 ```
 
-Use `/api/settings/verify/ai` or `/api/settings/verify/smtp` to test unsaved values. SMTP verification sends a real test message to `support_email`, or to `smtp_user` when support email is empty. It saves the verified fingerprint only after delivery succeeds; changing any SMTP field invalidates that state.
+Use `/api/settings/verify/ai` to test AI values. `POST /api/settings/verify/smtp` saves the candidate SMTP settings as unverified, sends a six-digit code to the required support email, and returns `challenge_id`, `expires_in`, and a masked recipient. Confirm real receipt with `POST /api/settings/verify/smtp/confirm` and `{"challenge_id":"...","verification_code":"123456"}`. Only confirmation saves the verified fingerprint; changing any SMTP field consumes pending confirmations and closes registration. The QQ preset uses `smtp.qq.com:465`, SSL enabled, and STARTTLS disabled.
 
 ## AI Provider Profiles
 

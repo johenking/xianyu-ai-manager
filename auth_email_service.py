@@ -229,22 +229,39 @@ def registration_readiness(
     settings: Mapping[str, Any],
     *,
     db_path: str,
-    active_invite_available: bool,
+    user_count: int,
 ) -> dict[str, Any]:
     smtp_status = smtp_configuration_status(settings, db_path=db_path)
     terms_version = str(settings.get("terms_version") or "").strip()
     requested = _as_bool(settings.get("registration_enabled"))
+    try:
+        user_limit = int(settings.get("registration_user_limit") or 0)
+    except (TypeError, ValueError):
+        user_limit = 0
+    valid_limit = 1 <= user_limit <= 1000
+    normalized_user_count = max(0, int(user_count))
+    remaining_slots = max(0, user_limit - normalized_user_count) if valid_limit else 0
+    try:
+        support_email_valid = bool(
+            _clean_email(settings.get("support_email"), label="支持邮箱")
+        )
+    except SMTPConfigurationError:
+        support_email_valid = False
     ready = bool(
         smtp_status["smtp_verified"]
-        and active_invite_available
-        and terms_version
+        and support_email_valid
+        and valid_limit
+        and remaining_slots > 0
+        and terms_version == "v2"
     )
     return {
         "enabled": requested and ready,
         "ready": ready,
         "requested": requested,
-        "invite_required": True,
-        "active_invite_available": bool(active_invite_available),
+        "invite_required": False,
         "terms_version": terms_version,
+        "user_limit": user_limit,
+        "user_count": normalized_user_count,
+        "remaining_slots": remaining_slots,
         **smtp_status,
     }

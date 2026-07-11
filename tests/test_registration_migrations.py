@@ -236,7 +236,10 @@ class RegistrationMigrationTests(unittest.TestCase):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
 
-        self.assertEqual(runner.run(), ["2026071101", "2026071102"])
+        self.assertEqual(
+            runner.run(),
+            ["2026071101", "2026071102", "2026071103"],
+        )
         self.assertEqual(
             table_columns(connection, "users")
             & {
@@ -336,7 +339,8 @@ class RegistrationMigrationTests(unittest.TestCase):
 
         settings = dict(connection.execute("SELECT key, value FROM system_settings"))
         self.assertEqual(settings["registration_enabled"], "false")
-        self.assertEqual(settings["terms_version"], "v1")
+        self.assertEqual(settings["terms_version"], "v2")
+        self.assertEqual(settings["registration_user_limit"], "20")
         self.assertEqual(settings["support_email"], "")
         self.assertEqual(settings["smtp_verified_fingerprint"], "")
         self.assertEqual(settings["smtp_verified_at"], "")
@@ -423,7 +427,7 @@ class RegistrationMigrationTests(unittest.TestCase):
             str(self.db_path),
             backup_enabled=False,
         )
-        self.assertEqual(runner.run(), ["2026071102"])
+        self.assertEqual(runner.run(), ["2026071102", "2026071103"])
         self.assertEqual(
             connection.execute(
                 "SELECT username_normalized, email_normalized FROM users"
@@ -431,6 +435,72 @@ class RegistrationMigrationTests(unittest.TestCase):
             ("alice", "user@example.com"),
         )
         self.assertEqual(runner.run(), [])
+        connection.close()
+
+    def test_direct_registration_migration_preserves_invites_and_consumes_legacy_codes(self):
+        connection = sqlite3.connect(self.db_path)
+        migrations_through_1102 = tuple(
+            migration
+            for migration in MIGRATIONS
+            if migration.version <= "2026071102"
+        )
+        runner = MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=migrations_through_1102,
+            backup_enabled=False,
+        )
+        self.assertEqual(runner.run(), ["2026071101", "2026071102"])
+        connection.execute(
+            "INSERT INTO registration_invites "
+            "(code_digest, code_hint, expires_at) VALUES (?, ?, ?)",
+            ("synthetic-digest", "REG-...TEST", 2_000_000_000),
+        )
+        connection.executemany(
+            "INSERT INTO auth_challenges "
+            "(challenge_id, purpose, subject_digest, context_digest, "
+            "secret_digest, max_attempts, expires_at) "
+            "VALUES (?, ?, ?, '', ?, 5, ?)",
+            (
+                ("legacy-open", "register_email", "subject-a", "secret-a", 2_000_000_000),
+                ("legacy-used", "register_email", "subject-b", "secret-b", 2_000_000_000),
+                ("reset-open", "password_reset_email", "subject-c", "secret-c", 2_000_000_000),
+            ),
+        )
+        connection.execute(
+            "UPDATE auth_challenges SET consumed_at = 123 WHERE challenge_id = 'legacy-used'"
+        )
+        connection.execute(
+            "UPDATE system_settings SET value = 'true' WHERE key = 'registration_enabled'"
+        )
+        connection.commit()
+
+        migrated = MigrationRunner(
+            connection,
+            str(self.db_path),
+            backup_enabled=False,
+        )
+        self.assertEqual(migrated.run(), ["2026071103"])
+        settings = dict(connection.execute("SELECT key, value FROM system_settings"))
+        self.assertEqual(settings["registration_enabled"], "false")
+        self.assertEqual(settings["registration_user_limit"], "20")
+        self.assertEqual(settings["terms_version"], "v2")
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM registration_invites").fetchone()[0],
+            1,
+        )
+        consumed = dict(
+            connection.execute(
+                "SELECT challenge_id, consumed_at FROM auth_challenges ORDER BY challenge_id"
+            )
+        )
+        self.assertIsNotNone(consumed["legacy-open"])
+        self.assertEqual(consumed["legacy-used"], 123)
+        self.assertIsNone(consumed["reset-open"])
+
+        before = "\n".join(connection.iterdump())
+        self.assertEqual(migrated.run(), [])
+        self.assertEqual("\n".join(connection.iterdump()), before)
         connection.close()
 
 

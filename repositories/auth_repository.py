@@ -105,6 +105,18 @@ class UserRepository:
             )
         return _user_from_row(row)
 
+    def get_by_email_indexed(self, email: str) -> Optional[Dict[str, Any]]:
+        """Use the normalized unique index without legacy fallback scanning."""
+
+        normalized = _normalized_email(email)
+        row = self.connection.execute(
+            f"SELECT {USER_COLUMNS} FROM users "
+            "INDEXED BY idx_users_email_normalized "
+            "WHERE email_normalized = ? LIMIT 1",
+            (normalized,),
+        ).fetchone()
+        return _user_from_row(row)
+
     def get_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
         username_normalized = _normalized_username(identifier)
         email_normalized = _normalized_email(identifier)

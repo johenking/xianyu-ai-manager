@@ -2,9 +2,9 @@
 
 ## Source State On 2026-07-11
 
-The `v1.6.0` source combines the v1.5.0 official Goofish session renewal and Skill Center automation with fail-closed invitation registration, email-based password recovery, persistent authentication limits, local agreement pages, and administrator registration controls. Passwords, Cookies, email codes, invite codes, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
+The `v1.7.0` source combines official Goofish session renewal and Skill Center automation with fail-closed direct registration, email-based password recovery, persistent authentication limits, local agreement pages, SMTP receipt confirmation, and administrator capacity controls. Passwords, Cookies, email codes, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
 
-Publishing source does not prove a running service was upgraded. Verify the process path, health response, migration version, frontend entry bundle, account listeners, and Skill scheduler before describing any deployment as running v1.6.0. Registration must remain closed until real SMTP delivery and an end-to-end invited-user acceptance test have both succeeded.
+Publishing source does not prove a running service was upgraded. Verify the process path, health response, migration version, frontend entry bundle, account listeners, and Skill scheduler before describing any deployment as running v1.7.0. Registration must remain closed until the real SMTP receipt code and an end-to-end direct-registration acceptance test have both succeeded.
 
 ## Working Capabilities
 
@@ -20,9 +20,9 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram result delivery with `sent`, `partial`, and `failed` outcomes.
 - Cross-run result deduplication by task and item URL, falling back to platform item ID.
 - Expert prompts and real runtime, browser, AI, delivery, and account-listener diagnostics.
-- One-transaction invitation registration with a single-use invite, image CAPTCHA, purpose-bound email code, terms acceptance, and automatic login.
+- One-transaction direct registration with capacity recheck, image CAPTCHA, purpose-bound email code, `v2` terms acceptance, and automatic login.
 - Username-or-email login and email password recovery that revokes all older sessions after reset.
-- Administrator SMTP readiness, invite creation/revocation, ordinary-user enablement, and guarded registration switch controls.
+- Administrator SMTP receipt confirmation, 1–1000 ordinary-user capacity, user enablement, and guarded registration switch controls.
 - Purpose-isolated HMAC storage for authentication secrets and identifiers, persistent multi-dimensional rate limits, and trusted-proxy client-IP handling.
 
 ## Important Boundaries
@@ -36,9 +36,9 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - Skill Center notification delivery excludes QQ and email even though those channel types may exist elsewhere in the database.
 - Capability readiness does not guarantee an external AI provider or notification endpoint will remain reachable.
 - The scheduler depends on the intentional one-process, one-Uvicorn-worker runtime.
-- Registration defaults off and cannot be enabled without a verified current SMTP fingerprint and an active invite.
-- SMTP verification sends a real message and has no third-party fallback. Missing credentials, failed delivery, database errors, or changed SMTP settings keep registration closed.
-- Raw invite codes appear once. CAPTCHA and email challenges expire after 10 minutes and stop after five attempts.
+- Registration defaults off and cannot be enabled without a receipt-confirmed current SMTP fingerprint and remaining ordinary-user capacity.
+- SMTP verification sends a six-digit code to the independent support mailbox and has no third-party fallback. Missing credentials, failed delivery, an unconfirmed code, database errors, or changed SMTP settings keep registration closed.
+- CAPTCHA, email, and SMTP challenges expire after 10 minutes and stop after five attempts. Historical invite data is retained, while legacy invite APIs return HTTP 410.
 - The system-secret key is independent from the AI-provider and Xianyu-account keys; all three local key files must be restored with SQLite when environment keys are absent.
 
 ## Verification Baseline
@@ -65,11 +65,11 @@ Also run `git diff --check` and a secret scan over every tracked and prospective
 
 The automated suite covers official login modes, profile promotion and reuse, encrypted credential fallback, verification timeout and cancellation, account data retention, Skill scheduler lifecycle and locking, success/failure rescheduling, AI filtering, supported-channel filtering, multi-channel notification outcomes, cross-run deduplication, registration transactions and races, challenge expiry and attempts, rate limits, trusted proxies, SMTP failure behavior, session revocation, public auth views, and administrator registration interactions. Real platform acceptance still requires operator-owned Xianyu, AI provider, notification, and SMTP accounts.
 
-Verified on 2026-07-11 for the v1.6.0 source: Ruff and explicit Python compilation passed, all 194 backend tests passed, all 15 frontend test files with 37 tests passed, and `npm audit --audit-level=high` reported zero vulnerabilities. Two production builds retained two generations of 28 assets with zero orphans; the 235,685-byte entry bundle is 72.8% below the 865,910-byte baseline. The favicon resolves at `/static/favicon.svg`.
+Verified on 2026-07-11 for the v1.7.0 branch: Ruff and explicit Python compilation passed, all 204 backend tests passed, all 15 frontend test files with 46 tests passed, and `npm audit --audit-level=high` reported zero vulnerabilities. Two production builds retained two generations of 28 assets with zero orphans; the 234,760-byte entry bundle is 72.9% below the 865,910-byte baseline. The favicon resolves at `/static/favicon.svg`.
 
 ## Next Acceptance Steps
 
-- Keep registration closed while configuring a real QQ or 163 SMTP authorization code and support mailbox, then verify actual inbox delivery.
-- Create a small seven-day invite batch and complete one real registration, automatic login, service-restart session restore, password reset, and invite second-use rejection before opening registration.
-- Verify the deployed frontend entry, schema migration `2026071102`, account listeners, and Skill scheduler after restart; Skill schedules remain default off.
+- Keep registration closed while configuring a real QQ SMTP authorization code and independent support mailbox, then enter the six-digit code from the actual inbox.
+- Confirm the limit is 20, then complete one real direct registration, automatic login, service-restart session restore, username/email login, password reset, and old-session rejection before leaving registration open.
+- Verify the deployed frontend entry, schema migration `2026071103`, account listeners, and Skill scheduler after restart; Skill schedules remain default off.
 - Keep monitoring official page, SMTP, AI-provider, and notification changes; do not weaken human verification, rate limits, or secret-handling boundaries to improve automation rates.
