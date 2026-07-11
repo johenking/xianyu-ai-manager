@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from db_manager import DBManager
 
@@ -86,6 +86,45 @@ class SMTPEmailServiceTests(unittest.TestCase):
         )
         self.assertEqual(fake.message["To"], "recipient@example.test")
         self.assertIn("sender@example.test", fake.message["From"])
+        self.assertEqual(fake.quit_calls, 1)
+
+    def test_sender_uses_smtp_ssl_for_qq_port_465(self):
+        fake = FakeSMTP()
+        ssl_settings = {
+            **SMTP_SETTINGS,
+            "smtp_server": "smtp.qq.com",
+            "smtp_port": "465",
+            "smtp_use_ssl": "true",
+            "smtp_use_tls": "false",
+        }
+
+        with (
+            patch(
+                "auth_email_service.smtplib.SMTP_SSL",
+                return_value=fake,
+            ) as ssl_factory,
+            patch("auth_email_service.smtplib.SMTP") as plain_factory,
+        ):
+            SMTPEmailSender(timeout_seconds=9).send(
+                ssl_settings,
+                recipient="recipient@example.test",
+                subject="SMTP SSL verification",
+                text="This is an SSL delivery test.",
+            )
+
+        ssl_factory.assert_called_once_with(
+            "smtp.qq.com",
+            465,
+            timeout=9,
+            context=ANY,
+        )
+        plain_factory.assert_not_called()
+        self.assertEqual(fake.starttls_calls, 0)
+        self.assertEqual(
+            fake.login_args,
+            ("sender@example.test", "synthetic-smtp-secret"),
+        )
+        self.assertEqual(fake.message["To"], "recipient@example.test")
         self.assertEqual(fake.quit_calls, 1)
 
     def test_delivery_failure_is_generic_and_has_no_fallback(self):

@@ -279,7 +279,7 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
         ).fetchone()[0]
         self.assertEqual(after, before)
 
-    def test_existing_email_has_same_public_success_shape_without_sending(self):
+    def test_existing_email_has_same_public_success_shape_and_sends(self):
         self.make_registration_ready()
         self.assertTrue(
             self.db.create_user(
@@ -330,7 +330,7 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
             fresh.json()["cooldown_seconds"],
         )
         self.assertEqual(existing.json()["message"], fresh.json()["message"])
-        existing_sender.assert_not_called()
+        existing_sender.assert_called_once()
         fresh_sender.assert_called_once()
         row = self.db.conn.execute(
             "SELECT purpose, context_digest, secret_digest FROM auth_challenges "
@@ -397,6 +397,207 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
         self.assertEqual(response.status_code, 410)
         self.assertEqual(response.json()["code"], "LEGACY_AUTH_ENDPOINT_REMOVED")
         self.assertIn("/api/auth/email-code", response.json()["message"])
+
+
+class EmailEnumerationAPITests(RegistrationAPIFixture):
+    def setUp(self):
+        super().setUp()
+        self.make_registration_ready()
+        self.assertTrue(
+            self.db.create_user(
+                "existing-target",
+                "existing-target@example.com",
+                "Existing-target-pass-2026!",
+            )
+        )
+        self.assertTrue(
+            self.db.create_user(
+                "inactive-target",
+                "inactive-target@example.com",
+                "Inactive-target-pass-2026!",
+            )
+        )
+        inactive = self.db.get_user_by_email("inactive-target@example.com")
+        self.db.auth_service.set_user_active(inactive["id"], False)
+
+    def request_code(self, *, purpose, email, captcha_code, send_error=None):
+        captcha = self.captcha(code=captcha_code)
+        with patch.object(
+            reply_server.SMTPEmailSender,
+            "send",
+            autospec=True,
+            side_effect=send_error,
+        ) as sender:
+            response = self.client.post(
+                "/api/auth/email-code",
+                json={
+                    "purpose": purpose,
+                    "email": email,
+                    "captcha_challenge_id": captcha["challenge_id"],
+                    "captcha_code": captcha_code,
+                },
+            )
+        return response, sender
+
+    @staticmethod
+    def stable_success_payload(response):
+        return {
+            key: value
+            for key, value in response.json().items()
+            if key != "challenge_id"
+        }
+
+    def test_all_target_states_send_once_and_return_identical_success(self):
+        cases = (
+            ("register", "fresh-target@example.com", "A101"),
+            ("register", "existing-target@example.com", "A102"),
+            ("password_reset", "existing-target@example.com", "A103"),
+            ("password_reset", "missing-target@example.com", "A104"),
+            ("password_reset", "inactive-target@example.com", "A105"),
+        )
+        responses = []
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "enforce_email_send",
+        ):
+            for purpose, email, captcha_code in cases:
+                with self.subTest(purpose=purpose, target=email.split("@", 1)[0]):
+                    response, sender = self.request_code(
+                        purpose=purpose,
+                        email=email,
+                        captcha_code=captcha_code,
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    sender.assert_called_once()
+                    sent_text = sender.call_args.kwargs["text"]
+                    self.assertRegex(sent_text, r"\b\d{6}\b")
+                    responses.append(self.stable_success_payload(response))
+
+        self.assertTrue(responses)
+        self.assertTrue(all(payload == responses[0] for payload in responses))
+
+    def test_smtp_failure_is_identical_for_all_target_states(self):
+        cases = (
+            ("register", "fresh-failure@example.com", "B201"),
+            ("register", "existing-target@example.com", "B202"),
+            ("password_reset", "existing-target@example.com", "B203"),
+            ("password_reset", "missing-failure@example.com", "B204"),
+            ("password_reset", "inactive-target@example.com", "B205"),
+        )
+        failures = []
+        before = self.db.conn.execute(
+            "SELECT COUNT(*) FROM auth_challenges WHERE purpose IN "
+            "('register_email', 'password_reset_email')"
+        ).fetchone()[0]
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "enforce_email_send",
+        ):
+            for purpose, email, captcha_code in cases:
+                with self.subTest(purpose=purpose, target=email.split("@", 1)[0]):
+                    response, sender = self.request_code(
+                        purpose=purpose,
+                        email=email,
+                        captcha_code=captcha_code,
+                        send_error=SMTPDeliveryError("synthetic failure"),
+                    )
+                    sender.assert_called_once()
+                    failures.append(
+                        (response.status_code, response.json()["code"], response.json()["message"])
+                    )
+
+        self.assertTrue(all(failure == failures[0] for failure in failures))
+        self.assertEqual(failures[0][0:2], (502, "EMAIL_SEND_FAILED"))
+        after = self.db.conn.execute(
+            "SELECT COUNT(*) FROM auth_challenges WHERE purpose IN "
+            "('register_email', 'password_reset_email')"
+        ).fetchone()[0]
+        self.assertEqual(after, before)
+
+    def test_mailed_codes_cannot_consume_decoy_challenges_or_mutate_state(self):
+        inactive = self.db.get_user_by_email("inactive-target@example.com")
+        self.assertTrue(
+            self.db.save_auth_session(
+                token="synthetic-inactive-session",
+                user_id=inactive["id"],
+                username=inactive["username"],
+                is_admin=False,
+                expires_at=2_000_000_000,
+            )
+        )
+        inactive_hash = self.db.conn.execute(
+            "SELECT password_hash_v2 FROM users WHERE id = ?",
+            (inactive["id"],),
+        ).fetchone()[0]
+        user_count = self.db.registration_service.registration_capacity()["user_count"]
+        cases = (
+            ("register", "existing-target@example.com", "C301"),
+            ("password_reset", "missing-decoy@example.com", "C302"),
+            ("password_reset", "inactive-target@example.com", "C303"),
+        )
+        issued = []
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "enforce_email_send",
+        ):
+            for purpose, email, captcha_code in cases:
+                response, sender = self.request_code(
+                    purpose=purpose,
+                    email=email,
+                    captcha_code=captcha_code,
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                mailed_code = re.search(
+                    r"\b(\d{6})\b",
+                    sender.call_args.kwargs["text"],
+                ).group(1)
+                issued.append((purpose, email, response.json()["challenge_id"], mailed_code))
+
+        errors = []
+        for purpose, email, challenge_id, mailed_code in issued:
+            if purpose == "register":
+                response = self.client.post(
+                    "/register",
+                    json={
+                        "email": email,
+                        "challenge_id": challenge_id,
+                        "verification_code": mailed_code,
+                        "username": "decoy-register-user",
+                        "password": "Decoy-register-pass-2026!",
+                        "terms_version": "v2",
+                        "terms_accepted": True,
+                    },
+                )
+            else:
+                response = self.client.post(
+                    "/api/auth/password-reset",
+                    json={
+                        "email": email,
+                        "challenge_id": challenge_id,
+                        "verification_code": mailed_code,
+                        "new_password": "Decoy-reset-pass-2026!",
+                    },
+                )
+            errors.append(
+                (response.status_code, response.json()["code"], response.json()["message"])
+            )
+
+        self.assertTrue(all(error == errors[0] for error in errors))
+        self.assertEqual(errors[0][0:2], (400, "CHALLENGE_SECRET_INVALID"))
+        self.assertEqual(
+            self.db.registration_service.registration_capacity()["user_count"],
+            user_count,
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT password_hash_v2 FROM users WHERE id = ?",
+                (inactive["id"],),
+            ).fetchone()[0],
+            inactive_hash,
+        )
+        self.assertIsNotNone(
+            self.db.get_auth_session("synthetic-inactive-session")
+        )
 
 
 class LoginAndPasswordResetAPITests(RegistrationAPIFixture):

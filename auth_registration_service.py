@@ -1101,30 +1101,13 @@ class RegistrationService:
         verification_code: str,
     ) -> int:
         email_identity = normalize_email(email)
-        with self.lock:
-            initial_user = self.users.get_by_email(email_identity.normalized)
-        if initial_user is None:
-            raise RegistrationError("USER_NOT_FOUND", "用户不存在")
-        validate_password(
-            new_password,
-            username_normalized=initial_user["username_normalized"],
-        )
         now = self.clock()
         failed_challenge: RegistrationError | None = None
-        user_id = int(initial_user["id"])
+        user_id: int | None = None
 
         with self.lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
-                user = self.users.get_by_email(email_identity.normalized)
-                if user is None:
-                    raise RegistrationError("USER_NOT_FOUND", "用户不存在")
-                if not user["is_active"]:
-                    raise RegistrationError("USER_INACTIVE", "用户已停用")
-                validate_password(
-                    new_password,
-                    username_normalized=user["username_normalized"],
-                )
                 challenge = self._get_challenge(challenge_id)
                 self._validate_challenge_binding(
                     challenge,
@@ -1139,6 +1122,16 @@ class RegistrationService:
                 ):
                     raise _WrongChallengeSecret
 
+                user = self.users.get_by_email(email_identity.normalized)
+                if not user or not user["is_active"]:
+                    raise RegistrationError(
+                        "PASSWORD_RESET_UNAVAILABLE",
+                        "密码重置请求不可用",
+                    )
+                validate_password(
+                    new_password,
+                    username_normalized=user["username_normalized"],
+                )
                 password_hash = hash_user_password(new_password)
                 user_id = int(user["id"])
                 if (
@@ -1176,6 +1169,11 @@ class RegistrationService:
                 raise
         if failed_challenge is not None:
             raise failed_challenge
+        if user_id is None:
+            raise RegistrationError(
+                "PASSWORD_RESET_FAILED",
+                "密码重置失败，请稍后重试",
+            )
         return user_id
 
     def _get_challenge(self, challenge_id: str) -> Any:

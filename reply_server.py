@@ -1238,45 +1238,40 @@ async def send_auth_email_code(request: EmailCodeRequest, http_request: Request)
     _require_verified_smtp(settings)
 
     verification_code = f"{secrets.randbelow(1_000_000):06d}"
-    should_send = True
+    user = db_manager.get_user_by_email(email)
     if request.purpose == 'register':
-        if db_manager.get_user_by_email(email):
-            should_send = False
-            challenge_secret = secrets.token_urlsafe(32)
-        else:
-            challenge_secret = verification_code
+        actionable_target = user is None
     else:
-        user = db_manager.get_user_by_email(email)
-        if not user or not user.get('is_active'):
-            raise RegistrationError(
-                "PASSWORD_RESET_UNAVAILABLE",
-                "该账号暂不能重置密码",
-            )
-        challenge_secret = verification_code
+        actionable_target = bool(user and user.get('is_active'))
+    decoy_secret = secrets.token_urlsafe(32)
+    challenge_secret = (
+        verification_code
+        if actionable_target
+        else decoy_secret
+    )
     text_content = (
         f"您的验证码是 {verification_code}\n\n"
         "验证码在 10 分钟内有效，最多可尝试 5 次。请勿向任何人泄露。\n"
         "如非本人操作，请忽略此邮件。"
     )
-    if should_send:
-        try:
-            await asyncio.to_thread(
-                SMTPEmailSender().send,
-                settings,
-                recipient=email,
-                subject=subject,
-                text=text_content,
-            )
-        except (SMTPConfigurationError, SMTPDeliveryError) as exc:
-            logger.warning(
-                f"认证邮件发送失败 type={type(exc).__name__} "
-                f"email={mask_email_for_log(email)}"
-            )
-            raise RegistrationError(
-                "EMAIL_SEND_FAILED",
-                "验证码邮件发送失败，请稍后重试",
-                http_status=502,
-            ) from exc
+    try:
+        await asyncio.to_thread(
+            SMTPEmailSender().send,
+            settings,
+            recipient=email,
+            subject=subject,
+            text=text_content,
+        )
+    except (SMTPConfigurationError, SMTPDeliveryError) as exc:
+        logger.warning(
+            f"认证邮件发送失败 type={type(exc).__name__} "
+            f"email={mask_email_for_log(email)}"
+        )
+        raise RegistrationError(
+            "EMAIL_SEND_FAILED",
+            "验证码邮件发送失败，请稍后重试",
+            http_status=502,
+        ) from exc
 
     challenge = db_manager.registration_service.create_challenge(
         purpose=challenge_purpose,
