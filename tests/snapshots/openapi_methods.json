@@ -102,6 +102,37 @@
   "/api/accounts/{cookie_id}/session-status": [
     "GET"
   ],
+  "/api/admin/registration/enabled": [
+    "PUT"
+  ],
+  "/api/admin/registration/invites": [
+    "GET",
+    "POST"
+  ],
+  "/api/admin/registration/invites/{invite_id}": [
+    "DELETE"
+  ],
+  "/api/admin/registration/status": [
+    "GET"
+  ],
+  "/api/admin/registration/users": [
+    "GET"
+  ],
+  "/api/admin/registration/users/{user_id}": [
+    "PUT"
+  ],
+  "/api/auth/captcha": [
+    "POST"
+  ],
+  "/api/auth/email-code": [
+    "POST"
+  ],
+  "/api/auth/password-reset": [
+    "POST"
+  ],
+  "/api/auth/registration-config": [
+    "GET"
+  ],
   "/api/ai/providers": [
     "GET",
     "POST"

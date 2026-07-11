@@ -185,6 +185,34 @@ class SMTPVerificationPersistenceTests(unittest.TestCase):
             "",
         )
 
+    def test_verification_result_cannot_overwrite_a_concurrent_smtp_change(self):
+        self.assertTrue(self.db.save_system_settings_section(dict(SMTP_SETTINGS)))
+        baseline = self.db.get_all_system_settings()
+        self.assertTrue(
+            self.db.set_system_setting("smtp_server", "new.smtp.example.test")
+        )
+        old_fingerprint = smtp_configuration_fingerprint(
+            SMTP_SETTINGS,
+            db_path=str(self.db_path),
+        )
+
+        saved = self.db.save_verified_smtp_settings(
+            SMTP_SETTINGS,
+            fingerprint=old_fingerprint,
+            verified_at="2026-07-11T10:00:00+08:00",
+            expected_settings=baseline,
+        )
+
+        self.assertFalse(saved)
+        self.assertEqual(
+            self.db.get_system_setting("smtp_server"),
+            "new.smtp.example.test",
+        )
+        self.assertEqual(
+            self.db.get_system_setting("smtp_verified_fingerprint"),
+            "",
+        )
+
     def test_readiness_requires_switch_verified_smtp_and_an_invite(self):
         settings = {
             **SMTP_SETTINGS,

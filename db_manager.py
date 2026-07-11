@@ -6,7 +6,7 @@ import time
 import json
 import random
 import string
-import aiohttp
+import asyncio
 import io
 import base64
 import binascii
@@ -31,10 +31,18 @@ from repositories.auth_repository import (
     public_user_view,
 )
 from services.auth_service import AuthService
-from auth_registration_service import AuthRateLimiter, RegistrationService
+from auth_registration_service import (
+    AuthRateLimiter,
+    RegistrationService,
+    mask_email_for_log,
+)
 from auth_email_service import (
     SMTP_CONFIGURATION_KEYS,
+    SMTPConfigurationError,
+    SMTPDeliveryError,
+    SMTPEmailSender,
     canonical_smtp_setting_value,
+    smtp_configuration_status,
 )
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
@@ -4111,6 +4119,7 @@ class DBManager:
         *,
         fingerprint: str,
         verified_at: str,
+        expected_settings: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Atomically save SMTP settings and mark that exact configuration verified."""
         if not str(fingerprint or "") or not str(verified_at or ""):
@@ -4119,6 +4128,15 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute("BEGIN")
+                if expected_settings is not None:
+                    expected = {
+                        key: value
+                        for key, value in expected_settings.items()
+                        if key in SMTP_CONFIGURATION_KEYS
+                    }
+                    if self._smtp_configuration_changed(cursor, expected):
+                        self.conn.rollback()
+                        return False
                 allowed = {
                     key: value
                     for key, value in settings.items()
@@ -4340,7 +4358,7 @@ class DBManager:
                     logger.debug(f"图形验证码验证成功: {session_id}")
                     return True
                 else:
-                    logger.warning(f"图形验证码验证失败: {session_id} - {user_input}")
+                    logger.warning(f"兼容图形验证码验证失败: {session_id}")
                     return False
             except Exception as e:
                 logger.error(f"验证图形验证码失败: {e}")
@@ -4359,7 +4377,10 @@ class DBManager:
                 ''', (email, code, code_type, expires_at))
 
                 self.conn.commit()
-                logger.info(f"保存验证码成功: {email} ({code_type})")
+                logger.info(
+                    f"保存兼容验证码成功: {mask_email_for_log(email)} "
+                    f"({code_type})"
+                )
                 return True
             except Exception as e:
                 logger.error(f"保存验证码失败: {e}")
@@ -4387,140 +4408,48 @@ class DBManager:
                     UPDATE email_verifications SET used = TRUE WHERE id = ?
                     ''', (row[0],))
                     self.conn.commit()
-                    logger.info(f"验证码验证成功: {email} ({code_type})")
+                    logger.info(
+                        f"兼容验证码验证成功: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return True
                 else:
-                    logger.warning(f"验证码验证失败: {email} - {code} ({code_type})")
+                    logger.warning(
+                        f"兼容验证码验证失败: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return False
             except Exception as e:
                 logger.error(f"验证邮箱验证码失败: {e}")
                 return False
 
     async def send_verification_email(self, email: str, code: str) -> bool:
-        """发送验证码邮件（支持SMTP和API两种方式）"""
+        """Compatibility wrapper that sends only through verified SMTP."""
         try:
-            subject = "闲鱼自动回复系统 - 邮箱验证码"
-            # 使用简单的纯文本邮件内容
-            text_content = f"""【闲鱼自动回复系统】邮箱验证码
-
-您好！
-
-感谢您使用闲鱼自动回复系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
-
-验证码：{code}
-
-重要提醒：
-• 验证码有效期为 10 分钟，请及时使用
-• 请勿将验证码分享给任何人
-• 如非本人操作，请忽略此邮件
-• 系统不会主动索要您的验证码
-
-如果您在使用过程中遇到任何问题，请联系我们的技术支持团队。
-感谢您选择闲鱼自动回复系统！
-
----
-此邮件由系统自动发送，请勿直接回复
-© 2025 闲鱼自动回复系统"""
-
-            # 从系统设置读取SMTP配置
-            try:
-                smtp_server = self.get_system_setting('smtp_server') or ''
-                smtp_port = int(self.get_system_setting('smtp_port') or 0)
-                smtp_user = self.get_system_setting('smtp_user') or ''
-                smtp_password = self.get_system_setting('smtp_password') or ''
-                smtp_from = (self.get_system_setting('smtp_from') or '').strip() or smtp_user
-                smtp_use_tls = (self.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
-                smtp_use_ssl = (self.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
-            except Exception as e:
-                logger.error(f"读取SMTP系统设置失败: {e}")
-                # 如果读取配置失败，使用API方式
-                return await self._send_email_via_api(email, subject, text_content)
-
-            # 检查SMTP配置是否完整
-            if smtp_server and smtp_port and smtp_user and smtp_password:
-                # 配置完整，使用SMTP方式发送
-                logger.info(f"使用SMTP方式发送验证码邮件: {email}")
-                return await self._send_email_via_smtp(email, subject, text_content,
-                                                     smtp_server, smtp_port, smtp_user,
-                                                     smtp_password, smtp_from, smtp_use_tls, smtp_use_ssl)
-            else:
-                # 配置不完整，使用API方式发送
-                logger.info(f"SMTP配置不完整，使用API方式发送验证码邮件: {email}")
-                return await self._send_email_via_api(email, subject, text_content)
-
-        except Exception as e:
-            logger.error(f"发送验证码邮件异常: {e}")
-            return False
-
-    async def _send_email_via_smtp(self, email: str, subject: str, text_content: str,
-                                 smtp_server: str, smtp_port: int, smtp_user: str,
-                                 smtp_password: str, smtp_from: str, smtp_use_tls: bool, smtp_use_ssl: bool) -> bool:
-        """使用SMTP方式发送邮件"""
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-
-            msg = MIMEMultipart()
-            msg['Subject'] = subject
-            msg['From'] = smtp_from
-            msg['To'] = email
-
-            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
-
-            if smtp_use_ssl:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port)
-
-            server.ehlo()
-            if smtp_use_tls and not smtp_use_ssl:
-                server.starttls()
-                server.ehlo()
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, [email], msg.as_string())
-            server.quit()
-
-            logger.info(f"验证码邮件发送成功(SMTP): {email}")
+            settings = self.get_all_system_settings()
+            status = smtp_configuration_status(settings, db_path=self.db_path)
+            if not status['smtp_verified']:
+                logger.warning("SMTP 未验证，拒绝发送兼容验证码邮件")
+                return False
+            await asyncio.to_thread(
+                SMTPEmailSender().send,
+                settings,
+                recipient=email,
+                subject="闲鱼监控台邮箱验证码",
+                text=(
+                    f"您的验证码是 {code}\n\n"
+                    "验证码在 10 分钟内有效，请勿向任何人泄露。"
+                ),
+            )
+            logger.info(
+                f"兼容验证码邮件已提交 email={mask_email_for_log(email)}"
+            )
             return True
+        except (SMTPConfigurationError, SMTPDeliveryError) as e:
+            logger.warning(f"兼容验证码邮件发送失败 type={type(e).__name__}")
+            return False
         except Exception as e:
-            logger.error(f"SMTP发送验证码邮件失败: {e}")
-            # SMTP发送失败，尝试使用API方式
-            logger.info(f"SMTP发送失败，尝试使用API方式发送: {email}")
-            return await self._send_email_via_api(email, subject, text_content)
-
-    async def _send_email_via_api(self, email: str, subject: str, text_content: str) -> bool:
-        """使用API方式发送邮件"""
-        try:
-            import aiohttp
-
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
-            params = {
-                'subject': subject,
-                'receiveUser': email,
-                'sendHtml': text_content
-            }
-
-            async with aiohttp.ClientSession() as session:
-                try:
-                    logger.info(f"使用API发送验证码邮件: {email}")
-                    async with session.get(api_url, params=params, timeout=15) as response:
-                        response_text = await response.text()
-                        logger.info(f"邮件API响应: {response.status}")
-
-                        if response.status == 200:
-                            logger.info(f"验证码邮件发送成功(API): {email}")
-                            return True
-                        else:
-                            logger.error(f"API发送验证码邮件失败: {email}, 状态码: {response.status}, 响应: {response_text[:200]}")
-                            return False
-                except Exception as e:
-                    logger.error(f"API邮件发送异常: {email}, 错误: {e}")
-                    return False
-        except Exception as e:
-            logger.error(f"API邮件发送方法异常: {e}")
+            logger.error(f"兼容验证码邮件异常 type={type(e).__name__}")
             return False
 
     # ==================== 卡券管理方法 ====================
