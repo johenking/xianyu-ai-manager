@@ -28,6 +28,8 @@ curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 
 Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
 
+The last verified runtime and CI baseline remains v1.7.1. The v1.7.2 source change has no database migration and must leave the latest migration at `2026071104`, but that does not prove the service or public bundle was upgraded. Before calling v1.7.2 deployed, verify the listening process path, health response, HTML entry bundle and referenced asset, public page version, staged password-reset flow, account listeners, and Skill scheduler.
+
 ## Backup Before Risky Changes
 
 Back up the live SQLite database before migrations, account identity changes, authentication deployments, or bulk data operations:
@@ -60,6 +62,8 @@ npm run verify:build
 ```
 
 The frontend build writes to `static/`. It keeps the current and previous successful asset generations and disables source maps unless `VITE_BUILD_SOURCEMAP=true`. A production build alone does not restart the backend.
+
+The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
 
 Basic smoke tests:
 
@@ -116,6 +120,8 @@ Registration is disabled on new installations and is forced disabled by migratio
 6. Complete one real registration, automatic login, service-restart session restore, username-or-email login, password reset, and old-session rejection before leaving registration open.
 
 Changing any SMTP field invalidates the verified fingerprint, consumes pending SMTP challenges, and closes registration. The final available slot also closes registration automatically; increasing the limit requires a manual reopen. SMTP errors never generate a usable authentication challenge, and there is no third-party mail fallback.
+
+After a registration or password-reset email is sent successfully, the public UI must not fetch another CAPTCHA immediately. Once the cooldown ends, the user must explicitly request a resend, solve the newly fetched CAPTCHA, and submit it before a second email can be sent.
 
 The default authentication limits are 30 image CAPTCHAs per IP per hour; one email send per email per 60 seconds, five per email per hour, and 20 per IP per hour; five attempts per 10-minute challenge; five failed logins per account or IP in 15 minutes followed by a 15-minute cooldown; and 10 registration failures per IP per hour. HTTP 429 responses include `retry_after`.
 
@@ -203,7 +209,7 @@ tmux capture-pane -t xianyu-butler -p -S -500
 rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
 ```
 
-Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, passwords, provider keys, or verification URLs.
+Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, provider keys, verification URLs, the default administrator password, email OTPs, password-reset grant IDs or tokens, full email addresses, or any password. Use masked email values, digests, request IDs, and exception classes for correlation instead.
 
 Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard logs out unexpectedly, check browser `localStorage.auth_token`, call `/verify`, confirm the same `DB_PATH` is in use, and verify that the session row still exists.
 
@@ -211,10 +217,12 @@ Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard
 
 1. Keep the same ordinary user logged in in window A and sign in again in private window B.
 2. Confirm two unexpired sessions exist for that user without printing their Token values.
-3. Complete `/forgot-password` with the registered mailbox; enter CAPTCHA, email code, and the new password only in the browser.
-4. Refresh A and B. Both old sessions must return to login, and the database must show zero sessions for that user before the first new login.
-5. Confirm the old password fails. Confirm the new password works once with the username and once with the email.
-6. Confirm other users and the administrator were not logged out. Never place passwords or verification codes in logs, screenshots, shell history, or chat.
+3. Open `/forgot-password`, solve CAPTCHA, and request the email code. Confirm the successful send does not fetch another CAPTCHA; after cooldown, confirm an explicit resend requires a newly fetched CAPTCHA.
+4. Enter the six-digit code and confirm the UI completes `POST /api/auth/password-reset/verify-code` before displaying the new-password fields. Do not print or persist the returned grant; the public UI must keep it only in component memory.
+5. Submit the new password and confirm `POST /api/auth/password-reset` consumes the grant. A second use of the same grant must fail.
+6. Refresh A and B. Both old sessions must return to login, and the database must show zero sessions for that user before the first new login.
+7. Confirm the old password fails. Confirm the new password works once with the username and once with the email.
+8. Confirm other users and the administrator were not logged out. Never place passwords, verification codes, reset grants, or full email addresses in logs, screenshots, shell history, or chat.
 
 For an ordinary-user dashboard that does not finish loading, verify `/verify` returns `is_admin: false` and call `/api/dashboard/summary` with that user's Token. The page must not request `/admin/stats`; a 403 or 500 from the summary should end in a visible retry state. Migration `2026071104` adds `idx_orders_cookie_created_at` and `idx_orders_status_created_at`; verify them with `PRAGMA index_list(orders)` when summary latency regresses.
 

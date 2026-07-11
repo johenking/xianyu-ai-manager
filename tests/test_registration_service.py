@@ -1002,6 +1002,273 @@ class PasswordResetAndAccountStateTests(RegistrationServiceFixture):
             self.now,
         )
 
+    def test_password_reset_grant_is_digest_only_one_time_and_revokes_on_reset(self):
+        user = self.create_user()
+        old_hash = self.connection.execute(
+            "SELECT password_hash_v2 FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()[0]
+        self.connection.execute(
+            "INSERT INTO auth_sessions "
+            "(token, token_digest, user_id, username, created_at, expires_at) "
+            "VALUES ('digest:grant-session', 'grant-session', ?, ?, ?, ?)",
+            (user["id"], user["username"], self.now, self.now + 3600),
+        )
+        self.connection.commit()
+        email_challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+
+        grant = self.service.verify_password_reset_code(
+            email="RESET@EXAMPLE.COM",
+            challenge_id=email_challenge["challenge_id"],
+            verification_code="930517",
+        )
+
+        self.assertEqual(grant["expires_at"], self.now + 600)
+        self.assertNotIn(grant["grant_token"], repr(grant["grant_id"]))
+        stored_grant = self.connection.execute(
+            "SELECT purpose, secret_digest, consumed_at FROM auth_challenges "
+            "WHERE challenge_id = ?",
+            (grant["grant_id"],),
+        ).fetchone()
+        self.assertEqual(stored_grant[0], "password_reset_grant")
+        self.assertNotIn(grant["grant_token"], stored_grant[1])
+        self.assertIsNone(stored_grant[2])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (email_challenge["challenge_id"],),
+            ).fetchone()[0],
+            self.now,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT password_hash_v2 FROM users WHERE id = ?", (user["id"],)
+            ).fetchone()[0],
+            old_hash,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?", (user["id"],)
+            ).fetchone()[0],
+            1,
+        )
+
+        user_id = self.service.reset_password_with_grant(
+            email="reset@example.com",
+            new_password="New-reset-pass-2026!",
+            grant_id=grant["grant_id"],
+            grant_token=grant["grant_token"],
+        )
+
+        self.assertEqual(user_id, user["id"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?", (user["id"],)
+            ).fetchone()[0],
+            0,
+        )
+        self.assertTrue(
+            verify_user_password_hash(
+                "New-reset-pass-2026!",
+                self.connection.execute(
+                    "SELECT password_hash_v2 FROM users WHERE id = ?", (user["id"],)
+                ).fetchone()[0],
+            )
+        )
+        self.assert_error_code(
+            "CHALLENGE_CONSUMED",
+            lambda: self.service.reset_password_with_grant(
+                email="reset@example.com",
+                new_password="Another-reset-pass-2026!",
+                grant_id=grant["grant_id"],
+                grant_token=grant["grant_token"],
+            ),
+        )
+
+    def test_weak_password_does_not_consume_reset_grant(self):
+        self.create_user()
+        email_challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+        grant = self.service.verify_password_reset_code(
+            email="reset@example.com",
+            challenge_id=email_challenge["challenge_id"],
+            verification_code="930517",
+        )
+
+        self.assert_error_code(
+            "PASSWORD_TOO_WEAK",
+            lambda: self.service.reset_password_with_grant(
+                email="reset@example.com",
+                new_password="password",
+                grant_id=grant["grant_id"],
+                grant_token=grant["grant_token"],
+            ),
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT consumed_at FROM auth_challenges WHERE challenge_id = ?",
+                (grant["grant_id"],),
+            ).fetchone()[0]
+        )
+
+        self.service.reset_password_with_grant(
+            email="reset@example.com",
+            new_password="Valid-reset-pass-2026!",
+            grant_id=grant["grant_id"],
+            grant_token=grant["grant_token"],
+        )
+
+    def test_reset_code_can_issue_only_one_grant_concurrently(self):
+        self.create_user()
+        challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+
+        def verify():
+            try:
+                self.service.verify_password_reset_code(
+                    email="reset@example.com",
+                    challenge_id=challenge["challenge_id"],
+                    verification_code="930517",
+                )
+                return "ok"
+            except RegistrationError as exc:
+                return exc.code
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: verify(), range(2)))
+
+        self.assertEqual(results.count("ok"), 1)
+        self.assertEqual(results.count("CHALLENGE_CONSUMED"), 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_challenges "
+                "WHERE purpose = 'password_reset_grant'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_reset_code_verification_enforces_attempt_expiry_and_purpose(self):
+        self.create_user()
+        challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+
+        for expected_attempt in range(1, 5):
+            self.assert_error_code(
+                "CHALLENGE_SECRET_INVALID",
+                lambda: self.service.verify_password_reset_code(
+                    email="reset@example.com",
+                    challenge_id=challenge["challenge_id"],
+                    verification_code="000000",
+                ),
+            )
+            attempts = self.connection.execute(
+                "SELECT attempt_count FROM auth_challenges WHERE challenge_id = ?",
+                (challenge["challenge_id"],),
+            ).fetchone()[0]
+            self.assertEqual(attempts, expected_attempt)
+
+        self.assert_error_code(
+            "CHALLENGE_LOCKED",
+            lambda: self.service.verify_password_reset_code(
+                email="reset@example.com",
+                challenge_id=challenge["challenge_id"],
+                verification_code="000000",
+            ),
+        )
+        self.assert_error_code(
+            "CHALLENGE_LOCKED",
+            lambda: self.service.verify_password_reset_code(
+                email="reset@example.com",
+                challenge_id=challenge["challenge_id"],
+                verification_code="930517",
+            ),
+        )
+
+        expired = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="135790",
+        )
+        self.connection.execute(
+            "UPDATE auth_challenges SET expires_at = ? WHERE challenge_id = ?",
+            (self.now - 1, expired["challenge_id"]),
+        )
+        self.connection.commit()
+        self.assert_error_code(
+            "CHALLENGE_EXPIRED",
+            lambda: self.service.verify_password_reset_code(
+                email="reset@example.com",
+                challenge_id=expired["challenge_id"],
+                verification_code="135790",
+            ),
+        )
+
+        wrong_purpose = self.service.create_challenge(
+            purpose="register_email",
+            subject="reset@example.com",
+            secret="246802",
+        )
+        self.assert_error_code(
+            "CHALLENGE_PURPOSE_MISMATCH",
+            lambda: self.service.verify_password_reset_code(
+                email="reset@example.com",
+                challenge_id=wrong_purpose["challenge_id"],
+                verification_code="246802",
+            ),
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM auth_challenges "
+                "WHERE purpose = 'password_reset_grant'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_reset_grant_is_email_bound_and_expires(self):
+        self.create_user()
+        challenge = self.service.create_challenge(
+            purpose="password_reset_email",
+            subject="reset@example.com",
+            secret="930517",
+        )
+        grant = self.service.verify_password_reset_code(
+            email="reset@example.com",
+            challenge_id=challenge["challenge_id"],
+            verification_code="930517",
+        )
+
+        self.assert_error_code(
+            "CHALLENGE_SUBJECT_MISMATCH",
+            lambda: self.service.reset_password_with_grant(
+                email="other@example.com",
+                new_password="Valid-reset-pass-2026!",
+                grant_id=grant["grant_id"],
+                grant_token=grant["grant_token"],
+            ),
+        )
+        self.now += 601
+        self.assert_error_code(
+            "CHALLENGE_EXPIRED",
+            lambda: self.service.reset_password_with_grant(
+                email="reset@example.com",
+                new_password="Valid-reset-pass-2026!",
+                grant_id=grant["grant_id"],
+                grant_token=grant["grant_token"],
+            ),
+        )
+
     def test_failed_password_reset_only_records_wrong_attempt(self):
         user = self.create_user()
         old_hash = self.connection.execute(

@@ -133,6 +133,9 @@
   "/api/auth/password-reset": [
     "POST"
   ],
+  "/api/auth/password-reset/verify-code": [
+    "POST"
+  ],
   "/api/auth/registration-config": [
     "GET"
   ],

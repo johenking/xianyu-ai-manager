@@ -232,9 +232,17 @@ class EmailCodeRequest(BaseModel):
 
 class PasswordResetRequest(BaseModel):
     email: str
+    new_password: str
+    reset_grant_id: Optional[str] = None
+    reset_grant_token: Optional[str] = None
+    challenge_id: Optional[str] = None
+    verification_code: Optional[str] = None
+
+
+class PasswordResetVerifyCodeRequest(BaseModel):
+    email: str
     challenge_id: str
     verification_code: str
-    new_password: str
 
 
 class UserActiveUpdate(BaseModel):
@@ -905,7 +913,7 @@ async def check_default_password(current_user: Dict[str, Any] = Depends(get_curr
 
         # 检查是否使用默认密码
         using_default = db_manager.verify_user_password('admin', DEFAULT_ADMIN_PASSWORD)
-        logger.info(f"默认密码检查结果: {using_default}, DEFAULT_ADMIN_PASSWORD={DEFAULT_ADMIN_PASSWORD}")
+        logger.info(f"默认密码检查结果: {using_default}")
 
         return {"using_default": using_default}
 
@@ -1339,17 +1347,66 @@ async def register(request: RegisterRequest, http_request: Request):
     )
 
 
-@auth_router.post('/api/auth/password-reset')
-async def reset_user_password(request: PasswordResetRequest):
+@auth_router.post('/api/auth/password-reset/verify-code')
+async def verify_password_reset_code(request: PasswordResetVerifyCodeRequest):
     settings = db_manager.get_all_system_settings()
     _require_verified_smtp(settings)
     try:
-        user_id = db_manager.registration_service.reset_password(
+        grant = db_manager.registration_service.verify_password_reset_code(
             email=request.email,
-            new_password=request.new_password,
             challenge_id=request.challenge_id,
             verification_code=request.verification_code,
         )
+    except RegistrationError:
+        raise
+    except Exception as exc:
+        logger.error(f"密码重置邮箱校验失败 type={type(exc).__name__}")
+        raise RegistrationError(
+            "PASSWORD_RESET_VERIFICATION_FAILED",
+            "邮箱验证失败，请稍后重试",
+            http_status=503,
+        ) from exc
+    logger.info("密码重置邮箱校验成功")
+    return {
+        "success": True,
+        "reset_grant_id": grant["grant_id"],
+        "reset_grant_token": grant["grant_token"],
+        "expires_in": max(0, int(grant["expires_at"] - time.time())),
+        "message": "邮箱验证成功",
+    }
+
+
+@auth_router.post('/api/auth/password-reset')
+async def reset_user_password(request: PasswordResetRequest):
+    use_grant = bool(request.reset_grant_id or request.reset_grant_token)
+    if use_grant and not (request.reset_grant_id and request.reset_grant_token):
+        raise RegistrationError(
+            "PASSWORD_RESET_GRANT_REQUIRED",
+            "密码重置授权不完整，请重新验证邮箱",
+        )
+    if not use_grant and not (request.challenge_id and request.verification_code):
+        raise RegistrationError(
+            "PASSWORD_RESET_VERIFICATION_REQUIRED",
+            "请先完成邮箱验证",
+        )
+
+    try:
+        if use_grant:
+            user_id = db_manager.registration_service.reset_password_with_grant(
+                email=request.email,
+                new_password=request.new_password,
+                grant_id=request.reset_grant_id or "",
+                grant_token=request.reset_grant_token or "",
+            )
+        else:
+            settings = db_manager.get_all_system_settings()
+            _require_verified_smtp(settings)
+            user_id = db_manager.registration_service.reset_password(
+                email=request.email,
+                new_password=request.new_password,
+                challenge_id=request.challenge_id or "",
+                verification_code=request.verification_code or "",
+            )
     except RegistrationError:
         raise
     except Exception as exc:

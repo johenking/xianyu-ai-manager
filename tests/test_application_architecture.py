@@ -16,7 +16,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 215)
+        self.assertEqual(len(signatures), 216)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -43,6 +43,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("GET", "/health/ready"), signatures)
         self.assertIn(("GET", "/api/auth/registration-config"), signatures)
         self.assertIn(("POST", "/api/auth/password-reset"), signatures)
+        self.assertIn(("POST", "/api/auth/password-reset/verify-code"), signatures)
         self.assertIn(("POST", "/api/admin/registration/invites"), signatures)
         self.assertIn(("PUT", "/api/admin/registration/limit"), signatures)
         self.assertIn(("POST", "/api/settings/verify/smtp/confirm"), signatures)
@@ -75,6 +76,14 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("new_event_loop", source)
         self.assertNotIn("run_until_complete", source)
         self.assertIn('"app_factory:create_app"', source)
+
+    def test_auth_logs_do_not_reference_the_default_password_constant(self):
+        source = Path("reply_server.py").read_text(encoding="utf-8")
+        logging_lines = [line for line in source.splitlines() if "logger." in line]
+        self.assertTrue(logging_lines)
+        self.assertTrue(
+            all("DEFAULT_ADMIN_PASSWORD" not in line for line in logging_lines)
+        )
 
 
 if __name__ == "__main__":

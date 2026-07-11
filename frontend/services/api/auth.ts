@@ -7,6 +7,8 @@ import type {
   LoginRequest,
   LoginResponse,
   PasswordResetRequest,
+  PasswordResetVerifyRequest,
+  PasswordResetVerifyResponse,
   RegistrationAdminStatus,
   RegistrationConfig,
   RegistrationRequest,
@@ -49,6 +51,12 @@ export const registerAccount = async (data: RegistrationRequest): Promise<LoginR
 
 export const requestPasswordReset = async (data: PasswordResetRequest): Promise<ApiResponse> => {
   return post('/api/auth/password-reset', data);
+};
+
+export const verifyPasswordResetCode = async (
+  data: PasswordResetVerifyRequest,
+): Promise<PasswordResetVerifyResponse> => {
+  return post('/api/auth/password-reset/verify-code', data);
 };
 
 export const getRegistrationAdminStatus = async (): Promise<RegistrationAdminStatus> => {
