@@ -61,6 +61,7 @@ const summary: SettingsSummary = {
 
 describe('Settings configuration sections', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.mocked(getSettingsSummary).mockResolvedValue(summary);
     vi.mocked(getAIProviders).mockResolvedValue({ providers: [], presets: {} });
     vi.mocked(getRegistrationAdminStatus).mockResolvedValue({
@@ -179,34 +180,47 @@ describe('Settings configuration sections', () => {
     expect(await screen.findByText('SMTP 实收验证成功')).toBeInTheDocument();
   });
 
-  it('ignores an SMTP verification response after the configuration changes', async () => {
+  it('serializes SMTP verification actions and clears a returned challenge after editing', async () => {
     let resolveVerification: (result: Awaited<ReturnType<typeof verifySettingsSection>>) => void = () => undefined;
     vi.mocked(verifySettingsSection).mockImplementation(() => new Promise((resolve) => {
       resolveVerification = resolve;
     }));
     render(<Settings />);
     fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.before-verify.example.com' } });
     fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
     await waitFor(() => expect(verifySettingsSection).toHaveBeenCalledTimes(1));
 
-    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.changed.example.com' } });
+    expect(screen.getByLabelText('SMTP 服务器')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'QQ 邮箱预设' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '验证连接' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存并折叠' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '重新读取' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存并折叠' }));
+    fireEvent.click(screen.getByRole('button', { name: '重新读取' }));
+    expect(verifySettingsSection).toHaveBeenCalledTimes(1);
+    expect(saveSettingsSection).not.toHaveBeenCalled();
+    expect(getSettingsSummary).toHaveBeenCalledTimes(1);
+
     await act(async () => {
       resolveVerification({
         success: true,
         state: 'pending',
-        message: '旧验证邮件已发送',
-        challenge_id: 'stale-smtp-challenge',
+        message: '验证邮件已发送',
+        challenge_id: 'current-smtp-challenge',
         expires_in: 600,
-        masked_recipient: 'ol***@example.com',
+        masked_recipient: 're***@example.com',
       });
     });
 
+    expect(await screen.findByLabelText('SMTP 收件验证码')).toBeInTheDocument();
+    expect(screen.getByLabelText('SMTP 服务器')).not.toBeDisabled();
+    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.changed.example.com' } });
     expect(screen.queryByLabelText('SMTP 收件验证码')).not.toBeInTheDocument();
-    expect(screen.queryByText(/ol\*\*\*@example.com/)).not.toBeInTheDocument();
-    expect(screen.queryByText('旧验证邮件已发送')).not.toBeInTheDocument();
   });
 
-  it('ignores an SMTP confirmation response after its challenge becomes stale', async () => {
+  it('locks SMTP-changing actions while receipt confirmation is pending', async () => {
     let resolveConfirmation: (result: Awaited<ReturnType<typeof confirmSmtpVerification>>) => void = () => undefined;
     vi.mocked(verifySettingsSection).mockResolvedValue({
       success: true,
@@ -226,12 +240,80 @@ describe('Settings configuration sections', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认收件码' }));
     await waitFor(() => expect(confirmSmtpVerification).toHaveBeenCalledTimes(1));
 
-    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.changed.example.com' } });
+    expect(screen.getByLabelText('SMTP 服务器')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'QQ 邮箱预设' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '验证连接' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '保存并折叠' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '重新读取' })).toBeDisabled();
     await act(async () => {
-      resolveConfirmation({ success: true, state: 'ready', message: '旧挑战确认成功' });
+      resolveConfirmation({ success: true, state: 'ready', message: 'SMTP 实收验证成功' });
     });
 
-    expect(screen.queryByText('旧挑战确认成功')).not.toBeInTheDocument();
-    expect(screen.queryByText('已验证')).not.toBeInTheDocument();
+    expect(await screen.findByText('SMTP 实收验证成功')).toBeInTheDocument();
+  });
+
+  it('synchronizes persisted settings and registration state after a pending SMTP challenge', async () => {
+    const syncedSummary: SettingsSummary = {
+      ...summary,
+      settings: { ...summary.settings, smtp_server: 'smtp.persisted.example.com' },
+      sections: { ...summary.sections, smtp: { state: 'warning', label: '待验证', configured: true } },
+    };
+    vi.mocked(getSettingsSummary)
+      .mockResolvedValueOnce(summary)
+      .mockResolvedValue(syncedSummary);
+    vi.mocked(verifySettingsSection).mockResolvedValue({
+      success: true,
+      state: 'pending',
+      message: '验证邮件已发送',
+      challenge_id: 'smtp-pending-sync',
+      expires_in: 600,
+      masked_recipient: 're***@example.com',
+    });
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.change(screen.getByLabelText('SMTP 服务器'), { target: { value: 'smtp.persisted.example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+
+    expect(await screen.findByLabelText('SMTP 收件验证码')).toBeInTheDocument();
+    await waitFor(() => expect(getSettingsSummary).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(getRegistrationAdminStatus).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('当前内容与数据库一致')).toBeInTheDocument();
+    expect(screen.getByLabelText('SMTP 服务器')).toHaveValue('smtp.persisted.example.com');
+  });
+
+  it('synchronizes persisted state after SMTP verification delivery fails', async () => {
+    vi.mocked(verifySettingsSection).mockRejectedValue(new Error('SMTP 验证邮件发送失败'));
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+
+    expect(await screen.findByText('SMTP 验证邮件发送失败')).toBeInTheDocument();
+    await waitFor(() => expect(getSettingsSummary).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(getRegistrationAdminStatus).toHaveBeenCalledTimes(2));
+  });
+
+  it('synchronizes settings and registration state after SMTP confirmation succeeds', async () => {
+    vi.mocked(verifySettingsSection).mockResolvedValue({
+      success: true,
+      state: 'pending',
+      message: '验证邮件已发送',
+      challenge_id: 'smtp-confirm-sync',
+      expires_in: 600,
+      masked_recipient: 're***@example.com',
+    });
+    vi.mocked(confirmSmtpVerification).mockResolvedValue({
+      success: true,
+      state: 'ready',
+      message: 'SMTP 配置已确认',
+    });
+    render(<Settings />);
+    fireEvent.click(await screen.findByRole('button', { name: /SMTP 配置/ }));
+    fireEvent.click(screen.getByRole('button', { name: '验证连接' }));
+    fireEvent.change(await screen.findByLabelText('SMTP 收件验证码'), { target: { value: '482615' } });
+    fireEvent.click(screen.getByRole('button', { name: '确认收件码' }));
+
+    expect(await screen.findByText('SMTP 配置已确认')).toBeInTheDocument();
+    await waitFor(() => expect(getSettingsSummary).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(getRegistrationAdminStatus).toHaveBeenCalledTimes(3));
   });
 });
