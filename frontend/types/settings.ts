@@ -54,6 +54,22 @@ export interface SettingsSummary {
   };
 }
 
+export interface UserBasicSettings {
+  item_sync_enabled: boolean;
+  item_sync_interval: number;
+  item_sync_max_pages: number;
+}
+
+export type UserSettingKey = keyof UserBasicSettings;
+export type UserSettingSource = 'user' | 'global';
+
+export interface UserSettingsSummary {
+  success: boolean;
+  settings: UserBasicSettings;
+  sources: Record<UserSettingKey, UserSettingSource>;
+  inherited: boolean;
+}
+
 export interface AIReplySettings {
   ai_enabled: boolean;
   provider_profile_id?: number | null;

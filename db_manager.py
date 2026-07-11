@@ -10,6 +10,7 @@ import asyncio
 import io
 import base64
 import binascii
+from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
@@ -5914,6 +5915,107 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def set_user_settings(self, user_id: int, settings: Dict[str, Any]) -> bool:
+        """Atomically replace a bounded set of user-owned settings."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                for key, value in settings.items():
+                    stored = (
+                        "true" if value is True else "false" if value is False else str(value)
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO user_settings (user_id, key, value, description, updated_at)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            description = excluded.description,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (user_id, key, stored, "Personal item synchronization setting"),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error(f"批量保存用户设置失败: {exc}")
+                self.conn.rollback()
+                return False
+
+    def get_dashboard_stats(self, user_id: Optional[int] = None) -> Dict[str, int]:
+        """Return business counters scoped to one owner or the whole system."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cookie_filter = "" if user_id is None else "WHERE c.user_id = ?"
+            params: Tuple[Any, ...] = () if user_id is None else (user_id,)
+            cookie_row = cursor.execute(
+                f"""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN COALESCE(cs.enabled, 1) = 1 THEN 1 ELSE 0 END)
+                FROM cookies AS c
+                LEFT JOIN cookie_status AS cs ON cs.cookie_id = c.id
+                {cookie_filter}
+                """,
+                params,
+            ).fetchone()
+            cards = cursor.execute(
+                "SELECT COUNT(*) FROM cards" + ("" if user_id is None else " WHERE user_id = ?"),
+                params,
+            ).fetchone()[0]
+            keywords = cursor.execute(
+                """
+                SELECT COUNT(*) FROM keywords AS k
+                JOIN cookies AS c ON c.id = k.cookie_id
+                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                params,
+            ).fetchone()[0]
+            orders = cursor.execute(
+                """
+                SELECT COUNT(*) FROM orders AS o
+                JOIN cookies AS c ON c.id = o.cookie_id
+                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                params,
+            ).fetchone()[0]
+            users = 1 if user_id is not None else cursor.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+            return {
+                "total_users": int(users or 0),
+                "total_cookies": int((cookie_row or (0, 0))[0] or 0),
+                "active_cookies": int((cookie_row or (0, 0))[1] or 0),
+                "total_cards": int(cards or 0),
+                "total_keywords": int(keywords or 0),
+                "total_orders": int(orders or 0),
+            }
+
+    def get_dashboard_item_names(
+        self,
+        user_id: Optional[int],
+        item_ids: List[str],
+    ) -> Dict[str, str]:
+        bounded_item_ids = list(dict.fromkeys(str(item_id) for item_id in item_ids if item_id))[:20]
+        if not bounded_item_ids:
+            return {}
+        with self.lock:
+            placeholders = ",".join("?" for _ in bounded_item_ids)
+            conditions = [f"i.item_id IN ({placeholders})"]
+            params: List[Any] = list(bounded_item_ids)
+            if user_id is not None:
+                conditions.append("c.user_id = ?")
+                params.append(user_id)
+            rows = self.conn.execute(
+                f"""
+                SELECT i.item_id, MAX(COALESCE(NULLIF(i.item_title, ''), i.item_id))
+                FROM item_info AS i
+                JOIN cookies AS c ON c.id = i.cookie_id
+                WHERE {' AND '.join(conditions)}
+                GROUP BY i.item_id
+                """,
+                params,
+            ).fetchall()
+            return {str(item_id): str(title or item_id) for item_id, title in rows}
+
     # ==================== 管理员专用方法 ====================
 
     def get_all_users(self):
@@ -7080,42 +7182,49 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 构建WHERE条件
+                # Use timestamp boundaries so SQLite can use the analysis indexes.
                 where_conditions = []
                 params = []
+                from_clause = "orders AS o"
 
                 if start_date:
-                    where_conditions.append("DATE(created_at) >= ?")
-                    params.append(start_date)
+                    start = datetime.strptime(start_date, "%Y-%m-%d")
+                    where_conditions.append("o.created_at >= ?")
+                    params.append(start.strftime("%Y-%m-%d 00:00:00"))
 
                 if end_date:
-                    where_conditions.append("DATE(created_at) <= ?")
-                    params.append(end_date)
+                    end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                    where_conditions.append("o.created_at < ?")
+                    params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                # 关联cookies表以过滤user_id
                 if user_id is not None:
-                    where_conditions.append("EXISTS (SELECT 1 FROM cookies WHERE cookies.id = orders.cookie_id AND cookies.user_id = ?)")
+                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
+                    where_conditions.append("c.user_id = ?")
                     params.append(user_id)
 
                 # 只包含指定状态（小写形式）
                 if include_statuses:
                     placeholders = ','.join(['?' for _ in include_statuses])
-                    where_conditions.append(f"order_status IN ({placeholders})")
+                    where_conditions.append(f"o.order_status IN ({placeholders})")
                     params.extend(include_statuses)
 
-                where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+                where_conditions.extend([
+                    "o.amount IS NOT NULL",
+                    "o.amount != ''",
+                    "o.amount != 'N/A'",
+                ])
+                where_clause = f"WHERE {' AND '.join(where_conditions)}"
 
                 # 1. 总收益统计（估值，实际会扣税等）
                 cursor.execute(f"""
                     SELECT
-                        COUNT(DISTINCT order_id) as total_orders,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
-                        COUNT(DISTINCT buyer_id) as unique_buyers,
-                        COUNT(DISTINCT item_id) as unique_items
-                    FROM orders
+                        COUNT(DISTINCT o.order_id) as total_orders,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
+                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
+                        COUNT(DISTINCT o.buyer_id) as unique_buyers,
+                        COUNT(DISTINCT o.item_id) as unique_items
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                 """, params)
 
                 row = cursor.fetchone()
@@ -7130,13 +7239,12 @@ class DBManager:
                 # 2. 按日期统计订单量和收益
                 cursor.execute(f"""
                     SELECT
-                        DATE(created_at) as date,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as daily_amount
-                    FROM orders
+                        DATE(o.created_at) as date,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as daily_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY DATE(created_at)
+                    GROUP BY DATE(o.created_at)
                     ORDER BY date DESC
                     LIMIT 30
                 """, params)
@@ -7152,13 +7260,12 @@ class DBManager:
                 # 3. 按状态统计订单
                 cursor.execute(f"""
                     SELECT
-                        order_status,
-                        COUNT(DISTINCT order_id) as count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as amount
-                    FROM orders
+                        o.order_status,
+                        COUNT(DISTINCT o.order_id) as count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY order_status
+                    GROUP BY o.order_status
                     ORDER BY count DESC
                 """, params)
 
@@ -7173,14 +7280,13 @@ class DBManager:
                 # 4. 按城市统计地区分布（如果有收货城市数据）
                 cursor.execute(f"""
                     SELECT
-                        receiver_city,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount
-                    FROM orders
+                        o.receiver_city,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND receiver_city IS NOT NULL AND receiver_city != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY receiver_city
+                    AND o.receiver_city IS NOT NULL AND o.receiver_city != ''
+                    GROUP BY o.receiver_city
                     ORDER BY order_count DESC
                     LIMIT 50
                 """, params)
@@ -7196,15 +7302,14 @@ class DBManager:
                 # 5. 商品排行（按订单量）
                 cursor.execute(f"""
                     SELECT
-                        item_id,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount
-                    FROM orders
+                        o.item_id,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
+                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND item_id IS NOT NULL AND item_id != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY item_id
+                    AND o.item_id IS NOT NULL AND o.item_id != ''
+                    GROUP BY o.item_id
                     ORDER BY order_count DESC
                     LIMIT 20
                 """, params)
@@ -7292,46 +7397,48 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 构建WHERE条件
                 where_conditions = []
                 params = []
+                from_clause = "orders AS o"
 
                 if start_date:
-                    where_conditions.append("DATE(created_at) >= ?")
-                    params.append(start_date)
+                    start = datetime.strptime(start_date, "%Y-%m-%d")
+                    where_conditions.append("o.created_at >= ?")
+                    params.append(start.strftime("%Y-%m-%d 00:00:00"))
 
                 if end_date:
-                    where_conditions.append("DATE(created_at) <= ?")
-                    params.append(end_date)
+                    end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                    where_conditions.append("o.created_at < ?")
+                    params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                # 关联cookies表以过滤user_id
                 if user_id is not None:
-                    where_conditions.append("EXISTS (SELECT 1 FROM cookies WHERE cookies.id = orders.cookie_id AND cookies.user_id = ?)")
+                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
+                    where_conditions.append("c.user_id = ?")
                     params.append(user_id)
 
                 # 只包含指定状态
                 if include_statuses:
                     placeholders = ','.join(['?' for _ in include_statuses])
-                    where_conditions.append(f"order_status IN ({placeholders})")
+                    where_conditions.append(f"o.order_status IN ({placeholders})")
                     params.extend(include_statuses)
 
                 where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
 
                 cursor.execute(f"""
                     SELECT
-                        order_id,
-                        item_id,
-                        buyer_id,
-                        amount,
-                        order_status,
-                        spec_name,
-                        spec_value,
-                        quantity,
-                        created_at,
-                        receiver_city
-                    FROM orders
+                        o.order_id,
+                        o.item_id,
+                        o.buyer_id,
+                        o.amount,
+                        o.order_status,
+                        o.spec_name,
+                        o.spec_value,
+                        o.quantity,
+                        o.created_at,
+                        o.receiver_city
+                    FROM {from_clause}
                     {where_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY o.created_at DESC
                     LIMIT 1000
                 """, params)
 

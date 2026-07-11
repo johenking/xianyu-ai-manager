@@ -1,6 +1,13 @@
 from typing import Any, Dict
 
 
+USER_BASIC_SETTING_KEYS = (
+    "item_sync_enabled",
+    "item_sync_interval",
+    "item_sync_max_pages",
+)
+
+
 BOOLEAN_SETTING_KEYS = {
     "registration_enabled",
     "show_default_login_info",
@@ -87,6 +94,40 @@ def normalize_system_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         result.setdefault(f"{key}_configured", False)
         result.setdefault(f"{key}_masked", "")
     return result
+
+
+def resolve_user_basic_settings(
+    global_settings: Dict[str, Any],
+    user_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve personal item-sync settings with global values as defaults."""
+    values: Dict[str, Any] = {}
+    sources: Dict[str, str] = {}
+    defaults = {
+        "item_sync_enabled": True,
+        "item_sync_interval": 600,
+        "item_sync_max_pages": 5,
+    }
+    for key in USER_BASIC_SETTING_KEYS:
+        user_entry = (user_settings or {}).get(key)
+        if isinstance(user_entry, dict):
+            user_value = user_entry.get("value")
+        else:
+            user_value = user_entry
+        has_user_value = user_entry is not None
+        global_value = (global_settings or {}).get(key)
+        if global_value is None:
+            global_value = defaults[key]
+        raw_value = user_value if has_user_value else global_value
+        values[key] = _as_bool(raw_value) if key == "item_sync_enabled" else _as_int(
+            raw_value, defaults[key]
+        )
+        sources[key] = "user" if has_user_value else "global"
+    return {
+        "settings": values,
+        "sources": sources,
+        "inherited": all(source == "global" for source in sources.values()),
+    }
 
 
 def apply_secret_action(existing: str, action: str, value: str) -> str:

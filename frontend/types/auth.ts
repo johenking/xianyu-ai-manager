@@ -15,6 +15,18 @@ export interface LoginRequest {
   password: string;
 }
 
+export type VerifyResponse = {
+  authenticated: true;
+  user_id: number;
+  username: string;
+  is_admin: boolean;
+} | {
+  authenticated: false;
+  user_id?: never;
+  username?: never;
+  is_admin?: never;
+};
+
 export interface RegistrationConfig {
   enabled: boolean;
   ready: boolean;

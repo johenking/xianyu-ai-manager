@@ -1,7 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Bot, ChevronDown, Database, Eye, EyeOff, Loader2, Mail, RefreshCw, Save, Settings as SettingsIcon, TestTube2 } from 'lucide-react';
-import { confirmSmtpVerification, getSettingsSummary, saveSettingsSection, verifySettingsSection } from '../services/api';
-import { SettingsSectionKey, SettingsSummary, SystemSettings } from '../types';
+import {
+  confirmSmtpVerification,
+  getSettingsSummary,
+  getUserSettingsSummary,
+  saveSettingsSection,
+  saveUserBasicSettings,
+  verifySettingsSection,
+} from '../services/api';
+import {
+  SettingsSectionKey,
+  SettingsSummary,
+  SystemSettings,
+  UserBasicSettings,
+  UserSettingKey,
+  UserSettingSource,
+  UserSettingsSummary,
+} from '../types';
 import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import AIProviderManager from './AIProviderManager';
@@ -26,7 +41,7 @@ const pickSection = (settings: SystemSettings, section: SettingsSectionKey) => s
 
 type SmtpOperation = 'verify' | 'confirm' | 'save' | 'reload';
 
-const Settings: React.FC = () => {
+const AdminSettings: React.FC = () => {
   const [summary, setSummary] = useState<SettingsSummary | null>(null);
   const [saved, setSaved] = useState<SystemSettings>({});
   const [draft, setDraft] = useState<SystemSettings>({});
@@ -354,6 +369,159 @@ const Settings: React.FC = () => {
     </div>
   );
 };
+
+const sourceLabels: Record<UserSettingSource, string> = {
+  user: '个人设置',
+  global: '继承系统默认',
+};
+
+const SettingSource: React.FC<{ source: UserSettingSource }> = ({ source }) => (
+  <span className="inline-flex rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-bold text-gray-600">
+    {sourceLabels[source]}
+  </span>
+);
+
+const UserSettings: React.FC = () => {
+  const [summary, setSummary] = useState<UserSettingsSummary | null>(null);
+  const [draft, setDraft] = useState<UserBasicSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [validationErrors, setValidationErrors] = useState<Partial<Record<UserSettingKey, string>>>({});
+  const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+
+  const changedSettings = useMemo(() => {
+    if (!summary || !draft) return {};
+    return (Object.keys(draft) as UserSettingKey[]).reduce<Partial<UserBasicSettings>>((changes, key) => {
+      if (draft[key] !== summary.settings[key]) {
+        Object.assign(changes, { [key]: draft[key] });
+      }
+      return changes;
+    }, {});
+  }, [draft, summary]);
+  const dirty = Object.keys(changedSettings).length > 0;
+
+  const load = async () => {
+    setLoading(true);
+    setLoadError('');
+    setNotice(null);
+    try {
+      const result = await getUserSettingsSummary();
+      setSummary(result);
+      setDraft(result.settings);
+      setValidationErrors({});
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : '个人设置读取失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  const update = <K extends UserSettingKey>(key: K, value: UserBasicSettings[K]) => {
+    setDraft((current) => current ? { ...current, [key]: value } : current);
+    setValidationErrors((current) => ({ ...current, [key]: undefined }));
+    setNotice(null);
+  };
+
+  const save = async () => {
+    if (!draft || saving) return;
+    const errors: Partial<Record<UserSettingKey, string>> = {};
+    if (!Number.isInteger(draft.item_sync_interval) || draft.item_sync_interval < 60 || draft.item_sync_interval > 86400) {
+      errors.item_sync_interval = '同步间隔需为 60 到 86400 秒';
+    }
+    if (!Number.isInteger(draft.item_sync_max_pages) || draft.item_sync_max_pages < 1 || draft.item_sync_max_pages > 50) {
+      errors.item_sync_max_pages = '最多同步页数需为 1 到 50';
+    }
+    setValidationErrors(errors);
+    if (Object.keys(errors).length > 0) return;
+
+    setSaving(true);
+    setNotice(null);
+    try {
+      const result = await saveUserBasicSettings(changedSettings);
+      setSummary(result);
+      setDraft(result.settings);
+      setNotice({ tone: 'success', text: result.message || '个人设置已保存' });
+    } catch (error) {
+      setNotice({ tone: 'error', text: error instanceof Error ? error.message : '个人设置保存失败' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return <div className="p-8 text-center text-gray-500">加载个人设置中...</div>;
+  }
+
+  if (loadError || !summary || !draft) {
+    return (
+      <div className="mx-auto max-w-3xl space-y-4 p-8 text-center">
+        <InlineNotice tone="error">{loadError || '个人设置读取失败'}</InlineNotice>
+        <button type="button" onClick={() => void load()} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black">
+          <RefreshCw className="h-4 w-4" />重试
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-5xl space-y-6 pb-16">
+      <header className="flex items-center gap-3">
+        <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-gray-900 text-[#FFE815]"><SettingsIcon className="h-5 w-5" /></div>
+        <div><h2 className="text-2xl font-extrabold text-gray-900">个人设置与 AI</h2><p className="mt-1 text-sm text-gray-500">管理自己的同步频率和 AI 平台配置</p></div>
+      </header>
+
+      {notice ? <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice> : null}
+
+      <section className="rounded-lg bg-white p-5 shadow-sm ring-1 ring-gray-200 sm:p-7">
+        <div className="mb-6">
+          <h3 className="text-lg font-extrabold text-gray-900">商品自动同步</h3>
+          <p className="mt-1 text-sm text-gray-500">设置你的闲鱼账号商品同步节奏</p>
+        </div>
+
+        <div className="space-y-4">
+          <div className="flex min-h-16 items-center justify-between gap-4 rounded-lg bg-gray-50 px-4 py-3">
+            <div>
+              <div className="flex flex-wrap items-center gap-2"><span className="font-bold text-gray-900">商品自动同步</span><SettingSource source={summary.sources.item_sync_enabled} /></div>
+              <div className="mt-0.5 text-xs text-gray-500">定时同步你名下账号的商品资料</div>
+            </div>
+            <ToggleControl checked={draft.item_sync_enabled} onChange={(value) => update('item_sync_enabled', value)} label="商品自动同步" />
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <label className="block text-sm font-bold text-gray-800">
+              <span className="flex flex-wrap items-center gap-2">同步间隔（秒）<SettingSource source={summary.sources.item_sync_interval} /></span>
+              <input aria-label="同步间隔（秒）" aria-invalid={Boolean(validationErrors.item_sync_interval)} aria-describedby={validationErrors.item_sync_interval ? 'item-sync-interval-error' : undefined} type="number" min={60} max={86400} step={1} value={draft.item_sync_interval} onChange={(event) => update('item_sync_interval', Number(event.target.value))} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" />
+              {validationErrors.item_sync_interval ? <span id="item-sync-interval-error" className="mt-1.5 block text-xs font-medium text-red-600">{validationErrors.item_sync_interval}</span> : null}
+            </label>
+            <label className="block text-sm font-bold text-gray-800">
+              <span className="flex flex-wrap items-center gap-2">最多同步页数<SettingSource source={summary.sources.item_sync_max_pages} /></span>
+              <input aria-label="最多同步页数" aria-invalid={Boolean(validationErrors.item_sync_max_pages)} aria-describedby={validationErrors.item_sync_max_pages ? 'item-sync-pages-error' : undefined} type="number" min={1} max={50} step={1} value={draft.item_sync_max_pages} onChange={(event) => update('item_sync_max_pages', Number(event.target.value))} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" />
+              {validationErrors.item_sync_max_pages ? <span id="item-sync-pages-error" className="mt-1.5 block text-xs font-medium text-red-600">{validationErrors.item_sync_max_pages}</span> : null}
+            </label>
+          </div>
+        </div>
+
+        <div className="mt-7 flex justify-end">
+          <button type="button" onClick={() => void save()} disabled={saving || !dirty} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存设置
+          </button>
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <div><h3 className="text-lg font-extrabold text-gray-900">AI 平台</h3><p className="mt-1 text-sm text-gray-500">管理自己的模型平台和密钥</p></div>
+        <AIProviderManager />
+      </section>
+    </div>
+  );
+};
+
+const Settings: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => (
+  isAdmin ? <AdminSettings /> : <UserSettings />
+);
 
 const ToggleRow: React.FC<{ label: string; detail: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }> = ({ label, detail, checked, onChange, disabled }) => <div className="flex min-h-16 items-center justify-between gap-4 rounded-lg bg-gray-50 px-4 py-3"><div><div className="font-bold text-gray-900">{label}</div><div className="mt-0.5 text-xs text-gray-500">{detail}</div></div><ToggleControl checked={checked} onChange={onChange} label={label} disabled={disabled} /></div>;
 const Field: React.FC<{ label: string; value: string | number; onChange: (value: string) => void; placeholder?: string; type?: string; disabled?: boolean }> = ({ label, value, onChange, placeholder, type = 'text', disabled }) => <label className="block text-sm font-bold text-gray-800">{label}<input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} disabled={disabled} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100 disabled:cursor-not-allowed disabled:bg-gray-100" /></label>;

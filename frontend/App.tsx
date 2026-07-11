@@ -1,8 +1,8 @@
-import React, { Suspense, lazy, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import Sidebar from './components/Sidebar';
 import AuthPortal from './components/AuthPortal';
 import { verifyToken, logout } from './services/api';
-import { Loader2, Menu } from 'lucide-react';
+import { AlertCircle, Loader2, Menu, RefreshCw } from 'lucide-react';
 
 const pageLoaders = {
   dashboard: () => import('./components/Dashboard'),
@@ -56,35 +56,84 @@ const PageLoading: React.FC = () => (
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [checkingAuth, setCheckingAuth] = useState(true);
+  const [authError, setAuthError] = useState('');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const clearIdentity = useCallback(() => {
+      setIsLoggedIn(false);
+      setIsAdmin(false);
+      setAuthError('');
+  }, []);
+
+  const hydrateIdentity = useCallback(async () => {
+      const tokenAtStart = localStorage.getItem('auth_token');
+      if (!tokenAtStart) {
+          clearIdentity();
+          setCheckingAuth(false);
+          return;
+      }
+      setAuthError('');
+      try {
+          const response = await verifyToken();
+          if (localStorage.getItem('auth_token') !== tokenAtStart) return;
+          if (!response.authenticated) {
+              localStorage.removeItem('auth_token');
+              clearIdentity();
+              return;
+          }
+          setIsLoggedIn(true);
+          setIsAdmin(response.is_admin);
+      } catch (error) {
+          if (localStorage.getItem('auth_token') !== tokenAtStart) return;
+          setIsLoggedIn(false);
+          setIsAdmin(false);
+          setAuthError(error instanceof Error ? error.message : '身份验证暂时不可用');
+      } finally {
+          if (localStorage.getItem('auth_token') === tokenAtStart) {
+              setCheckingAuth(false);
+          }
+      }
+  }, [clearIdentity]);
+
+  const handleAuthenticated = useCallback(() => {
+      setCheckingAuth(true);
+      void hydrateIdentity();
+  }, [hydrateIdentity]);
 
   // Check auth on mount
   useEffect(() => {
       const token = localStorage.getItem('auth_token');
       if (token) {
-          verifyToken()
-            .then((res) => {
-                if (res.authenticated) {
-                    setIsLoggedIn(true);
-                } else {
-                    localStorage.removeItem('auth_token');
-                }
-            })
-            .catch(() => localStorage.removeItem('auth_token'))
-            .finally(() => setCheckingAuth(false));
+          void hydrateIdentity();
       } else {
+          clearIdentity();
           setCheckingAuth(false);
       }
 
       const handleLogout = () => {
-          setIsLoggedIn(false);
+          clearIdentity();
           window.history.replaceState({}, '', '/login');
       };
+      const handleStorage = (event: StorageEvent) => {
+          if (event.key !== 'auth_token') return;
+          if (!event.newValue) {
+              clearIdentity();
+              setCheckingAuth(false);
+              return;
+          }
+          setCheckingAuth(true);
+          void hydrateIdentity();
+      };
       window.addEventListener('auth:logout', handleLogout);
-      return () => window.removeEventListener('auth:logout', handleLogout);
-  }, []);
+      window.addEventListener('storage', handleStorage);
+      return () => {
+          window.removeEventListener('auth:logout', handleLogout);
+          window.removeEventListener('storage', handleStorage);
+      };
+  }, [clearIdentity, hydrateIdentity]);
 
   useEffect(() => {
       if (isLoggedIn) {
@@ -96,7 +145,7 @@ const App: React.FC = () => {
     || window.location.pathname === '/privacy';
 
   if (publicDocument) {
-      return <AuthPortal onAuthenticated={() => setIsLoggedIn(true)} />;
+      return <AuthPortal onAuthenticated={handleAuthenticated} />;
   }
 
   if (checkingAuth) {
@@ -107,8 +156,23 @@ const App: React.FC = () => {
       );
   }
 
+  if (authError && localStorage.getItem('auth_token')) {
+      return (
+          <div className="flex min-h-screen items-center justify-center bg-[#f5f5f7] p-6">
+              <div className="max-w-md text-center">
+                  <AlertCircle className="mx-auto h-10 w-10 text-amber-500" />
+                  <h1 className="mt-4 text-xl font-extrabold text-gray-900">身份验证暂时不可用</h1>
+                  <p className="mt-2 text-sm text-gray-500">{authError}</p>
+                  <button type="button" onClick={() => { setCheckingAuth(true); void hydrateIdentity(); }} className="mt-5 inline-flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-bold text-white">
+                      <RefreshCw className="h-4 w-4" />重试身份验证
+                  </button>
+              </div>
+          </div>
+      );
+  }
+
   if (!isLoggedIn) {
-    return <AuthPortal onAuthenticated={() => setIsLoggedIn(true)} />;
+    return <AuthPortal onAuthenticated={handleAuthenticated} />;
   }
 
   // Main App Layout
@@ -121,7 +185,7 @@ const App: React.FC = () => {
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;
       case 'skills': return <SkillCenter />;
-      case 'settings': return <Settings />;
+      case 'settings': return <Settings isAdmin={isAdmin} />;
       default: return <Dashboard />;
     }
   };
@@ -140,7 +204,7 @@ const App: React.FC = () => {
             }
             localStorage.removeItem('auth_token');
             window.history.replaceState({}, '', '/login');
-            setIsLoggedIn(false);
+            clearIdentity();
         }}
         mobileOpen={mobileNavOpen}
         onMobileClose={() => setMobileNavOpen(false)}

@@ -36,6 +36,7 @@ from settings_service import (
     SETTINGS_SECTION_KEYS,
     apply_secret_action,
     normalize_system_settings,
+    resolve_user_basic_settings,
     validate_skill_monitor_features,
 )
 from account_session_refresh import (
@@ -1600,6 +1601,12 @@ class SystemSettingsVerifyIn(BaseModel):
     secret_actions: Dict[str, str] = Field(default_factory=dict)
 
 
+class UserBasicSettingsIn(BaseModel):
+    item_sync_enabled: Optional[bool] = None
+    item_sync_interval: Optional[int] = Field(None, ge=60, le=86400)
+    item_sync_max_pages: Optional[int] = Field(None, ge=1, le=50)
+
+
 class SystemSettingCreateIn(BaseModel):
     key: str
     value: str
@@ -2124,7 +2131,7 @@ async def check_password_login_status(
         if session_id not in password_login_sessions:
             persisted = registry.get(session_id)
             if persisted and persisted.get('owner_user_id') != current_user['user_id']:
-                return {'status': 'forbidden', 'message': '无权限访问该会话'}
+                raise HTTPException(status_code=403, detail='无权限访问该会话')
             if persisted and persisted.get('status') == 'interrupted':
                 return {'status': 'interrupted', 'message': persisted.get('error_message') or '服务已重启，请重新发起登录'}
             return {'status': 'not_found', 'message': '会话不存在或已过期'}
@@ -2133,7 +2140,7 @@ async def check_password_login_status(
 
         # 检查用户权限
         if session['user_id'] != current_user['user_id']:
-            return {'status': 'forbidden', 'message': '无权限访问该会话'}
+            raise HTTPException(status_code=403, detail='无权限访问该会话')
 
         status = session['status']
         registry.update(
@@ -2189,6 +2196,8 @@ async def check_password_login_status(
                 'message': '登录处理中，请稍候...'
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
         return {'status': 'error', 'message': str(e)}
@@ -2437,6 +2446,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             status_info.pop('unb', None)
             return status_info
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"检查扫码登录状态异常: {str(e)}", current_user)
         return {'status': 'error', 'message': str(e)}
@@ -2449,6 +2460,8 @@ async def continue_qr_code_after_verification(session_id: str, current_user: Dic
         log_with_user('info', f"请求继续检查扫码安全验证结果: {session_id}", current_user)
         qr_login_manager.continue_after_verification(session_id)
         return await check_qr_code_status(session_id, current_user)
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"继续检查扫码安全验证结果异常: {str(e)}", current_user)
         return {'status': 'error', 'message': str(e)}
@@ -3093,7 +3106,7 @@ def get_public_system_settings():
 
 
 @settings_router.get('/system-settings')
-def get_system_settings(_: None = Depends(require_auth)):
+def get_system_settings(_: Dict[str, Any] = Depends(require_admin)):
     """获取类型化系统设置，不返回明文密钥。"""
     from db_manager import db_manager
     try:
@@ -3193,6 +3206,42 @@ def _settings_summary() -> Dict[str, Any]:
 @settings_router.get('/api/settings/summary')
 def get_settings_summary(_: Dict[str, Any] = Depends(require_admin)):
     return {'success': True, **_settings_summary()}
+
+
+def _user_basic_settings_summary(user_id: int) -> Dict[str, Any]:
+    resolved = resolve_user_basic_settings(
+        db_manager.get_all_system_settings(),
+        db_manager.get_user_settings(user_id),
+    )
+    return {"success": True, **resolved}
+
+
+@settings_router.get('/api/settings/user-summary')
+def get_user_settings_summary(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    return _user_basic_settings_summary(current_user['user_id'])
+
+
+@settings_router.put('/api/settings/user-basic')
+def save_user_basic_settings(
+    request: UserBasicSettingsIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    values = (
+        request.model_dump(exclude_none=True)
+        if hasattr(request, "model_dump")
+        else request.dict(exclude_none=True)
+    )
+    if not values:
+        raise HTTPException(status_code=400, detail='至少提交一项个人设置')
+    if not db_manager.set_user_settings(current_user['user_id'], values):
+        raise HTTPException(status_code=500, detail='个人设置保存失败')
+    return {
+        **_user_basic_settings_summary(current_user['user_id']),
+        "message": "个人同步设置已保存",
+        "saved_at": datetime.now().isoformat(timespec='seconds'),
+    }
 
 
 @settings_router.put('/api/settings/sections/{section}')
@@ -5641,9 +5690,14 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
 
 
 @ai_router.post("/ai-reply-test/{cookie_id}")
-def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_auth)):
+def test_ai_reply(
+    cookie_id: str,
+    test_data: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """测试AI回复功能"""
     try:
+        _ensure_ai_cookie_access(cookie_id, current_user)
         # 检查账号是否存在
         if cookie_manager.manager is None:
             raise HTTPException(status_code=500, detail='CookieManager 未就绪')
@@ -7862,6 +7916,80 @@ def get_system_stats(admin_user: Dict[str, Any] = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------------- BI报表分析接口 -------------------------
+
+
+def _dashboard_period(
+    range_key: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Dict[str, str]:
+    try:
+        end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else datetime.now().date()
+        if range_key == "custom":
+            if not start_date or not end_date:
+                raise ValueError("自定义时间范围需要开始和结束日期")
+            start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        elif range_key == "yesterday":
+            end = end - timedelta(days=1)
+            start = end
+        else:
+            days = {"today": 1, "3days": 3, "7days": 7, "30days": 30}[range_key]
+            start = end - timedelta(days=days - 1)
+        if start > end:
+            raise ValueError("开始日期不能晚于结束日期")
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc) or "时间范围无效") from exc
+    period_days = (end - start).days + 1
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=period_days - 1)
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "previous_start_date": previous_start.isoformat(),
+        "previous_end_date": previous_end.isoformat(),
+    }
+
+
+@orders_router.get('/api/dashboard/summary')
+def get_dashboard_summary(
+    range_key: Literal['today', 'yesterday', '3days', '7days', '30days', 'custom'] = Query('7days', alias='range'),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    period = _dashboard_period(range_key, start_date, end_date)
+    is_admin = bool(current_user.get('is_admin')) or current_user.get('username') == ADMIN_USERNAME
+    scoped_user_id = None if is_admin else current_user['user_id']
+    valid_statuses = ['pending_ship', 'shipped', 'completed']
+    current = db_manager.get_order_analytics(
+        start_date=period['start_date'],
+        end_date=period['end_date'],
+        user_id=scoped_user_id,
+        include_statuses=valid_statuses,
+    )
+    previous = db_manager.get_order_analytics(
+        start_date=period['previous_start_date'],
+        end_date=period['previous_end_date'],
+        user_id=scoped_user_id,
+        include_statuses=valid_statuses,
+    )
+    if 'error' in current or 'error' in previous:
+        raise HTTPException(
+            status_code=500,
+            detail=current.get('error') or previous.get('error') or '仪表盘统计失败',
+        )
+    return {
+        "success": True,
+        "scope": "system" if is_admin else "user",
+        "range": period,
+        "stats": db_manager.get_dashboard_stats(scoped_user_id),
+        "current": current,
+        "previous": previous,
+        "item_names": db_manager.get_dashboard_item_names(
+            scoped_user_id,
+            [item.get("item_id") for item in current["item_stats"]],
+        ),
+    }
 
 @orders_router.get('/analytics/orders')
 def get_order_analytics(

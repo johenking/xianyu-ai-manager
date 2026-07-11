@@ -77,6 +77,9 @@ After login, verify settings and operations with a bearer token:
 curl -sS http://127.0.0.1:8091/api/settings/summary \
   -H "Authorization: Bearer $TOKEN"
 
+curl -sS 'http://127.0.0.1:8091/api/dashboard/summary?range=7days' \
+  -H "Authorization: Bearer $TOKEN"
+
 curl -sS http://127.0.0.1:8091/api/skills/ops/health \
   -H "Authorization: Bearer $TOKEN"
 ```
@@ -203,3 +206,16 @@ rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|p
 Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, passwords, provider keys, or verification URLs.
 
 Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard logs out unexpectedly, check browser `localStorage.auth_token`, call `/verify`, confirm the same `DB_PATH` is in use, and verify that the session row still exists.
+
+### Password Reset Acceptance
+
+1. Keep the same ordinary user logged in in window A and sign in again in private window B.
+2. Confirm two unexpired sessions exist for that user without printing their Token values.
+3. Complete `/forgot-password` with the registered mailbox; enter CAPTCHA, email code, and the new password only in the browser.
+4. Refresh A and B. Both old sessions must return to login, and the database must show zero sessions for that user before the first new login.
+5. Confirm the old password fails. Confirm the new password works once with the username and once with the email.
+6. Confirm other users and the administrator were not logged out. Never place passwords or verification codes in logs, screenshots, shell history, or chat.
+
+For an ordinary-user dashboard that does not finish loading, verify `/verify` returns `is_admin: false` and call `/api/dashboard/summary` with that user's Token. The page must not request `/admin/stats`; a 403 or 500 from the summary should end in a visible retry state. Migration `2026071104` adds `idx_orders_cookie_created_at` and `idx_orders_status_created_at`; verify them with `PRAGMA index_list(orders)` when summary latency regresses.
+
+When account-level `cookie_refresh_enabled` is false, Token or Session failure must not launch Chrome for Testing. The refresh status should record `automatic_refresh_disabled`; only the account page's manual immediate-refresh action may launch the official browser in that state.

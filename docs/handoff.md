@@ -2,9 +2,9 @@
 
 ## Source State On 2026-07-11
 
-The `v1.7.0` source combines official Goofish session renewal and Skill Center automation with fail-closed direct registration, email-based password recovery, persistent authentication limits, local agreement pages, SMTP receipt confirmation, and administrator capacity controls. Passwords, Cookies, email codes, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
+The `v1.7.1` source combines official Goofish session renewal, Skill Center automation, direct registration, and email password recovery with role-aware settings and dashboards. Ordinary users retain personal item-sync and AI configuration while administrator-only SMTP, registration, global security, and runtime controls remain hidden and protected. Passwords, Cookies, email codes, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
 
-Publishing source does not prove a running service was upgraded. Verify the process path, health response, migration version, frontend entry bundle, account listeners, and Skill scheduler before describing any deployment as running v1.7.0. Registration must remain closed until the real SMTP receipt code and an end-to-end direct-registration acceptance test have both succeeded.
+Publishing source does not prove a running service was upgraded. Verify the process path, health response, migration version, frontend entry bundle, account listeners, and Skill scheduler before describing any deployment as running v1.7.1. Registration defaults closed and must not be opened on a new installation until the real SMTP receipt code and an end-to-end direct-registration acceptance test have both succeeded.
 
 ## Working Capabilities
 
@@ -23,6 +23,8 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - One-transaction direct registration with capacity recheck, image CAPTCHA, purpose-bound email code, `v2` terms acceptance, and automatic login.
 - Username-or-email login and email password recovery that revokes all older sessions after reset.
 - Administrator SMTP receipt confirmation, 1–1000 ordinary-user capacity, user enablement, and guarded registration switch controls.
+- Ordinary-user personal item-sync settings with per-field global inheritance, plus user-owned AI provider access without administrator settings calls.
+- One-request role-aware dashboard summaries, retryable error and empty states, deferred order details, and a separately loaded chart bundle.
 - Purpose-isolated HMAC storage for authentication secrets and identifiers, persistent multi-dimensional rate limits, and trusted-proxy client-IP handling.
 
 ## Important Boundaries
@@ -31,6 +33,7 @@ Publishing source does not prove a running service was upgraded. Verify the proc
 - Copying knowledge writes target drafts only, defaults to no overwrite, and never publishes automatically.
 - Deleting an account removes account-linked data. Re-login or update the Cookie instead of deleting for session recovery.
 - Scheduled Cookie refresh and Skill monitor schedules both default off. Cookie refresh allows 1 hour to 7 days; Skill monitoring allows 15 minutes or longer.
+- Disabled Cookie refresh prevents non-manual Token failures from launching Chrome; manual immediate refresh remains available.
 - Goofish rejects headless Chromium. Official renewal uses a headed off-screen browser and becomes visible for human verification.
 - Alibaba SMS, QR, face, and risk-control verification cannot be bypassed. A profile can renew without another scan only while the official session or encrypted credential fallback remains usable.
 - Skill Center notification delivery excludes QQ and email even though those channel types may exist elsewhere in the database.
@@ -65,11 +68,11 @@ Also run `git diff --check` and a secret scan over every tracked and prospective
 
 The automated suite covers official login modes, profile promotion and reuse, encrypted credential fallback, verification timeout and cancellation, account data retention, Skill scheduler lifecycle and locking, success/failure rescheduling, AI filtering, supported-channel filtering, multi-channel notification outcomes, cross-run deduplication, registration transactions and races, challenge expiry and attempts, rate limits, trusted proxies, SMTP failure behavior, session revocation, public auth views, and administrator registration interactions. Real platform acceptance still requires operator-owned Xianyu, AI provider, notification, and SMTP accounts.
 
-Verified on 2026-07-11 for the v1.7.0 branch: Ruff and explicit Python compilation passed, all 204 backend tests passed, all 15 frontend test files with 46 tests passed, and `npm audit --audit-level=high` reported zero vulnerabilities. Two production builds retained two generations of 28 assets with zero orphans; the 234,760-byte entry bundle is 72.9% below the 865,910-byte baseline. The favicon resolves at `/static/favicon.svg`.
+Verified on 2026-07-11 for the v1.7.1 branch: Ruff and explicit Python compilation passed, all 212 backend tests passed, all 17 frontend test files with 55 tests passed, Gitleaks found no leaks, and `npm audit --audit-level=high` reported zero vulnerabilities. Two production builds retained two generations of 29 assets with zero orphans; the 236,442-byte entry bundle is 72.7% below the 865,910-byte baseline, while the 402,730-byte Recharts bundle loads separately after summary cards. The favicon resolves at `/static/favicon.svg`.
 
 ## Next Acceptance Steps
 
-- Keep registration closed while configuring a real QQ SMTP authorization code and independent support mailbox, then enter the six-digit code from the actual inbox.
-- Confirm the limit is 20, then complete one real direct registration, automatic login, service-restart session restore, username/email login, password reset, and old-session rejection before leaving registration open.
-- Verify the deployed frontend entry, schema migration `2026071103`, account listeners, and Skill scheduler after restart; Skill schedules remain default off.
+- Deploy the exact v1.7.1 source and clean static build, then verify migration `2026071104`, the ordinary/admin settings split, dashboard response time, account listeners, and Skill scheduler after restart.
+- Complete password-reset acceptance with two old sessions: reset through the registered mailbox, confirm both old sessions are rejected, confirm the old password fails, and verify the new password through both username and email login.
+- Keep Skill schedules default off and keep account-level scheduled Cookie refresh off unless an operator explicitly needs preventive renewal.
 - Keep monitoring official page, SMTP, AI-provider, and notification changes; do not weaken human verification, rate limits, or secret-handling boundaries to improve automation rates.

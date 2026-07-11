@@ -2,6 +2,7 @@ import { del, get, post, put } from '../request';
 import type {
   AdminStats,
   ApiResponse,
+  DashboardSummary,
   Order,
   OrderAnalytics,
   OrderSyncResponse,
@@ -95,6 +96,14 @@ export const importOrders = async (data: Partial<Order>[] | FormData): Promise<a
 // Stats
 export const getAdminStats = async (): Promise<AdminStats> => {
   return get('/admin/stats');
+};
+
+export const getDashboardSummary = async (params: {
+  range: 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
+  start_date?: string;
+  end_date?: string;
+}): Promise<DashboardSummary> => {
+  return get('/api/dashboard/summary', params);
 };
 
 export const getOrderAnalytics = async (daysOrParams: number | {start_date: string; end_date: string} = 7): Promise<OrderAnalytics> => {

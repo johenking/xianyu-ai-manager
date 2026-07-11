@@ -28,14 +28,14 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | Health | `GET /health/live`, `GET /health/ready`, compatibility `GET /health` |
 | Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset` |
 | Registration administration | `/api/admin/registration/status`, `/limit`, `/users`, `/enabled`; legacy `/invites` returns 410 |
-| Settings | `GET /api/settings/summary`, `PUT /api/settings/sections/{section}`, `POST /api/settings/verify/{section}`, `POST /api/settings/verify/smtp/confirm` |
+| Settings | User-owned `GET /api/settings/user-summary`, `PUT /api/settings/user-basic`; administrator-only `/api/settings/summary`, `/sections/{section}`, `/verify/{section}`, `/verify/smtp/confirm` |
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
 | Official password login | `POST /password-login`, `GET /password-login/check/{session_id}` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
-| Orders | `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
+| Dashboard and orders | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
 | Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
 
 Routes below require `Authorization: Bearer $TOKEN` unless they are explicitly described as public.
@@ -132,7 +132,7 @@ The administrator status includes `user_limit`, `user_count`, and `remaining_slo
 
 ## Settings Sections
 
-Read typed values, secret masks, and section states:
+Administrators read typed global values, secret masks, and section states:
 
 ```bash
 curl -sS "$BASE_URL/api/settings/summary" \
@@ -152,6 +152,29 @@ curl -sS -X PUT "$BASE_URL/api/settings/sections/ai" \
 ```
 
 Use `/api/settings/verify/ai` to test AI values. `POST /api/settings/verify/smtp` saves the candidate SMTP settings as unverified, sends a six-digit code to the required support email, and returns `challenge_id`, `expires_in`, and a masked recipient. Confirm real receipt with `POST /api/settings/verify/smtp/confirm` and `{"challenge_id":"...","verification_code":"123456"}`. Only confirmation saves the verified fingerprint; changing any SMTP field consumes pending confirmations and closes registration. The QQ preset uses `smtp.qq.com:465`, SSL enabled, and STARTTLS disabled.
+
+Ordinary users receive HTTP 403 from global `/system-settings` and administrator setting routes. They use the personal item-sync endpoints instead:
+
+```bash
+curl -sS "$BASE_URL/api/settings/user-summary" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -sS -X PUT "$BASE_URL/api/settings/user-basic" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"item_sync_enabled":true,"item_sync_interval":600,"item_sync_max_pages":5}'
+```
+
+The summary reports each value's source as `user` or `global`. The update accepts only changed fields, preserving global inheritance for omitted values. The interval accepts 60–86400 seconds and page count accepts 1–50. These settings apply only to Xianyu instances owned by the authenticated backend user. AI provider APIs remain user-scoped and are available to ordinary users.
+
+## Dashboard Summary
+
+```bash
+curl -sS "$BASE_URL/api/dashboard/summary?range=7days" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Ranges are `today`, `yesterday`, `3days`, `7days`, `30days`, or `custom`; custom requests also send `start_date` and `end_date` as `YYYY-MM-DD`. The response declares `scope: user` for ordinary users and `scope: system` for administrators, then returns `stats`, `current`, `previous`, `item_names`, and resolved date boundaries. Frontends should render the summary first and request `/analytics/orders/valid` afterward for detail rows.
 
 ## AI Provider Profiles
 

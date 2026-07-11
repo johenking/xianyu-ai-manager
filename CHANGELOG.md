@@ -2,6 +2,25 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.7.1] - 2026-07-11
+
+### Added
+
+- Add user-owned item synchronization settings with global-default inheritance and typed validation from 1 minute to 24 hours and 1 to 50 pages.
+- Add one user-aware dashboard summary endpoint that returns current and previous periods, owned account and inventory counters, and product names in one first-paint response.
+- Add migration `2026071104` with order analysis indexes on Cookie/date and status/date.
+
+### Changed
+
+- Keep the full system, SMTP, registration, runtime, and global-security settings visible only to administrators while ordinary users retain personal synchronization and AI provider configuration.
+- Lazy-load dashboard charts and defer order details until after summary cards render; use indexed timestamp boundaries and account-owner joins for analytics.
+- Make `/system-settings`, password-login polling, QR-login polling, AI reply tests, account sessions, and account diagnostics enforce their intended administrator or owner boundaries.
+
+### Fixed
+
+- Stop ordinary-user dashboards from waiting forever after the administrator statistics endpoint returns HTTP 403; failed summary requests now show a retryable terminal state.
+- Prevent Token or Session failures from opening Chrome for Testing when scheduled Cookie refresh is disabled; manual immediate refresh remains available.
+
 ## [1.7.0] - 2026-07-11
 
 ### Added

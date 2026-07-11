@@ -324,6 +324,22 @@ def _direct_registration_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _order_analysis_indexes_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    orders_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone()
+    if not orders_exists:
+        return
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_cookie_created_at "
+        "ON orders(cookie_id, created_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_orders_status_created_at "
+        "ON orders(order_status, created_at)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -334,6 +350,7 @@ MIGRATIONS: Sequence[Migration] = (
         _registration_identity_nfkc_v2,
     ),
     Migration("2026071103", "direct_registration_v1", _direct_registration_v1),
+    Migration("2026071104", "order_analysis_indexes_v1", _order_analysis_indexes_v1),
 )
 
 
