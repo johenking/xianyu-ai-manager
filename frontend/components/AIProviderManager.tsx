@@ -10,6 +10,7 @@ import {
 } from '../services/api';
 import { AIProviderPreset, AIProviderProfile } from '../types';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import { IconAction } from './ui/ProtectedPage';
 
 type ProviderForm = {
   id?: number;
@@ -166,22 +167,22 @@ const AIProviderManager: React.FC = () => {
     }
   };
 
-  return <div className="space-y-4 border-b border-gray-200 pb-6">
+  return <div className="space-y-4">
     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div><h4 className="font-extrabold text-gray-900">AI 平台配置库</h4><p className="mt-1 text-xs text-gray-500">平台 Key 在这里集中管理；每个闲鱼账号可以单独选择模型。</p></div>
-      <button type="button" onClick={() => setForm(emptyForm(presets.deepseek))} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black"><Plus className="h-4 w-4" />添加平台</button>
+      <button type="button" onClick={() => setForm(emptyForm(presets.deepseek))} className="ios-btn-primary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold"><Plus className="h-4 w-4" />添加平台</button>
     </div>
 
     {notice && <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice>}
 
-    <div className="divide-y divide-gray-100 rounded-lg border border-gray-200 bg-white">
+    <div className="divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-100 bg-gray-50/70">
       {providers.length === 0 && <div className="px-4 py-6 text-center text-sm text-gray-500">暂无平台配置</div>}
-      {providers.map((provider) => <div key={provider.id} className="flex flex-col gap-3 px-4 py-4 lg:flex-row lg:items-center">
+      {providers.map((provider) => <div key={provider.id} className="flex flex-col gap-3 bg-white px-4 py-4 lg:flex-row lg:items-center">
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2"><span className="font-extrabold text-gray-900">{provider.name}</span>{provider.is_default && <span className="rounded-full bg-gray-900 px-2 py-0.5 text-[11px] font-bold text-[#FFE815]">默认</span>}<StatusBadge state={provider.verification_status === 'verified' ? 'ready' : provider.verification_status === 'failed' ? 'error' : 'dirty'} label={provider.verification_status === 'verified' ? '已验证' : provider.verification_status === 'failed' ? '验证失败' : '待验证'} /></div>
+          <div className="flex flex-wrap items-center gap-2"><span className="font-extrabold text-gray-900">{provider.name}</span>{provider.is_default && <span className="rounded-md bg-[#FFE815] px-2 py-0.5 text-[11px] font-bold text-black">默认</span>}<StatusBadge state={provider.verification_status === 'verified' ? 'ready' : provider.verification_status === 'failed' ? 'error' : 'dirty'} label={provider.verification_status === 'verified' ? '已验证' : provider.verification_status === 'failed' ? '验证失败' : '待验证'} /></div>
           <div className="mt-1 truncate text-xs text-gray-500">{provider.default_model || '未填写模型'} · {provider.api_key_masked || '未配置 Key'} · {provider.base_url}</div>
         </div>
-        <div className="grid grid-cols-4 gap-2 sm:flex">
+        <div className="flex gap-2">
           <IconButton label="刷新模型" busy={busy === `refresh-${provider.id}`} icon={RefreshCw} onClick={() => void refresh(provider)} />
           <IconButton label="测试回复" busy={busy === `test-${provider.id}`} icon={TestTube2} onClick={() => void test(provider)} />
           <IconButton label="编辑平台" icon={Pencil} onClick={() => edit(provider)} />
@@ -190,20 +191,20 @@ const AIProviderManager: React.FC = () => {
       </div>)}
     </div>
 
-    {form && <div className="space-y-4 rounded-lg border border-yellow-300 bg-yellow-50/60 p-4">
+    {form && <div className="space-y-4 rounded-xl border border-yellow-200 bg-yellow-50/60 p-4">
       <div className="flex items-center justify-between"><strong>{form.id ? '编辑平台' : '添加平台'}</strong><button type="button" aria-label="关闭平台编辑" onClick={() => setForm(null)} className="rounded-md p-1.5 hover:bg-white"><X className="h-4 w-4" /></button></div>
-      <label className="block text-sm font-bold text-gray-800">平台预设<select value={form.preset} onChange={(e) => choosePreset(e.target.value)} className="mt-2 h-11 w-full rounded-lg border border-gray-200 bg-white px-3 font-normal">{presetEntries.map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}</select></label>
+      <label className="block text-sm font-bold text-gray-800">平台预设<select value={form.preset} onChange={(e) => choosePreset(e.target.value)} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal">{presetEntries.map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}</select></label>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2"><TextField label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} /><TextField label="默认模型" value={form.default_model} onChange={(default_model) => setForm({ ...form, default_model })} placeholder="可刷新后选择或手填" /></div>
       <TextField label="API 地址" value={form.base_url} onChange={(base_url) => setForm({ ...form, base_url })} />
-      <label className="block text-sm font-bold text-gray-800">API Key<div className="relative mt-2"><input type={showKey ? 'text' : 'password'} value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value, api_key_action: e.target.value ? 'set' : 'keep' })} placeholder={form.id ? '留空保持原 Key' : '输入平台 API Key'} className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 pr-11 font-mono font-normal" /><button type="button" aria-label={showKey ? '隐藏平台密钥' : '显示平台密钥'} onClick={() => setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-2 text-gray-500 hover:bg-gray-100">{showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></label>
-      <div className="flex items-center justify-between rounded-lg bg-white px-3 py-2"><span className="text-sm font-bold text-gray-800">设为默认平台</span><ToggleControl checked={form.is_default} onChange={(is_default) => setForm({ ...form, is_default })} label="默认平台" /></div>
-      <div className="flex justify-end"><button type="button" disabled={busy === 'save'} onClick={() => void save()} className="inline-flex h-10 items-center gap-2 rounded-lg bg-[#FFE815] px-5 text-sm font-extrabold text-black disabled:opacity-50">{busy === 'save' ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}保存平台</button></div>
+      <label className="block text-sm font-bold text-gray-800">API Key<div className="relative mt-2"><input type={showKey ? 'text' : 'password'} value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value, api_key_action: e.target.value ? 'set' : 'keep' })} placeholder={form.id ? '留空保持原 Key' : '输入平台 API Key'} className="ios-input h-11 w-full rounded-xl px-3 pr-11 font-mono font-normal" /><button type="button" aria-label={showKey ? '隐藏平台密钥' : '显示平台密钥'} onClick={() => setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 text-gray-500 hover:bg-gray-100">{showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></label>
+      <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2"><span className="text-sm font-bold text-gray-800">设为默认平台</span><ToggleControl checked={form.is_default} onChange={(is_default) => setForm({ ...form, is_default })} label="默认平台" /></div>
+      <div className="flex justify-end"><button type="button" disabled={busy === 'save'} onClick={() => void save()} className="ios-btn-primary inline-flex h-10 items-center gap-2 rounded-xl px-5 text-sm font-extrabold">{busy === 'save' ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}保存平台</button></div>
     </div>}
   </div>;
 };
 
-const TextField: React.FC<{ label: string; value: string; onChange: (value: string) => void; placeholder?: string }> = ({ label, value, onChange, placeholder }) => <label className="block text-sm font-bold text-gray-800">{label}<input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className="mt-2 h-11 w-full rounded-lg border border-gray-200 bg-white px-3 font-normal" /></label>;
+const TextField: React.FC<{ label: string; value: string; onChange: (value: string) => void; placeholder?: string }> = ({ label, value, onChange, placeholder }) => <label className="block text-sm font-bold text-gray-800">{label}<input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal" /></label>;
 
-const IconButton: React.FC<{ label: string; icon: React.ComponentType<{ className?: string }>; onClick: () => void; busy?: boolean; danger?: boolean }> = ({ label, icon: Icon, onClick, busy, danger }) => <button type="button" title={label} aria-label={label} onClick={onClick} disabled={busy} className={`inline-flex h-9 w-full items-center justify-center rounded-lg border text-sm sm:w-9 ${danger ? 'border-red-200 text-red-600 hover:bg-red-50' : 'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Icon className="h-4 w-4" />}</button>;
+const IconButton: React.FC<{ label: string; icon: React.ComponentType<{ className?: string }>; onClick: () => void; busy?: boolean; danger?: boolean }> = ({ label, icon, onClick, busy, danger }) => <IconAction icon={busy ? Loader2 : icon} label={label} onClick={onClick} busy={busy} danger={danger} disabled={busy} />;
 
 export default AIProviderManager;

@@ -87,8 +87,8 @@ describe('SkillCenter loading and monitor controls', () => {
     fireEvent.change(screen.getByPlaceholderText(/AI 商品过滤要求/), {
       target: { value: '只保留低价商品' },
     });
-    fireEvent.click(screen.getByText('定时运行').closest('label')!.querySelector('input')!);
-    fireEvent.click(screen.getByText('命中后通知').closest('label')!.querySelector('input')!);
+    fireEvent.click(screen.getByRole('switch', { name: '定时运行' }));
+    fireEvent.click(screen.getByRole('switch', { name: '命中后通知' }));
     fireEvent.click(screen.getByRole('button', { name: /创建监控任务/ }));
 
     await waitFor(() => expect(createSkillMonitorTask).toHaveBeenCalledWith(expect.objectContaining({
@@ -122,5 +122,21 @@ describe('SkillCenter loading and monitor controls', () => {
       schedule_interval_minutes: 30,
     }));
     expect(await screen.findByText('已开启定时监控')).toBeInTheDocument();
+  });
+
+  it('uses the protected-page navigation across every skill view', async () => {
+    render(<SkillCenter />);
+
+    await screen.findByPlaceholderText('监控关键词');
+    expect(screen.queryByText('SKILL CENTER')).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: '页面分区' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /AI 专家客服/ }));
+    expect(await screen.findByText('测试回复')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /稳定增强/ }));
+    expect(await screen.findByText('部署健康')).toBeInTheDocument();
+    expect(screen.getByText('浏览器状态')).toBeInTheDocument();
+    expect(screen.getByText('发货诊断')).toBeInTheDocument();
   });
 });
