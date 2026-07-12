@@ -2,11 +2,13 @@ import asyncio
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import reply_server
 from db_manager import DBManager
 from utils.xianyu_official_login import OfficialLoginResult
+from account_session_refresh import active_refresh_registry
 
 
 class FakeCookieManager:
@@ -76,6 +78,10 @@ class OfficialPasswordLoginBackendTests(unittest.IsolatedAsyncioTestCase):
         reply_server.password_login_sessions.clear()
         self.db.conn.close()
         os.unlink(self.db_path)
+
+    async def asyncTearDown(self):
+        active_refresh_registry.unregister("legacy-account")
+        active_refresh_registry.consume_cancelled("legacy-account")
 
     async def test_legacy_account_id_is_accepted_but_not_used_or_stored(self):
         execute_login = AsyncMock(return_value=None)
@@ -173,6 +179,59 @@ class OfficialPasswordLoginBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["has_login_password"])
         self.assertNotIn("password", result)
         self.assertNotIn("password_encrypted", result)
+
+    async def test_manual_session_refresh_reserves_the_account_before_scheduling(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def run_refresh(*args, **kwargs):
+            del args, kwargs
+            started.set()
+            await release.wait()
+            return True
+
+        live = SimpleNamespace(
+            _try_password_login_refresh=AsyncMock(side_effect=run_refresh),
+        )
+        fake_db = SimpleNamespace(
+            get_all_cookies=lambda user_id: {"legacy-account": "unb=stable-unb"},
+            get_account_session_refresh=lambda cookie_id: {
+                "state": "idle",
+                "trigger": "",
+                "message": "",
+                "error_code": "",
+                "verification_image_url": "",
+                "started_at": None,
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "expires_at": None,
+                "updated_at": None,
+            },
+        )
+
+        with (
+            patch.object(reply_server, "db_manager", fake_db),
+            patch("XianyuAutoAsync.XianyuLive.get_instance", return_value=live),
+            patch.object(reply_server.cookie_manager, "manager", SimpleNamespace(loop=asyncio.get_running_loop())),
+        ):
+            first = await reply_server.refresh_account_session(
+                "legacy-account",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+            await started.wait()
+            second = await reply_server.refresh_account_session(
+                "legacy-account",
+                current_user={"user_id": 1, "username": "admin"},
+            )
+
+        self.assertEqual(first["message"], "已开始刷新 Cookie")
+        self.assertEqual(second["message"], "Cookie 刷新已经在进行中")
+        live._try_password_login_refresh.assert_awaited_once_with(
+            "手动立即刷新",
+            reuse_active_registration=True,
+        )
+        release.set()
+        await asyncio.sleep(0)
 
 
 if __name__ == "__main__":

@@ -6156,6 +6156,13 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
     if live_instance is None:
         raise HTTPException(status_code=409, detail="账号监听实例未运行，请先开启账号监听")
 
+    if not active_refresh_registry.register(cookie_id, live_instance):
+        return {
+            'success': True,
+            'message': 'Cookie 刷新已经在进行中',
+            'data': _current_session_refresh_status(cookie_id),
+        }
+
     get_session_registry().register(
         f"cookie-refresh:{cookie_id}",
         "cookie_refresh",
@@ -6168,13 +6175,23 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
 
     manager_loop = getattr(cookie_manager.manager, 'loop', None) if cookie_manager.manager else None
     running_loop = asyncio.get_running_loop()
-    if manager_loop and manager_loop is not running_loop and manager_loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            live_instance._try_password_login_refresh("手动立即刷新"),
-            manager_loop,
-        )
-    else:
-        asyncio.create_task(live_instance._try_password_login_refresh("手动立即刷新"))
+    async def run_reserved_refresh():
+        try:
+            await live_instance._try_password_login_refresh(
+                "手动立即刷新",
+                reuse_active_registration=True,
+            )
+        finally:
+            active_refresh_registry.unregister(cookie_id)
+
+    try:
+        if manager_loop and manager_loop is not running_loop and manager_loop.is_running():
+            asyncio.run_coroutine_threadsafe(run_reserved_refresh(), manager_loop)
+        else:
+            asyncio.create_task(run_reserved_refresh())
+    except Exception:
+        active_refresh_registry.unregister(cookie_id)
+        raise
     await asyncio.sleep(0)
     return {
         'success': True,

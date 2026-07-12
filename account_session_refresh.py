@@ -32,6 +32,26 @@ def is_runtime_event_active(
     return True
 
 
+def resolve_refresh_schedule_anchor(
+    status: Optional[dict[str, Any]],
+    *,
+    now: Optional[float] = None,
+) -> float:
+    """Return the newest persisted refresh timestamp, or start from now."""
+    current_time = time.time() if now is None else float(now)
+    candidates = []
+    for key in ("last_attempt_at", "last_success_at"):
+        try:
+            value = float((status or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            candidates.append(value)
+    if not candidates:
+        return current_time
+    return min(max(candidates), current_time)
+
+
 def remove_verification_image(path: Optional[str]) -> None:
     if not path:
         return

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AccountList from './AccountList';
 import {
@@ -9,6 +9,7 @@ import {
   getAllAISettings,
   getAccountSessionStatus,
   passwordLogin,
+  refreshAccountSession,
   updateAccountCookieRefreshSettings,
 } from '../services/api';
 
@@ -178,6 +179,36 @@ describe('AccountList session verification UI', () => {
         cookie_refresh_interval_minutes: 360,
       });
     });
+  });
+
+  it('starts only one manual refresh when the button is double-clicked', async () => {
+    vi.mocked(refreshAccountSession).mockResolvedValue({
+      success: true,
+      message: '已开始刷新 Cookie',
+      data: {
+        state: 'refreshing',
+        trigger: 'manual',
+        message: '正在刷新闲鱼登录状态',
+        error_code: '',
+        verification_image_url: '',
+        started_at: 10,
+        last_attempt_at: 10,
+        last_success_at: null,
+        expires_at: null,
+        updated_at: 10,
+      },
+    });
+    render(<AccountList />);
+
+    const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    const refreshButton = within(accountCard as HTMLElement).getByTitle('立即刷新 Cookie');
+    act(() => {
+      fireEvent.click(refreshButton);
+      fireEvent.click(refreshButton);
+    });
+
+    await waitFor(() => expect(refreshAccountSession).toHaveBeenCalledTimes(1));
   });
 
   it('submits official password login without a client supplied account id', async () => {

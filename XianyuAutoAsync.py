@@ -681,7 +681,13 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None):
+    def __init__(
+        self,
+        cookies_str=None,
+        cookie_id: str = "default",
+        user_id: int = None,
+        runtime_state: dict = None,
+    ):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -748,7 +754,19 @@ class XianyuLive:
         self.cookie_refresh_task = None
         cookie_refresh_settings = self._load_cookie_refresh_settings()
         self.cookie_refresh_interval = cookie_refresh_settings['interval_minutes'] * 60
-        self.last_cookie_refresh_time = 0
+        try:
+            from account_session_refresh import resolve_refresh_schedule_anchor
+
+            persisted_refresh_status = db_manager.get_account_session_refresh(self.cookie_id)
+            self.last_cookie_refresh_time = resolve_refresh_schedule_anchor(
+                persisted_refresh_status,
+            )
+        except Exception as refresh_anchor_error:
+            logger.warning(
+                f"【{self.cookie_id}】恢复Cookie刷新调度时间失败，改从当前时间计算: "
+                f"{self._safe_str(refresh_anchor_error)}"
+            )
+            self.last_cookie_refresh_time = time.time()
         self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
         self.cookie_refresh_enabled = cookie_refresh_settings['enabled']  # 是否启用Cookie刷新功能
 
@@ -759,6 +777,15 @@ class XianyuLive:
         self.item_sync_max_pages = cfg.get('ITEM_SYNC', {}).get('max_pages', 5)
         self.last_item_sync_time = 0
         self.item_sync_lock = asyncio.Lock()  # 使用Lock防止重复执行商品同步
+
+        if runtime_state:
+            self.last_cookie_refresh_time = max(
+                self.last_cookie_refresh_time,
+                float(runtime_state.get('cookie_refresh_anchor') or 0),
+            )
+            self.last_item_sync_time = float(
+                runtime_state.get('item_sync_anchor') or self.last_item_sync_time
+            )
 
         # 扫码登录Cookie刷新标志
         self.last_qr_cookie_refresh_time = 0  # 记录上次扫码登录Cookie刷新时间
@@ -877,8 +904,11 @@ class XianyuLive:
         """更新运行中的定时Cookie刷新设置"""
         interval_seconds = max(60, int(interval_minutes) * 60)
         previous = (self.cookie_refresh_enabled, self.cookie_refresh_interval)
+        was_enabled = self.cookie_refresh_enabled
         self.cookie_refresh_enabled = bool(enabled)
         self.cookie_refresh_interval = interval_seconds
+        if self.cookie_refresh_enabled and not was_enabled:
+            self.last_cookie_refresh_time = time.time()
         current = (self.cookie_refresh_enabled, self.cookie_refresh_interval)
         if previous != current:
             status = "开启" if self.cookie_refresh_enabled else "关闭"
@@ -2561,7 +2591,16 @@ class XianyuLive:
                         time.sleep(0.5)
 
                         # save_to_db=False 因为 update_config_cookies 已经保存过了
-                        cookie_manager.update_cookie(self.cookie_id, self.cookies_str, save_to_db=False)
+                        restart_anchor = time.time()
+                        cookie_manager.update_cookie(
+                            self.cookie_id,
+                            self.cookies_str,
+                            save_to_db=False,
+                            runtime_state={
+                                'cookie_refresh_anchor': restart_anchor,
+                                'item_sync_anchor': restart_anchor,
+                            },
+                        )
                         logger.info(f"【{self.cookie_id}】实例重启请求已触发")
                     except Exception as e:
                         logger.error(f"【{self.cookie_id}】触发实例重启失败: {e}")
@@ -5720,6 +5759,7 @@ class XianyuLive:
                             logger.warning(f"【{self.cookie_id}】Cookie刷新任务已在执行中，跳过本次触发")
                         else:
                             logger.info(f"【{self.cookie_id}】开始执行定时Cookie刷新任务，间隔 {self._format_cookie_refresh_interval()}...")
+                            self.last_cookie_refresh_time = current_time
                             # 在独立的任务中执行Cookie刷新，避免阻塞主循环
                             asyncio.create_task(self._execute_cookie_refresh(current_time))
 
@@ -5755,6 +5795,13 @@ class XianyuLive:
 
         async with self.cookie_refresh_lock:
             try:
+                self.refresh_cookie_refresh_settings_from_db()
+                if not self.cookie_refresh_enabled:
+                    logger.info(
+                        f"【{self.cookie_id}】定时 Cookie 刷新已关闭，跳过待执行任务"
+                    )
+                    return
+                self.last_cookie_refresh_time = current_time
                 success = await self._try_password_login_refresh(
                     f"定时 Cookie 刷新（每{self._format_cookie_refresh_interval()}）"
                 )
