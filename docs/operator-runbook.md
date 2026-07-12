@@ -28,7 +28,7 @@ curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 
 Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
 
-The last verified runtime and CI baseline remains v1.7.1. The v1.7.2 source change has no database migration and must leave the latest migration at `2026071104`, but that does not prove the service or public bundle was upgraded. Before calling v1.7.2 deployed, verify the listening process path, health response, HTML entry bundle and referenced asset, public page version, staged password-reset flow, account listeners, and Skill scheduler.
+The v1.7.3 source change has no database migration and must leave the latest migration at `2026071104`, but that does not prove the service or public bundle was upgraded. Before calling v1.7.3 deployed, verify the listening process path, health response, HTML entry bundle and referenced asset, public page version, staged password-reset flow, account listeners, disabled Cookie schedules, and Skill scheduler.
 
 ## Backup Before Risky Changes
 
@@ -173,6 +173,8 @@ Recommended order:
 5. Complete the account-page verification when required; the visible browser waits for up to 15 minutes and platform verification cannot be bypassed.
 6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
 7. Use QR or update the existing Cookie only when the official profile and password fallback cannot recover the session.
+
+For a v1.7.3 manual-refresh acceptance check, keep the account's scheduled refresh disabled, click immediate refresh once, and observe logs and processes for at least two minutes. There must be one official session and one listener restart, with no later scheduled refresh and no immediate item-detail Playwright session. Active duplicate requests should return the current refresh status instead of creating queued browser work. A Cookie-driven listener restart sets a fresh item-sync anchor; normal item synchronization resumes only after its configured interval.
 8. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.

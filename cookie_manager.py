@@ -69,7 +69,13 @@ class CookieManager:
         logger.info("CookieManager 账号监听任务已全部停止")
 
     # ------------------------ 内部协程 ------------------------
-    async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
+    async def _run_xianyu(
+        self,
+        cookie_id: str,
+        cookie_value: str,
+        user_id: int = None,
+        runtime_state: dict = None,
+    ):
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
         self.task_status[cookie_id] = {
@@ -87,7 +93,12 @@ class CookieManager:
 
             logger.info(f"【{cookie_id}】开始创建XianyuLive实例...")
             logger.info(f"【{cookie_id}】Cookie值长度: {len(cookie_value)}")
-            live = XianyuLive(cookie_value, cookie_id=cookie_id, user_id=user_id)
+            live = XianyuLive(
+                cookie_value,
+                cookie_id=cookie_id,
+                user_id=user_id,
+                runtime_state=runtime_state,
+            )
             logger.info(f"【{cookie_id}】XianyuLive实例创建成功，开始调用main()...")
 
             # 强制刷新日志，确保日志被写入
@@ -248,7 +259,13 @@ class CookieManager:
             return fut.result()
 
     # 更新 Cookie 值
-    def update_cookie(self, cookie_id: str, new_value: str, save_to_db: bool = True):
+    def update_cookie(
+        self,
+        cookie_id: str,
+        new_value: str,
+        save_to_db: bool = True,
+        runtime_state: dict = None,
+    ):
         """替换指定账号的 Cookie 并重启任务
 
         Args:
@@ -307,7 +324,14 @@ class CookieManager:
                 self.cookie_status[cookie_id] = original_status
 
                 # 重新启动任务
-                task = self.loop.create_task(self._run_xianyu(cookie_id, new_value, original_user_id))
+                task = self.loop.create_task(
+                    self._run_xianyu(
+                        cookie_id,
+                        new_value,
+                        original_user_id,
+                        runtime_state=runtime_state,
+                    )
+                )
                 self.tasks[cookie_id] = task
 
                 logger.info(f"已更新Cookie并重启任务: {cookie_id} (用户ID: {original_user_id}, 关键词: {len(original_keywords)}条)")

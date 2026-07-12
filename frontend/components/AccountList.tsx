@@ -43,6 +43,7 @@ type AddLoginMethod = 'qr' | 'password' | 'cookie';
 type AddLoginStatus = 'idle' | 'processing' | 'success' | 'failed' | 'verification_required';
 
 const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
+const ACTIVE_SESSION_REFRESH_STATES = new Set(['refreshing', 'verification_required']);
 const COOKIE_REFRESH_INTERVAL_OPTIONS = [
   { value: 60, label: '1 小时' },
   { value: 360, label: '6 小时' },
@@ -79,6 +80,7 @@ const AccountList: React.FC = () => {
   const [diagnosingId, setDiagnosingId] = useState<string>('');
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AccountSessionRefreshStatus>>({});
   const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
+  const manualRefreshFlightsRef = useRef<Set<string>>(new Set());
   const [checkingSessionId, setCheckingSessionId] = useState<string>('');
   const [passwordForm, setPasswordForm] = useState({
     account: '',
@@ -139,6 +141,11 @@ const AccountList: React.FC = () => {
       }
     }));
     const next = Object.fromEntries(results.filter((entry): entry is readonly [string, AccountSessionRefreshStatus] => Boolean(entry)));
+    Object.entries(next).forEach(([accountId, status]) => {
+      if (!ACTIVE_SESSION_REFRESH_STATES.has(status.state)) {
+        manualRefreshFlightsRef.current.delete(accountId);
+      }
+    });
     setSessionStatuses((current) => ({ ...current, ...next }));
   };
 
@@ -329,12 +336,19 @@ const AccountList: React.FC = () => {
   };
 
   const handleRefreshSession = async (account: AccountDetail) => {
+    if (manualRefreshFlightsRef.current.has(account.id)) return;
+
+    manualRefreshFlightsRef.current.add(account.id);
     setRefreshingSessionId(account.id);
     try {
       const result = await refreshAccountSession(account.id);
+      if (!ACTIVE_SESSION_REFRESH_STATES.has(result.data.state)) {
+        manualRefreshFlightsRef.current.delete(account.id);
+      }
       setSessionStatuses((current) => ({ ...current, [account.id]: result.data }));
       setPageNotice({ tone: 'info', text: result.message || '已开始刷新 Cookie' });
     } catch (error) {
+      manualRefreshFlightsRef.current.delete(account.id);
       setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : 'Cookie 刷新启动失败' });
     } finally {
       setRefreshingSessionId('');

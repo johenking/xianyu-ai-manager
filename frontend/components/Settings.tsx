@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, ChevronDown, Database, Eye, EyeOff, Loader2, Mail, RefreshCw, Save, Settings as SettingsIcon, TestTube2 } from 'lucide-react';
+import { Bot, Database, Eye, EyeOff, Loader2, Mail, RefreshCw, Save, Settings as SettingsIcon, TestTube2 } from 'lucide-react';
 import {
   confirmSmtpVerification,
   getSettingsSummary,
@@ -19,6 +19,7 @@ import {
 } from '../types';
 import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import { IconAction, PageHeader, SegmentedNav, WorkSurface } from './ui/ProtectedPage';
 import AIProviderManager from './AIProviderManager';
 import RegistrationManagement from './RegistrationManagement';
 
@@ -295,31 +296,29 @@ const AdminSettings: React.FC = () => {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 pb-16">
-      <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-gray-900 text-[#FFE815]"><SettingsIcon className="h-5 w-5" /></div>
-          <div><h2 className="text-2xl font-extrabold text-gray-900">系统与 AI</h2><p className="mt-1 text-sm text-gray-500">配置保存、连接验证和运行状态都在这里确认</p></div>
-        </div>
-        <button onClick={() => void load()} disabled={smtpBusy} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-white px-4 text-sm font-bold text-gray-700 shadow-sm ring-1 ring-gray-200 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"><RefreshCw className="h-4 w-4" />重新读取</button>
-      </header>
+      <PageHeader
+        icon={SettingsIcon}
+        title="系统与 AI"
+        description="配置保存、连接验证和运行状态"
+        actions={<IconAction icon={smtpBusy ? Loader2 : RefreshCw} label="重新读取" busy={smtpBusy} onClick={() => void load()} disabled={smtpBusy} />}
+      />
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-        {(Object.keys(sectionMeta) as SettingsSectionKey[]).map((section) => {
-          const meta = sectionMeta[section]; const Icon = meta.icon; const isOpen = openSection === section;
+      <SegmentedNav
+        value={openSection || ''}
+        expandedValue={openSection}
+        onChange={(value) => setOpenSection((current) => current === value ? null : value as SettingsSectionKey)}
+        items={(Object.keys(sectionMeta) as SettingsSectionKey[]).map((section) => {
+          const meta = sectionMeta[section]; const Icon = meta.icon;
           const state = dirty[section]
             ? { state: 'dirty', label: '未保存' }
             : verificationState[section] || summary.sections[section];
-          return <button key={section} aria-expanded={isOpen} onClick={() => setOpenSection(isOpen ? null : section)} className={`flex min-h-20 items-center gap-3 rounded-full border px-4 py-3 text-left transition ${isOpen ? 'border-yellow-400 bg-yellow-50 shadow-sm' : 'border-gray-200 bg-white hover:border-gray-300'}`}>
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gray-900 text-[#FFE815]"><Icon className="h-5 w-5" /></span>
-            <span className="min-w-0 flex-1"><span className="block font-extrabold text-gray-900">{meta.title}</span><span className="block truncate text-xs text-gray-500">{meta.detail}</span></span>
-            <span className="flex shrink-0 items-center gap-2"><StatusBadge state={state.state} label={state.label} /><ChevronDown className={`h-4 w-4 transition-transform ${isOpen ? 'rotate-180' : ''}`} /></span>
-          </button>;
+          return { id: section, label: meta.title, detail: meta.detail, icon: Icon, trailing: <StatusBadge state={state.state} label={state.label} /> };
         })}
-      </div>
+      />
 
       {notice && <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice>}
 
-      {openSection && <section className="rounded-lg bg-white p-5 shadow-sm ring-1 ring-gray-200 sm:p-7">
+      {openSection && <WorkSurface className="p-5 sm:p-7">
         <div className="mb-6 flex items-center justify-between"><div><h3 className="text-lg font-extrabold text-gray-900">{sectionMeta[openSection].title}</h3><p className="mt-1 text-sm text-gray-500">{dirty[openSection] ? '有尚未保存的修改' : '当前内容与数据库一致'}</p></div><StatusBadge state={dirty[openSection] ? 'dirty' : (verificationState[openSection]?.state || summary.sections[openSection].state)} label={dirty[openSection] ? '未保存' : (verificationState[openSection]?.label || summary.sections[openSection].label)} /></div>
 
         {openSection === 'basic' && <div className="space-y-4">
@@ -335,7 +334,7 @@ const AdminSettings: React.FC = () => {
           <Field label="API 地址" value={draft.ai_api_url || ''} onChange={(v) => update('ai_api_url', v)} placeholder="https://api.deepseek.com" />
           <Field label="模型" value={draft.ai_model || ''} onChange={(v) => update('ai_model', v)} placeholder="deepseek-chat" />
           <SecretField label="API Key" name="ai_api_key" configured={Boolean(saved.ai_api_key_configured)} masked={saved.ai_api_key_masked || ''} value={draft.ai_api_key || ''} show={Boolean(showSecret.ai_api_key)} onToggle={() => setShowSecret((s) => ({ ...s, ai_api_key: !s.ai_api_key }))} onChange={(v) => { update('ai_api_key', v); setSecretActions((s) => ({ ...s, ai_api_key: v ? 'set' : 'keep' })); }} onClear={() => { update('ai_api_key', ''); setSecretActions((s) => ({ ...s, ai_api_key: 'clear' })); }} />
-          <label className="block text-sm font-bold text-gray-800">默认回复<textarea value={draft.default_reply || ''} onChange={(e) => update('default_reply', e.target.value)} className="mt-2 min-h-24 w-full rounded-lg border border-gray-200 px-3 py-2.5 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" /></label>
+          <label className="block text-sm font-bold text-gray-800">默认回复<textarea value={draft.default_reply || ''} onChange={(e) => update('default_reply', e.target.value)} className="ios-input mt-2 min-h-24 w-full rounded-xl px-3 py-2.5 font-normal" /></label>
         </div>}
 
         {openSection === 'smtp' && <div className="space-y-4">
@@ -347,21 +346,21 @@ const AdminSettings: React.FC = () => {
           <SecretField label="邮箱授权码" name="smtp_password" configured={Boolean(saved.smtp_password_configured)} masked={saved.smtp_password_masked || ''} value={draft.smtp_password || ''} show={Boolean(showSecret.smtp_password)} onToggle={() => setShowSecret((s) => ({ ...s, smtp_password: !s.smtp_password }))} onChange={(v) => { if (smtpOperationRef.current) return; update('smtp_password', v); setSecretActions((s) => ({ ...s, smtp_password: v ? 'set' : 'keep' })); }} onClear={() => { if (smtpOperationRef.current) return; update('smtp_password', ''); setSecretActions((s) => ({ ...s, smtp_password: 'clear' })); }} disabled={smtpBusy} />
           <Field label="发件人显示名" value={draft.smtp_from || ''} onChange={(v) => update('smtp_from', v)} placeholder="闲鱼商品管理" disabled={smtpBusy} />
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2"><ToggleRow label="STARTTLS" detail="常用于587端口" checked={Boolean(draft.smtp_use_tls ?? true)} onChange={(v) => update('smtp_use_tls', v)} disabled={smtpBusy} /><ToggleRow label="SSL" detail="常用于465端口" checked={Boolean(draft.smtp_use_ssl)} onChange={(v) => update('smtp_use_ssl', v)} disabled={smtpBusy} /></div>
-          {smtpChallenge ? <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
-            <p className="text-sm font-bold text-blue-900">验证邮件已发送至 {smtpChallenge.recipient}</p>
-            <p className="mt-1 text-xs text-blue-700">请检查该独立邮箱并输入 6 位收件码{smtpChallenge.expiresIn ? `，${Math.ceil(smtpChallenge.expiresIn / 60)} 分钟内有效` : ''}。</p>
+          {smtpChallenge ? <div className="rounded-xl border border-yellow-200 bg-yellow-50 p-4">
+            <p className="text-sm font-bold text-gray-900">验证邮件已发送至 {smtpChallenge.recipient}</p>
+            <p className="mt-1 text-xs text-gray-600">请检查该独立邮箱并输入 6 位收件码{smtpChallenge.expiresIn ? `，${Math.ceil(smtpChallenge.expiresIn / 60)} 分钟内有效` : ''}。</p>
             <div className="mt-3 flex flex-col gap-3 sm:flex-row">
-              <label className="block flex-1 text-sm font-bold text-gray-800">SMTP 收件验证码<input aria-label="SMTP 收件验证码" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={smtpVerificationCode} onChange={(event) => setSmtpVerificationCode(event.target.value.replace(/\D/g, ''))} placeholder="6 位数字" disabled={smtpBusy} className="mt-2 h-10 w-full rounded-lg border border-blue-200 bg-white px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100 disabled:cursor-not-allowed disabled:bg-gray-100" /></label>
-              <button type="button" onClick={() => void confirmSmtp()} disabled={confirmingSmtp || saving !== null || !/^\d{6}$/.test(smtpVerificationCode)} className="mt-auto inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black disabled:cursor-not-allowed disabled:opacity-50">{confirmingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认收件码</button>
+              <label className="block flex-1 text-sm font-bold text-gray-800">SMTP 收件验证码<input aria-label="SMTP 收件验证码" inputMode="numeric" autoComplete="one-time-code" maxLength={6} value={smtpVerificationCode} onChange={(event) => setSmtpVerificationCode(event.target.value.replace(/\D/g, ''))} placeholder="6 位数字" disabled={smtpBusy} className="ios-input mt-2 h-10 w-full rounded-xl px-3 font-normal disabled:cursor-not-allowed disabled:bg-gray-100" /></label>
+              <button type="button" onClick={() => void confirmSmtp()} disabled={confirmingSmtp || saving !== null || !/^\d{6}$/.test(smtpVerificationCode)} className="ios-btn-primary mt-auto inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold">{confirmingSmtp ? <Loader2 className="h-4 w-4 animate-spin" /> : null}确认收件码</button>
             </div>
           </div> : null}
         </div>}
 
         <div className="mt-7 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-          {(openSection === 'ai' || openSection === 'smtp') && <button onClick={() => void verify(openSection)} disabled={verifying === openSection || (openSection === 'smtp' && (smtpBusy || saving !== null))} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-gray-100 px-5 text-sm font-bold text-gray-800 hover:bg-gray-200 disabled:cursor-not-allowed disabled:opacity-50">{verifying === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}验证连接</button>}
-          <button onClick={() => void save(openSection)} disabled={saving !== null || smtpBusy || !dirty[openSection]} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">{saving === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存并折叠</button>
+          {(openSection === 'ai' || openSection === 'smtp') && <button onClick={() => void verify(openSection)} disabled={verifying === openSection || (openSection === 'smtp' && (smtpBusy || saving !== null))} className="ios-btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-50">{verifying === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <TestTube2 className="h-4 w-4" />}验证连接</button>}
+          <button onClick={() => void save(openSection)} disabled={saving !== null || smtpBusy || !dirty[openSection]} className="ios-btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-6 text-sm font-extrabold">{saving === openSection ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存并折叠</button>
         </div>
-      </section>}
+      </WorkSurface>}
 
       <RegistrationManagement refreshKey={registrationRefreshKey} />
 
@@ -376,7 +375,7 @@ const sourceLabels: Record<UserSettingSource, string> = {
 };
 
 const SettingSource: React.FC<{ source: UserSettingSource }> = ({ source }) => (
-  <span className="inline-flex rounded-full border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-bold text-gray-600">
+  <span className="inline-flex rounded-md border border-gray-200 bg-gray-50 px-2 py-0.5 text-xs font-bold text-gray-600">
     {sourceLabels[source]}
   </span>
 );
@@ -459,7 +458,7 @@ const UserSettings: React.FC = () => {
     return (
       <div className="mx-auto max-w-3xl space-y-4 p-8 text-center">
         <InlineNotice tone="error">{loadError || '个人设置读取失败'}</InlineNotice>
-        <button type="button" onClick={() => void load()} className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white hover:bg-black">
+        <button type="button" onClick={() => void load()} className="ios-btn-primary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold">
           <RefreshCw className="h-4 w-4" />重试
         </button>
       </div>
@@ -468,14 +467,11 @@ const UserSettings: React.FC = () => {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6 pb-16">
-      <header className="flex items-center gap-3">
-        <div className="flex h-11 w-11 items-center justify-center rounded-lg bg-gray-900 text-[#FFE815]"><SettingsIcon className="h-5 w-5" /></div>
-        <div><h2 className="text-2xl font-extrabold text-gray-900">个人设置与 AI</h2><p className="mt-1 text-sm text-gray-500">管理自己的同步频率和 AI 平台配置</p></div>
-      </header>
+      <PageHeader icon={SettingsIcon} title="个人设置与 AI" description="管理自己的同步频率和 AI 平台配置" />
 
       {notice ? <InlineNotice tone={notice.tone}>{notice.text}</InlineNotice> : null}
 
-      <section className="rounded-lg bg-white p-5 shadow-sm ring-1 ring-gray-200 sm:p-7">
+      <WorkSurface className="p-5 sm:p-7">
         <div className="mb-6">
           <h3 className="text-lg font-extrabold text-gray-900">商品自动同步</h3>
           <p className="mt-1 text-sm text-gray-500">设置你的闲鱼账号商品同步节奏</p>
@@ -493,28 +489,28 @@ const UserSettings: React.FC = () => {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <label className="block text-sm font-bold text-gray-800">
               <span className="flex flex-wrap items-center gap-2">同步间隔（秒）<SettingSource source={summary.sources.item_sync_interval} /></span>
-              <input aria-label="同步间隔（秒）" aria-invalid={Boolean(validationErrors.item_sync_interval)} aria-describedby={validationErrors.item_sync_interval ? 'item-sync-interval-error' : undefined} type="number" min={60} max={86400} step={1} value={draft.item_sync_interval} onChange={(event) => update('item_sync_interval', Number(event.target.value))} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" />
+              <input aria-label="同步间隔（秒）" aria-invalid={Boolean(validationErrors.item_sync_interval)} aria-describedby={validationErrors.item_sync_interval ? 'item-sync-interval-error' : undefined} type="number" min={60} max={86400} step={1} value={draft.item_sync_interval} onChange={(event) => update('item_sync_interval', Number(event.target.value))} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal" />
               {validationErrors.item_sync_interval ? <span id="item-sync-interval-error" className="mt-1.5 block text-xs font-medium text-red-600">{validationErrors.item_sync_interval}</span> : null}
             </label>
             <label className="block text-sm font-bold text-gray-800">
               <span className="flex flex-wrap items-center gap-2">最多同步页数<SettingSource source={summary.sources.item_sync_max_pages} /></span>
-              <input aria-label="最多同步页数" aria-invalid={Boolean(validationErrors.item_sync_max_pages)} aria-describedby={validationErrors.item_sync_max_pages ? 'item-sync-pages-error' : undefined} type="number" min={1} max={50} step={1} value={draft.item_sync_max_pages} onChange={(event) => update('item_sync_max_pages', Number(event.target.value))} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100" />
+              <input aria-label="最多同步页数" aria-invalid={Boolean(validationErrors.item_sync_max_pages)} aria-describedby={validationErrors.item_sync_max_pages ? 'item-sync-pages-error' : undefined} type="number" min={1} max={50} step={1} value={draft.item_sync_max_pages} onChange={(event) => update('item_sync_max_pages', Number(event.target.value))} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal" />
               {validationErrors.item_sync_max_pages ? <span id="item-sync-pages-error" className="mt-1.5 block text-xs font-medium text-red-600">{validationErrors.item_sync_max_pages}</span> : null}
             </label>
           </div>
         </div>
 
         <div className="mt-7 flex justify-end">
-          <button type="button" onClick={() => void save()} disabled={saving || !dirty} className="inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-6 text-sm font-extrabold text-black hover:bg-yellow-300 disabled:cursor-not-allowed disabled:opacity-50">
+          <button type="button" onClick={() => void save()} disabled={saving || !dirty} className="ios-btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-6 text-sm font-extrabold">
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}保存设置
           </button>
         </div>
-      </section>
+      </WorkSurface>
 
-      <section className="space-y-3">
+      <WorkSurface className="space-y-4 p-5 sm:p-7">
         <div><h3 className="text-lg font-extrabold text-gray-900">AI 平台</h3><p className="mt-1 text-sm text-gray-500">管理自己的模型平台和密钥</p></div>
         <AIProviderManager />
-      </section>
+      </WorkSurface>
     </div>
   );
 };
@@ -523,9 +519,9 @@ const Settings: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => (
   isAdmin ? <AdminSettings /> : <UserSettings />
 );
 
-const ToggleRow: React.FC<{ label: string; detail: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }> = ({ label, detail, checked, onChange, disabled }) => <div className="flex min-h-16 items-center justify-between gap-4 rounded-lg bg-gray-50 px-4 py-3"><div><div className="font-bold text-gray-900">{label}</div><div className="mt-0.5 text-xs text-gray-500">{detail}</div></div><ToggleControl checked={checked} onChange={onChange} label={label} disabled={disabled} /></div>;
-const Field: React.FC<{ label: string; value: string | number; onChange: (value: string) => void; placeholder?: string; type?: string; disabled?: boolean }> = ({ label, value, onChange, placeholder, type = 'text', disabled }) => <label className="block text-sm font-bold text-gray-800">{label}<input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} disabled={disabled} className="mt-2 h-11 w-full rounded-lg border border-gray-200 px-3 font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100 disabled:cursor-not-allowed disabled:bg-gray-100" /></label>;
-const SecretField: React.FC<{ label: string; name: string; configured: boolean; masked: string; value: string; show: boolean; onToggle: () => void; onChange: (value: string) => void; onClear: () => void; disabled?: boolean }> = ({ label, configured, masked, value, show, onToggle, onChange, onClear, disabled }) => <label className="block text-sm font-bold text-gray-800">{label}<div className="relative mt-2"><input type={show ? 'text' : 'password'} value={value} onChange={(e) => onChange(e.target.value)} placeholder={configured ? `已配置 ${masked}，留空保持不变` : '尚未配置'} disabled={disabled} className="h-11 w-full rounded-lg border border-gray-200 px-3 pr-11 font-mono font-normal outline-none focus:border-yellow-400 focus:ring-2 focus:ring-yellow-100 disabled:cursor-not-allowed disabled:bg-gray-100" /><button type="button" aria-label={show ? '隐藏密钥' : '显示密钥'} onClick={onToggle} disabled={disabled} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-2 text-gray-500 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50">{show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div>{configured && <button type="button" onClick={onClear} disabled={disabled} className="mt-2 text-xs font-bold text-red-600 hover:underline disabled:cursor-not-allowed disabled:opacity-50">清除已保存密钥</button>}</label>;
-const Metric: React.FC<{ label: string; value: string }> = ({ label, value }) => <div className="flex items-center justify-between rounded-lg bg-white px-4 py-3 text-sm shadow-sm ring-1 ring-gray-200"><span className="text-gray-500">{label}</span><span className="font-bold text-gray-900">{value}</span></div>;
+const ToggleRow: React.FC<{ label: string; detail: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }> = ({ label, detail, checked, onChange, disabled }) => <div className="flex min-h-16 items-center justify-between gap-4 rounded-xl bg-gray-50 px-4 py-3"><div><div className="font-bold text-gray-900">{label}</div><div className="mt-0.5 text-xs text-gray-500">{detail}</div></div><ToggleControl checked={checked} onChange={onChange} label={label} disabled={disabled} /></div>;
+const Field: React.FC<{ label: string; value: string | number; onChange: (value: string) => void; placeholder?: string; type?: string; disabled?: boolean }> = ({ label, value, onChange, placeholder, type = 'text', disabled }) => <label className="block text-sm font-bold text-gray-800">{label}<input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} disabled={disabled} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal disabled:cursor-not-allowed disabled:bg-gray-100" /></label>;
+const SecretField: React.FC<{ label: string; name: string; configured: boolean; masked: string; value: string; show: boolean; onToggle: () => void; onChange: (value: string) => void; onClear: () => void; disabled?: boolean }> = ({ label, configured, masked, value, show, onToggle, onChange, onClear, disabled }) => <label className="block text-sm font-bold text-gray-800">{label}<div className="relative mt-2"><input type={show ? 'text' : 'password'} value={value} onChange={(e) => onChange(e.target.value)} placeholder={configured ? `已配置 ${masked}，留空保持不变` : '尚未配置'} disabled={disabled} className="ios-input h-11 w-full rounded-xl px-3 pr-11 font-mono font-normal disabled:cursor-not-allowed disabled:bg-gray-100" /><button type="button" aria-label={show ? '隐藏密钥' : '显示密钥'} onClick={onToggle} disabled={disabled} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 text-gray-500 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50">{show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div>{configured && <button type="button" onClick={onClear} disabled={disabled} className="mt-2 text-xs font-bold text-red-600 hover:underline disabled:cursor-not-allowed disabled:opacity-50">清除已保存密钥</button>}</label>;
+const Metric: React.FC<{ label: string; value: string }> = ({ label, value }) => <WorkSurface as="div" className="flex items-center justify-between px-4 py-3 text-sm"><span className="text-gray-500">{label}</span><span className="font-bold text-gray-900">{value}</span></WorkSurface>;
 
 export default Settings;

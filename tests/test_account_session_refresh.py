@@ -3,7 +3,11 @@ import tempfile
 import time
 import unittest
 
-from account_session_refresh import is_runtime_event_active, is_valid_account_login_username
+from account_session_refresh import (
+    is_runtime_event_active,
+    is_valid_account_login_username,
+    resolve_refresh_schedule_anchor,
+)
 from db_manager import DBManager
 
 
@@ -138,6 +142,22 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
                 now=now,
                 max_age_seconds=600,
             )
+        )
+
+    def test_refresh_schedule_anchor_uses_latest_persisted_attempt(self):
+        self.assertEqual(
+            resolve_refresh_schedule_anchor(
+                {
+                    "last_attempt_at": 920.0,
+                    "last_success_at": 880.0,
+                },
+                now=1_000.0,
+            ),
+            920.0,
+        )
+        self.assertEqual(
+            resolve_refresh_schedule_anchor({}, now=1_000.0),
+            1_000.0,
         )
 
     def test_cookie_refresh_settings_default_to_disabled_and_can_be_updated(self):
