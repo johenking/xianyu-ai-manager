@@ -2,6 +2,21 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [1.7.3] - 2026-07-12
+
+### Changed
+
+- Unify Skill Center and administrator or ordinary-user settings with the protected application page header, segmented navigation, yellow primary actions, gray-white work surfaces, consistent inputs, and fixed-size icon actions.
+- Keep scheduled Cookie renewal anchored to persisted attempts and successes across listener restarts. Enabling a schedule starts a complete new interval, and every scheduled execution rechecks the database switch.
+- Reset item-synchronization timing when a Cookie update restarts an account listener, so item details are fetched only after the configured interval becomes due.
+
+### Fixed
+
+- Reserve each manual Cookie refresh before its background task starts, so rapid clicks, concurrent windows, and duplicate requests reuse the active status instead of opening another official browser session.
+- Keep the account-page refresh action disabled until the backend reports a terminal state, while allowing a new manual refresh after success, failure, timeout, cancellation, or idle recovery.
+- Prevent a successful Cookie refresh and listener restart from immediately starting another scheduled refresh or an early Playwright item-detail session.
+- Render partial Skill Center diagnostics as unavailable or unknown instead of crashing when an optional runtime subsection is absent.
+
 ## [1.7.2] - 2026-07-11
 
 ### Added

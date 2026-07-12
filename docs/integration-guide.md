@@ -334,6 +334,8 @@ When enabled, `cookie_refresh_interval_minutes` must be between 60 and 10080. Tu
 
 A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. The backend keeps the same profile open visibly for up to 15 minutes and may return a safe screenshot path, but it never exposes the official verification URL. After verification, success is shown only when the login and security surfaces disappear and the backend detects both the expected `unb` and a valid session Cookie. Cancel with `POST .../session-refresh/cancel`.
 
+An active refresh is account-scoped and single-flight. Repeated `POST .../session-refresh` requests return the current persisted status and do not queue another browser session. Listener restarts restore the latest attempt or success as the scheduled-refresh anchor and set a fresh item-sync anchor, so a successful manual refresh cannot immediately trigger scheduled renewal or item-detail browser work.
+
 The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. QR and manual Cookie binding remain recovery options, but normal renewal should reuse the persisted official profile instead of repeatedly asking for QR login.
 
 ## Recent Order Sync
