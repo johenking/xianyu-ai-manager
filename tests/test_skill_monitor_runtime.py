@@ -217,7 +217,12 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             "source": "playwright",
             "items": [{"item_id": "item-1", "title": "iPhone 15", "item_url": "https://example.test/item-1"}],
         }
-        task = {"id": 3, "keyword": "iPhone", "notify_enabled": True}
+        task = {
+            "id": 3,
+            "keyword": "iPhone",
+            "account_id": "account-1",
+            "notify_enabled": True,
+        }
 
         with patch("utils.item_search.search_xianyu_items", new=AsyncMock(return_value=search_result)), patch.object(
             reply_server.db_manager,
@@ -250,7 +255,12 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
-        task = {"id": 3, "keyword": "iPhone", "notify_enabled": True}
+        task = {
+            "id": 3,
+            "keyword": "iPhone",
+            "account_id": "account-1",
+            "notify_enabled": True,
+        }
         persisted = {
             "state": "created",
             "created": True,

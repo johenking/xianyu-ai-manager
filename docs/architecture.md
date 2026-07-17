@@ -121,11 +121,13 @@ Core tables:
 
 ## Skill Center Boundary
 
-The Skill Center is an independent safe rewrite informed by monitor workflow, expert-strategy, and diagnostics ideas from the projects named in `NOTICE`. Manual searches and scheduled tasks share `execute_skill_monitor_task`, so the database running flag prevents overlapping runs. The single-worker scheduler polls every 30 seconds, starts only enabled due tasks, resets interrupted `running` rows during startup, and computes the next run after success or failure. Schedules default off and accept intervals of at least 15 minutes.
+The Skill Center is an independent safe rewrite informed by monitor workflow, expert-strategy, and diagnostics ideas from the projects named in `NOTICE`. Global execution, scheduling, delivery, and experimental MTop switches default off. Manual and scheduled entry points share an atomic database claim with a run token, lease, heartbeat, attempt number, and auditable stale recovery. Shutdown and lost leases record `interrupted`; startup does not blindly reset every running row. Schedules accept intervals of at least 15 minutes.
 
-Rule-matched items can pass through the account's configured AI provider. Missing AI configuration fails the run instead of silently accepting items. Accepted results are deduplicated across runs by `(task_id, user_id, item_url)`, with `raw_data.item_id` as fallback when no URL exists.
+Every task must bind an account owned by the task owner. Playwright receives only that account's owner-scoped Cookie snapshot, uses an account-isolated browser profile, and rechecks `cookie_revision` before starting. Cookie refresh writes use an owner/identity/revision compare-and-swap, so an older response cannot overwrite a newer login. Missing or changed `xianyu_unb` enters `action_required` before external access. Parsed search output is field-whitelisted; full MTop responses are not retained.
 
-Skill notifications use enabled Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channels. Every supported channel is attempted. Results persist `sent` when all succeed, `partial` when only some succeed, and `failed` when all fail; disabled or missing-channel states remain explicit. QQ and email may exist elsewhere in the notification schema but are not advertised as Skill Center delivery channels.
+Rule-matched items can pass through the account's configured AI provider. Missing AI configuration fails the run instead of silently accepting items. Item upsert, first-seen event, and delivery outbox rows commit in one transaction and use stable identity keys for cross-run deduplication.
+
+The delivery dispatcher has its own claim token, lease, heartbeat, and stale recovery. Webhook requests carry a stable idempotency key. A timeout or process loss after an external endpoint accepted a request but before the local receipt commits is recorded as `unknown`; delivery is at-least-once with receiver-side idempotency, not falsely reported as exactly-once. QQ and email are not Skill Center delivery channels.
 
 ## Deployment Notes
 

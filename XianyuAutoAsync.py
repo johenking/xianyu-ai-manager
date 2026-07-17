@@ -1535,16 +1535,42 @@ class XianyuLive:
                 db_manager.get_cookie_details,
                 self.cookie_id,
             )
-            if account_info:
-                db_cookie_value = str(account_info.get("value") or "")
-                if db_cookie_value and db_cookie_value != self.cookies_str:
-                    self.cookies_str = db_cookie_value
-                    self.cookies = trans_cookies(self.cookies_str)
-                persisted_user_agent = str(
-                    account_info.get("browser_user_agent") or ""
-                ).strip()
-                if persisted_user_agent:
-                    self.browser_user_agent = persisted_user_agent
+            account_user_id = int((account_info or {}).get("user_id") or 0)
+            account_unb = str((account_info or {}).get("xianyu_unb") or "").strip()
+            db_cookie_value = str((account_info or {}).get("value") or "")
+            db_cookie_unb = str(trans_cookies(db_cookie_value).get("unb") or "").strip()
+            try:
+                cookie_revision = int(account_info["cookie_revision"])
+            except (KeyError, TypeError, ValueError):
+                cookie_revision = -1
+            if (
+                not account_info
+                or account_user_id != int(self.user_id)
+                or not account_unb
+                or not db_cookie_unb
+                or db_cookie_unb != account_unb
+                or str(self.myid or "").strip() != account_unb
+                or cookie_revision < 0
+            ):
+                await self._mark_human_verification_required(
+                    SessionProbeResult(
+                        status=PROBE_EXPIRED,
+                        cookies=dict(getattr(self, "cookies", {}) or {}),
+                        error_code="account_identity_incomplete",
+                        message="账号身份或 Cookie 版本不完整",
+                    ),
+                    trigger="消息 Token 探测",
+                )
+                return None
+
+            if db_cookie_value != self.cookies_str:
+                self.cookies_str = db_cookie_value
+                self.cookies = trans_cookies(self.cookies_str)
+            persisted_user_agent = str(
+                account_info.get("browser_user_agent") or ""
+            ).strip()
+            if persisted_user_agent:
+                self.browser_user_agent = persisted_user_agent
 
             logger.info(f"【{self.cookie_id}】开始探测消息 Token")
             probe = await probe_message_session_async(
@@ -1559,7 +1585,7 @@ class XianyuLive:
                 return None
 
             probe_unb = str(probe.cookies.get("unb") or "").strip()
-            if probe_unb and probe_unb != str(self.myid):
+            if not probe_unb or probe_unb != account_unb:
                 mismatch = SessionProbeResult(
                     status=PROBE_EXPIRED,
                     cookies=dict(self.cookies),
@@ -1573,26 +1599,52 @@ class XianyuLive:
                 return None
 
             new_cookie_string = probe_cookies_to_string(probe.cookies)
-            if new_cookie_string and new_cookie_string != self.cookies_str:
-                saved = await asyncio.to_thread(
-                    db_manager.update_cookie_account_info,
-                    self.cookie_id,
-                    cookie_value=new_cookie_string,
-                    browser_user_agent=self.browser_user_agent,
-                    user_id=self.user_id,
+            cas_result = await asyncio.to_thread(
+                db_manager.compare_and_swap_cookie_session,
+                self.cookie_id,
+                user_id=self.user_id,
+                expected_xianyu_unb=account_unb,
+                expected_revision=cookie_revision,
+                cookie_value=new_cookie_string,
+                browser_user_agent=self.browser_user_agent,
+            )
+            if cas_result.get("state") == "revision_conflict":
+                self.last_token_refresh_status = "revision_conflict"
+                logger.warning(
+                    f"【{self.cookie_id}】消息 Token 探测结果因 Cookie 版本变化被丢弃"
                 )
-                if not saved:
-                    persistence_failure = SessionProbeResult(
-                        status=PROBE_RETRYABLE_ERROR,
-                        cookies=dict(self.cookies),
-                        error_code="cookie_persist_failed",
-                        message="消息 Token 已返回，但 Cookie 保存失败",
-                    )
+                return None
+            if cas_result.get("state") not in {"updated", "unchanged"}:
+                if cas_result.get("state") in {
+                    "action_required",
+                    "ownership_mismatch",
+                    "not_found",
+                }:
                     await self._mark_human_verification_required(
-                        persistence_failure,
+                        SessionProbeResult(
+                            status=PROBE_EXPIRED,
+                            cookies=dict(self.cookies),
+                            error_code=str(
+                                cas_result.get("reason")
+                                or "account_identity_changed"
+                            ),
+                            message="账号身份已变化，已丢弃旧刷新结果",
+                        ),
                         trigger="消息 Token 探测",
                     )
                     return None
+                persistence_failure = SessionProbeResult(
+                    status=PROBE_RETRYABLE_ERROR,
+                    cookies=dict(self.cookies),
+                    error_code="cookie_persist_failed",
+                    message="消息 Token 已返回，但 Cookie 保存失败",
+                )
+                await self._mark_human_verification_required(
+                    persistence_failure,
+                    trigger="消息 Token 探测",
+                )
+                return None
+            if new_cookie_string:
                 self.cookies_str = new_cookie_string
                 self.cookies = dict(probe.cookies)
 
@@ -1912,6 +1964,8 @@ class XianyuLive:
         *,
         browser_user_agent: str = "",
         access_token: str = "",
+        expected_revision: int = None,
+        expected_xianyu_unb: str = "",
     ) -> bool:
         """Atomically persist a validated identity and install one new listener."""
         from cookie_manager import manager as cookie_manager
@@ -1920,12 +1974,42 @@ class XianyuLive:
         if not new_cookies_str or not new_cookies_str.strip() or cookie_manager is None:
             return False
 
-        old_cookies_str = self.cookies_str
-        old_cookies = dict(self.cookies)
         account_info = await asyncio.to_thread(
             db_manager.get_cookie_details,
             self.cookie_id,
         )
+        if not account_info:
+            return False
+        try:
+            stored_user_id = int(account_info.get("user_id"))
+            stored_revision = int(account_info["cookie_revision"])
+        except (KeyError, TypeError, ValueError):
+            stored_user_id = 0
+            stored_revision = -1
+        stored_unb = str(account_info.get("xianyu_unb") or "").strip()
+        old_cookies_str = str(account_info.get("value") or "")
+        old_cookies = trans_cookies(old_cookies_str)
+        old_cookie_unb = str(old_cookies.get("unb") or "").strip()
+        cas_revision = stored_revision if expected_revision is None else int(expected_revision)
+        cas_unb = str(expected_xianyu_unb or stored_unb).strip()
+        if (
+            stored_user_id != int(self.user_id)
+            or stored_revision < 0
+            or stored_revision != cas_revision
+            or not stored_unb
+            or not old_cookie_unb
+            or stored_unb != old_cookie_unb
+            or cas_unb != stored_unb
+            or str(self.myid or "").strip() != stored_unb
+        ):
+            await asyncio.to_thread(
+                db_manager.update_account_session_refresh,
+                self.cookie_id,
+                state="action_required",
+                message="账号身份或 Cookie 版本已变化，旧刷新结果已丢弃",
+                error_code="cookie_identity_or_revision_changed",
+            )
+            return False
         old_user_agent = str((account_info or {}).get("browser_user_agent") or "")
         effective_user_agent = str(
             browser_user_agent
@@ -1940,10 +2024,17 @@ class XianyuLive:
                 return False
             merged = dict(old_cookies)
             merged.update(incoming)
-            expected_unb = str(old_cookies.get("unb") or self.myid or "").strip()
+            expected_unb = stored_unb
             merged_unb = str(merged.get("unb") or "").strip()
-            if expected_unb and merged_unb != expected_unb:
+            if not merged_unb or merged_unb != expected_unb:
                 logger.error(f"【{self.cookie_id}】刷新结果账号不匹配，保留旧监听")
+                await asyncio.to_thread(
+                    db_manager.update_account_session_refresh,
+                    self.cookie_id,
+                    state="action_required",
+                    message="刷新结果账号身份不匹配，旧结果已丢弃",
+                    error_code="account_identity_changed",
+                )
                 return False
             merged_cookie_string = probe_cookies_to_string(merged)
         except Exception as exc:
@@ -1953,15 +2044,36 @@ class XianyuLive:
             )
             return False
 
-        saved = await asyncio.to_thread(
-            db_manager.update_cookie_account_info,
+        cas_result = await asyncio.to_thread(
+            db_manager.compare_and_swap_cookie_session,
             self.cookie_id,
-            cookie_value=merged_cookie_string,
             user_id=self.user_id,
+            expected_xianyu_unb=stored_unb,
+            expected_revision=cas_revision,
+            cookie_value=merged_cookie_string,
             browser_user_agent=effective_user_agent,
         )
-        if not saved:
+        if cas_result.get("state") not in {"updated", "unchanged"}:
+            if cas_result.get("state") in {
+                "action_required",
+                "ownership_mismatch",
+                "not_found",
+            }:
+                await asyncio.to_thread(
+                    db_manager.update_account_session_refresh,
+                    self.cookie_id,
+                    state="action_required",
+                    message="账号身份已变化，旧刷新结果已丢弃",
+                    error_code=str(
+                        cas_result.get("reason") or "account_identity_changed"
+                    ),
+                )
+            elif cas_result.get("state") == "revision_conflict":
+                logger.warning(
+                    f"【{self.cookie_id}】刷新结果因 Cookie 版本冲突被丢弃"
+                )
             return False
+        committed_revision = int(cas_result["cookie_revision"])
 
         handoff_time = time.time()
         runtime_state = {
@@ -1977,6 +2089,8 @@ class XianyuLive:
                 merged_cookie_string,
                 save_to_db=False,
                 runtime_state=runtime_state,
+                expected_cookie_revision=committed_revision,
+                expected_cookie_value=merged_cookie_string,
             )
             if replacement.get("status") != "restarted":
                 raise RuntimeError("listener replacement was superseded")
@@ -1985,17 +2099,18 @@ class XianyuLive:
                 f"【{self.cookie_id}】安装刷新后的监听失败: "
                 f"{type(exc).__name__}: {sanitize_runtime_error(exc)}"
             )
-            latest = await asyncio.to_thread(
-                db_manager.get_cookie_details,
+            rollback = await asyncio.to_thread(
+                db_manager.compare_and_swap_cookie_session,
                 self.cookie_id,
+                user_id=self.user_id,
+                expected_xianyu_unb=stored_unb,
+                expected_revision=committed_revision,
+                cookie_value=old_cookies_str,
+                browser_user_agent=old_user_agent,
             )
-            if str((latest or {}).get("value") or "") == merged_cookie_string:
-                await asyncio.to_thread(
-                    db_manager.update_cookie_account_info,
-                    self.cookie_id,
-                    cookie_value=old_cookies_str,
-                    user_id=self.user_id,
-                    browser_user_agent=old_user_agent,
+            if rollback.get("state") not in {"updated", "unchanged"}:
+                logger.warning(
+                    f"【{self.cookie_id}】监听安装失败后的 Cookie 回滚被更新版本阻止"
                 )
             self.cookies_str = old_cookies_str
             self.cookies = old_cookies
@@ -2129,16 +2244,25 @@ class XianyuLive:
                 return False
 
             db_cookie_value = str(account_info.get("value") or self.cookies_str)
-            profile_unb = (
-                str(account_info.get("xianyu_unb") or "").strip()
-                or str(self.cookies.get("unb") or "").strip()
-            )
-            if not profile_unb:
+            profile_unb = str(account_info.get("xianyu_unb") or "").strip()
+            db_cookie_unb = str(trans_cookies(db_cookie_value).get("unb") or "").strip()
+            try:
+                refresh_revision = int(account_info["cookie_revision"])
+                refresh_user_id = int(account_info.get("user_id"))
+            except (KeyError, TypeError, ValueError):
+                refresh_revision = -1
+                refresh_user_id = 0
+            if (
+                refresh_user_id != int(self.user_id)
+                or refresh_revision < 0
+                or not profile_unb
+                or db_cookie_unb != profile_unb
+            ):
                 db_manager.update_account_session_refresh(
                     self.cookie_id,
-                    state="failed",
+                    state="action_required",
                     trigger=trigger_reason,
-                    message="账号缺少真实 unb，无法定位官方浏览器档案",
+                    message="账号身份或 Cookie 版本不完整，无法开始刷新",
                     error_code="account_identity_missing",
                 )
                 return False
@@ -2194,6 +2318,8 @@ class XianyuLive:
                     ),
                     browser_user_agent=validated_result.browser_user_agent,
                     access_token=validated_result.access_token,
+                    expected_revision=refresh_revision,
+                    expected_xianyu_unb=profile_unb,
                 )
                 if not updated:
                     db_manager.update_account_session_refresh(
@@ -6147,7 +6273,36 @@ class XianyuLive:
         try:
             import asyncio
             from playwright.async_api import async_playwright
+            from db_manager import db_manager
             from utils.xianyu_utils import trans_cookies
+
+            account_info = await asyncio.to_thread(
+                db_manager.get_cookie_details,
+                self.cookie_id,
+            )
+            expected_unb = str((account_info or {}).get("xianyu_unb") or "").strip()
+            stored_cookie = str((account_info or {}).get("value") or "")
+            stored_cookie_unb = str(
+                trans_cookies(stored_cookie).get("unb") or ""
+            ).strip()
+            try:
+                expected_revision = int(account_info["cookie_revision"])
+                stored_user_id = int(account_info.get("user_id"))
+            except (KeyError, TypeError, ValueError):
+                expected_revision = -1
+                stored_user_id = 0
+            if (
+                not account_info
+                or stored_user_id != int(self.user_id)
+                or expected_revision < 0
+                or not expected_unb
+                or stored_cookie_unb != expected_unb
+                or stored_cookie != str(current_cookies_str or "")
+            ):
+                logger.warning(
+                    f"【{self.cookie_id}】浏览器刷新前账号身份或 Cookie 版本已变化"
+                )
+                return False
 
             logger.info(f"【{self.cookie_id}】开始使用当前cookie访问指定页面获取真实cookie...")
             logger.info(f"【{self.cookie_id}】当前cookie长度: {len(current_cookies_str)}")
@@ -6377,7 +6532,11 @@ class XianyuLive:
 
             # 更新Cookie并重启任务
             logger.info(f"【{self.cookie_id}】开始更新Cookie并重启任务...")
-            update_success = await self._update_cookies_and_restart(real_cookies_str)
+            update_success = await self._update_cookies_and_restart(
+                real_cookies_str,
+                expected_revision=expected_revision,
+                expected_xianyu_unb=expected_unb,
+            )
 
             if update_success:
                 logger.info(f"【{self.cookie_id}】通过访问指定页面成功更新Cookie并重启任务")

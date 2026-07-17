@@ -17,6 +17,9 @@ from utils.xianyu_session_probe import (
 class FakeRefreshDatabase:
     def __init__(self):
         self.updates = []
+        self.cas_calls = []
+        self.cookie_value = "unb=9988; cookie2=old"
+        self.cookie_revision = 0
         self.status = {
             "state": "idle",
             "verification_image_url": "",
@@ -34,11 +37,29 @@ class FakeRefreshDatabase:
     def get_cookie_details(self, cookie_id):
         del cookie_id
         return {
-            "value": "unb=9988; cookie2=old",
+            "value": self.cookie_value,
+            "user_id": 7,
             "xianyu_unb": "9988",
+            "cookie_revision": self.cookie_revision,
             "username": "",
             "password": "",
             "show_browser": False,
+        }
+
+    def compare_and_swap_cookie_session(self, cookie_id, **kwargs):
+        self.cas_calls.append((cookie_id, kwargs))
+        if kwargs["expected_revision"] != self.cookie_revision:
+            return {"state": "revision_conflict", "updated": False}
+        if kwargs["expected_xianyu_unb"] != "9988":
+            return {"state": "action_required", "updated": False}
+        changed = kwargs["cookie_value"] != self.cookie_value
+        self.cookie_value = kwargs["cookie_value"]
+        if changed:
+            self.cookie_revision += 1
+        return {
+            "state": "updated" if changed else "unchanged",
+            "updated": changed,
+            "cookie_revision": self.cookie_revision,
         }
 
 
@@ -75,6 +96,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_uses_persistent_profile_even_without_saved_credentials(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
+        live.user_id = 7
         live.cookies_str = "unb=9988; cookie2=old"
         live.cookies = {"unb": "9988", "cookie2": "old"}
         live.pending_verification_url = ""
@@ -101,6 +123,8 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "unb=9988; cookie2=renewed; _m_h5_tk=token",
             browser_user_agent="",
             access_token="",
+            expected_revision=0,
+            expected_xianyu_unb="9988",
         )
         self.assertEqual(database.updates[-1][1]["state"], "success")
 
@@ -149,7 +173,6 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         details = database.get_cookie_details("account-1")
         details["browser_user_agent"] = live.browser_user_agent
         database.get_cookie_details = lambda _cookie_id: dict(details)
-        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
         probe = AsyncMock(return_value=SessionProbeResult(
             status=PROBE_VERIFICATION_REQUIRED,
             cookies=dict(live.cookies),
@@ -192,7 +215,6 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         details = database.get_cookie_details("account-1")
         details["browser_user_agent"] = live.browser_user_agent
         database.get_cookie_details = lambda _cookie_id: dict(details)
-        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
         probe = AsyncMock(return_value=SessionProbeResult(
             status=PROBE_SUCCESS,
             cookies={"unb": "9988", "cookie2": "renewed", "_m_h5_tk": "token_2"},
@@ -208,7 +230,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(token, "message-access-token")
         self.assertEqual(live.current_token, "message-access-token")
         self.assertEqual(probe.await_count, 1)
-        database.update_cookie_account_info.assert_called_once()
+        self.assertEqual(len(database.cas_calls), 1)
 
     async def test_validated_cookie_ua_and_token_install_one_listener_generation(self):
         live = object.__new__(XianyuLive)
@@ -222,10 +244,16 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         live.last_token_refresh_time = 100.0
         stored = {
             "value": live.cookies_str,
+            "user_id": 7,
+            "xianyu_unb": "9988",
+            "cookie_revision": 0,
             "browser_user_agent": live.browser_user_agent,
         }
 
-        def update_cookie_account_info(_cookie_id, **kwargs):
+        def compare_and_swap_cookie_session(_cookie_id, **kwargs):
+            if kwargs["expected_revision"] != stored["cookie_revision"]:
+                return {"state": "revision_conflict", "updated": False}
+            changed = kwargs["cookie_value"] != stored["value"]
             stored.update({
                 "value": kwargs.get("cookie_value", stored["value"]),
                 "browser_user_agent": kwargs.get(
@@ -233,12 +261,19 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     stored["browser_user_agent"],
                 ),
             })
-            return True
+            if changed:
+                stored["cookie_revision"] += 1
+            return {
+                "state": "updated" if changed else "unchanged",
+                "updated": changed,
+                "cookie_revision": stored["cookie_revision"],
+            }
 
         database = SimpleNamespace(
             get_cookie_details=lambda _cookie_id: dict(stored),
-            update_cookie_account_info=unittest.mock.Mock(
-                side_effect=update_cookie_account_info
+            update_account_session_refresh=unittest.mock.Mock(return_value=True),
+            compare_and_swap_cookie_session=unittest.mock.Mock(
+                side_effect=compare_and_swap_cookie_session
             ),
         )
         manager = SimpleNamespace(

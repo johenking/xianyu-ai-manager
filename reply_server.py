@@ -1737,7 +1737,11 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
                 raise HTTPException(status_code=400, detail="该Cookie ID已被其他用户使用")
 
         # 保存到数据库时指定用户ID
-        db_manager.save_cookie(target_id, item.value, user_id)
+        if not db_manager.save_cookie(target_id, item.value, user_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Cookie 账号身份与现有账号不匹配",
+            )
 
         # 添加到CookieManager，同时指定用户ID
         if target_id in cookie_manager.manager.cookies:
@@ -4629,17 +4633,19 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 class ItemSearchRequest(BaseModel):
     keyword: str
+    account_id: str
     page: int = 1
     page_size: int = 20
 
 class ItemSearchMultipleRequest(BaseModel):
     keyword: str
+    account_id: str
     total_pages: int = 1
 
 @content_router.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -4652,6 +4658,8 @@ async def search_items(
         # 执行搜索
         result = await search_xianyu_items(
             keyword=search_request.keyword,
+            user_id=current_user['user_id'],
+            account_id=search_request.account_id,
             page=search_request.page,
             page_size=search_request.page_size
         )
@@ -4738,7 +4746,7 @@ async def check_valid_cookies(
 @content_router.post("/items/search_multiple")
 async def search_multiple_pages(
     search_request: ItemSearchMultipleRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索多页闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -4751,6 +4759,8 @@ async def search_multiple_pages(
         # 执行多页搜索
         result = await search_multiple_pages_xianyu(
             keyword=search_request.keyword,
+            user_id=current_user['user_id'],
+            account_id=search_request.account_id,
             total_pages=search_request.total_pages
         )
 
@@ -6620,16 +6630,30 @@ async def _run_real_skill_monitor(
     from utils.item_search import search_xianyu_items
 
     keyword = (task.get('keyword') or '').strip()
+    account_id = str(task.get('account_id') or '').strip()
+    if not account_id:
+        raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
     if str(task.get('ai_filter') or '').strip():
-        _user_ai_cookie_settings(user_id, task.get('account_id') or '')
+        _user_ai_cookie_settings(user_id, account_id)
         if not _user_has_ai_configuration(user_id):
             raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
 
     page_size = 20
-    search_result = await search_xianyu_items(keyword=keyword, page=1, page_size=page_size)
+    search_result = await search_xianyu_items(
+        keyword=keyword,
+        user_id=user_id,
+        account_id=account_id,
+        page=1,
+        page_size=page_size,
+    )
 
     if not search_result or search_result.get('error'):
         error_message = (search_result or {}).get('error') or '真实搜索没有返回结果'
+        error_code = str((search_result or {}).get('error_code') or '')
+        if error_code in {'action_required', 'revision_conflict'}:
+            raise HTTPException(status_code=409, detail=f"闲鱼账号需要处理: {error_message}")
+        if error_code in {'ownership_mismatch', 'not_found'}:
+            raise HTTPException(status_code=403, detail="监控任务绑定的闲鱼账号不可用")
         raise HTTPException(status_code=502, detail=f"闲鱼真实搜索失败: {error_message}")
 
     if not search_result.get('is_real_data'):

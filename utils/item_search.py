@@ -5,11 +5,13 @@
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import sys
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 from loguru import logger
 
@@ -39,15 +41,138 @@ except ImportError:
     logger.warning("Playwright 未安装，将使用模拟数据")
 
 
+SEARCH_RESPONSE_ITEM_LIMIT = 200
+
+
+class SearchAccountBindingError(RuntimeError):
+    def __init__(self, state: str, reason: str):
+        self.state = str(state or "action_required")
+        self.reason = str(reason or "account_binding_required")
+        super().__init__(self.reason)
+
+
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        account_id: str,
+        account_context: Optional[Dict[str, Any]] = None,
+    ):
+        try:
+            self.owner_user_id = int(user_id)
+        except (TypeError, ValueError) as exc:
+            raise SearchAccountBindingError(
+                "action_required",
+                "missing_account_binding",
+            ) from exc
+        self.account_id = str(account_id or "").strip()
+        if self.owner_user_id <= 0 or not self.account_id:
+            raise SearchAccountBindingError(
+                "action_required",
+                "missing_account_binding",
+            )
+
+        if account_context is None:
+            from db_manager import db_manager
+
+            account_context = db_manager.get_owned_cookie_search_context(
+                self.owner_user_id,
+                self.account_id,
+            )
+        self.account_context = dict(account_context or {})
+        if self.account_context.get("state") != "ready":
+            raise SearchAccountBindingError(
+                str(self.account_context.get("state") or "action_required"),
+                str(
+                    self.account_context.get("reason")
+                    or "account_binding_required"
+                ),
+            )
+        if (
+            int(self.account_context.get("user_id") or 0) != self.owner_user_id
+            or str(self.account_context.get("account_id") or "") != self.account_id
+            or not str(self.account_context.get("xianyu_unb") or "").strip()
+            or not str(self.account_context.get("value") or "").strip()
+        ):
+            raise SearchAccountBindingError(
+                "action_required",
+                "account_identity_incomplete",
+            )
+
         self.browser = None
         self.context = None
         self.page = None
-        self.api_responses = []
-        self.user_id = "default"  # 默认用户ID
+        self.playwright = None
+        self.api_response_summaries = []
+        profile_identity = (
+            f"{self.owner_user_id}:{self.account_id}:"
+            f"{self.account_context['xianyu_unb']}"
+        )
+        self.profile_key = hashlib.sha256(
+            profile_identity.encode("utf-8")
+        ).hexdigest()[:24]
+        self.user_id = f"search_{self.profile_key}"
+
+    def _profile_path(self) -> Path:
+        configured_root = os.getenv("XIANYU_SEARCH_BROWSER_DATA_DIR", "").strip()
+        requested_root = Path(configured_root) if configured_root else (
+            Path.cwd() / "browser_data" / "item_search"
+        )
+        requested_root = requested_root.expanduser()
+        if requested_root.is_symlink():
+            raise RuntimeError("商品搜索 profile 根目录不能是符号链接")
+        root = requested_root.resolve(strict=False)
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        profile = root / f"account_{self.profile_key}"
+        if profile.is_symlink():
+            raise RuntimeError("商品搜索账号 profile 不能是符号链接")
+        profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+        resolved_profile = profile.resolve(strict=False)
+        if root not in resolved_profile.parents:
+            raise RuntimeError("商品搜索账号 profile 越界")
+        return resolved_profile
+
+    def _assert_account_context_current(self) -> None:
+        from db_manager import db_manager
+
+        current = db_manager.get_owned_cookie_search_context(
+            self.owner_user_id,
+            self.account_id,
+        )
+        if current.get("state") != "ready":
+            raise SearchAccountBindingError(
+                str(current.get("state") or "action_required"),
+                str(current.get("reason") or "account_binding_required"),
+            )
+        if (
+            str(current.get("xianyu_unb") or "")
+            != str(self.account_context.get("xianyu_unb") or "")
+            or int(current.get("cookie_revision") or 0)
+            != int(self.account_context.get("cookie_revision") or 0)
+            or str(current.get("value") or "")
+            != str(self.account_context.get("value") or "")
+        ):
+            raise SearchAccountBindingError(
+                "revision_conflict",
+                "cookie_revision_conflict",
+            )
+
+    @staticmethod
+    def _extract_search_items(payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            raise ValueError("搜索响应结构无效")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("搜索响应缺少 data 对象")
+        items = data.get("resultList")
+        if not isinstance(items, list):
+            raise ValueError("搜索响应缺少 resultList 数组")
+        if len(items) > SEARCH_RESPONSE_ITEM_LIMIT:
+            raise ValueError("搜索响应结果数量超过安全上限")
+        return [item for item in items if isinstance(item, dict)]
 
     async def _handle_scratch_captcha_manual(self, page, max_retries=3, wait_for_completion=True):
         """人工处理刮刮乐滑块（远程控制 + 截图备份）
@@ -631,29 +756,6 @@ class XianyuSearcher:
                 return default
         return data
 
-    async def get_first_valid_cookie(self):
-        """获取第一个有效的cookie"""
-        try:
-            from db_manager import db_manager
-
-            # 获取所有cookies，返回格式是 {id: value}
-            cookies = db_manager.get_all_cookies()
-
-            # 找到第一个有效的cookie（长度大于50的认为是有效的）
-            for cookie_id, cookie_value in cookies.items():
-                if len(cookie_value) > 50:
-                    logger.info(f"找到有效cookie: {cookie_id}")
-                    return {
-                        'id': cookie_id,
-                        'value': cookie_value
-                    }
-
-            return None
-
-        except Exception as e:
-            logger.error(f"获取cookie失败: {str(e)}")
-            return None
-
     async def set_browser_cookies(self, cookie_value: str):
         """设置浏览器cookies"""
         try:
@@ -673,7 +775,8 @@ class XianyuSearcher:
                         'path': '/'
                     })
 
-            # 设置cookies到浏览器
+            # Persistent profile 只复用当前账号自己的缓存；数据库快照是 Cookie 真值。
+            await self.context.clear_cookies()
             await self.context.add_cookies(cookies)
             logger.info(f"成功设置 {len(cookies)} 个cookies到浏览器")
             return True
@@ -688,13 +791,13 @@ class XianyuSearcher:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
         if not self.browser:
-            playwright = await async_playwright().start()
+            self._assert_account_context_current()
+            self.playwright = await async_playwright().start()
 
-            # 设置持久化数据目录（保存缓存、cookies等）
-            import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
-            os.makedirs(user_data_dir, exist_ok=True)
-            logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
+            user_data_dir = self._profile_path()
+            logger.info(
+                f"使用账号隔离的商品搜索 profile: account_{self.profile_key}"
+            )
 
             # 简化的浏览器启动参数，避免冲突
             browser_args = [
@@ -722,13 +825,20 @@ class XianyuSearcher:
 
             # 使用 launch_persistent_context 实现跨会话的缓存持久化
             # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
-            self.context = await playwright.chromium.launch_persistent_context(
-                user_data_dir,  # 第一个参数是用户数据目录，用于持久化
-                headless=True,  # 无头模式，后台运行
-                args=browser_args,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={'width': 1280, 'height': 720},
-                locale='zh-CN',  # 设置语言为中文
+            stored_user_agent = str(
+                self.account_context.get("browser_user_agent") or ""
+            ).strip()
+            context_options = {
+                "headless": True,
+                "args": browser_args,
+                "viewport": {'width': 1280, 'height': 720},
+                "locale": 'zh-CN',
+            }
+            if stored_user_agent:
+                context_options["user_agent"] = stored_user_agent
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                **context_options,
                 # 持久化上下文会自动保存和加载：
                 # - Cookies
                 # - 缓存
@@ -764,6 +874,13 @@ class XianyuSearcher:
             logger.debug("商品搜索器浏览器已关闭（缓存已保存）")
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")
+        finally:
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception as e:
+                    logger.warning(f"停止商品搜索 Playwright 失败: {type(e).__name__}")
+                self.playwright = None
 
     async def search_items(self, keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """
@@ -790,8 +907,8 @@ class XianyuSearcher:
 
             await self.init_browser()
 
-            # 清空之前的API响应
-            self.api_responses = []
+            # 只保留响应摘要，不保存完整 MTop 响应。
+            self.api_response_summaries = []
             data_list = []
 
             # 设置API响应监听器
@@ -814,10 +931,12 @@ class XianyuSearcher:
                             logger.warning(f"无法解析响应JSON: {str(json_error)}")
                             return
 
-                        self.api_responses.append(result_json)
-                        logger.info(f"捕获到API响应，URL: {response.url}")
-
-                        items = result_json.get("data", {}).get("resultList", [])
+                        items = self._extract_search_items(result_json)
+                        self.api_response_summaries.append({
+                            "status": int(response.status),
+                            "item_count": len(items),
+                        })
+                        logger.info("捕获到商品搜索 API 响应")
                         logger.info(f"从API获取到 {len(items)} 条原始数据")
 
                         for item in items:
@@ -833,27 +952,20 @@ class XianyuSearcher:
                         logger.warning(f"响应处理异常: {str(e)}")
 
             try:
-                # 获取并设置cookies进行登录
-                logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
-                if not cookie_data:
-                    raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
-
-                logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
+                self._assert_account_context_current()
+                logger.info("正在设置任务所属账号的 Cookie...")
+                cookie_success = await self.set_browser_cookies(
+                    str(self.account_context.get('value') or '')
+                )
+                if not cookie_success:
+                    raise SearchAccountBindingError(
+                        "action_required",
+                        "account_cookie_install_failed",
+                    )
+                logger.info("任务所属账号 Cookie 已设置")
 
                 logger.info("正在访问闲鱼首页...")
                 await self.page.goto("https://www.goofish.com", timeout=30000)
-
-                # 设置cookies进行登录
-                logger.info("正在设置cookies进行登录...")
-                cookie_success = await self.set_browser_cookies(cookie_data.get('value', ''))
-                if not cookie_success:
-                    logger.warning("设置cookies失败，将以未登录状态继续")
-                else:
-                    logger.info("✅ cookies设置成功，已登录")
-                    # 刷新页面以应用cookies
-                    await self.page.reload()
-                    await asyncio.sleep(2)
 
 
 
@@ -1064,8 +1176,7 @@ class XianyuSearcher:
                 "publish_time": publish_time,
                 "tags": [fish_tags_content] if fish_tags_content else [],
                 "area": area,
-                "want_count": want_count,  # 添加想要人数用于排序
-                "raw_data": item_data
+                "want_count": want_count,
             }
 
         except Exception as e:
@@ -1197,8 +1308,8 @@ class XianyuSearcher:
 
             logger.info("浏览器初始化成功，开始搜索...")
 
-            # 清空之前的API响应
-            self.api_responses = []
+            # 只保留响应摘要，不保存完整 MTop 响应。
+            self.api_response_summaries = []
             all_data_list = []
 
             # 设置API响应监听器
@@ -1221,10 +1332,12 @@ class XianyuSearcher:
                             logger.warning(f"无法解析响应JSON: {str(json_error)}")
                             return
 
-                        self.api_responses.append(result_json)
-                        logger.info(f"捕获到API响应，URL: {response.url}")
-
-                        items = result_json.get("data", {}).get("resultList", [])
+                        items = self._extract_search_items(result_json)
+                        self.api_response_summaries.append({
+                            "status": int(response.status),
+                            "item_count": len(items),
+                        })
+                        logger.info("捕获到商品搜索 API 响应")
                         logger.info(f"从API获取到 {len(items)} 条原始数据")
 
                         for item in items:
@@ -1244,27 +1357,20 @@ class XianyuSearcher:
                 if not self.page or self.page.is_closed():
                     raise Exception("页面已关闭或不可用")
 
-                # 获取并设置cookies进行登录
-                logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
-                if not cookie_data:
-                    raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
-
-                logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
+                self._assert_account_context_current()
+                logger.info("正在设置任务所属账号的 Cookie...")
+                cookie_success = await self.set_browser_cookies(
+                    str(self.account_context.get('value') or '')
+                )
+                if not cookie_success:
+                    raise SearchAccountBindingError(
+                        "action_required",
+                        "account_cookie_install_failed",
+                    )
+                logger.info("任务所属账号 Cookie 已设置")
 
                 logger.info("正在访问闲鱼首页...")
                 await self.page.goto("https://www.goofish.com", timeout=30000)
-
-                # 设置cookies进行登录
-                logger.info("正在设置cookies进行登录...")
-                cookie_success = await self.set_browser_cookies(cookie_data.get('value', ''))
-                if not cookie_success:
-                    logger.warning("设置cookies失败，将以未登录状态继续")
-                else:
-                    logger.info("✅ cookies设置成功，已登录")
-                    # 刷新页面以应用cookies
-                    await self.page.reload()
-                    await asyncio.sleep(2)
 
                 # 再次检查页面状态
                 if self.page.is_closed():
@@ -1517,7 +1623,14 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(
+    keyword: str,
+    *,
+    user_id: int,
+    account_id: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
@@ -1536,7 +1649,10 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(
+                user_id=user_id,
+                account_id=account_id,
+            )
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
@@ -1546,6 +1662,16 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
                 logger.info(f"单页搜索成功，获取到 {len(result.get('items', []))} 条数据")
                 return result
 
+        except SearchAccountBindingError as exc:
+            logger.warning(
+                f"商品搜索账号绑定校验失败: state={exc.state}, reason={exc.reason}"
+            )
+            return {
+                'items': [],
+                'total': 0,
+                'error': exc.reason,
+                'error_code': exc.state,
+            }
         except Exception as e:
             error_msg = str(e)
             logger.error(f"搜索商品失败 (尝试 {attempt + 1}/{max_retries + 1}): {error_msg}")
@@ -1578,7 +1704,13 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
-async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+async def search_multiple_pages_xianyu(
+    keyword: str,
+    *,
+    user_id: int,
+    account_id: str,
+    total_pages: int = 1,
+) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
 
@@ -1596,7 +1728,10 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
         searcher = None
         try:
             # 每次搜索都创建新的搜索器实例，避免浏览器状态混乱
-            searcher = XianyuSearcher()
+            searcher = XianyuSearcher(
+                user_id=user_id,
+                account_id=account_id,
+            )
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)
@@ -1606,6 +1741,16 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
                 logger.info(f"多页搜索成功，获取到 {len(result.get('items', []))} 条数据")
                 return result
 
+        except SearchAccountBindingError as exc:
+            logger.warning(
+                f"多页搜索账号绑定校验失败: state={exc.state}, reason={exc.reason}"
+            )
+            return {
+                'items': [],
+                'total': 0,
+                'error': exc.reason,
+                'error_code': exc.state,
+            }
         except Exception as e:
             error_msg = str(e)
             logger.error(f"多页搜索商品失败 (尝试 {attempt + 1}/{max_retries + 1}): {error_msg}")

@@ -271,6 +271,8 @@ class CookieManager:
         save_to_db: bool = True,
         user_id: int = None,
         runtime_state: dict = None,
+        expected_cookie_revision: int = None,
+        expected_cookie_value: str = None,
         shutdown_timeout: float = 10.0,
     ) -> dict:
         """Replace one listener without holding its account lock during shutdown."""
@@ -306,13 +308,29 @@ class CookieManager:
             if self._task_generations.get(cookie_id) != generation:
                 return {"status": "superseded", "cookie_id": cookie_id}
 
+            if expected_cookie_revision is not None:
+                latest_cookie_info = db_manager.get_cookie_details(cookie_id)
+                if (
+                    not latest_cookie_info
+                    or int(latest_cookie_info.get("cookie_revision", -1))
+                    != int(expected_cookie_revision)
+                    or (
+                        expected_cookie_value is not None
+                        and str(latest_cookie_info.get("value") or "")
+                        != str(expected_cookie_value)
+                    )
+                ):
+                    return {"status": "superseded", "cookie_id": cookie_id}
+
             if save_to_db:
-                await asyncio.to_thread(
+                saved = await asyncio.to_thread(
                     db_manager.save_cookie,
                     cookie_id,
                     new_value,
                     original_user_id,
                 )
+                if not saved:
+                    return {"status": "rejected", "cookie_id": cookie_id}
 
             self.cookies[cookie_id] = new_value
             self.keywords[cookie_id] = original_keywords

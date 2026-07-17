@@ -367,6 +367,15 @@ The response reports `discovered`, `status_updated`, `details_updated`, `unchang
 
 ## Skill Center
 
+Authenticated direct item search also requires an explicit owned account. The backend rejects a missing, cross-user, identity-incomplete, or revision-changed account before Playwright starts:
+
+```bash
+curl -sS -X POST "$BASE_URL/items/search" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"keyword":"canary","account_id":"<owned-cookie-id>","page":1,"page_size":20}'
+```
+
 Create and list monitor tasks at `/api/skills/monitor/tasks`, update one with `PUT /api/skills/monitor/tasks/{task_id}`, run one immediately with `POST /api/skills/monitor/tasks/{task_id}/run`, and read results from `/api/skills/monitor/results`. A scheduled task uses these additional fields:
 
 ```json
@@ -379,11 +388,11 @@ Create and list monitor tasks at `/api/skills/monitor/tasks`, update one with `P
 }
 ```
 
-Schedules default off and the interval must be at least 15 minutes. Task responses include `next_run_at`, `last_status`, `last_error`, and `last_run_at`. Manual and scheduled calls share one task lock; an overlapping manual run returns HTTP 409. Failed scheduled runs record the error and still compute their next attempt.
+Global monitor, scheduler, delivery, and experimental MTop switches default off. The schedule interval must be at least 15 minutes. Task responses include `next_run_at`, `last_status`, `last_error`, and `last_run_at`. Manual and scheduled runs share one persistent claim/lease; an overlap returns HTTP 409, and stale or shutdown-interrupted attempts remain auditable.
 
 AI filtering requires an owned account with an enabled provider, API key, base URL, and model. Missing configuration fails the run explicitly. Results are deduplicated across runs by task and `item_url`, falling back to platform item ID. Existing matches are not inserted or notified again.
 
-When notifications are enabled, the backend uses enabled Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram channels. It attempts all supported channels and stores `sent`, `partial`, or `failed`; `skipped_no_channel` means no supported enabled channel was available. QQ and email channel records are not used by Skill Center monitoring.
+Accepted item data, its first-seen event, and delivery outbox records commit together. The dispatcher separately claims each delivery with a lease. Generic Webhooks receive a stable `Idempotency-Key`; an ambiguous send is stored as `unknown` and is not automatically retried. QQ and email channel records are not used by Skill Center monitoring.
 
 Expert prompts live at `/api/skills/agent/prompts`; test them against a real account and product with `/api/skills/agent/test-reply`. Runtime diagnostics are available at:
 

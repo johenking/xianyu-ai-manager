@@ -53,6 +53,10 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
         os.unlink(self.db_path)
 
     def test_cookie_upsert_only_updates_cookie_and_preserves_account_data(self):
+        self.assertEqual(
+            self.db.get_cookie_details("legacy-account")["cookie_revision"],
+            0,
+        )
         self.assertTrue(
             self.db.save_cookie(
                 "legacy-account",
@@ -68,6 +72,18 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
         self.assertEqual(details["password"], "login-password")
         self.assertTrue(details["show_browser"])
         self.assertFalse(details["auto_confirm"])
+        self.assertEqual(details["cookie_revision"], 1)
+        self.assertTrue(
+            self.db.save_cookie(
+                "legacy-account",
+                "unb=stable-unb; cookie2=new",
+                user_id=1,
+            )
+        )
+        self.assertEqual(
+            self.db.get_cookie_details("legacy-account")["cookie_revision"],
+            1,
+        )
         with self.db.lock:
             count = self.db.conn.execute(
                 "SELECT COUNT(*) FROM keywords WHERE cookie_id = ?",
@@ -83,6 +99,86 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
             "legacy-account",
         )
         self.assertIsNone(self.db.find_cookie_id_by_unb(2, "stable-unb"))
+
+    def test_search_context_is_owner_scoped_and_requires_stable_identity(self):
+        self.db.backfill_cookie_identities()
+
+        context = self.db.get_owned_cookie_search_context(1, "legacy-account")
+        self.assertEqual(context["state"], "ready")
+        self.assertEqual(context["xianyu_unb"], "stable-unb")
+        self.assertEqual(context["cookie_revision"], 0)
+        self.assertNotIn("password", context)
+
+        other_owner = self.db.get_owned_cookie_search_context(2, "legacy-account")
+        self.assertEqual(other_owner["state"], "ownership_mismatch")
+
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE cookies SET xianyu_unb = '' WHERE id = ?",
+                ("legacy-account",),
+            )
+            self.db.conn.commit()
+        incomplete = self.db.get_owned_cookie_search_context(1, "legacy-account")
+        self.assertEqual(incomplete["state"], "action_required")
+
+    def test_cookie_cas_rejects_stale_or_changed_identity(self):
+        self.db.backfill_cookie_identities()
+
+        first = self.db.compare_and_swap_cookie_session(
+            "legacy-account",
+            user_id=1,
+            expected_xianyu_unb="stable-unb",
+            expected_revision=0,
+            cookie_value="unb=stable-unb; cookie2=renewed",
+            browser_user_agent="browser-a",
+        )
+        self.assertEqual(first["state"], "updated")
+        self.assertEqual(first["cookie_revision"], 1)
+
+        stale = self.db.compare_and_swap_cookie_session(
+            "legacy-account",
+            user_id=1,
+            expected_xianyu_unb="stable-unb",
+            expected_revision=0,
+            cookie_value="unb=stable-unb; cookie2=stale",
+        )
+        self.assertEqual(stale["state"], "revision_conflict")
+        self.assertEqual(
+            self.db.get_cookie_details("legacy-account")["value"],
+            "unb=stable-unb; cookie2=renewed",
+        )
+
+        self.assertFalse(
+            self.db.save_cookie(
+                "legacy-account",
+                "unb=other-unb; cookie2=manual-overwrite",
+                user_id=1,
+            )
+        )
+        self.assertFalse(
+            self.db.update_cookie_account_info(
+                "legacy-account",
+                cookie_value="cookie2=identity-missing",
+                user_id=1,
+            )
+        )
+        self.assertEqual(
+            self.db.get_cookie_details("legacy-account")["value"],
+            "unb=stable-unb; cookie2=renewed",
+        )
+
+        changed_identity = self.db.compare_and_swap_cookie_session(
+            "legacy-account",
+            user_id=1,
+            expected_xianyu_unb="stable-unb",
+            expected_revision=1,
+            cookie_value="unb=other-unb; cookie2=new",
+        )
+        self.assertEqual(changed_identity["state"], "action_required")
+        self.assertEqual(
+            self.db.get_cookie_details("legacy-account")["value"],
+            "unb=stable-unb; cookie2=renewed",
+        )
 
 
 class AccountSessionRefreshDatabaseTests(unittest.TestCase):

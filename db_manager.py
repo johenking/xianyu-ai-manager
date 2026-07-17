@@ -180,6 +180,7 @@ class DBManager:
                 cookie_refresh_enabled INTEGER DEFAULT 0,
                 cookie_refresh_interval_minutes INTEGER DEFAULT 1440,
                 browser_user_agent TEXT NOT NULL DEFAULT '',
+                cookie_revision INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -1827,9 +1828,27 @@ class DBManager:
                     INSERT INTO cookies (id, value, user_id, xianyu_unb)
                     VALUES (?, ?, ?, NULLIF(?, ''))
                     ON CONFLICT(id) DO UPDATE SET
+                        cookie_revision = CASE
+                            WHEN cookies.value <> excluded.value
+                            THEN cookies.cookie_revision + 1
+                            ELSE cookies.cookie_revision
+                        END,
                         value = excluded.value,
                         xianyu_unb = COALESCE(NULLIF(excluded.xianyu_unb, ''), cookies.xianyu_unb)
+                    WHERE cookies.user_id = excluded.user_id
+                      AND (
+                          cookies.xianyu_unb IS NULL
+                          OR cookies.xianyu_unb = ''
+                          OR excluded.xianyu_unb IS NULL
+                          OR excluded.xianyu_unb = ''
+                          OR cookies.xianyu_unb = excluded.xianyu_unb
+                      )
                 ''', (cookie_id, cookie_value, user_id, xianyu_unb))
+
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    logger.warning("Cookie保存被账号归属或身份校验阻止")
+                    return False
 
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
@@ -1928,7 +1947,8 @@ class DBManager:
                     cursor,
                     "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, "
                     "show_browser, created_at, xianyu_unb, password_encrypted, "
-                    "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent "
+                    "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent, "
+                    "cookie_revision "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -1956,11 +1976,209 @@ class DBManager:
                             else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
                         ),
                         'browser_user_agent': result[14] or '',
+                        'cookie_revision': int(result[15] or 0),
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    def get_owned_cookie_search_context(self, user_id: int, cookie_id: str) -> Dict[str, any]:
+        """Return the minimum owner-scoped account context needed by item search."""
+        normalized_cookie_id = str(cookie_id or '').strip()
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            normalized_user_id = 0
+        if normalized_user_id <= 0 or not normalized_cookie_id:
+            return {
+                'state': 'action_required',
+                'reason': 'missing_account_binding',
+            }
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT id, value, user_id, xianyu_unb, cookie_revision, browser_user_agent "
+                    "FROM cookies WHERE id = ? AND user_id = ?",
+                    (normalized_cookie_id, normalized_user_id),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    self._execute_sql(
+                        cursor,
+                        "SELECT 1 FROM cookies WHERE id = ?",
+                        (normalized_cookie_id,),
+                    )
+                    return {
+                        'state': (
+                            'ownership_mismatch'
+                            if cursor.fetchone()
+                            else 'not_found'
+                        ),
+                        'reason': 'account_not_owned',
+                    }
+
+                cookie_value = str(row[1] or '')
+                stored_unb = str(row[3] or '').strip()
+                cookie_unb = self._extract_cookie_unb(cookie_value)
+                if not stored_unb or not cookie_unb or cookie_unb != stored_unb:
+                    return {
+                        'state': 'action_required',
+                        'reason': 'account_identity_incomplete',
+                    }
+
+                return {
+                    'state': 'ready',
+                    'account_id': str(row[0]),
+                    'value': cookie_value,
+                    'user_id': int(row[2]),
+                    'xianyu_unb': stored_unb,
+                    'cookie_revision': int(row[4] or 0),
+                    'browser_user_agent': str(row[5] or '').strip(),
+                }
+            except Exception as exc:
+                logger.error(
+                    f"读取账号搜索上下文失败: {type(exc).__name__}"
+                )
+                return {
+                    'state': 'error',
+                    'reason': 'account_context_read_failed',
+                }
+
+    def compare_and_swap_cookie_session(
+        self,
+        cookie_id: str,
+        *,
+        user_id: int,
+        expected_xianyu_unb: str,
+        expected_revision: int,
+        cookie_value: str,
+        browser_user_agent: str = None,
+    ) -> Dict[str, any]:
+        """Persist a refreshed Cookie only while owner, identity, and revision match."""
+        normalized_cookie_id = str(cookie_id or '').strip()
+        normalized_expected_unb = str(expected_xianyu_unb or '').strip()
+        normalized_cookie_value = str(cookie_value or '').strip()
+        incoming_unb = self._extract_cookie_unb(normalized_cookie_value)
+        try:
+            normalized_user_id = int(user_id)
+            normalized_revision = int(expected_revision)
+        except (TypeError, ValueError):
+            return {
+                'state': 'action_required',
+                'reason': 'invalid_cookie_cas_identity',
+                'updated': False,
+            }
+
+        if (
+            not normalized_cookie_id
+            or normalized_user_id <= 0
+            or normalized_revision < 0
+            or not normalized_expected_unb
+            or not incoming_unb
+        ):
+            return {
+                'state': 'action_required',
+                'reason': 'account_identity_incomplete',
+                'updated': False,
+            }
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(
+                    cursor,
+                    "SELECT value, user_id, xianyu_unb, cookie_revision, browser_user_agent "
+                    "FROM cookies WHERE id = ?",
+                    (normalized_cookie_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return {
+                        'state': 'not_found',
+                        'reason': 'account_missing',
+                        'updated': False,
+                    }
+
+                stored_value = str(row[0] or '')
+                stored_user_id = int(row[1] or 0)
+                stored_unb = str(row[2] or '').strip()
+                stored_revision = int(row[3] or 0)
+                stored_cookie_unb = self._extract_cookie_unb(stored_value)
+                if stored_user_id != normalized_user_id:
+                    return {
+                        'state': 'ownership_mismatch',
+                        'reason': 'account_not_owned',
+                        'updated': False,
+                    }
+                if (
+                    not stored_unb
+                    or not stored_cookie_unb
+                    or stored_cookie_unb != stored_unb
+                    or normalized_expected_unb != stored_unb
+                    or incoming_unb != stored_unb
+                ):
+                    return {
+                        'state': 'action_required',
+                        'reason': 'account_identity_changed',
+                        'updated': False,
+                    }
+                if stored_revision != normalized_revision:
+                    return {
+                        'state': 'revision_conflict',
+                        'reason': 'cookie_revision_conflict',
+                        'updated': False,
+                        'cookie_revision': stored_revision,
+                    }
+
+                cookie_changed = stored_value != normalized_cookie_value
+                next_revision = stored_revision + (1 if cookie_changed else 0)
+                next_user_agent = (
+                    str(browser_user_agent).strip()
+                    if browser_user_agent is not None
+                    else str(row[4] or '').strip()
+                )
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET value = ?, xianyu_unb = ?, cookie_revision = ?, "
+                    "browser_user_agent = ? "
+                    "WHERE id = ? AND user_id = ? AND xianyu_unb = ? AND cookie_revision = ?",
+                    (
+                        normalized_cookie_value,
+                        stored_unb,
+                        next_revision,
+                        next_user_agent,
+                        normalized_cookie_id,
+                        normalized_user_id,
+                        stored_unb,
+                        stored_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return {
+                        'state': 'revision_conflict',
+                        'reason': 'cookie_revision_conflict',
+                        'updated': False,
+                    }
+                self.conn.commit()
+                return {
+                    'state': 'updated' if cookie_changed else 'unchanged',
+                    'reason': '',
+                    'updated': cookie_changed,
+                    'cookie_revision': next_revision,
+                }
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"Cookie CAS 保存失败: {type(exc).__name__}")
+                return {
+                    'state': 'error',
+                    'reason': 'cookie_cas_failed',
+                    'updated': False,
+                }
 
     def _validate_cookie_refresh_interval(self, interval_minutes: int) -> int:
         try:
@@ -2201,8 +2419,13 @@ class DBManager:
                 cursor = self.conn.cursor()
 
                 # 检查记录是否存在
-                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                exists = cursor.fetchone() is not None
+                self._execute_sql(
+                    cursor,
+                    "SELECT user_id, xianyu_unb, value FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                existing_row = cursor.fetchone()
+                exists = existing_row is not None
 
                 if not exists:
                     # 记录不存在，需要创建新记录
@@ -2255,12 +2478,28 @@ class DBManager:
                     logger.info(f"创建新账号 {cookie_id} 并保存信息成功: {insert_fields}")
                     return True
                 else:
+                    if user_id is not None and int(existing_row[0]) != int(user_id):
+                        logger.warning("账号信息更新被所有权校验阻止")
+                        return False
+                    if cookie_value is not None:
+                        stored_unb = str(existing_row[1] or '').strip()
+                        incoming_unb = self._extract_cookie_unb(cookie_value)
+                        if stored_unb and (
+                            not incoming_unb or incoming_unb != stored_unb
+                        ):
+                            logger.warning("账号信息更新被稳定身份校验阻止")
+                            return False
+
                     # 记录存在，执行更新
                     # 构建动态SQL更新语句
                     update_fields = []
                     params = []
 
                     if cookie_value is not None:
+                        update_fields.append(
+                            "cookie_revision = cookie_revision + CASE WHEN value <> ? THEN 1 ELSE 0 END"
+                        )
+                        params.append(cookie_value)
                         update_fields.append("value = ?")
                         params.append(cookie_value)
                         xianyu_unb = self._extract_cookie_unb(cookie_value)
