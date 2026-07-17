@@ -9,14 +9,17 @@
 
 ## 功能
 
-- 多账号管理：扫码和手动 Cookie 绑定、监听与自动确认状态诊断；账号级定时 Cookie 预防刷新默认关闭，可按需开启。
+- 多账号管理：官方账号密码登录、扫码和手动 Cookie 绑定，按真实 `unb` 保留账号数据；持久浏览器档案可续期 Cookie，账号级定时刷新默认关闭，活动刷新不会排队或重复启动浏览器。
 - 商品管理：按账号筛选和同步真实商品，只有选择“全部账号”时才展示全量商品；每件商品可维护独立知识档案和训练规则，相同商品可复刻知识草稿。
 - AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复；不同账号可选择不同平台和模型。
 - AI 训练：在独立对话框中模拟买家咨询，显示实际加载、排除和停用的规则；修正确认后才写入线上配置。
 - 关键词回复：账号级关键词回复、默认回复与关键词发货规则。
 - 订单与卡密：发现并同步近 90 天订单，区分签收、退款中、已退款和关闭状态，并管理卡密库存与自动发货规则。
-- 系统设置：基础、AI、SMTP 三个独立配置区，保存复读确认和真实连接检测。
-- 技能中心：手动真实商品监控、专家提示词、运行诊断。
+- 权限化设置：普通用户维护自己的商品同步节奏和 AI 平台；管理员额外管理全局基础、SMTP、注册开关和运行状态。
+- 经营仪表盘：首屏一次读取当前用户的账号、订单、库存和营收汇总，图表与订单明细延后加载；管理员查看系统范围。
+- 技能中心：手动与定时真实商品监控、AI 商品筛选、结果通知、专家提示词和运行诊断。
+- 直接注册：管理员开关、图形验证码、邮箱验证码和普通用户容量共同控制注册；支持用户名或邮箱登录、两阶段密码找回、协议页面和普通用户启停。
+- 统一公共入口：登录、注册、找回密码、服务条款和隐私说明复用主应用的品牌组件与视觉体系，页面版本由 `frontend/package.json` 在 Vite 构建时注入。
 
 当前技能中心能力边界：
 
@@ -24,11 +27,11 @@
 | --- | --- |
 | 手动执行一次真实商品搜索 | 可用 |
 | 专家策略用于测试与正式回复 | 可用 |
-| 定时监控调度 | 暂不可用 |
-| AI 商品过滤 | 暂不可用 |
-| 监控结果通知发送 | 暂不可用 |
+| 定时监控调度 | 可用，默认关闭，最短 15 分钟 |
+| AI 商品过滤 | 可用，需要至少一个账号完成 AI 配置 |
+| 监控结果通知发送 | 可用，支持 Webhook、微信、钉钉、飞书、Bark、Telegram |
 
-未实现能力会在界面和 API 中明确返回“暂不可用”，不会伪装成已排队或已发送。
+调度器运行在单进程事件循环中，每 30 秒检查到期任务。结果按任务和商品链接去重，缺少链接时使用商品 ID；通知会尝试全部已启用的受支持渠道，并记录 `sent`、`partial` 或 `failed`，不会把未发送结果伪装成成功。
 
 ## AI 上下文优先级
 
@@ -57,13 +60,27 @@
 
 同一后台用户重新扫码、密码登录或更新 Cookie 时，系统会优先按 Cookie 中的闲鱼 `unb` 找回原账号记录，因此原账号 ID、AI 配置、训练规则和商品知识可以继续复用。不要通过“删除账号”来解决过期登录：删除操作会清理该账号关联数据。
 
-Token 失效时会触发 Cookie 刷新；账号级定时预防性刷新默认关闭，可在账号编辑中开启并设置 1 小时到 7 天的间隔。手动“立即刷新 Cookie”始终保留。平台要求二次验证时，账号页会显示验证状态；安全验证本身无法被程序绕过。
+新增账号默认打开 `https://www.goofish.com/login` 官方组合页并展示闲鱼 App 二维码，短信等官方方式可在同一浏览器会话中完成。扫码或用户明确选择的密码登录后，系统还会验证真实消息 Token；仅有 Cookie 或 `unb` 不会显示登录成功。通过后系统按真实 `unb` 保存账号，把临时浏览器档案原子归档为 `browser_data/user_<unb>`。前端不再要求账号 ID；旧客户端传入的 `account_id` 仅为兼容字段，不参与身份判定。只有手动密码登录成功后才加密保存登录凭据，接口不会返回明文或密文。
 
-扫码仍是推荐登录方式。账号密码登录依赖闲鱼网页结构和风控流程，平台页面变化时可能不可用；失败时请改用扫码或更新现有账号的 Cookie，不要删除账号重建。
+Token 或连接失败只会进入被动 `action_required` 状态，不会启动 Chrome。只有用户点击“开始一次验证”，或已启用的账号定时刷新真正到期时，才复用同一官方浏览器档案启动一次会话；续期不会读取或提交保存的密码。人工验证期间同一窗口最多保留 15 分钟，后台会持续检测真实消息 Token；Cookie、实际浏览器 User-Agent 和监听任务交接完成后才结束会话。定时刷新默认关闭，可设置 1 小时到 7 天。
+
+官方登录使用本机系统 Chrome 的真实版本和有头窗口；后台运行只把窗口移到屏幕外。闲鱼要求短信、扫码、人脸或其他安全验证时，系统停止自动重试，保留同一会话最多 15 分钟，同时在账号页显示安全截图；用户可明确点击“本机打开”让窗口回到屏幕内。完成后系统只有在真实 `unb`、关键会话 Cookie 和页面状态同时通过时才保存 Cookie 并恢复监听。不要通过删除账号来重试登录。
+
+新客户端通过 `POST /api/official-login/sessions` 创建 `qr` 或 `password` 会话，并用同一路径查询状态、显示本机浏览器或取消；兼容的 `/qr-login/*`、`/password-login/*` 和账号刷新接口仍保留。完整状态与请求示例见 [接入指南](docs/integration-guide.md#account-binding-and-refresh)。
+
+## 直接注册与找回
+
+公开注册默认关闭。普通用户上限默认为 20，可由管理员设置为 1–1000；管理员不计入容量，停用的普通用户仍占名额。管理员需要先在“系统与 AI”中保存 SMTP 与独立支持邮箱，发送 6 位 SMTP 收件码并从真实收件箱填回确认，之后才能手动开启注册。SMTP 配置、指纹或授权码发生变化时，验证状态会立即失效并关闭注册。
+
+注册页面不需要邀请码，使用一次性图形验证码和用途隔离的邮件验证码。首次邮件发送成功后，页面保留“已发送”状态，不会立即请求或刷新新的图形验证码；冷却结束后，只有用户明确选择重发，页面才会获取并要求通过新的图形验证码。验证码和网络标识在数据库中只保存 HMAC 摘要；用户名和邮箱按规范化值检查唯一性。注册事务会重新检查开关、容量、协议版本和验证码，成功后直接创建摘要 Session 并登录。最后一个名额使用后注册开关自动关闭；提高上限后仍需管理员手动重新开放。
+
+登录框接受用户名或邮箱。密码找回先调用 `POST /api/auth/password-reset/verify-code` 校验注册邮箱验证码并取得一次性重置授权，公开页面只在当前组件内存中保存该授权；随后 `POST /api/auth/password-reset` 消费授权并设置新密码。服务端只在现有 `auth_challenges` 表保存授权摘要，因此 v1.7.2 不新增数据库迁移；旧版直接提交 `challenge_id`、`verification_code` 和新密码的负载暂时兼容。重置成功会撤销该用户的全部旧 Session。管理员设置页只启停普通用户，不提供注册页删除入口。`/terms` 与 `/privacy` 记录当前技术处理方式，不声称经过法律审查。
 
 ## AI 平台与模型
 
 “系统与 AI”中的平台配置库支持 DeepSeek、OpenAI、通义千问、OpenRouter、硅基流动、Gemini 和自定义 OpenAI 兼容接口。平台 Key 集中加密保存，账号只选择平台与模型。
+
+普通用户只读取和修改自己的 AI 平台及个人商品同步设置，不会收到 SMTP、注册管理、全局登录安全或系统运行指标。个人同步设置缺失时继承管理员全局默认值，保存后按后台用户隔离，并应用到该用户拥有的闲鱼实例。
 
 - OpenAI 兼容接口读取标准 `/models`；Gemini 读取 `models.list` 并仅保留支持文本生成的模型。
 - 模型列表无法读取时可以手填模型 ID。
@@ -105,6 +122,7 @@ python Start.py
 默认后台用户名为 `admin`。请在 `.env` 中设置强密码 `ADMIN_PASSWORD` 和随机 `JWT_SECRET_KEY`，不要在公网使用默认值。
 AI 平台密钥使用 Fernet 加密保存。生产环境请另外设置随机的 `AI_PROVIDER_ENCRYPTION_KEY`；未设置时会在 `data/.ai_provider_key` 生成仅本机可读的密钥文件，请与数据库一起备份且不要提交。
 闲鱼账号登录密码使用另一把 Fernet 密钥。生产环境建议设置独立的 `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY`；未设置时会生成权限为 `0600` 的 `data/.account_credential_key`。数据库迁移会在修改前同时备份数据库和本地密钥。
+SMTP 授权码、验证码摘要和脱敏网络标识使用第三把系统秘密。生产环境建议设置 `SYSTEM_SECRET_ENCRYPTION_KEY`；未设置时会生成 `data/.system_secret_key`。这三把本地密钥必须与 SQLite 一起备份，缺失任何一把都可能导致相应密文或摘要无法继续使用。
 
 `requirements.txt` 保留旧的安装入口，实际引用 Python 3.11 生成的精确 `requirements.lock`。更新依赖时修改 `requirements.in` 并重新生成锁文件；测试、Ruff 和构建工具使用 `requirements-dev.lock`。
 
@@ -126,14 +144,15 @@ docker compose up --build -d
 - 新后台 Session 只保存 Token 摘要，旧 Session 在过渡期内继续兼容。
 - 闲鱼账号登录密码使用独立密钥加密，接口不返回密码或密文。
 - 账号专属 AI Key 使用 `keep / set / clear` 操作，空输入不会误删旧 Key。
+- 认证日志不得记录默认管理员密码、邮件一次性验证码、密码重置授权、完整邮箱或任何密码；需要标识邮箱时只使用脱敏值或摘要。
 - 不要提交 `data/`、数据库、Cookie、日志、浏览器状态、上传文件或 `.env`。
-- SMTP 是可选能力，未配置不代表系统故障；连接检测只做连接与认证，不发送邮件。
+- SMTP 对核心闲鱼自动化仍是可选能力，但直接注册和密码找回依赖它。QQ 邮箱可使用 `smtp.qq.com:465`、SSL 开启、STARTTLS 关闭；SMTP 只有在独立支持邮箱收到 6 位验证码并填回确认后才算已验证。
 
 ## 测试
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 

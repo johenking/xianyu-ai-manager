@@ -1,0 +1,5 @@
+EXPLICIT REVIEWED EXCEPTIONS ADDED TO STAGE A ALLOWLIST:
+global_config.yml — tracked non-sensitive runtime config; live equals c94854d; COOKIES.value length is zero.
+frontend/build/staticRetention.ts — Vite source module imported by frontend/vite.config.ts; not generated output.
+static/xianyu_js_version_2.js — runtime source asset opened directly by utils/xianyu_utils.py; not generated output.
+TRUE BUILD OUTPUT REMAINS EXCLUDED: static/assets/, static/uploads/, frontend/dist/, node_modules/, coverage/.

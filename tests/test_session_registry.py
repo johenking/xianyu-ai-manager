@@ -82,10 +82,25 @@ class SessionRegistryTests(unittest.TestCase):
 
     def test_error_sanitizer_removes_sensitive_values(self):
         result = sanitize_runtime_error(
-            "Cookie: unb=secret Authorization=BearerSecret https://example.com/token"
+            "cookie2=COOKIE_SECRET; _m_h5_tk=TOKEN_SECRET; "
+            "password: PASSWORD_SECRET; Authorization: Bearer AUTH_SECRET; "
+            "{'token': 'QUOTED_TOKEN', 'password': 'QUOTED_PASSWORD'}; "
+            "cookies={'unb': 'COOKIE_IDENTITY', 'cookie2': 'DICT_COOKIE'}; "
+            "https://passport.goofish.com/verify?id=VERIFY_SECRET"
         )
-        self.assertNotIn("secret", result.lower())
-        self.assertNotIn("example.com", result)
+        for secret in (
+            "COOKIE_SECRET",
+            "TOKEN_SECRET",
+            "PASSWORD_SECRET",
+            "AUTH_SECRET",
+            "QUOTED_TOKEN",
+            "QUOTED_PASSWORD",
+            "COOKIE_IDENTITY",
+            "DICT_COOKIE",
+            "VERIFY_SECRET",
+            "passport.goofish.com",
+        ):
+            self.assertNotIn(secret, result)
 
 
 if __name__ == "__main__":

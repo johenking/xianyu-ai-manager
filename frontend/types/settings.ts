@@ -21,6 +21,8 @@ export interface SystemSettings {
   smtp_from?: string;
   smtp_use_tls?: boolean;
   smtp_use_ssl?: boolean;
+  smtp_verified?: boolean;
+  support_email?: string;
   [key: string]: any;
 }
 
@@ -33,12 +35,39 @@ export interface SettingsSummary {
     label: string;
     configured: boolean;
     model?: string;
+    verified?: boolean;
   }>;
+  registration?: {
+    enabled: boolean;
+    ready: boolean;
+    requested: boolean;
+    smtp_verified: boolean;
+    user_limit: number;
+    user_count: number;
+    remaining_slots: number;
+    terms_version?: string;
+  };
   runtime: {
     cookie_manager: boolean;
     account_count: number;
     active_tasks: number;
   };
+}
+
+export interface UserBasicSettings {
+  item_sync_enabled: boolean;
+  item_sync_interval: number;
+  item_sync_max_pages: number;
+}
+
+export type UserSettingKey = keyof UserBasicSettings;
+export type UserSettingSource = 'user' | 'global';
+
+export interface UserSettingsSummary {
+  success: boolean;
+  settings: UserBasicSettings;
+  sources: Record<UserSettingKey, UserSettingSource>;
+  inherited: boolean;
 }
 
 export interface AIReplySettings {

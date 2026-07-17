@@ -9,12 +9,11 @@ import {
   getAccountDetails,
   updateAccountStatus,
   deleteAccount,
-  generateQRLogin,
-  checkQRLoginStatus,
-  continueQRLoginAfterVerification,
+  createOfficialLoginSession,
+  getOfficialLoginSession,
+  showOfficialLoginBrowser,
+  cancelOfficialLoginSession,
   addAccountCookie,
-  passwordLogin,
-  checkPasswordLoginStatus,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -28,6 +27,7 @@ import {
   getAccountSessionStatus,
   refreshAccountSession,
   cancelAccountSessionRefresh,
+  showAccountSessionRefreshBrowser,
   getAIProviders,
   refreshAIProviderModels,
   testAIProvider
@@ -43,6 +43,7 @@ type AddLoginMethod = 'qr' | 'password' | 'cookie';
 type AddLoginStatus = 'idle' | 'processing' | 'success' | 'failed' | 'verification_required';
 
 const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
+const ACTIVE_SESSION_REFRESH_STATES = new Set(['refreshing', 'verification_required']);
 const COOKIE_REFRESH_INTERVAL_OPTIONS = [
   { value: 60, label: '1 小时' },
   { value: 360, label: '6 小时' },
@@ -70,8 +71,8 @@ const AccountList: React.FC = () => {
   const [qrMessage, setQrMessage] = useState<string>('');
   const [qrVerificationImage, setQrVerificationImage] = useState<string>('');
   const qrPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const qrHadVerificationRef = useRef(false);
   const passwordPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeOfficialSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [trainingAccount, setTrainingAccount] = useState<AccountDetail | null>(null);
@@ -79,17 +80,15 @@ const AccountList: React.FC = () => {
   const [diagnosingId, setDiagnosingId] = useState<string>('');
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AccountSessionRefreshStatus>>({});
   const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
-  const [checkingSessionId, setCheckingSessionId] = useState<string>('');
+  const manualRefreshFlightsRef = useRef<Set<string>>(new Set());
   const [passwordForm, setPasswordForm] = useState({
-    account_id: '',
     account: '',
     password: '',
-    show_browser: true,
+    show_browser: false,
     showPassword: false,
   });
   const [passwordStatus, setPasswordStatus] = useState<AddLoginStatus>('idle');
   const [passwordMessage, setPasswordMessage] = useState('');
-  const [passwordVerificationUrl, setPasswordVerificationUrl] = useState('');
   const [passwordVerificationImage, setPasswordVerificationImage] = useState('');
   const [passwordSubmitting, setPasswordSubmitting] = useState(false);
   const [manualCookieForm, setManualCookieForm] = useState({ id: '', value: '' });
@@ -141,6 +140,11 @@ const AccountList: React.FC = () => {
       }
     }));
     const next = Object.fromEntries(results.filter((entry): entry is readonly [string, AccountSessionRefreshStatus] => Boolean(entry)));
+    Object.entries(next).forEach(([accountId, status]) => {
+      if (!ACTIVE_SESSION_REFRESH_STATES.has(status.state)) {
+        manualRefreshFlightsRef.current.delete(accountId);
+      }
+    });
     setSessionStatuses((current) => ({ ...current, ...next }));
   };
 
@@ -158,19 +162,29 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const cancelActiveOfficialSession = async () => {
+    const sessionId = activeOfficialSessionRef.current;
+    activeOfficialSessionRef.current = '';
+    if (!sessionId) return;
+    try {
+      await cancelOfficialLoginSession(sessionId);
+    } catch {
+      // The session may already be terminal or expired.
+    }
+  };
+
   const closeAddModal = () => {
     clearQRPolling();
     clearPasswordPolling();
+    void cancelActiveOfficialSession();
     setShowAddModal(false);
     setPasswordStatus('idle');
     setPasswordMessage('');
-    setPasswordVerificationUrl('');
     setPasswordVerificationImage('');
     setPasswordForm({
-      account_id: '',
       account: '',
       password: '',
-      show_browser: true,
+      show_browser: false,
       showPassword: false,
     });
     setManualCookieStatus('idle');
@@ -182,7 +196,6 @@ const AccountList: React.FC = () => {
     clearPasswordPolling();
     setPasswordStatus('idle');
     setPasswordMessage('');
-    setPasswordVerificationUrl('');
     setPasswordVerificationImage('');
   };
 
@@ -194,7 +207,7 @@ const AccountList: React.FC = () => {
   const getReachableVerificationImage = (imageUrl?: string | null, screenshotPath?: string | null) => {
     if (imageUrl) return imageUrl;
     if (!screenshotPath) return '';
-    if (screenshotPath.startsWith('http') || screenshotPath.startsWith('/static/')) {
+    if (screenshotPath.startsWith('/static/')) {
       return screenshotPath;
     }
     if (screenshotPath.startsWith('static/')) {
@@ -239,6 +252,7 @@ const AccountList: React.FC = () => {
     return () => {
       clearQRPolling();
       clearPasswordPolling();
+      void cancelActiveOfficialSession();
     };
   }, []);
 
@@ -334,12 +348,19 @@ const AccountList: React.FC = () => {
   };
 
   const handleRefreshSession = async (account: AccountDetail) => {
+    if (manualRefreshFlightsRef.current.has(account.id)) return;
+
+    manualRefreshFlightsRef.current.add(account.id);
     setRefreshingSessionId(account.id);
     try {
       const result = await refreshAccountSession(account.id);
+      if (!ACTIVE_SESSION_REFRESH_STATES.has(result.data.state)) {
+        manualRefreshFlightsRef.current.delete(account.id);
+      }
       setSessionStatuses((current) => ({ ...current, [account.id]: result.data }));
       setPageNotice({ tone: 'info', text: result.message || '已开始刷新 Cookie' });
     } catch (error) {
+      manualRefreshFlightsRef.current.delete(account.id);
       setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : 'Cookie 刷新启动失败' });
     } finally {
       setRefreshingSessionId('');
@@ -356,22 +377,12 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const handleCheckSessionRefreshStatus = async (account: AccountDetail) => {
-    setCheckingSessionId(account.id);
+  const handleShowAccountSessionBrowser = async (account: AccountDetail) => {
     try {
-      const status = await getAccountSessionStatus(account.id);
-      setSessionStatuses((current) => ({ ...current, [account.id]: status }));
-      if (status.state === 'success') {
-        setPageNotice({ tone: 'success', text: '已检测到验证完成，账号监听状态已更新' });
-      } else if (status.state === 'verification_required' || status.state === 'refreshing') {
-        setPageNotice({ tone: 'info', text: '后台还未检测到登录成功，请确认手机端验证已完成并稍后再检查' });
-      } else {
-        setPageNotice({ tone: status.state === 'failed' || status.state === 'timeout' ? 'error' : 'info', text: status.message || '账号刷新状态已更新' });
-      }
+      const result = await showAccountSessionRefreshBrowser(account.id);
+      setPageNotice({ tone: 'info', text: result.message || '已在本机显示闲鱼官方窗口' });
     } catch (error) {
-      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '检查验证状态失败' });
-    } finally {
-      setCheckingSessionId('');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '打开官方窗口失败' });
     }
   };
 
@@ -498,71 +509,77 @@ const AccountList: React.FC = () => {
   };
 
   const handleQRStatusResult = (
-    statusRes: Awaited<ReturnType<typeof checkQRLoginStatus>>,
-    verificationMessage?: string
+    statusRes: Awaited<ReturnType<typeof getOfficialLoginSession>>,
   ) => {
-    if (statusRes.status === 'success' || statusRes.status === 'already_processed') {
+    if (statusRes.state === 'success') {
       clearQRPolling();
+      activeOfficialSessionRef.current = '';
       setQrStatus('success');
       setQrMessage('登录成功，正在刷新账号列表');
       setTimeout(() => {
         closeAddModal();
         loadAccounts();
       }, 1000);
-    } else if (statusRes.status === 'scanned' || statusRes.status === 'processing') {
+    } else if (statusRes.state === 'preparing') {
+      setQrStatus('loading');
+      setQrMessage(statusRes.message || '正在打开闲鱼官方登录页');
+    } else if (statusRes.state === 'waiting_user') {
+      setQrStatus('waiting');
+      setQrCodeUrl(statusRes.qr_image_url || '');
+      setQrMessage(statusRes.message || '请使用闲鱼 App 扫码');
+    } else if (statusRes.state === 'persisting' || statusRes.state === 'restarting_listener') {
       setQrStatus('scanned');
-      setQrMessage(statusRes.message || '正在检查登录状态');
-    } else if (statusRes.status === 'verification_required') {
-      qrHadVerificationRef.current = true;
+      setQrMessage(statusRes.message || '正在保存登录状态');
+    } else if (statusRes.state === 'verification_required') {
       setQrStatus('verification_required');
       const verificationImage = getReachableVerificationImage(
-        statusRes.verification_qr_code_url,
-        statusRes.verification_screenshot_path
+        statusRes.verification_image_url,
+        null,
       );
       if (verificationImage) {
         setQrVerificationImage(verificationImage);
       }
-      if (statusRes.verification_browser_status === 'failed') {
-        clearQRPolling();
-      }
       setQrMessage(
-        verificationMessage ||
         statusRes.message ||
         (verificationImage
-          ? '请用手机版闲鱼扫描图中的身份验证二维码，完成后系统会自动检测。'
-          : '正在打开闲鱼安全验证页面，请稍候。')
+          ? '请根据图中的官方页面完成验证，系统会自动继续。'
+          : '需要在官方页面完成人工验证。')
       );
-    } else if (statusRes.status === 'not_found') {
+    } else if (statusRes.state === 'cancelled') {
       clearQRPolling();
-      setQrStatus('error');
-      setQrMessage('二维码会话已失效，请重新生成二维码');
-    } else if (statusRes.status === 'cancelled') {
-      clearQRPolling();
+      activeOfficialSessionRef.current = '';
       setQrStatus('error');
       setQrMessage('你已取消登录，请重新扫码');
-    } else if (statusRes.status === 'expired' || statusRes.status === 'error') {
+    } else if (
+      statusRes.state === 'expired'
+      || statusRes.state === 'failed'
+      || statusRes.state === 'interrupted'
+    ) {
       clearQRPolling();
+      activeOfficialSessionRef.current = '';
       setQrStatus('error');
-      setQrMessage(statusRes.message || (qrHadVerificationRef.current ? '安全验证会话已过期，请重新生成二维码' : '二维码已过期，请重新扫码'));
+      setQrMessage(statusRes.message || '官方登录会话已结束，请重新生成二维码');
     }
   };
 
-  const startQRStatusPolling = (sessionId: string, verificationMessage?: string) => {
+  const startQRStatusPolling = (sessionId: string) => {
     clearQRPolling();
     qrPollingRef.current = setInterval(async () => {
       try {
-        const statusRes = await checkQRLoginStatus(sessionId);
-        handleQRStatusResult(statusRes, verificationMessage);
+        const statusRes = await getOfficialLoginSession(sessionId);
+        handleQRStatusResult(statusRes);
       } catch (error) {
         clearQRPolling();
         setQrStatus('error');
         setQrMessage(error instanceof Error ? error.message : '检查二维码状态失败，请重试');
       }
-    }, 2000);
+    }, 1500);
   };
 
   const startQRLogin = async () => {
     clearQRPolling();
+    clearPasswordPolling();
+    await cancelActiveOfficialSession();
     setShowAddModal(true);
     setActiveAddMethod('qr');
     setQrStatus('loading');
@@ -570,15 +587,15 @@ const AccountList: React.FC = () => {
     setQrSessionId('');
     setQrMessage('');
     setQrVerificationImage('');
-    qrHadVerificationRef.current = false;
     try {
-      const res = await generateQRLogin();
-      if (res.success && res.qr_code_url && res.session_id) {
-        setQrCodeUrl(res.qr_code_url);
+      const res = await createOfficialLoginSession({ mode: 'qr', show_browser: false });
+      if (res.success !== false && res.session_id) {
+        activeOfficialSessionRef.current = res.session_id;
         setQrSessionId(res.session_id);
-        setQrStatus('waiting');
-        setQrMessage('请打开闲鱼 APP 扫码并在手机上确认登录');
-        startQRStatusPolling(res.session_id);
+        handleQRStatusResult(res);
+        if (!['success', 'expired', 'failed', 'cancelled', 'interrupted'].includes(res.state)) {
+          startQRStatusPolling(res.session_id);
+        }
       } else {
         setQrStatus('error');
         setQrMessage(res.message || '二维码生成失败，请重试');
@@ -589,33 +606,15 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const handleContinueQRVerification = async () => {
-    if (!qrSessionId) {
-      setQrStatus('error');
-      setQrMessage('二维码会话不存在，请重新生成二维码');
-      return;
-    }
-
+  const handleAddMethodChange = async (method: AddLoginMethod) => {
+    if (method === activeAddMethod) return;
     clearQRPolling();
-    setQrStatus('verification_required');
-    setQrMessage('正在从后台浏览器会话检查安全验证结果');
-    try {
-      const result = await continueQRLoginAfterVerification(qrSessionId);
-      handleQRStatusResult(result);
-      if (result.status === 'processing' || result.status === 'scanned') {
-        startQRStatusPolling(qrSessionId);
-      }
-    } catch (error) {
-      clearQRPolling();
-      setQrStatus('verification_required');
-      setQrMessage(error instanceof Error ? error.message : '继续检查安全验证结果失败，请重试');
-    }
-  };
-
-  const handleAddMethodChange = (method: AddLoginMethod) => {
+    clearPasswordPolling();
+    await cancelActiveOfficialSession();
+    setQrSessionId('');
     setActiveAddMethod(method);
-    if (method === 'qr' && !qrSessionId && qrStatus !== 'loading') {
-      startQRLogin();
+    if (method === 'qr') {
+      await startQRLogin();
     }
   };
 
@@ -623,17 +622,22 @@ const AccountList: React.FC = () => {
     clearPasswordPolling();
     passwordPollingRef.current = setInterval(async () => {
       try {
-        const statusRes = await checkPasswordLoginStatus(sessionId);
-        if (statusRes.status === 'processing') {
+        const statusRes = await getOfficialLoginSession(sessionId);
+        if (
+          statusRes.state === 'preparing'
+          || statusRes.state === 'waiting_user'
+          || statusRes.state === 'persisting'
+          || statusRes.state === 'restarting_listener'
+        ) {
           setPasswordStatus('processing');
           setPasswordMessage(statusRes.message || '登录处理中，请稍候');
-        } else if (statusRes.status === 'verification_required') {
+        } else if (statusRes.state === 'verification_required') {
           setPasswordStatus('verification_required');
           setPasswordMessage(statusRes.message || '需要完成闲鱼安全验证');
-          setPasswordVerificationUrl(statusRes.verification_url || '');
-          setPasswordVerificationImage(getReachableVerificationImage(statusRes.qr_code_url, statusRes.screenshot_path));
-        } else if (statusRes.status === 'success') {
+          setPasswordVerificationImage(statusRes.verification_image_url || '');
+        } else if (statusRes.state === 'success') {
           clearPasswordPolling();
+          activeOfficialSessionRef.current = '';
           setPasswordStatus('success');
           setPasswordMessage(statusRes.message || '账号密码登录成功，正在刷新账号列表');
           setPasswordForm((current) => ({ ...current, password: '', showPassword: false }));
@@ -642,14 +646,15 @@ const AccountList: React.FC = () => {
             loadAccounts();
           }, 1000);
         } else if (
-          statusRes.status === 'failed' ||
-          statusRes.status === 'error' ||
-          statusRes.status === 'not_found' ||
-          statusRes.status === 'forbidden'
+          statusRes.state === 'failed' ||
+          statusRes.state === 'expired' ||
+          statusRes.state === 'cancelled' ||
+          statusRes.state === 'interrupted'
         ) {
           clearPasswordPolling();
+          activeOfficialSessionRef.current = '';
           setPasswordStatus('failed');
-          setPasswordMessage(statusRes.message || statusRes.error || '账号密码登录失败');
+          setPasswordMessage(statusRes.message || '账号密码登录失败');
         }
       } catch (error) {
         clearPasswordPolling();
@@ -663,10 +668,9 @@ const AccountList: React.FC = () => {
     event.preventDefault();
     resetPasswordStatus();
     const account = passwordForm.account.trim();
-    const accountId = passwordForm.account_id.trim() || account;
-    if (!accountId || !account || !passwordForm.password) {
+    if (!account || !passwordForm.password) {
       setPasswordStatus('failed');
-      setPasswordMessage('请填写账号ID、登录账号和密码');
+      setPasswordMessage('请填写闲鱼账号和密码');
       return;
     }
 
@@ -674,8 +678,9 @@ const AccountList: React.FC = () => {
     setPasswordStatus('processing');
     setPasswordMessage('正在启动账号密码登录');
     try {
-      const result = await passwordLogin({
-        account_id: accountId,
+      await cancelActiveOfficialSession();
+      const result = await createOfficialLoginSession({
+        mode: 'password',
         account,
         password: passwordForm.password,
         show_browser: passwordForm.show_browser,
@@ -685,6 +690,7 @@ const AccountList: React.FC = () => {
         setPasswordMessage(result.message || '账号密码登录任务启动失败');
         return;
       }
+      activeOfficialSessionRef.current = result.session_id;
       setPasswordMessage(result.message || '登录任务已启动，请等待');
       startPasswordStatusPolling(result.session_id);
     } catch (error) {
@@ -692,6 +698,34 @@ const AccountList: React.FC = () => {
       setPasswordMessage(error instanceof Error ? error.message : '账号密码登录请求失败');
     } finally {
       setPasswordSubmitting(false);
+    }
+  };
+
+  const handleShowOfficialBrowser = async () => {
+    const sessionId = activeOfficialSessionRef.current;
+    if (!sessionId) return;
+    try {
+      const result = await showOfficialLoginBrowser(sessionId);
+      const message = result.message || '已在本机显示闲鱼官方窗口';
+      if (activeAddMethod === 'qr') setQrMessage(message);
+      else setPasswordMessage(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '打开官方窗口失败';
+      if (activeAddMethod === 'qr') setQrMessage(message);
+      else setPasswordMessage(message);
+    }
+  };
+
+  const handleCancelOfficialLogin = async () => {
+    clearQRPolling();
+    clearPasswordPolling();
+    await cancelActiveOfficialSession();
+    if (activeAddMethod === 'qr') {
+      setQrStatus('error');
+      setQrMessage('登录会话已取消');
+    } else {
+      setPasswordStatus('failed');
+      setPasswordMessage('登录会话已取消');
     }
   };
 
@@ -793,6 +827,7 @@ const AccountList: React.FC = () => {
                     </span>
                    )}
                    {sessionStatus?.state === 'refreshing' && <StatusBadge state="checking" label="Cookie 刷新中" />}
+                   {sessionStatus?.state === 'action_required' && <StatusBadge state="warning" label="需要手动验证" />}
                    {sessionStatus?.state === 'verification_required' && <StatusBadge state="warning" label="等待身份验证" />}
                    {sessionStatus?.state === 'success' && <StatusBadge state="ready" label="Cookie 已刷新" />}
                    {(sessionStatus?.state === 'failed' || sessionStatus?.state === 'timeout') && <StatusBadge state="error" label="Cookie 刷新失败" />}
@@ -869,35 +904,41 @@ const AccountList: React.FC = () => {
               {diagnosis.diagnosed_at && <div className="mt-3 text-[11px] font-medium text-gray-400">诊断更新于 {new Date(diagnosis.diagnosed_at * 1000).toLocaleTimeString()}</div>}
             </div>
           )}
-          {sessionStatus && ['refreshing', 'verification_required', 'failed', 'timeout'].includes(sessionStatus.state) && (
-            <div className={`mt-5 rounded-2xl border p-4 ${sessionStatus.state === 'verification_required' ? 'border-amber-200 bg-amber-50' : sessionStatus.state === 'refreshing' ? 'border-blue-200 bg-blue-50' : 'border-red-200 bg-red-50'}`}>
+          {sessionStatus && ['action_required', 'refreshing', 'verification_required', 'failed', 'timeout'].includes(sessionStatus.state) && (
+            <div className={`mt-5 rounded-2xl border p-4 ${sessionStatus.state === 'action_required' || sessionStatus.state === 'verification_required' ? 'border-amber-200 bg-amber-50' : sessionStatus.state === 'refreshing' ? 'border-blue-200 bg-blue-50' : 'border-red-200 bg-red-50'}`}>
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                   <div className="font-bold text-gray-900">
-                    {sessionStatus.state === 'verification_required' ? '需要完成闲鱼身份验证' : sessionStatus.state === 'refreshing' ? '正在刷新 Cookie' : 'Cookie 刷新未完成'}
+                    {sessionStatus.state === 'action_required' ? '需要开始一次验证' : sessionStatus.state === 'verification_required' ? '需要完成闲鱼身份验证' : sessionStatus.state === 'refreshing' ? '正在刷新 Cookie' : 'Cookie 刷新未完成'}
                   </div>
                   <div className="mt-1 text-sm text-gray-700">{sessionStatus.message}</div>
                   {sessionStatus.updated_at && <div className="mt-1 text-xs text-gray-500">更新于 {new Date(sessionStatus.updated_at * 1000).toLocaleTimeString()}</div>}
                 </div>
                 <div className="flex shrink-0 gap-2">
-                  {(sessionStatus.state === 'refreshing' || sessionStatus.state === 'verification_required') && (
+                  {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
                     <button type="button" onClick={() => void handleCancelSessionRefresh(account)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700">取消</button>
                   )}
-                  {sessionStatus.state === 'verification_required' && (
+                  {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
                     <button
                       type="button"
-                      onClick={() => void handleCheckSessionRefreshStatus(account)}
-                      disabled={checkingSessionId === account.id}
-                      className="rounded-lg bg-[#FFE815] px-3 py-2 text-xs font-bold text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => void handleShowAccountSessionBrowser(account)}
+                      className="inline-flex items-center gap-2 rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700"
                     >
-                      {checkingSessionId === account.id ? '正在检查...' : '我已完成验证，立即检查'}
+                      <ExternalLink className="h-4 w-4" />
+                      本机打开
                     </button>
+                  )}
+                  {sessionStatus.state === 'action_required' && (
+                    <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-[#FFE815] px-3 py-2 text-xs font-bold text-gray-900">开始一次验证</button>
                   )}
                   {(sessionStatus.state === 'failed' || sessionStatus.state === 'timeout') && (
                     <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-black px-3 py-2 text-xs font-bold text-white">重新刷新</button>
                   )}
                 </div>
               </div>
+              {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
+                <div className="mt-3 text-xs font-bold text-amber-800">后台正在自动检测，完成验证后会自动保存并恢复监听。</div>
+              )}
               {sessionStatus.state === 'verification_required' && sessionStatus.verification_image_url && (
                 <div className="mt-4 overflow-hidden rounded-xl border border-amber-200 bg-white p-2">
                   <img src={`${sessionStatus.verification_image_url}?t=${sessionStatus.updated_at || Date.now()}`} alt="闲鱼身份验证" className="mx-auto max-h-[520px] w-auto max-w-full object-contain" />
@@ -936,11 +977,11 @@ const AccountList: React.FC = () => {
                     </button>
                   </div>
 
-                  <div className="modal-body space-y-6">
+                  <div className="modal-body space-y-4 sm:space-y-6">
                     <div className="grid grid-cols-3 gap-2 rounded-2xl bg-gray-100 p-1">
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('qr')}
+                        onClick={() => void handleAddMethodChange('qr')}
                         className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
                           activeAddMethod === 'qr' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
                         }`}
@@ -950,7 +991,7 @@ const AccountList: React.FC = () => {
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('password')}
+                        onClick={() => void handleAddMethodChange('password')}
                         className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
                           activeAddMethod === 'password' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
                         }`}
@@ -960,7 +1001,7 @@ const AccountList: React.FC = () => {
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('cookie')}
+                        onClick={() => void handleAddMethodChange('cookie')}
                         className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
                           activeAddMethod === 'cookie' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
                         }`}
@@ -972,13 +1013,9 @@ const AccountList: React.FC = () => {
 
                     {activeAddMethod === 'qr' && (
                       <div className="text-center">
-                        <div className={`${
-                          qrStatus === 'verification_required' && qrVerificationImage
-                            ? 'w-full max-w-xl h-[360px] rounded-2xl'
-                            : 'w-64 h-64 rounded-[2rem]'
-                        } bg-[#F7F8FA] mx-auto flex items-center justify-center overflow-hidden border-4 border-white shadow-inner mb-6 relative`}>
+                        <div className="relative mx-auto mb-4 flex h-[260px] w-full max-w-[420px] items-center justify-center overflow-hidden rounded-xl border border-gray-200 bg-[#F7F8FA] shadow-inner sm:mb-6 sm:h-[360px]">
                           {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
-                          {qrStatus === 'waiting' && <img src={qrCodeUrl} alt="闲鱼登录二维码" className="w-full h-full p-2" />}
+                          {qrStatus === 'waiting' && qrCodeUrl && <img src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full object-contain p-3" />}
                           {qrStatus === 'scanned' && (
                             <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-blue-600 animate-fade-in">
                               <Loader2 className="w-10 h-10 mb-4 animate-spin" />
@@ -997,20 +1034,20 @@ const AccountList: React.FC = () => {
                             qrVerificationImage ? (
                               <div className="absolute inset-0 bg-white flex flex-col items-center justify-center animate-fade-in p-3">
                                 <img src={qrVerificationImage} alt="闲鱼安全验证页面" className="w-full h-full object-contain p-2" />
-                                <span className="absolute bottom-3 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-orange-600 shadow-sm">用手机版闲鱼扫描图中的二维码</span>
+                                <span className="absolute bottom-3 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-orange-600 shadow-sm">请按官方页面提示完成验证</span>
                               </div>
                             ) : (
                               <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-orange-600 animate-fade-in p-6">
                                 <Key className="w-10 h-10 mb-4" />
                                 <span className="font-bold text-lg">需要安全验证</span>
-                                <span className="text-xs text-gray-500 mt-2 text-center">完成验证后回到这里继续检查。</span>
+                                <span className="text-xs text-gray-500 mt-2 text-center">后台正在自动检测，完成后会自动继续。</span>
                               </div>
                             )
                           )}
                           {qrStatus === 'error' && (
                             <div className="flex flex-col items-center">
                               <span className="text-red-500 font-bold mb-2">获取失败</span>
-                              <button onClick={startQRLogin} className="text-xs bg-gray-200 px-3 py-1 rounded-full flex items-center gap-1 hover:bg-gray-300">
+                              <button onClick={() => void startQRLogin()} className="flex items-center gap-1 rounded-lg bg-gray-200 px-3 py-1 text-xs hover:bg-gray-300">
                                 <RefreshCw className="w-3 h-3"/>
                                 重试
                               </button>
@@ -1024,52 +1061,49 @@ const AccountList: React.FC = () => {
                           </p>
                         )}
                         <div className="flex flex-wrap items-center justify-center gap-3">
-                          {qrStatus === 'verification_required' && (
+                          {qrSessionId && qrStatus !== 'success' && (
                             <button
                               type="button"
-                              onClick={handleContinueQRVerification}
-                              className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-[#FFE815] text-gray-900 px-4 py-2 rounded-full hover:bg-yellow-300 transition-colors"
+                              onClick={() => void handleShowOfficialBrowser()}
+                              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-50"
                             >
-                              <RefreshCw className="w-4 h-4" />
-                              我已完成验证，立即检查
+                              <ExternalLink className="h-4 w-4" />
+                              本机打开官方窗口
                             </button>
                           )}
                           <button
                             type="button"
-                            onClick={startQRLogin}
-                            className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-gray-100 text-gray-700 px-4 py-2 rounded-full hover:bg-gray-200 transition-colors"
+                            onClick={() => void startQRLogin()}
+                            className="inline-flex items-center justify-center gap-2 rounded-lg bg-gray-100 px-4 py-2 text-sm font-bold text-gray-700 transition-colors hover:bg-gray-200"
                           >
                             <RefreshCw className="w-4 h-4" />
                             重新生成二维码
                           </button>
+                          {qrSessionId && qrStatus !== 'success' && (
+                            <button
+                              type="button"
+                              onClick={() => void handleCancelOfficialLogin()}
+                              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-600 hover:bg-gray-50"
+                            >
+                              <X className="h-4 w-4" />
+                              取消
+                            </button>
+                          )}
                         </div>
-                        <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl mt-4">二维码有效期为5分钟；二次验证由后台浏览器最多等待7.5分钟。</p>
                       </div>
                     )}
 
                     {activeAddMethod === 'password' && (
                       <form onSubmit={handlePasswordLoginSubmit} className="space-y-4">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <div>
-                            <label className="block text-sm font-bold text-gray-700 mb-2">账号ID</label>
-                            <input
-                              type="text"
-                              value={passwordForm.account_id}
-                              onChange={(e) => setPasswordForm({ ...passwordForm, account_id: e.target.value })}
-                              placeholder="留空时使用登录账号"
-                              className="w-full ios-input px-4 py-3 rounded-xl"
-                            />
-                          </div>
-                          <div>
-                            <label className="block text-sm font-bold text-gray-700 mb-2">闲鱼账号/手机号</label>
-                            <input
-                              type="text"
-                              value={passwordForm.account}
-                              onChange={(e) => setPasswordForm({ ...passwordForm, account: e.target.value })}
-                              placeholder="用于登录闲鱼"
-                              className="w-full ios-input px-4 py-3 rounded-xl"
-                            />
-                          </div>
+                        <div>
+                          <label className="block text-sm font-bold text-gray-700 mb-2">闲鱼账号/手机号</label>
+                          <input
+                            type="text"
+                            value={passwordForm.account}
+                            onChange={(e) => setPasswordForm({ ...passwordForm, account: e.target.value })}
+                            placeholder="用于登录闲鱼官方网站"
+                            className="w-full ios-input px-4 py-3 rounded-xl"
+                          />
                         </div>
                         <div>
                           <label className="block text-sm font-bold text-gray-700 mb-2">登录密码</label>
@@ -1078,7 +1112,7 @@ const AccountList: React.FC = () => {
                               type={passwordForm.showPassword ? 'text' : 'password'}
                               value={passwordForm.password}
                               onChange={(e) => setPasswordForm({ ...passwordForm, password: e.target.value })}
-                              placeholder="仅用于本次登录请求"
+                              placeholder="登录成功后加密保存"
                               className="w-full ios-input px-4 py-3 rounded-xl pr-12"
                             />
                             <button
@@ -1089,6 +1123,9 @@ const AccountList: React.FC = () => {
                               {passwordForm.showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                             </button>
                           </div>
+                          <p className="mt-2 text-xs text-gray-500">
+                            密码只在本次手动登录中提交，登录成功后加密保存；后台续期不会自动填写。
+                          </p>
                         </div>
                         <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
                           <div>
@@ -1120,17 +1157,26 @@ const AccountList: React.FC = () => {
                                 className="w-full max-h-80 object-contain rounded-2xl bg-gray-50 border border-gray-100"
                               />
                             )}
-                            {passwordVerificationUrl && (
-                              <a
-                                href={passwordVerificationUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-black text-white px-4 py-2 rounded-full hover:bg-gray-800 transition-colors"
-                              >
-                                <ExternalLink className="w-4 h-4" />
-                                打开安全验证
-                              </a>
-                            )}
+                          </div>
+                        )}
+                        {(passwordStatus === 'processing' || passwordStatus === 'verification_required') && (
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void handleShowOfficialBrowser()}
+                              className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-700"
+                            >
+                              <ExternalLink className="h-4 w-4" />
+                              本机打开官方窗口
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleCancelOfficialLogin()}
+                              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-600"
+                            >
+                              <X className="h-4 w-4" />
+                              取消
+                            </button>
                           </div>
                         )}
                         <button
@@ -1298,7 +1344,7 @@ const AccountList: React.FC = () => {
                         type={editForm.showLoginPassword ? 'text' : 'password'}
                         value={editForm.login_password}
                         onChange={(e) => setEditForm({ ...editForm, login_password: e.target.value })}
-                        placeholder={editingAccount.has_login_password ? '密码已保存，留空表示不修改' : '用于自动登录'}
+                        placeholder={editingAccount.has_login_password ? '密码已保存，留空表示不修改' : '仅用于保存账号信息'}
                         className="w-full ios-input px-4 py-3 rounded-xl pr-12"
                       />
                       <button
@@ -1311,10 +1357,10 @@ const AccountList: React.FC = () => {
                     </div>
                     <p className={`mt-1 text-xs font-medium ${editingAccount.login_credentials_valid ? 'text-emerald-600' : 'text-amber-600'}`}>
                       {editingAccount.login_credentials_valid
-                        ? '登录信息已保存，系统不会把密码回传到页面。'
+                        ? '登录信息已加密保存；自动刷新仍只复用官方浏览器档案。'
                         : editingAccount.has_login_password
-                          ? '已保存的信息格式异常，请重新填写正确的闲鱼登录账号和密码。'
-                          : '尚未保存登录密码，Cookie 失效后无法自动登录刷新。'}
+                          ? '已保存的信息格式异常；自动刷新不会读取或提交这些信息。'
+                          : '自动刷新只复用官方浏览器档案，不会读取或提交这里保存的密码。'}
                     </p>
                   </div>
                   <div className="flex items-center justify-between">

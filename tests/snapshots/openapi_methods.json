@@ -99,7 +99,47 @@
   "/api/accounts/{cookie_id}/session-refresh/cancel": [
     "POST"
   ],
+  "/api/accounts/{cookie_id}/session-refresh/show-browser": [
+    "POST"
+  ],
   "/api/accounts/{cookie_id}/session-status": [
+    "GET"
+  ],
+  "/api/admin/registration/enabled": [
+    "PUT"
+  ],
+  "/api/admin/registration/invites": [
+    "GET",
+    "POST"
+  ],
+  "/api/admin/registration/invites/{invite_id}": [
+    "DELETE"
+  ],
+  "/api/admin/registration/limit": [
+    "PUT"
+  ],
+  "/api/admin/registration/status": [
+    "GET"
+  ],
+  "/api/admin/registration/users": [
+    "GET"
+  ],
+  "/api/admin/registration/users/{user_id}": [
+    "PUT"
+  ],
+  "/api/auth/captcha": [
+    "POST"
+  ],
+  "/api/auth/email-code": [
+    "POST"
+  ],
+  "/api/auth/password-reset": [
+    "POST"
+  ],
+  "/api/auth/password-reset/verify-code": [
+    "POST"
+  ],
+  "/api/auth/registration-config": [
     "GET"
   ],
   "/api/ai/providers": [
@@ -144,6 +184,9 @@
   "/api/check-default-password": [
     "GET"
   ],
+  "/api/dashboard/summary": [
+    "GET"
+  ],
   "/api/default-reply/{cid}": [
     "DELETE",
     "GET",
@@ -154,6 +197,18 @@
   ],
   "/api/diagnostics/auto-reply/{cookie_id}": [
     "GET"
+  ],
+  "/api/official-login/sessions": [
+    "POST"
+  ],
+  "/api/official-login/sessions/{session_id}": [
+    "GET"
+  ],
+  "/api/official-login/sessions/{session_id}/cancel": [
+    "POST"
+  ],
+  "/api/official-login/sessions/{session_id}/show-browser": [
+    "POST"
   ],
   "/api/orders": [
     "GET"
@@ -184,6 +239,15 @@
   "/api/settings/summary": [
     "GET"
   ],
+  "/api/settings/user-basic": [
+    "PUT"
+  ],
+  "/api/settings/user-summary": [
+    "GET"
+  ],
+  "/api/settings/verify/smtp/confirm": [
+    "POST"
+  ],
   "/api/settings/verify/{section}": [
     "POST"
   ],
@@ -205,6 +269,9 @@
   "/api/skills/monitor/tasks": [
     "GET",
     "POST"
+  ],
+  "/api/skills/monitor/tasks/{task_id}": [
+    "PUT"
   ],
   "/api/skills/monitor/tasks/{task_id}/run": [
     "POST"

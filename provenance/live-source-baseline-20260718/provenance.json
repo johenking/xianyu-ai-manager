@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-07-17T21:09:10Z",
+  "base_commit": "c94854df179a72f15e0669921d7be2316570156b",
+  "live_commit": "c94854df179a72f15e0669921d7be2316570156b",
+  "import_source": "verified Stage A live source snapshot plus three reviewed live source/config exceptions",
+  "source_file_count": 201,
+  "symlink_count": 0,
+  "stage_a_backup_root_sha256": "e6983cb07117c477bab2366bc26b2355789797255d5735b541b4c9ca39d3a08d",
+  "stage_a_source_snapshot_sha256": "3b3b44ce6c8e8e0fdcdc6f2362e25ddcc92782becb2cc12a605773223db5b357",
+  "source_manifest_sha256": "2695655234524d153b21bf07a8c6a08a24c4572d76d07aa91d7b843d40ef585d",
+  "reviewed_exceptions": [
+    {
+      "path": "global_config.yml",
+      "sha256": "e391e485f7d502213dc89619c86dff01d56afcef4390c739bfaf4983bf295730",
+      "classification": "non-sensitive tracked runtime config"
+    },
+    {
+      "path": "frontend/build/staticRetention.ts",
+      "sha256": "0622edbccc1732b4c699e7197d877295b098e9c79a444bb03bf864da2b096c08",
+      "classification": "build-tool source code, not output"
+    },
+    {
+      "path": "static/xianyu_js_version_2.js",
+      "sha256": "0a62ac8e5f7b6674319e7e26d9683194e27767074888ae0dd821353793f1b52f",
+      "classification": "runtime source asset, not output"
+    }
+  ],
+  "excluded": [
+    "data/",
+    "logs/",
+    "browser_data/",
+    ".env",
+    ".venv/",
+    "node_modules/",
+    "frontend/dist/",
+    "static/assets/",
+    "static/uploads/",
+    "coverage/",
+    "database files",
+    "encryption keys",
+    "PID files",
+    "generated static/favicon.svg"
+  ],
+  "license": "AGPL-3.0",
+  "notice": "NOTICE retains zhinianboke/xianyu-auto-reply attribution; MIT notice required only if Usagi expression is later copied"
+}

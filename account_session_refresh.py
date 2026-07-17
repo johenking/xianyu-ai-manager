@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 
 ACTIVE_STATES = {"refreshing", "verification_required"}
+PASSIVE_STATES = {"action_required"}
 TERMINAL_STATES = {"idle", "success", "failed", "timeout", "cancelled"}
 
 
@@ -30,6 +31,26 @@ def is_runtime_event_active(
     if last_success_at and float(event_at) <= float(last_success_at):
         return False
     return True
+
+
+def resolve_refresh_schedule_anchor(
+    status: Optional[dict[str, Any]],
+    *,
+    now: Optional[float] = None,
+) -> float:
+    """Return the newest persisted refresh timestamp, or start from now."""
+    current_time = time.time() if now is None else float(now)
+    candidates = []
+    for key in ("last_attempt_at", "last_success_at"):
+        try:
+            value = float((status or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            candidates.append(value)
+    if not candidates:
+        return current_time
+    return min(max(candidates), current_time)
 
 
 def remove_verification_image(path: Optional[str]) -> None:
@@ -67,15 +88,32 @@ class ActiveRefreshRegistry:
                 self._workers.pop(cookie_id, None)
 
     def set_worker(self, cookie_id: str, worker: Any) -> bool:
+        cancelled = False
         with self._lock:
             if cookie_id not in self._workers:
                 return False
             self._workers[cookie_id] = worker
-            return True
+            cancelled = cookie_id in self._cancelled
+        if cancelled:
+            close = getattr(worker, "close_browser", None)
+            if callable(close):
+                close()
+        return True
 
     def is_active(self, cookie_id: str) -> bool:
         with self._lock:
             return cookie_id in self._workers
+
+    def browser_active(self, cookie_id: str) -> bool:
+        with self._lock:
+            worker = self._workers.get(cookie_id)
+        active = getattr(worker, "browser_active", None)
+        if not callable(active):
+            return False
+        try:
+            return bool(active())
+        except Exception:
+            return False
 
     def cancel(self, cookie_id: str) -> bool:
         with self._lock:
@@ -87,6 +125,22 @@ class ActiveRefreshRegistry:
         close = getattr(worker, "close_browser", None)
         if callable(close):
             close()
+        return True
+
+    def show_browser(self, cookie_id: str) -> bool:
+        with self._lock:
+            worker = self._workers.get(cookie_id)
+        active = getattr(worker, "browser_active", None)
+        request_visible = getattr(worker, "request_visible", None)
+        try:
+            browser_active = bool(active()) if callable(active) else False
+        except Exception:
+            browser_active = False
+        if not browser_active:
+            return False
+        if not callable(request_visible):
+            return False
+        request_visible()
         return True
 
     def consume_cancelled(self, cookie_id: str) -> bool:

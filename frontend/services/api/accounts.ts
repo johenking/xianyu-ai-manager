@@ -61,16 +61,75 @@ export interface QRLoginStatusResponse {
 }
 
 export interface PasswordLoginStatusResponse {
-  status: 'processing' | 'success' | 'failed' | 'verification_required' | 'not_found' | 'forbidden' | 'error';
+  status:
+    | 'processing'
+    | 'success'
+    | 'failed'
+    | 'verification_required'
+    | 'timeout'
+    | 'cancelled'
+    | 'interrupted'
+    | 'not_found'
+    | 'forbidden'
+    | 'error';
   message?: string;
   error?: string;
+  error_code?: string;
   account_id?: string;
   is_new_account?: boolean;
   cookie_count?: number;
-  verification_url?: string | null;
   screenshot_path?: string | null;
   qr_code_url?: string | null;
 }
+
+export type OfficialLoginState =
+  | 'preparing'
+  | 'waiting_user'
+  | 'verification_required'
+  | 'persisting'
+  | 'restarting_listener'
+  | 'success'
+  | 'expired'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+export interface OfficialLoginSessionResponse {
+  success?: boolean;
+  session_id: string;
+  mode?: 'qr' | 'password';
+  state: OfficialLoginState;
+  message: string;
+  error_code: string;
+  qr_image_url?: string;
+  verification_image_url?: string;
+  account_id?: string;
+  is_new_account?: boolean;
+  created_at?: number;
+  updated_at?: number;
+  expires_at?: number;
+}
+
+export const createOfficialLoginSession = async (data: {
+  mode: 'qr' | 'password';
+  account?: string;
+  password?: string;
+  show_browser?: boolean;
+}): Promise<OfficialLoginSessionResponse> => {
+  return post('/api/official-login/sessions', data);
+};
+
+export const getOfficialLoginSession = async (sessionId: string): Promise<OfficialLoginSessionResponse> => {
+  return get(`/api/official-login/sessions/${sessionId}`);
+};
+
+export const showOfficialLoginBrowser = async (sessionId: string): Promise<ApiResponse> => {
+  return post(`/api/official-login/sessions/${sessionId}/show-browser`, {});
+};
+
+export const cancelOfficialLoginSession = async (sessionId: string): Promise<ApiResponse> => {
+  return post(`/api/official-login/sessions/${sessionId}/cancel`, {});
+};
 
 export const addAccountCookie = async (data: { id: string; value: string }): Promise<ApiResponse> => {
   return post('/cookies', data);
@@ -89,7 +148,6 @@ export const continueQRLoginAfterVerification = async (sessionId: string): Promi
 };
 
 export const passwordLogin = async (data: {
-  account_id: string;
   account: string;
   password: string;
   show_browser?: boolean;
@@ -160,4 +218,8 @@ export const refreshAccountSession = async (cookieId: string): Promise<{ success
 
 export const cancelAccountSessionRefresh = async (cookieId: string): Promise<ApiResponse> => {
   return post(`/api/accounts/${cookieId}/session-refresh/cancel`, {});
+};
+
+export const showAccountSessionRefreshBrowser = async (cookieId: string): Promise<ApiResponse> => {
+  return post(`/api/accounts/${cookieId}/session-refresh/show-browser`, {});
 };

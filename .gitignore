@@ -86,7 +86,6 @@ keywords_*.xlsx
 *.swo
 *~
 
-# Local agent metadata
+# Local agent working directories
 .claude/
 .spec-workflow/
-AGENTS.md

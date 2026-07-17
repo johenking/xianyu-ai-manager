@@ -12,6 +12,10 @@ Set `ADMIN_PASSWORD` before public deployment, or change the password immediatel
 
 This project is a long-running FastAPI application with SQLite data, WebSocket/background work, and Playwright/Chromium browser automation. Netlify is best for static sites and serverless/edge functions. Its functions run in ephemeral runtimes and have execution limits, so it is not a good fit for keeping this app alive as a normal backend service.
 
+The account listeners and Skill Center scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
+
+The official-login stability change adds migration `2026071701`, which persists the official browser User-Agent on each account. Before calling any build deployed, verify the listening process path, local and public health, the migration version, HTML entry bundle and every referenced asset, account listeners, disabled-by-default Cookie and Skill schedules, and the official-login status endpoints. Source or build completion alone is not deployment or CI evidence; dated Mac deployment evidence and external-account release gates live in `docs/handoff.md`.
+
 ## Recommended Platforms
 
 Use a Docker web service platform instead:
@@ -50,6 +54,10 @@ API_HOST=0.0.0.0
 TZ=Asia/Shanghai
 PYTHONUNBUFFERED=1
 ADMIN_PASSWORD=<set-a-strong-password>
+JWT_SECRET_KEY=<set-an-independent-random-secret>
+AI_PROVIDER_ENCRYPTION_KEY=<set-an-independent-random-secret>
+ACCOUNT_CREDENTIAL_ENCRYPTION_KEY=<set-an-independent-random-secret>
+SYSTEM_SECRET_ENCRYPTION_KEY=<set-an-independent-random-secret>
 ```
 
 5. After deploy, open:
@@ -68,17 +76,21 @@ Required/recommended Space secrets or variables:
 
 ```bash
 ADMIN_PASSWORD=<set-a-strong-password>
+JWT_SECRET_KEY=<set-an-independent-random-secret>
+AI_PROVIDER_ENCRYPTION_KEY=<set-an-independent-random-secret>
+ACCOUNT_CREDENTIAL_ENCRYPTION_KEY=<set-an-independent-random-secret>
+SYSTEM_SECRET_ENCRYPTION_KEY=<set-an-independent-random-secret>
 PORT=8080
 API_HOST=0.0.0.0
 TZ=Asia/Shanghai
 PYTHONUNBUFFERED=1
 ```
 
-When deploying with `huggingface_hub`, upload source and built assets only. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `logs/`, `backups/`, `.env`, and database files. If a Hugging Face token was pasted into chat or logs, rotate it after deployment.
+When deploying with `huggingface_hub`, upload source and built assets only. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files. If a Hugging Face token was pasted into chat or logs, rotate it after deployment.
 
 ## Local Docker
 
-The Docker image is prepared, but the current machine needs more free disk space before building. Use this after disk space is available:
+Build and run the Docker image locally with:
 
 ```bash
 docker build -t xianyu-ai-manager .
@@ -87,8 +99,19 @@ docker run --rm -p 8091:8080 \
   -e API_HOST=0.0.0.0 \
   -e ADMIN_PASSWORD='change-me' \
   -v "$PWD/data:/app/data" \
+  -v "$PWD/browser_data:/app/browser_data" \
   -v "$PWD/logs:/app/logs" \
   xianyu-ai-manager
 ```
 
 Then open `http://localhost:8091`.
+
+The official Goofish login flow requires the installed system Chrome in headed mode; the current container command does not start a virtual display. Automatic renewal is profile-only and never submits a stored password. Treat QR login, explicit password login, and profile renewal as unsupported in Docker or cloud environments until system Chrome, a display/Xvfb setup, and the human-verification path have been tested there. Persisting `browser_data/` is required once that support exists.
+
+## Direct Registration
+
+Do not enable registration as part of an unattended deployment. Start with `registration_enabled=false`, configure SMTP and an independent public support email in the administrator UI, send the six-digit SMTP receipt code, and enter the code from the real mailbox. The verified fingerprint becomes stale and registration closes after any SMTP change. Confirm the ordinary-user limit, then exercise direct registration, automatic login, restart persistence, username-or-email login, and two-stage password reset before opening the switch. A successful registration or reset email send must not refresh CAPTCHA immediately; an explicit resend after cooldown must require a new CAPTCHA. Reset acceptance must verify that `/api/auth/password-reset/verify-code` issues an in-memory one-time grant, `/api/auth/password-reset` consumes it, grant replay fails, and all old sessions are revoked. The legacy direct reset payload is temporary compatibility only. The default capacity is 20; disabled ordinary users still count, and the administrator does not.
+
+Inspect authentication logs after acceptance without printing request bodies. They must not expose the default administrator password, email OTPs, reset grant IDs or tokens, full email addresses, or passwords.
+
+When environment encryption keys are not supplied, persist and back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with SQLite. SMTP credentials are configured in the UI and encrypted with the system-secret key; the example `SMTP_*` environment names are not a configuration path for this application.

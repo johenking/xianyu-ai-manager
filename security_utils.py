@@ -8,6 +8,7 @@ import hmac
 import os
 from pathlib import Path
 import secrets
+import tempfile
 from typing import Optional
 
 import bcrypt
@@ -17,6 +18,8 @@ from cryptography.fernet import Fernet, InvalidToken
 PASSWORD_HASH_VERSION = 2
 ACCOUNT_PASSWORD_ENCRYPTION_VERSION = 1
 ACCOUNT_PASSWORD_PREFIX = "fernet:v1:"
+SYSTEM_SECRET_ENCRYPTION_VERSION = 1
+SYSTEM_SECRET_PREFIX = "fernet:system:v1:"
 
 
 def hash_user_password(password: str) -> str:
@@ -87,3 +90,112 @@ class AccountCredentialCipher:
             return self.fernet.decrypt(token.encode("ascii")).decode("utf-8")
         except InvalidToken as exc:
             raise ValueError("账号登录凭据无法解密，请重新保存登录密码") from exc
+
+
+class SystemSecretCipher:
+    """Encryption and purpose-isolated digests for server-side secrets."""
+
+    def __init__(self, db_path: str, secret: Optional[str] = None):
+        self.db_path = Path(db_path)
+        self.key_path = Path(
+            os.getenv(
+                "SYSTEM_SECRET_KEY_FILE",
+                str(self.db_path.parent / ".system_secret_key"),
+            )
+        )
+        raw_secret = secret or os.getenv("SYSTEM_SECRET_ENCRYPTION_KEY") or self._local_secret()
+        self._hmac_key = hashlib.sha256(
+            b"xianyu-system-secret:hmac:v1\0" + raw_secret.encode("utf-8")
+        ).digest()
+        encryption_key = base64.urlsafe_b64encode(
+            hashlib.sha256(
+                b"xianyu-system-secret:fernet:v1\0" + raw_secret.encode("utf-8")
+            ).digest()
+        )
+        self.fernet = Fernet(encryption_key)
+
+    def _local_secret(self) -> str:
+        if self.key_path.exists():
+            return self._read_local_secret()
+
+        self.key_path.parent.mkdir(parents=True, exist_ok=True)
+        secret = secrets.token_urlsafe(48)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{self.key_path.name}.tmp-",
+            dir=str(self.key_path.parent),
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(
+                    descriptor,
+                    "w",
+                    encoding="ascii",
+                    closefd=False,
+                ) as handle:
+                    handle.write(secret)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(descriptor)
+
+            try:
+                os.link(temporary_path, self.key_path)
+            except FileExistsError:
+                return self._read_local_secret()
+            os.chmod(self.key_path, 0o600)
+            return secret
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _read_local_secret(self) -> str:
+        os.chmod(self.key_path, 0o600)
+        secret = self.key_path.read_text(encoding="ascii").strip()
+        if not secret:
+            raise ValueError("系统秘密密钥文件为空")
+        return secret
+
+    def encrypt(self, value: str) -> str:
+        if not value:
+            return value
+        if value.startswith(SYSTEM_SECRET_PREFIX):
+            try:
+                self._decrypt_prefixed(value)
+            except (InvalidToken, UnicodeError):
+                pass
+            else:
+                return value
+        token = self.fernet.encrypt(value.encode("utf-8")).decode("ascii")
+        return SYSTEM_SECRET_PREFIX + token
+
+    def decrypt(self, value: str) -> str:
+        if not value or not value.startswith(SYSTEM_SECRET_PREFIX):
+            return value
+        try:
+            return self._decrypt_prefixed(value)
+        except (InvalidToken, UnicodeError) as exc:
+            raise ValueError("系统秘密无法解密，请检查系统秘密密钥") from exc
+
+    def _decrypt_prefixed(self, value: str) -> str:
+        token = value[len(SYSTEM_SECRET_PREFIX):]
+        return self.fernet.decrypt(token.encode("ascii")).decode("utf-8")
+
+    def digest(self, value: str, *, purpose: str) -> str:
+        normalized_purpose = str(purpose or "").strip()
+        if not normalized_purpose:
+            raise ValueError("摘要 purpose 不能为空")
+        purpose_key = hmac.new(
+            self._hmac_key,
+            normalized_purpose.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return hmac.new(
+            purpose_key,
+            str(value).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def compare_digest(self, value: str, expected_digest: str, *, purpose: str) -> bool:
+        candidate = self.digest(value, purpose=purpose)
+        return hmac.compare_digest(candidate, str(expected_digest or ""))

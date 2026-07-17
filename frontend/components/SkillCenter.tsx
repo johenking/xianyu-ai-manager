@@ -29,6 +29,7 @@ import {
   runSkillMonitorTask,
   testSkillAgentReply,
   updateSkillAgentPrompt,
+  updateSkillMonitorTask,
 } from '../services/api';
 import {
   AccountDetail,
@@ -41,7 +42,8 @@ import {
   SkillOpsHealth,
   SkillCapability,
 } from '../types';
-import { InlineNotice, StatusBadge } from './ui/StatusControls';
+import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import { IconAction, PageHeader, SegmentedNav, WorkSurface } from './ui/ProtectedPage';
 
 type SkillTab = 'monitor' | 'agent' | 'ops';
 
@@ -53,6 +55,10 @@ const emptyTaskForm = {
   region: '',
   published_within_hours: '24',
   account_id: '',
+  ai_filter: '',
+  notify_enabled: false,
+  schedule_enabled: false,
+  schedule_interval_minutes: '60',
 };
 
 const promptOrder: SkillAgentPrompt['prompt_type'][] = ['price', 'tech', 'default'];
@@ -91,6 +97,11 @@ const SkillCenter: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [runningTaskId, setRunningTaskId] = useState<number | null>(null);
   const [statusText, setStatusText] = useState('');
+  const [loadedTabs, setLoadedTabs] = useState<Record<SkillTab, boolean>>({
+    monitor: false,
+    agent: false,
+    ops: false,
+  });
 
   const promptMap = useMemo(() => {
     return prompts.reduce<Record<string, SkillAgentPrompt>>((acc, prompt) => {
@@ -106,10 +117,12 @@ const SkillCenter: React.FC = () => {
     ]);
     setTasks(taskList);
     setResults(resultList);
+    setLoadedTabs((current) => ({ ...current, monitor: true }));
   };
 
   const loadAgent = async () => {
     setPrompts(await getSkillAgentPrompts());
+    setLoadedTabs((current) => ({ ...current, agent: true }));
   };
 
   const loadOps = async () => {
@@ -121,6 +134,7 @@ const SkillCenter: React.FC = () => {
     setOpsHealth(health);
     setBrowserStatus(browser);
     setDeliveryDiagnostics(delivery);
+    setLoadedTabs((current) => ({ ...current, ops: true }));
   };
 
   const loadAll = async () => {
@@ -130,8 +144,6 @@ const SkillCenter: React.FC = () => {
         getAccountDetails(),
         getSkillCapabilities(),
         loadMonitor(),
-        loadAgent(),
-        loadOps(),
       ]);
       setAccounts(accountList);
       setCapabilities(capabilityList);
@@ -148,6 +160,15 @@ const SkillCenter: React.FC = () => {
   useEffect(() => {
     loadAll();
   }, []);
+
+  useEffect(() => {
+    if (activeSkill === 'agent' && !loadedTabs.agent) {
+      loadAgent().catch((error) => setStatusText(error instanceof Error ? error.message : '专家配置加载失败'));
+    }
+    if (activeSkill === 'ops' && !loadedTabs.ops) {
+      loadOps().catch((error) => setStatusText(error instanceof Error ? error.message : '诊断数据加载失败'));
+    }
+  }, [activeSkill, loadedTabs.agent, loadedTabs.ops]);
 
   useEffect(() => {
     if (!testAccountId) {
@@ -184,10 +205,12 @@ const SkillCenter: React.FC = () => {
         max_price: taskForm.max_price ? Number(taskForm.max_price) : null,
         region: taskForm.region,
         published_within_hours: Number(taskForm.published_within_hours) || 24,
-        ai_filter: '',
-        notify_enabled: false,
+        ai_filter: taskForm.ai_filter,
+        notify_enabled: taskForm.notify_enabled,
         account_id: taskForm.account_id,
         enabled: true,
+        schedule_enabled: taskForm.schedule_enabled,
+        schedule_interval_minutes: Number(taskForm.schedule_interval_minutes) || 60,
       });
       setTaskForm(emptyTaskForm);
       setStatusText('监控任务已创建');
@@ -205,11 +228,30 @@ const SkillCenter: React.FC = () => {
       const result = await runSkillMonitorTask(taskId);
       setStatusText(result.message || `真实监控完成，命中 ${result.created_count || 0} 条`);
       await loadMonitor();
-      await loadOps();
+      if (loadedTabs.ops) {
+        await loadOps();
+      }
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : '运行失败');
     } finally {
       setRunningTaskId(null);
+    }
+  };
+
+  const handleToggleTaskSchedule = async (task: SkillMonitorTask) => {
+    setLoading(true);
+    try {
+      await updateSkillMonitorTask(task.id, {
+        schedule_enabled: !task.schedule_enabled,
+        schedule_interval_minutes: task.schedule_interval_minutes || 60,
+      });
+      setStatusText(!task.schedule_enabled ? '已开启定时监控' : '已关闭定时监控');
+      await loadMonitor();
+      setCapabilities(await getSkillCapabilities());
+    } catch (error) {
+      setStatusText(error instanceof Error ? error.message : '更新定时状态失败');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -274,7 +316,7 @@ const SkillCenter: React.FC = () => {
 
   const renderMonitor = () => (
     <div className="grid grid-cols-1 xl:grid-cols-[420px_1fr] gap-6">
-      <section className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+      <WorkSurface className="p-5 sm:p-6">
         <div className="flex items-center gap-3 mb-5">
           <div className="w-10 h-10 rounded-xl bg-[#FFE815] flex items-center justify-center">
             <Search className="w-5 h-5 text-black" />
@@ -342,8 +384,46 @@ const SkillCenter: React.FC = () => {
               </option>
             ))}
           </select>
+          <textarea
+            value={taskForm.ai_filter}
+            onChange={(event) => setTaskForm({ ...taskForm, ai_filter: event.target.value })}
+            placeholder="AI 商品过滤要求，例如：只保留价格明显低于市场价、卖家描述可信、适合捡漏的商品"
+            className="w-full ios-input px-4 py-3 rounded-xl min-h-24 resize-none"
+          />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="flex items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-sm font-bold text-gray-700">
+              <span>定时运行</span>
+              <ToggleControl
+                label="定时运行"
+                checked={taskForm.schedule_enabled}
+                onChange={(schedule_enabled) => setTaskForm({ ...taskForm, schedule_enabled })}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-sm font-bold text-gray-700">
+              <span>命中后通知</span>
+              <ToggleControl
+                label="命中后通知"
+                checked={taskForm.notify_enabled}
+                onChange={(notify_enabled) => setTaskForm({ ...taskForm, notify_enabled })}
+              />
+            </div>
+          </div>
+          {taskForm.schedule_enabled && (
+            <select
+              value={taskForm.schedule_interval_minutes}
+              onChange={(event) => setTaskForm({ ...taskForm, schedule_interval_minutes: event.target.value })}
+              className="w-full ios-input px-4 py-3 rounded-xl"
+            >
+              <option value="15">每 15 分钟</option>
+              <option value="30">每 30 分钟</option>
+              <option value="60">每 1 小时</option>
+              <option value="360">每 6 小时</option>
+              <option value="720">每 12 小时</option>
+              <option value="1440">每 24 小时</option>
+            </select>
+          )}
           <InlineNotice>
-            当前只支持手动运行与规则筛选。定时调度、AI 商品过滤和结果通知暂不可用。
+            定时默认关闭，最短 15 分钟。AI 过滤会在规则命中后再判断；通知支持 Webhook、微信、钉钉、飞书、Bark 和 Telegram，并发送到全部已启用的受支持渠道。
           </InlineNotice>
           <button
             onClick={handleCreateTask}
@@ -354,10 +434,10 @@ const SkillCenter: React.FC = () => {
             创建监控任务
           </button>
         </div>
-      </section>
+      </WorkSurface>
 
       <section className="space-y-6">
-        <div className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+        <WorkSurface as="div" className="p-5 sm:p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-extrabold text-gray-900">任务列表</h3>
             <span className="text-xs font-bold text-gray-500">{tasks.length} 个任务</span>
@@ -370,22 +450,49 @@ const SkillCenter: React.FC = () => {
                   <div className="text-xs text-gray-500 mt-1">
                     {task.keyword} · {task.region || '全国'} · {task.min_price ?? '-'}-{task.max_price ?? '-'} 元
                   </div>
+                  <div className="mt-2 flex flex-wrap gap-2 text-[11px] font-bold">
+                    <span className={`rounded-md px-2 py-1 ${task.schedule_enabled ? 'bg-yellow-100 text-yellow-800' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.schedule_enabled ? `定时每 ${task.schedule_interval_minutes || 60} 分钟` : '定时关闭'}
+                    </span>
+                    <span className={`rounded-md px-2 py-1 ${task.ai_filter ? 'bg-yellow-100 text-yellow-800' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.ai_filter ? 'AI过滤开启' : 'AI过滤关闭'}
+                    </span>
+                    <span className={`rounded-md px-2 py-1 ${task.notify_enabled ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
+                      {task.notify_enabled ? '通知开启' : '通知关闭'}
+                    </span>
+                    {task.last_status && (
+                      <span className={`rounded-md px-2 py-1 ${task.last_status === 'failed' ? 'bg-red-100 text-red-700' : task.last_status === 'running' ? 'bg-yellow-100 text-yellow-800' : 'bg-gray-100 text-gray-500'}`}>
+                        {task.last_status}
+                      </span>
+                    )}
+                  </div>
+                  {task.next_run_at && <div className="mt-1 text-[11px] text-gray-400">下次运行：{task.next_run_at}</div>}
+                  {task.last_error && <div className="mt-1 text-[11px] text-red-500">错误：{task.last_error}</div>}
                 </div>
-                <button
-                  onClick={() => handleRunTask(task.id)}
-                  disabled={runningTaskId === task.id}
-                  className="px-4 py-2 rounded-xl bg-black text-white font-bold text-sm flex items-center gap-2 hover:bg-gray-800 transition-colors"
-                >
-                  {runningTaskId === task.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                  运行
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => handleToggleTaskSchedule(task)}
+                    disabled={loading}
+                    className="ios-btn-secondary rounded-xl px-4 py-2 text-sm font-bold"
+                  >
+                    {task.schedule_enabled ? '关闭定时' : '开启定时'}
+                  </button>
+                  <button
+                    onClick={() => handleRunTask(task.id)}
+                    disabled={runningTaskId === task.id}
+                    className="ios-btn-primary flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-bold"
+                  >
+                    {runningTaskId === task.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                    运行
+                  </button>
+                </div>
               </div>
             ))}
             {tasks.length === 0 && <div className="text-sm text-gray-500 py-8 text-center">暂无监控任务</div>}
           </div>
-        </div>
+        </WorkSurface>
 
-        <div className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+        <WorkSurface as="div" className="p-5 sm:p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-extrabold text-gray-900">监控结果</h3>
             <span className="text-xs font-bold text-gray-500">{results.length} 条结果</span>
@@ -398,6 +505,8 @@ const SkillCenter: React.FC = () => {
                   <th className="py-3 pr-4">价格</th>
                   <th className="py-3 pr-4">地区</th>
                   <th className="py-3 pr-4">来源</th>
+                  <th className="py-3 pr-4">AI</th>
+                  <th className="py-3 pr-4">通知</th>
                   <th className="py-3 pr-4">过滤</th>
                 </tr>
               </thead>
@@ -423,6 +532,19 @@ const SkillCenter: React.FC = () => {
                       )}
                     </td>
                     <td className="py-3 pr-4 text-xs text-gray-500">
+                      {result.raw_data?.ai_filter ? (
+                        <span className="rounded-lg bg-yellow-100 px-2 py-1 font-bold text-yellow-800">
+                          {result.ai_score} · {result.ai_reason || 'AI推荐'}
+                        </span>
+                      ) : '未启用'}
+                    </td>
+                    <td className="py-3 pr-4 text-xs text-gray-500">
+                      <span className="px-2 py-1 rounded-lg bg-gray-100 font-bold">
+                        {result.notify_status || 'disabled'}
+                      </span>
+                      {result.raw_data?.notify_error ? <div className="mt-1 text-red-500">{result.raw_data.notify_error}</div> : null}
+                    </td>
+                    <td className="py-3 pr-4 text-xs text-gray-500">
                       {result.raw_data?.filter_reason || '-'}
                       {result.raw_data?.publish_time ? ` · ${result.raw_data.publish_time}` : ''}
                     </td>
@@ -432,7 +554,7 @@ const SkillCenter: React.FC = () => {
             </table>
             {results.length === 0 && <div className="text-sm text-gray-500 py-8 text-center">暂无监控结果</div>}
           </div>
-        </div>
+        </WorkSurface>
       </section>
     </div>
   );
@@ -446,7 +568,7 @@ const SkillCenter: React.FC = () => {
         {promptOrder.map((promptType) => {
           const prompt = promptMap[promptType];
           return (
-            <div key={promptType} className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+            <WorkSurface key={promptType} as="div" className="p-5 sm:p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
                   <h3 className="font-extrabold text-gray-900">{prompt?.title || promptType}</h3>
@@ -455,7 +577,7 @@ const SkillCenter: React.FC = () => {
                 <button
                   onClick={() => handleSavePrompt(promptType)}
                   disabled={!prompt || loading}
-                  className="px-3 py-2 rounded-xl bg-gray-900 text-white text-sm font-bold flex items-center gap-2"
+                  className="ios-btn-primary flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-bold"
                 >
                   <Save className="w-4 h-4" />
                   保存
@@ -466,15 +588,15 @@ const SkillCenter: React.FC = () => {
                 onChange={(event) => handlePromptChange(promptType, event.target.value)}
                 className="w-full ios-input px-4 py-3 rounded-xl h-44 resize-none text-sm"
               />
-            </div>
+            </WorkSurface>
           );
         })}
       </section>
 
-      <section className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm h-fit">
+      <WorkSurface className="h-fit p-5 sm:p-6">
         <div className="flex items-center gap-3 mb-5">
-          <div className="w-10 h-10 rounded-xl bg-purple-100 flex items-center justify-center">
-            <Bot className="w-5 h-5 text-purple-600" />
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#FFE815]">
+            <Bot className="h-5 w-5 text-black" />
           </div>
           <div>
             <h3 className="text-lg font-extrabold text-gray-900">测试回复</h3>
@@ -514,7 +636,7 @@ const SkillCenter: React.FC = () => {
         <button
           onClick={handleTestReply}
           disabled={loading || !testAccountId || !testItemId}
-          className="w-full mt-4 h-12 rounded-xl bg-black text-white font-bold flex items-center justify-center gap-2"
+          className="ios-btn-primary mt-4 flex h-12 w-full items-center justify-center gap-2 rounded-xl font-bold"
         >
           {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           生成测试回复
@@ -532,32 +654,32 @@ const SkillCenter: React.FC = () => {
             <div className="font-bold text-gray-900 leading-relaxed">{testReply.reply}</div>
           </div>
         )}
-      </section>
+      </WorkSurface>
     </div>
   );
 
   const renderOps = () => (
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-      <section className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+      <WorkSurface className="p-5 sm:p-6">
         <div className="flex items-center gap-3 mb-5">
           <ShieldCheck className="w-6 h-6 text-green-600" />
           <h3 className="text-lg font-extrabold text-gray-900">部署健康</h3>
         </div>
         <div className="space-y-3 text-sm">
           <Metric label="API" value={opsHealth?.api === 'ok' ? '可用' : opsHealth?.api || '未知'} />
-          <Metric label="数据库" value={opsHealth?.database.exists ? '已连接' : '不可用'} />
-          <Metric label="数据库写入" value={opsHealth?.database.writable ? '可用' : '不可用'} />
+          <Metric label="数据库" value={opsHealth?.database?.exists ? '已连接' : '不可用'} />
+          <Metric label="数据库写入" value={opsHealth?.database?.writable ? '可用' : '不可用'} />
           <Metric label="账号监听管理器" value={opsHealth?.cookie_manager === 'ready' ? '已就绪' : opsHealth?.cookie_manager || '未知'} />
-          <Metric label="账号监听" value={opsHealth ? `${opsHealth.accounts.listening}/${opsHealth.accounts.total} 运行中` : '未知'} />
-          <Metric label="AI 全局配置" value={opsHealth?.ai.global_configured ? '已配置' : '未配置'} />
-          <Metric label="AI 可用账号" value={opsHealth ? `${opsHealth.ai.ready_accounts}/${opsHealth.accounts.total}` : '未知'} />
-          <Metric label="AI 模型" value={opsHealth?.ai.model || '未配置'} compact />
+          <Metric label="账号监听" value={opsHealth?.accounts ? `${opsHealth.accounts.listening}/${opsHealth.accounts.total} 运行中` : '未知'} />
+          <Metric label="AI 全局配置" value={opsHealth?.ai?.global_configured ? '已配置' : '未配置'} />
+          <Metric label="AI 可用账号" value={opsHealth?.ai && opsHealth?.accounts ? `${opsHealth.ai.ready_accounts}/${opsHealth.accounts.total}` : '未知'} />
+          <Metric label="AI 模型" value={opsHealth?.ai?.model || '未配置'} compact />
         </div>
-      </section>
+      </WorkSurface>
 
-      <section className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+      <WorkSurface className="p-5 sm:p-6">
         <div className="flex items-center gap-3 mb-5">
-          <Cpu className="w-6 h-6 text-blue-600" />
+          <Cpu className="h-6 w-6 text-gray-700" />
           <h3 className="text-lg font-extrabold text-gray-900">浏览器状态</h3>
         </div>
         <div className="space-y-3 text-sm">
@@ -568,9 +690,9 @@ const SkillCenter: React.FC = () => {
           <Metric label="浏览器内核" value={browserStatus?.browser_path || '未识别'} compact />
           {browserStatus?.playwright_error && <Metric label="启动原因" value={browserStatus.playwright_error} compact />}
         </div>
-      </section>
+      </WorkSurface>
 
-      <section className="bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+      <WorkSurface className="p-5 sm:p-6">
         <div className="flex items-center gap-3 mb-5">
           <Wrench className="w-6 h-6 text-amber-600" />
           <h3 className="text-lg font-extrabold text-gray-900">发货诊断</h3>
@@ -581,12 +703,12 @@ const SkillCenter: React.FC = () => {
           <Metric label="待处理样本" value={String(deliveryDiagnostics?.pending_orders_sample ?? '-')} />
           <Metric label="发货就绪" value={deliveryDiagnostics?.auto_delivery_ready ? '已就绪' : '条件不足'} />
         </div>
-      </section>
+      </WorkSurface>
 
-      <section className="xl:col-span-3 bg-white rounded-2xl border border-gray-100 p-6 shadow-sm">
+      <WorkSurface className="p-5 sm:p-6 xl:col-span-3">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-extrabold text-gray-900">运行日志</h3>
-          <button onClick={loadOps} className="px-4 py-2 rounded-xl bg-gray-100 font-bold text-sm flex items-center gap-2">
+          <button onClick={loadOps} className="ios-btn-secondary flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-bold">
             <Activity className="w-4 h-4" />
             刷新
           </button>
@@ -604,68 +726,43 @@ const SkillCenter: React.FC = () => {
             <div className="text-sm text-gray-500 py-8 text-center">暂无技能运行日志</div>
           )}
         </div>
-      </section>
+      </WorkSurface>
     </div>
   );
 
   return (
     <div className="space-y-6 sm:space-y-8">
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
-        <div>
-          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-black text-[#FFE815] text-xs font-extrabold mb-3">
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            SKILL CENTER
-          </div>
-          <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">技能中心</h2>
-          <p className="text-gray-500 mt-2">真实能力与暂不可用能力分开显示</p>
-        </div>
-        <button
-          onClick={loadAll}
-          disabled={loading}
-          className="px-5 py-3 rounded-xl bg-white border border-gray-100 font-bold flex items-center gap-2 shadow-sm"
-        >
-          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Eye className="w-4 h-4" />}
-          刷新状态
-        </button>
-      </div>
+      <PageHeader
+        icon={SlidersHorizontal}
+        title="技能中心"
+        description="监控任务、专家策略和运行状态"
+        actions={<IconAction icon={loading ? Loader2 : Eye} label="刷新状态" busy={loading} onClick={() => void loadAll()} disabled={loading} />}
+      />
 
-      <div className="flex max-w-full overflow-x-auto rounded-2xl bg-white border border-gray-100 p-1 shadow-sm">
-        {[
+      <SegmentedNav
+        value={activeSkill}
+        onChange={(value) => setActiveSkill(value as SkillTab)}
+        items={[
           { id: 'monitor', label: '监控捡漏', icon: Radar },
           { id: 'agent', label: 'AI 专家客服', icon: Bot },
           { id: 'ops', label: '稳定增强', icon: Wrench },
-        ].map((item) => {
-          const Icon = item.icon;
-          const selected = activeSkill === item.id;
-          return (
-            <button
-              key={item.id}
-              onClick={() => setActiveSkill(item.id as SkillTab)}
-              className={`flex-none whitespace-nowrap px-3 sm:px-5 py-3 rounded-xl font-bold text-sm flex items-center gap-2 transition-colors ${
-                selected ? 'bg-[#FFE815] text-black' : 'text-gray-500 hover:text-gray-900'
-              }`}
-            >
-              <Icon className="w-4 h-4 shrink-0" />
-              {item.label}
-            </button>
-          );
-        })}
-      </div>
+        ]}
+      />
 
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
         {(Object.entries(capabilities) as [string, SkillCapability][]).map(([key, capability]) => (
-          <div key={key} className="rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
+          <WorkSurface key={key} as="article" className="px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <span className="text-sm font-bold text-gray-900">{capabilityTitles[key] || key}</span>
               <StatusBadge state={capability.available ? 'ready' : 'missing'} label={capability.label} />
             </div>
             <p className="mt-2 text-xs leading-relaxed text-gray-500">{capability.detail}</p>
-          </div>
+          </WorkSurface>
         ))}
       </div>
 
       {statusText && (
-        <div className="bg-white border border-gray-100 rounded-2xl px-5 py-3 text-sm font-bold text-gray-700 shadow-sm">
+        <div className="rounded-xl border border-yellow-200 bg-yellow-50 px-5 py-3 text-sm font-bold text-gray-700">
           {statusText}
         </div>
       )}

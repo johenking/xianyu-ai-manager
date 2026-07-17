@@ -6,9 +6,11 @@ import time
 import json
 import random
 import string
-import aiohttp
+import asyncio
 import io
 import base64
+import binascii
+from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
@@ -18,12 +20,31 @@ from schema_migrations import MigrationRunner, get_schema_version
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
     PASSWORD_HASH_VERSION,
+    SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
+    SystemSecretCipher,
     hash_user_password,
     token_digest,
 )
-from repositories.auth_repository import AuthSessionRepository, UserRepository
+from repositories.auth_repository import (
+    AuthSessionRepository,
+    UserRepository,
+    public_user_view,
+)
 from services.auth_service import AuthService
+from auth_registration_service import (
+    AuthRateLimiter,
+    RegistrationService,
+    mask_email_for_log,
+)
+from auth_email_service import (
+    SMTP_CONFIGURATION_KEYS,
+    SMTPConfigurationError,
+    SMTPDeliveryError,
+    SMTPEmailSender,
+    canonical_smtp_setting_value,
+    smtp_configuration_status,
+)
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
@@ -154,6 +175,7 @@ class DBManager:
                 show_browser INTEGER DEFAULT 0,
                 cookie_refresh_enabled INTEGER DEFAULT 0,
                 cookie_refresh_interval_minutes INTEGER DEFAULT 1440,
+                browser_user_agent TEXT NOT NULL DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -329,6 +351,11 @@ class DBManager:
                 notify_enabled BOOLEAN DEFAULT FALSE,
                 account_id TEXT DEFAULT '',
                 enabled BOOLEAN DEFAULT TRUE,
+                schedule_enabled BOOLEAN DEFAULT FALSE,
+                schedule_interval_minutes INTEGER DEFAULT 60,
+                next_run_at TIMESTAMP,
+                last_status TEXT DEFAULT 'idle',
+                last_error TEXT DEFAULT '',
                 last_run_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -729,7 +756,7 @@ class DBManager:
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
             ('theme_color', 'blue', '主题颜色'),
-            ('registration_enabled', 'true', '是否开启用户注册'),
+            ('registration_enabled', 'false', '是否开启用户注册'),
             ('show_default_login_info', 'true', '是否显示默认登录信息'),
             ('login_captcha_enabled', 'true', '登录滑动验证码开关'),
             ('smtp_server', '', 'SMTP服务器地址'),
@@ -739,6 +766,12 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
+            ('terms_version', 'v2', '当前注册条款版本'),
+            ('registration_user_limit', '20', '非管理员注册用户上限'),
+            ('support_email', '', '公开支持邮箱'),
+            ('smtp_verified_fingerprint', '', '已验证SMTP配置指纹'),
+            ('smtp_verified_at', '', 'SMTP配置验证时间'),
+            ('auth_trusted_proxies', '', '认证可信代理列表'),
             ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
@@ -764,7 +797,21 @@ class DBManager:
             self.backfill_cookie_identities()
             self.user_repository = UserRepository(self.conn)
             self.auth_session_repository = AuthSessionRepository(self.conn)
-            self.auth_service = AuthService(self.user_repository)
+            self.auth_service = AuthService(
+                self.user_repository,
+                self.auth_session_repository,
+                lock=self.lock,
+            )
+            self.registration_service = RegistrationService(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
+            self.auth_rate_limiter = AuthRateLimiter(
+                self.conn,
+                self.db_path,
+                lock=self.lock,
+            )
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
@@ -961,11 +1008,55 @@ class DBManager:
                 self.set_system_setting("db_version", "1.5", "数据库版本号")
                 logger.info("数据库升级到版本1.5完成")
 
+            if current_version < "1.6":
+                logger.info("开始升级数据库到版本1.6...")
+                self.upgrade_skill_monitor_tasks_for_scheduler(cursor)
+                self.set_system_setting("db_version", "1.6", "数据库版本号")
+                logger.info("数据库升级到版本1.6完成")
+
             # 迁移遗留数据（在所有版本升级完成后执行）
+            self.upgrade_skill_monitor_tasks_for_scheduler(cursor)
             self.migrate_legacy_data(cursor)
 
         except Exception as e:
             logger.error(f"数据库版本检查或升级失败: {e}")
+            raise
+
+    def upgrade_skill_monitor_tasks_for_scheduler(self, cursor):
+        """为技能中心监控任务补齐调度和运行状态字段。"""
+        columns = {
+            'schedule_enabled': "ALTER TABLE skill_monitor_tasks ADD COLUMN schedule_enabled BOOLEAN DEFAULT FALSE",
+            'schedule_interval_minutes': "ALTER TABLE skill_monitor_tasks ADD COLUMN schedule_interval_minutes INTEGER DEFAULT 60",
+            'next_run_at': "ALTER TABLE skill_monitor_tasks ADD COLUMN next_run_at TIMESTAMP",
+            'last_status': "ALTER TABLE skill_monitor_tasks ADD COLUMN last_status TEXT DEFAULT 'idle'",
+            'last_error': "ALTER TABLE skill_monitor_tasks ADD COLUMN last_error TEXT DEFAULT ''",
+        }
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='skill_monitor_tasks'")
+            if not cursor.fetchone():
+                return
+            cursor.execute("PRAGMA table_info(skill_monitor_tasks)")
+            existing = {row[1] for row in cursor.fetchall()}
+            for column, sql in columns.items():
+                if column not in existing:
+                    self._execute_sql(cursor, sql)
+                    logger.info(f"为skill_monitor_tasks添加字段: {column}")
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET schedule_interval_minutes = 60 "
+                "WHERE schedule_interval_minutes IS NULL OR schedule_interval_minutes < 15"
+            )
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET last_status = 'idle' "
+                "WHERE last_status IS NULL OR last_status = ''"
+            )
+            self._execute_sql(
+                cursor,
+                "UPDATE skill_monitor_tasks SET last_error = '' WHERE last_error IS NULL"
+            )
+        except Exception as e:
+            logger.error(f"升级skill_monitor_tasks调度字段失败: {e}")
             raise
 
     def update_admin_user_id(self, cursor):
@@ -1520,6 +1611,9 @@ class DBManager:
         formatted_sql = ' '.join(sql.split())
         sensitive_sql_terms = (
             'auth_sessions',
+            'auth_challenges',
+            'registration_invites',
+            'auth_rate_events',
             'cookies',
             'password',
             'token',
@@ -1830,7 +1924,7 @@ class DBManager:
                     cursor,
                     "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, "
                     "show_browser, created_at, xianyu_unb, password_encrypted, "
-                    "cookie_refresh_enabled, cookie_refresh_interval_minutes "
+                    "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -1857,6 +1951,7 @@ class DBManager:
                             if result[13] is not None
                             else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
                         ),
+                        'browser_user_agent': result[14] or '',
                     }
                 return None
             except Exception as e:
@@ -1951,7 +2046,10 @@ class DBManager:
         verification_image_path: str = '',
         expires_at: float = None,
     ) -> bool:
-        allowed_states = {'idle', 'refreshing', 'verification_required', 'success', 'failed', 'timeout', 'cancelled'}
+        allowed_states = {
+            'idle', 'action_required', 'refreshing', 'verification_required',
+            'success', 'failed', 'timeout', 'cancelled',
+        }
         if state not in allowed_states:
             raise ValueError(f"不支持的刷新状态: {state}")
         now = time.time()
@@ -2081,7 +2179,16 @@ class DBManager:
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
-    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
+    def update_cookie_account_info(
+        self,
+        cookie_id: str,
+        cookie_value: str = None,
+        username: str = None,
+        password: str = None,
+        show_browser: bool = None,
+        user_id: int = None,
+        browser_user_agent: str = None,
+    ) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
         """
@@ -2133,6 +2240,11 @@ class DBManager:
                         insert_values.append(1 if show_browser else 0)
                         insert_placeholders.append('?')
 
+                    if browser_user_agent is not None:
+                        insert_fields.append('browser_user_agent')
+                        insert_values.append(str(browser_user_agent).strip())
+                        insert_placeholders.append('?')
+
                     sql = f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(insert_placeholders)})"
                     self._execute_sql(cursor, sql, tuple(insert_values))
                     self.conn.commit()
@@ -2170,6 +2282,10 @@ class DBManager:
                     if show_browser is not None:
                         update_fields.append("show_browser = ?")
                         params.append(1 if show_browser else 0)
+
+                    if browser_user_agent is not None:
+                        update_fields.append("browser_user_agent = ?")
+                        params.append(str(browser_user_agent).strip())
 
                     if not update_fields:
                         logger.warning(f"更新账号 {cookie_id} 信息时没有提供任何更新字段")
@@ -3692,6 +3808,76 @@ class DBManager:
                 logger.error(f"导出备份失败: {e}")
                 raise
 
+    @staticmethod
+    def _looks_like_fernet_ciphertext(value: str) -> bool:
+        if not value.startswith('fernet:'):
+            return False
+        token = value.rsplit(':', 1)[-1]
+        try:
+            decoded = base64.b64decode(
+                token.encode('ascii'),
+                altchars=b'-_',
+                validate=True,
+            )
+        except (binascii.Error, UnicodeError, ValueError):
+            return False
+        return len(decoded) >= 73 and decoded[0] == 0x80
+
+    def _normalize_imported_smtp_password(self, value: Any) -> tuple[str, bool]:
+        imported_value = str(value if value is not None else '')
+        if not imported_value:
+            return '', False
+
+        cipher = SystemSecretCipher(self.db_path)
+        if imported_value.startswith(SYSTEM_SECRET_PREFIX):
+            try:
+                cipher.decrypt(imported_value)
+            except ValueError:
+                if self._looks_like_fernet_ciphertext(imported_value):
+                    return '', True
+                return cipher.encrypt(imported_value), False
+            return imported_value, False
+        if self._looks_like_fernet_ciphertext(imported_value):
+            return '', True
+        return cipher.encrypt(imported_value), False
+
+    def _prepare_imported_system_settings(
+        self,
+        columns: List[str],
+        rows: List[List[Any]],
+    ) -> tuple[List[List[Any]], bool, bool]:
+        try:
+            key_index = columns.index('key')
+            value_index = columns.index('value')
+        except ValueError as exc:
+            raise ValueError("系统设置备份缺少必要字段") from exc
+
+        prepared_rows = []
+        smtp_settings_imported = False
+        smtp_reconfiguration_required = False
+        for row in rows:
+            prepared_row = list(row)
+            key = str(prepared_row[key_index])
+            if key.startswith('smtp_'):
+                smtp_settings_imported = True
+            if key == 'smtp_password':
+                normalized, requires_reconfiguration = (
+                    self._normalize_imported_smtp_password(
+                        prepared_row[value_index]
+                    )
+                )
+                prepared_row[value_index] = normalized
+                smtp_reconfiguration_required |= requires_reconfiguration
+            elif key in {'smtp_verified_fingerprint', 'smtp_verified_at'}:
+                prepared_row[value_index] = ''
+            prepared_rows.append(prepared_row)
+
+        return (
+            prepared_rows,
+            smtp_settings_imported,
+            smtp_reconfiguration_required,
+        )
+
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
         """导入系统备份数据（支持用户隔离）"""
         with self.lock:
@@ -3739,6 +3925,8 @@ class DBManager:
 
                 # 导入数据
                 data = backup_data['data']
+                smtp_settings_imported = False
+                smtp_reconfiguration_required = False
                 for table_name, table_data in data.items():
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
@@ -3752,6 +3940,15 @@ class DBManager:
 
                     if not rows:
                         continue
+
+                    if table_name == 'system_settings':
+                        (
+                            rows,
+                            imported_smtp_settings,
+                            imported_smtp_reconfiguration,
+                        ) = self._prepare_imported_system_settings(columns, rows)
+                        smtp_settings_imported |= imported_smtp_settings
+                        smtp_reconfiguration_required |= imported_smtp_reconfiguration
 
                     # 如果是用户级导入，需要确保cookies表的user_id正确
                     if user_id is not None and table_name == 'cookies':
@@ -3768,14 +3965,22 @@ class DBManager:
 
                     if table_name == 'system_settings':
                         # 系统设置需要特殊处理，避免覆盖管理员密码
+                        key_index = columns.index('key')
                         for row in rows:
-                            if len(row) >= 1 and row[0] != 'admin_password_hash':
+                            if row[key_index] != 'admin_password_hash':
                                 cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
                     else:
                         cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
 
+                if smtp_settings_imported:
+                    self._clear_smtp_verification(cursor)
+
                 # 提交事务
                 self.conn.commit()
+                if smtp_reconfiguration_required:
+                    logger.warning(
+                        "导入的 SMTP 密码无法由当前系统密钥解密，已清空，请重新配置"
+                    )
                 logger.info("导入备份成功")
                 return True
 
@@ -3785,6 +3990,90 @@ class DBManager:
                 return False
 
     # -------------------- 系统设置操作 --------------------
+    def _decode_system_setting(self, key: str, value: str) -> str:
+        if key == 'smtp_password':
+            return SystemSecretCipher(self.db_path).decrypt(str(value or ''))
+        return value
+
+    def _encode_system_setting(self, cursor, key: str, value: Any) -> Any:
+        if key != 'smtp_password':
+            return value
+
+        plaintext = str(value if value is not None else '')
+        if not plaintext:
+            return ''
+
+        cipher = SystemSecretCipher(self.db_path)
+        existing_row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = 'smtp_password'"
+        ).fetchone()
+        if existing_row:
+            existing_value = str(existing_row[0] or '')
+            if existing_value.startswith(SYSTEM_SECRET_PREFIX):
+                try:
+                    existing_plaintext = cipher.decrypt(existing_value)
+                except ValueError:
+                    pass
+                else:
+                    if existing_plaintext == plaintext:
+                        return existing_value
+        return cipher.encrypt(plaintext)
+
+    def _system_setting_value(self, cursor, key: str) -> str:
+        row = cursor.execute(
+            "SELECT value FROM system_settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(self._decode_system_setting(key, row[0]) or "")
+
+    def _smtp_configuration_changed(self, cursor, settings: Dict[str, Any]) -> bool:
+        for key in SMTP_CONFIGURATION_KEYS.intersection(settings):
+            current = canonical_smtp_setting_value(
+                key,
+                self._system_setting_value(cursor, key),
+            )
+            candidate = canonical_smtp_setting_value(key, settings[key])
+            if current != candidate:
+                return True
+        return False
+
+    def _write_system_settings(self, cursor, settings: Dict[str, Any]) -> None:
+        for key, value in settings.items():
+            if isinstance(value, bool):
+                stored_value = "true" if value else "false"
+            else:
+                stored_value = str(value if value is not None else "")
+            stored_value = self._encode_system_setting(cursor, key, stored_value)
+            cursor.execute(
+                """
+                INSERT INTO system_settings (key, value, description, updated_at)
+                VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, stored_value),
+            )
+
+    def _clear_smtp_verification(self, cursor) -> None:
+        self._write_system_settings(
+            cursor,
+            {
+                "smtp_verified_fingerprint": "",
+                "smtp_verified_at": "",
+                "registration_enabled": "false",
+            },
+        )
+        cursor.execute(
+            """
+            UPDATE auth_challenges
+            SET consumed_at = CAST(strftime('%s', 'now') AS REAL)
+            WHERE purpose = 'smtp_verify_email' AND consumed_at IS NULL
+            """
+        )
+
     def get_system_setting(self, key: str) -> Optional[str]:
         """获取系统设置"""
         with self.lock:
@@ -3792,7 +4081,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT value FROM system_settings WHERE key = ?", (key,))
                 result = cursor.fetchone()
-                return result[0] if result else None
+                return self._decode_system_setting(key, result[0]) if result else None
             except Exception as e:
                 logger.error(f"获取系统设置失败: {e}")
                 return None
@@ -3802,10 +4091,24 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                INSERT OR REPLACE INTO system_settings (key, value, description, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (key, value, description))
+                smtp_changed = self._smtp_configuration_changed(
+                    cursor,
+                    {key: value},
+                )
+                stored_value = self._encode_system_setting(cursor, key, value)
+                cursor.execute(
+                    """
+                    INSERT INTO system_settings (key, value, description, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        description = COALESCE(excluded.description, system_settings.description),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, stored_value, description),
+                )
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 logger.debug(f"设置系统设置: {key}")
                 return True
@@ -3820,22 +4123,78 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute("BEGIN")
-                for key, value in settings.items():
-                    if isinstance(value, bool):
-                        stored_value = "true" if value else "false"
-                    else:
-                        stored_value = str(value if value is not None else "")
-                    cursor.execute('''
-                        INSERT INTO system_settings (key, value, description, updated_at)
-                        VALUES (?, ?, NULL, CURRENT_TIMESTAMP)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = excluded.value,
-                            updated_at = CURRENT_TIMESTAMP
-                    ''', (key, stored_value))
+                smtp_changed = self._smtp_configuration_changed(cursor, settings)
+                self._write_system_settings(cursor, settings)
+                if smtp_changed:
+                    self._clear_smtp_verification(cursor)
                 self.conn.commit()
                 return True
             except Exception as e:
                 logger.error(f"分区保存系统设置失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def save_unverified_smtp_settings(self, settings: Dict[str, Any]) -> bool:
+        """Persist an SMTP candidate and force a fresh email confirmation."""
+        allowed = {
+            key: value
+            for key, value in settings.items()
+            if key in SMTP_CONFIGURATION_KEYS
+        }
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                self._write_system_settings(cursor, allowed)
+                self._clear_smtp_verification(cursor)
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存待验证 SMTP 配置失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def save_verified_smtp_settings(
+        self,
+        settings: Dict[str, Any],
+        *,
+        fingerprint: str,
+        verified_at: str,
+        expected_settings: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Atomically save SMTP settings and mark that exact configuration verified."""
+        if not str(fingerprint or "") or not str(verified_at or ""):
+            return False
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN")
+                if expected_settings is not None:
+                    expected = {
+                        key: value
+                        for key, value in expected_settings.items()
+                        if key in SMTP_CONFIGURATION_KEYS
+                    }
+                    if self._smtp_configuration_changed(cursor, expected):
+                        self.conn.rollback()
+                        return False
+                allowed = {
+                    key: value
+                    for key, value in settings.items()
+                    if key in SMTP_CONFIGURATION_KEYS
+                }
+                self._write_system_settings(cursor, allowed)
+                self._write_system_settings(
+                    cursor,
+                    {
+                        "smtp_verified_fingerprint": fingerprint,
+                        "smtp_verified_at": verified_at,
+                    },
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存 SMTP 验证状态失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 
@@ -3848,7 +4207,7 @@ class DBManager:
 
                 settings = {}
                 for row in cursor.fetchall():
-                    settings[row[0]] = row[1]
+                    settings[row[0]] = self._decode_system_setting(row[0], row[1])
 
                 return settings
             except Exception as e:
@@ -3869,7 +4228,7 @@ class DBManager:
                 )
 
                 self.conn.commit()
-                logger.info(f"创建用户成功: {username} ({email})")
+                logger.info(f"创建用户成功: {username}")
                 return True
             except sqlite3.IntegrityError as e:
                 logger.error(f"创建用户失败，用户名或邮箱已存在: {e}")
@@ -3897,6 +4256,15 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
+
+    def get_user_by_email_for_public_auth(
+        self,
+        email: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up normalized email using only the migration-backed index."""
+
+        with self.lock:
+            return self.user_repository.get_by_email_indexed(email)
 
     def verify_user_password(self, username: str, password: str) -> bool:
         """验证用户密码"""
@@ -4040,7 +4408,7 @@ class DBManager:
                     logger.debug(f"图形验证码验证成功: {session_id}")
                     return True
                 else:
-                    logger.warning(f"图形验证码验证失败: {session_id} - {user_input}")
+                    logger.warning(f"兼容图形验证码验证失败: {session_id}")
                     return False
             except Exception as e:
                 logger.error(f"验证图形验证码失败: {e}")
@@ -4059,7 +4427,10 @@ class DBManager:
                 ''', (email, code, code_type, expires_at))
 
                 self.conn.commit()
-                logger.info(f"保存验证码成功: {email} ({code_type})")
+                logger.info(
+                    f"保存兼容验证码成功: {mask_email_for_log(email)} "
+                    f"({code_type})"
+                )
                 return True
             except Exception as e:
                 logger.error(f"保存验证码失败: {e}")
@@ -4087,140 +4458,48 @@ class DBManager:
                     UPDATE email_verifications SET used = TRUE WHERE id = ?
                     ''', (row[0],))
                     self.conn.commit()
-                    logger.info(f"验证码验证成功: {email} ({code_type})")
+                    logger.info(
+                        f"兼容验证码验证成功: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return True
                 else:
-                    logger.warning(f"验证码验证失败: {email} - {code} ({code_type})")
+                    logger.warning(
+                        f"兼容验证码验证失败: {mask_email_for_log(email)} "
+                        f"({code_type})"
+                    )
                     return False
             except Exception as e:
                 logger.error(f"验证邮箱验证码失败: {e}")
                 return False
 
     async def send_verification_email(self, email: str, code: str) -> bool:
-        """发送验证码邮件（支持SMTP和API两种方式）"""
+        """Compatibility wrapper that sends only through verified SMTP."""
         try:
-            subject = "闲鱼自动回复系统 - 邮箱验证码"
-            # 使用简单的纯文本邮件内容
-            text_content = f"""【闲鱼自动回复系统】邮箱验证码
-
-您好！
-
-感谢您使用闲鱼自动回复系统。为了确保账户安全，请使用以下验证码完成邮箱验证：
-
-验证码：{code}
-
-重要提醒：
-• 验证码有效期为 10 分钟，请及时使用
-• 请勿将验证码分享给任何人
-• 如非本人操作，请忽略此邮件
-• 系统不会主动索要您的验证码
-
-如果您在使用过程中遇到任何问题，请联系我们的技术支持团队。
-感谢您选择闲鱼自动回复系统！
-
----
-此邮件由系统自动发送，请勿直接回复
-© 2025 闲鱼自动回复系统"""
-
-            # 从系统设置读取SMTP配置
-            try:
-                smtp_server = self.get_system_setting('smtp_server') or ''
-                smtp_port = int(self.get_system_setting('smtp_port') or 0)
-                smtp_user = self.get_system_setting('smtp_user') or ''
-                smtp_password = self.get_system_setting('smtp_password') or ''
-                smtp_from = (self.get_system_setting('smtp_from') or '').strip() or smtp_user
-                smtp_use_tls = (self.get_system_setting('smtp_use_tls') or 'true').lower() == 'true'
-                smtp_use_ssl = (self.get_system_setting('smtp_use_ssl') or 'false').lower() == 'true'
-            except Exception as e:
-                logger.error(f"读取SMTP系统设置失败: {e}")
-                # 如果读取配置失败，使用API方式
-                return await self._send_email_via_api(email, subject, text_content)
-
-            # 检查SMTP配置是否完整
-            if smtp_server and smtp_port and smtp_user and smtp_password:
-                # 配置完整，使用SMTP方式发送
-                logger.info(f"使用SMTP方式发送验证码邮件: {email}")
-                return await self._send_email_via_smtp(email, subject, text_content,
-                                                     smtp_server, smtp_port, smtp_user,
-                                                     smtp_password, smtp_from, smtp_use_tls, smtp_use_ssl)
-            else:
-                # 配置不完整，使用API方式发送
-                logger.info(f"SMTP配置不完整，使用API方式发送验证码邮件: {email}")
-                return await self._send_email_via_api(email, subject, text_content)
-
-        except Exception as e:
-            logger.error(f"发送验证码邮件异常: {e}")
-            return False
-
-    async def _send_email_via_smtp(self, email: str, subject: str, text_content: str,
-                                 smtp_server: str, smtp_port: int, smtp_user: str,
-                                 smtp_password: str, smtp_from: str, smtp_use_tls: bool, smtp_use_ssl: bool) -> bool:
-        """使用SMTP方式发送邮件"""
-        try:
-            import smtplib
-            from email.mime.text import MIMEText
-            from email.mime.multipart import MIMEMultipart
-
-            msg = MIMEMultipart()
-            msg['Subject'] = subject
-            msg['From'] = smtp_from
-            msg['To'] = email
-
-            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
-
-            if smtp_use_ssl:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port)
-
-            server.ehlo()
-            if smtp_use_tls and not smtp_use_ssl:
-                server.starttls()
-                server.ehlo()
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, [email], msg.as_string())
-            server.quit()
-
-            logger.info(f"验证码邮件发送成功(SMTP): {email}")
+            settings = self.get_all_system_settings()
+            status = smtp_configuration_status(settings, db_path=self.db_path)
+            if not status['smtp_verified']:
+                logger.warning("SMTP 未验证，拒绝发送兼容验证码邮件")
+                return False
+            await asyncio.to_thread(
+                SMTPEmailSender().send,
+                settings,
+                recipient=email,
+                subject="闲鱼监控台邮箱验证码",
+                text=(
+                    f"您的验证码是 {code}\n\n"
+                    "验证码在 10 分钟内有效，请勿向任何人泄露。"
+                ),
+            )
+            logger.info(
+                f"兼容验证码邮件已提交 email={mask_email_for_log(email)}"
+            )
             return True
+        except (SMTPConfigurationError, SMTPDeliveryError) as e:
+            logger.warning(f"兼容验证码邮件发送失败 type={type(e).__name__}")
+            return False
         except Exception as e:
-            logger.error(f"SMTP发送验证码邮件失败: {e}")
-            # SMTP发送失败，尝试使用API方式
-            logger.info(f"SMTP发送失败，尝试使用API方式发送: {email}")
-            return await self._send_email_via_api(email, subject, text_content)
-
-    async def _send_email_via_api(self, email: str, subject: str, text_content: str) -> bool:
-        """使用API方式发送邮件"""
-        try:
-            import aiohttp
-
-            # 使用GET请求发送邮件
-            api_url = "https://dy.zhinianboke.com/api/emailSend"
-            params = {
-                'subject': subject,
-                'receiveUser': email,
-                'sendHtml': text_content
-            }
-
-            async with aiohttp.ClientSession() as session:
-                try:
-                    logger.info(f"使用API发送验证码邮件: {email}")
-                    async with session.get(api_url, params=params, timeout=15) as response:
-                        response_text = await response.text()
-                        logger.info(f"邮件API响应: {response.status}")
-
-                        if response.status == 200:
-                            logger.info(f"验证码邮件发送成功(API): {email}")
-                            return True
-                        else:
-                            logger.error(f"API发送验证码邮件失败: {email}, 状态码: {response.status}, 响应: {response_text[:200]}")
-                            return False
-                except Exception as e:
-                    logger.error(f"API邮件发送异常: {email}, 错误: {e}")
-                    return False
-        except Exception as e:
-            logger.error(f"API邮件发送方法异常: {e}")
+            logger.error(f"兼容验证码邮件异常 type={type(e).__name__}")
             return False
 
     # ==================== 卡券管理方法 ====================
@@ -5184,7 +5463,12 @@ class DBManager:
                             item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
                         except:
                             item_info['item_detail_parsed'] = {}
-                    logger.info(f"item_info: {item_info}")
+                    logger.debug(
+                        "已读取商品信息摘要: item_id={}, has_detail={}, parsed_detail={}",
+                        item_id,
+                        bool(item_info.get('item_detail')),
+                        bool(item_info.get('item_detail_parsed')),
+                    )
                     return item_info
                 return None
 
@@ -5659,30 +5943,117 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def set_user_settings(self, user_id: int, settings: Dict[str, Any]) -> bool:
+        """Atomically replace a bounded set of user-owned settings."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                for key, value in settings.items():
+                    stored = (
+                        "true" if value is True else "false" if value is False else str(value)
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO user_settings (user_id, key, value, description, updated_at)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id, key) DO UPDATE SET
+                            value = excluded.value,
+                            description = excluded.description,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (user_id, key, stored, "Personal item synchronization setting"),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error(f"批量保存用户设置失败: {exc}")
+                self.conn.rollback()
+                return False
+
+    def get_dashboard_stats(self, user_id: Optional[int] = None) -> Dict[str, int]:
+        """Return business counters scoped to one owner or the whole system."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cookie_filter = "" if user_id is None else "WHERE c.user_id = ?"
+            params: Tuple[Any, ...] = () if user_id is None else (user_id,)
+            cookie_row = cursor.execute(
+                f"""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN COALESCE(cs.enabled, 1) = 1 THEN 1 ELSE 0 END)
+                FROM cookies AS c
+                LEFT JOIN cookie_status AS cs ON cs.cookie_id = c.id
+                {cookie_filter}
+                """,
+                params,
+            ).fetchone()
+            cards = cursor.execute(
+                "SELECT COUNT(*) FROM cards" + ("" if user_id is None else " WHERE user_id = ?"),
+                params,
+            ).fetchone()[0]
+            keywords = cursor.execute(
+                """
+                SELECT COUNT(*) FROM keywords AS k
+                JOIN cookies AS c ON c.id = k.cookie_id
+                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                params,
+            ).fetchone()[0]
+            orders = cursor.execute(
+                """
+                SELECT COUNT(*) FROM orders AS o
+                JOIN cookies AS c ON c.id = o.cookie_id
+                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                params,
+            ).fetchone()[0]
+            users = 1 if user_id is not None else cursor.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+            return {
+                "total_users": int(users or 0),
+                "total_cookies": int((cookie_row or (0, 0))[0] or 0),
+                "active_cookies": int((cookie_row or (0, 0))[1] or 0),
+                "total_cards": int(cards or 0),
+                "total_keywords": int(keywords or 0),
+                "total_orders": int(orders or 0),
+            }
+
+    def get_dashboard_item_names(
+        self,
+        user_id: Optional[int],
+        item_ids: List[str],
+    ) -> Dict[str, str]:
+        bounded_item_ids = list(dict.fromkeys(str(item_id) for item_id in item_ids if item_id))[:20]
+        if not bounded_item_ids:
+            return {}
+        with self.lock:
+            placeholders = ",".join("?" for _ in bounded_item_ids)
+            conditions = [f"i.item_id IN ({placeholders})"]
+            params: List[Any] = list(bounded_item_ids)
+            if user_id is not None:
+                conditions.append("c.user_id = ?")
+                params.append(user_id)
+            rows = self.conn.execute(
+                f"""
+                SELECT i.item_id, MAX(COALESCE(NULLIF(i.item_title, ''), i.item_id))
+                FROM item_info AS i
+                JOIN cookies AS c ON c.id = i.cookie_id
+                WHERE {' AND '.join(conditions)}
+                GROUP BY i.item_id
+                """,
+                params,
+            ).fetchall()
+            return {str(item_id): str(title or item_id) for item_id, title in rows}
+
     # ==================== 管理员专用方法 ====================
 
     def get_all_users(self):
         """获取所有用户信息（管理员专用）"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                ORDER BY created_at DESC
-                ''')
-
-                users = []
-                for row in cursor.fetchall():
-                    users.append({
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    })
-
-                return users
+                return [
+                    public_user_view(user)
+                    for user in self.user_repository.list_recent(limit=200)
+                ]
             except Exception as e:
                 logger.error(f"获取所有用户失败: {e}")
                 return []
@@ -5691,23 +6062,8 @@ class DBManager:
         """根据ID获取用户信息"""
         with self.lock:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
-                FROM users
-                WHERE id = ?
-                ''', (user_id,))
-
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],
-                        'username': row[1],
-                        'email': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
-                    }
-                return None
+                user = self.user_repository.get_by_id(user_id)
+                return public_user_view(user) if user else None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
@@ -6854,42 +7210,49 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 构建WHERE条件
+                # Use timestamp boundaries so SQLite can use the analysis indexes.
                 where_conditions = []
                 params = []
+                from_clause = "orders AS o"
 
                 if start_date:
-                    where_conditions.append("DATE(created_at) >= ?")
-                    params.append(start_date)
+                    start = datetime.strptime(start_date, "%Y-%m-%d")
+                    where_conditions.append("o.created_at >= ?")
+                    params.append(start.strftime("%Y-%m-%d 00:00:00"))
 
                 if end_date:
-                    where_conditions.append("DATE(created_at) <= ?")
-                    params.append(end_date)
+                    end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                    where_conditions.append("o.created_at < ?")
+                    params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                # 关联cookies表以过滤user_id
                 if user_id is not None:
-                    where_conditions.append("EXISTS (SELECT 1 FROM cookies WHERE cookies.id = orders.cookie_id AND cookies.user_id = ?)")
+                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
+                    where_conditions.append("c.user_id = ?")
                     params.append(user_id)
 
                 # 只包含指定状态（小写形式）
                 if include_statuses:
                     placeholders = ','.join(['?' for _ in include_statuses])
-                    where_conditions.append(f"order_status IN ({placeholders})")
+                    where_conditions.append(f"o.order_status IN ({placeholders})")
                     params.extend(include_statuses)
 
-                where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+                where_conditions.extend([
+                    "o.amount IS NOT NULL",
+                    "o.amount != ''",
+                    "o.amount != 'N/A'",
+                ])
+                where_clause = f"WHERE {' AND '.join(where_conditions)}"
 
                 # 1. 总收益统计（估值，实际会扣税等）
                 cursor.execute(f"""
                     SELECT
-                        COUNT(DISTINCT order_id) as total_orders,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
-                        COUNT(DISTINCT buyer_id) as unique_buyers,
-                        COUNT(DISTINCT item_id) as unique_items
-                    FROM orders
+                        COUNT(DISTINCT o.order_id) as total_orders,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
+                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
+                        COUNT(DISTINCT o.buyer_id) as unique_buyers,
+                        COUNT(DISTINCT o.item_id) as unique_items
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
                 """, params)
 
                 row = cursor.fetchone()
@@ -6904,13 +7267,12 @@ class DBManager:
                 # 2. 按日期统计订单量和收益
                 cursor.execute(f"""
                     SELECT
-                        DATE(created_at) as date,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as daily_amount
-                    FROM orders
+                        DATE(o.created_at) as date,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as daily_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY DATE(created_at)
+                    GROUP BY DATE(o.created_at)
                     ORDER BY date DESC
                     LIMIT 30
                 """, params)
@@ -6926,13 +7288,12 @@ class DBManager:
                 # 3. 按状态统计订单
                 cursor.execute(f"""
                     SELECT
-                        order_status,
-                        COUNT(DISTINCT order_id) as count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as amount
-                    FROM orders
+                        o.order_status,
+                        COUNT(DISTINCT o.order_id) as count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY order_status
+                    GROUP BY o.order_status
                     ORDER BY count DESC
                 """, params)
 
@@ -6947,14 +7308,13 @@ class DBManager:
                 # 4. 按城市统计地区分布（如果有收货城市数据）
                 cursor.execute(f"""
                     SELECT
-                        receiver_city,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount
-                    FROM orders
+                        o.receiver_city,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND receiver_city IS NOT NULL AND receiver_city != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY receiver_city
+                    AND o.receiver_city IS NOT NULL AND o.receiver_city != ''
+                    GROUP BY o.receiver_city
                     ORDER BY order_count DESC
                     LIMIT 50
                 """, params)
@@ -6970,15 +7330,14 @@ class DBManager:
                 # 5. 商品排行（按订单量）
                 cursor.execute(f"""
                     SELECT
-                        item_id,
-                        COUNT(DISTINCT order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(amount, '¥', ''), ',', '') AS REAL)) as avg_amount
-                    FROM orders
+                        o.item_id,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
+                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount
+                    FROM {from_clause}
                     {where_clause}
-                    AND item_id IS NOT NULL AND item_id != ''
-                    AND amount IS NOT NULL AND amount != '' AND amount != 'N/A'
-                    GROUP BY item_id
+                    AND o.item_id IS NOT NULL AND o.item_id != ''
+                    GROUP BY o.item_id
                     ORDER BY order_count DESC
                     LIMIT 20
                 """, params)
@@ -7066,46 +7425,48 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 构建WHERE条件
                 where_conditions = []
                 params = []
+                from_clause = "orders AS o"
 
                 if start_date:
-                    where_conditions.append("DATE(created_at) >= ?")
-                    params.append(start_date)
+                    start = datetime.strptime(start_date, "%Y-%m-%d")
+                    where_conditions.append("o.created_at >= ?")
+                    params.append(start.strftime("%Y-%m-%d 00:00:00"))
 
                 if end_date:
-                    where_conditions.append("DATE(created_at) <= ?")
-                    params.append(end_date)
+                    end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+                    where_conditions.append("o.created_at < ?")
+                    params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                # 关联cookies表以过滤user_id
                 if user_id is not None:
-                    where_conditions.append("EXISTS (SELECT 1 FROM cookies WHERE cookies.id = orders.cookie_id AND cookies.user_id = ?)")
+                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
+                    where_conditions.append("c.user_id = ?")
                     params.append(user_id)
 
                 # 只包含指定状态
                 if include_statuses:
                     placeholders = ','.join(['?' for _ in include_statuses])
-                    where_conditions.append(f"order_status IN ({placeholders})")
+                    where_conditions.append(f"o.order_status IN ({placeholders})")
                     params.extend(include_statuses)
 
                 where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
 
                 cursor.execute(f"""
                     SELECT
-                        order_id,
-                        item_id,
-                        buyer_id,
-                        amount,
-                        order_status,
-                        spec_name,
-                        spec_value,
-                        quantity,
-                        created_at,
-                        receiver_city
-                    FROM orders
+                        o.order_id,
+                        o.item_id,
+                        o.buyer_id,
+                        o.amount,
+                        o.order_status,
+                        o.spec_name,
+                        o.spec_value,
+                        o.quantity,
+                        o.created_at,
+                        o.receiver_city
+                    FROM {from_clause}
                     {where_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY o.created_at DESC
                     LIMIT 1000
                 """, params)
 
@@ -7146,9 +7507,14 @@ class DBManager:
             'notify_enabled': bool(row[9]),
             'account_id': row[10],
             'enabled': bool(row[11]),
-            'last_run_at': row[12],
-            'created_at': row[13],
-            'updated_at': row[14],
+            'schedule_enabled': bool(row[12]),
+            'schedule_interval_minutes': row[13] if row[13] is not None else 60,
+            'next_run_at': row[14],
+            'last_status': row[15] or 'idle',
+            'last_error': row[16] or '',
+            'last_run_at': row[17],
+            'created_at': row[18],
+            'updated_at': row[19],
         }
 
     def _skill_monitor_result_from_row(self, row) -> Dict[str, Any]:
@@ -7181,7 +7547,8 @@ class DBManager:
                 cursor.execute('''
                     SELECT id, user_id, name, keyword, min_price, max_price, region,
                            published_within_hours, ai_filter, notify_enabled, account_id,
-                           enabled, last_run_at, created_at, updated_at
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
                     FROM skill_monitor_tasks
                     WHERE user_id = ?
                     ORDER BY updated_at DESC, id DESC
@@ -7198,7 +7565,8 @@ class DBManager:
                 cursor.execute('''
                     SELECT id, user_id, name, keyword, min_price, max_price, region,
                            published_within_hours, ai_filter, notify_enabled, account_id,
-                           enabled, last_run_at, created_at, updated_at
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
                     FROM skill_monitor_tasks
                     WHERE id = ? AND user_id = ?
                 ''', (task_id, user_id))
@@ -7215,8 +7583,9 @@ class DBManager:
                 cursor.execute('''
                     INSERT INTO skill_monitor_tasks (
                         user_id, name, keyword, min_price, max_price, region,
-                        published_within_hours, ai_filter, notify_enabled, account_id, enabled
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        published_within_hours, ai_filter, notify_enabled, account_id, enabled,
+                        schedule_enabled, schedule_interval_minutes, next_run_at, last_status, last_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id,
                     task_data.get('name') or task_data.get('keyword') or '监控任务',
@@ -7229,6 +7598,11 @@ class DBManager:
                     1 if task_data.get('notify_enabled') else 0,
                     task_data.get('account_id', ''),
                     1 if task_data.get('enabled', True) else 0,
+                    1 if task_data.get('schedule_enabled') else 0,
+                    max(15, int(task_data.get('schedule_interval_minutes') or 60)),
+                    task_data.get('next_run_at'),
+                    task_data.get('last_status') or 'idle',
+                    task_data.get('last_error') or '',
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
@@ -7237,15 +7611,126 @@ class DBManager:
                 self.conn.rollback()
                 return None
 
-    def update_skill_monitor_task_run(self, task_id: int, user_id: int) -> bool:
+    def update_skill_monitor_task(self, task_id: int, user_id: int, task_data: Dict[str, Any]) -> bool:
+        allowed = {
+            'name',
+            'keyword',
+            'min_price',
+            'max_price',
+            'region',
+            'published_within_hours',
+            'ai_filter',
+            'notify_enabled',
+            'account_id',
+            'enabled',
+            'schedule_enabled',
+            'schedule_interval_minutes',
+            'next_run_at',
+        }
+        updates = []
+        params = []
+        for key in allowed:
+            if key not in task_data:
+                continue
+            value = task_data[key]
+            if key in {'notify_enabled', 'enabled', 'schedule_enabled'}:
+                value = 1 if value else 0
+            if key == 'schedule_interval_minutes':
+                value = max(15, int(value or 60))
+            updates.append(f"{key} = ?")
+            params.append(value)
+
+        if not updates:
+            return True
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.extend([task_id, user_id])
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    f"UPDATE skill_monitor_tasks SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+                    params,
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新技能监控任务失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def list_due_skill_monitor_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT id, user_id, name, keyword, min_price, max_price, region,
+                           published_within_hours, ai_filter, notify_enabled, account_id,
+                           enabled, schedule_enabled, schedule_interval_minutes, next_run_at,
+                           last_status, last_error, last_run_at, created_at, updated_at
+                    FROM skill_monitor_tasks
+                    WHERE enabled = 1
+                      AND schedule_enabled = 1
+                      AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
+                      AND COALESCE(last_status, 'idle') != 'running'
+                    ORDER BY COALESCE(next_run_at, created_at) ASC, id ASC
+                    LIMIT ?
+                ''', (limit,))
+                return [self._skill_monitor_task_from_row(row) for row in cursor.fetchall()]
+            except Exception as e:
+                logger.error(f"获取到期技能监控任务失败: {e}")
+                return []
+
+    def mark_skill_monitor_task_running(self, task_id: int, user_id: int) -> bool:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     UPDATE skill_monitor_tasks
-                    SET last_run_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND user_id = ?
+                    SET last_status = 'running', last_error = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ? AND COALESCE(last_status, 'idle') != 'running'
                 ''', (task_id, user_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"标记技能监控任务运行中失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def reset_running_skill_monitor_tasks(self) -> int:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'failed',
+                        last_error = '服务重启时中断',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE last_status = 'running'
+                ''')
+                self.conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                logger.error(f"重置运行中技能监控任务失败: {e}")
+                self.conn.rollback()
+                return 0
+
+    def update_skill_monitor_task_run(self, task_id: int, user_id: int, *,
+                                      status: str = 'success',
+                                      error: str = '',
+                                      next_run_at: str = None) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_run_at = CURRENT_TIMESTAMP,
+                        last_status = ?,
+                        last_error = ?,
+                        next_run_at = COALESCE(?, next_run_at),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (status, error or '', next_run_at, task_id, user_id))
                 self.conn.commit()
                 return cursor.rowcount > 0
             except Exception as e:
@@ -7282,6 +7767,77 @@ class DBManager:
                 logger.error(f"创建技能监控结果失败: {e}")
                 self.conn.rollback()
                 return None
+
+    def skill_monitor_result_exists(self, task_id: int, user_id: int,
+                                    item_url: str = '', item_id: str = '') -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if item_url:
+                    cursor.execute('''
+                        SELECT 1 FROM skill_monitor_results
+                        WHERE task_id = ? AND user_id = ? AND item_url = ?
+                        LIMIT 1
+                    ''', (task_id, user_id, item_url))
+                    if cursor.fetchone():
+                        return True
+
+                if not item_id:
+                    return False
+                cursor.execute('''
+                    SELECT raw_data FROM skill_monitor_results
+                    WHERE task_id = ? AND user_id = ?
+                ''', (task_id, user_id))
+                for row in cursor.fetchall():
+                    try:
+                        raw_data = json.loads(row[0] or '{}')
+                    except Exception:
+                        continue
+                    if str(raw_data.get('item_id') or '') == str(item_id):
+                        return True
+                return False
+            except Exception as e:
+                logger.error(f"检查技能监控结果重复失败: {e}")
+                return False
+
+    def update_skill_monitor_result_notification(self, result_id: int, user_id: int,
+                                                 notify_status: str,
+                                                 notify_error: str = '') -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT raw_data FROM skill_monitor_results
+                    WHERE id = ? AND user_id = ?
+                ''', (result_id, user_id))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                try:
+                    raw_data = json.loads(row[0] or '{}')
+                except Exception:
+                    raw_data = {}
+                if notify_error:
+                    raw_data['notify_error'] = notify_error
+                elif 'notify_error' in raw_data:
+                    raw_data.pop('notify_error', None)
+
+                cursor.execute('''
+                    UPDATE skill_monitor_results
+                    SET notify_status = ?, raw_data = ?
+                    WHERE id = ? AND user_id = ?
+                ''', (
+                    notify_status,
+                    json.dumps(raw_data, ensure_ascii=False),
+                    result_id,
+                    user_id,
+                ))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新技能监控结果通知状态失败: {e}")
+                self.conn.rollback()
+                return False
 
     def list_skill_monitor_results(self, user_id: int, task_id: int = None, limit: int = 100) -> List[Dict[str, Any]]:
         with self.lock:

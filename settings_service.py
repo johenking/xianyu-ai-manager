@@ -1,6 +1,13 @@
 from typing import Any, Dict
 
 
+USER_BASIC_SETTING_KEYS = (
+    "item_sync_enabled",
+    "item_sync_interval",
+    "item_sync_max_pages",
+)
+
+
 BOOLEAN_SETTING_KEYS = {
     "registration_enabled",
     "show_default_login_info",
@@ -39,7 +46,14 @@ SETTINGS_SECTION_KEYS = {
         "smtp_from",
         "smtp_use_tls",
         "smtp_use_ssl",
+        "support_email",
     },
+}
+
+INTERNAL_SETTING_KEYS = {
+    "admin_password_hash",
+    "smtp_verified_fingerprint",
+    "auth_trusted_proxies",
 }
 
 
@@ -73,13 +87,47 @@ def normalize_system_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = _as_bool(value)
         elif key in INTEGER_SETTING_KEYS:
             result[key] = _as_int(value)
-        elif key != "admin_password_hash":
+        elif key not in INTERNAL_SETTING_KEYS:
             result[key] = value
 
     for key in SECRET_SETTING_KEYS:
         result.setdefault(f"{key}_configured", False)
         result.setdefault(f"{key}_masked", "")
     return result
+
+
+def resolve_user_basic_settings(
+    global_settings: Dict[str, Any],
+    user_settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Resolve personal item-sync settings with global values as defaults."""
+    values: Dict[str, Any] = {}
+    sources: Dict[str, str] = {}
+    defaults = {
+        "item_sync_enabled": True,
+        "item_sync_interval": 600,
+        "item_sync_max_pages": 5,
+    }
+    for key in USER_BASIC_SETTING_KEYS:
+        user_entry = (user_settings or {}).get(key)
+        if isinstance(user_entry, dict):
+            user_value = user_entry.get("value")
+        else:
+            user_value = user_entry
+        has_user_value = user_entry is not None
+        global_value = (global_settings or {}).get(key)
+        if global_value is None:
+            global_value = defaults[key]
+        raw_value = user_value if has_user_value else global_value
+        values[key] = _as_bool(raw_value) if key == "item_sync_enabled" else _as_int(
+            raw_value, defaults[key]
+        )
+        sources[key] = "user" if has_user_value else "global"
+    return {
+        "settings": values,
+        "sources": sources,
+        "inherited": all(source == "global" for source in sources.values()),
+    }
 
 
 def apply_secret_action(existing: str, action: str, value: str) -> str:
@@ -97,7 +145,8 @@ def apply_secret_action(existing: str, action: str, value: str) -> str:
 
 
 def validate_skill_monitor_features(*, notify_enabled: bool, ai_filter: str) -> None:
-    if notify_enabled:
-        raise ValueError("通知发送暂不可用，请关闭通知后重试")
-    if str(ai_filter or "").strip():
-        raise ValueError("AI筛选暂不可用，请清空AI筛选条件后重试")
+    # AI筛选和通知已经由技能中心运行时根据真实配置处理：
+    # - AI不可用时任务运行会返回明确错误/跳过原因；
+    # - 通知无渠道时任务运行会标记 skipped_no_channel。
+    # 保留该函数作为旧调用点的兼容验证入口。
+    return None

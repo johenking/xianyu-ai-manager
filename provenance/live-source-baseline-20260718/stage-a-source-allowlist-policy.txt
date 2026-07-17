@@ -1,0 +1,6 @@
+ROOT_REQUIRED: AGENTS.md LICENSE* NOTICE* README* SECURITY* CHANGELOG* DEPLOYMENT* CONTRIBUTING*
+ROOT_CONFIG: .dockerignore .env.example .gitattributes .gitignore .gitleaks.toml Dockerfile* docker-compose*.yml|yaml entrypoint.sh fly.toml render.yaml pyproject.toml requirements*.{in,txt,lock}
+ROOT_SOURCE: *.py *.html *.sh
+SOURCE_DIRS: .github/ docs/ frontend/ nginx/ repositories/ services/ tests/ utils/
+EXCLUDE: .env* except .env.example; global_config.yml; data/; logs/; browser_data/; backups/; .venv/; node_modules/; dist/; build/; coverage/; static/; PID; database; keys
+SYMLINK: preserve link only; reject broken or canonical target outside repository

@@ -49,11 +49,64 @@ class SettingsServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不能为空"):
             apply_secret_action("existing", "set", "")
 
-    def test_unsupported_monitor_features_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "通知发送暂不可用"):
-            validate_skill_monitor_features(notify_enabled=True, ai_filter="")
-        with self.assertRaisesRegex(ValueError, "AI筛选暂不可用"):
-            validate_skill_monitor_features(notify_enabled=False, ai_filter="低风险卖家")
+    def test_monitor_features_are_runtime_validated(self):
+        self.assertIsNone(validate_skill_monitor_features(notify_enabled=True, ai_filter="低风险卖家"))
+
+    def test_skill_monitor_task_scheduler_fields_round_trip(self):
+        task_id = self.db.create_skill_monitor_task(1, {
+            "name": "测试任务",
+            "keyword": "iPhone",
+            "notify_enabled": True,
+            "ai_filter": "只保留低价商品",
+            "schedule_enabled": True,
+            "schedule_interval_minutes": 5,
+            "next_run_at": "2000-01-01 00:00:00",
+        })
+
+        task = self.db.get_skill_monitor_task(task_id, 1)
+        self.assertTrue(task["notify_enabled"])
+        self.assertEqual(task["ai_filter"], "只保留低价商品")
+        self.assertTrue(task["schedule_enabled"])
+        self.assertEqual(task["schedule_interval_minutes"], 15)
+        self.assertEqual(task["last_status"], "idle")
+
+        due = self.db.list_due_skill_monitor_tasks()
+        self.assertEqual([item["id"] for item in due], [task_id])
+
+        self.assertTrue(self.db.mark_skill_monitor_task_running(task_id, 1))
+        self.assertFalse(self.db.mark_skill_monitor_task_running(task_id, 1))
+        self.assertEqual(self.db.reset_running_skill_monitor_tasks(), 1)
+
+        self.assertTrue(self.db.update_skill_monitor_task(task_id, 1, {
+            "schedule_interval_minutes": 30,
+            "schedule_enabled": False,
+        }))
+        task = self.db.get_skill_monitor_task(task_id, 1)
+        self.assertFalse(task["schedule_enabled"])
+        self.assertEqual(task["schedule_interval_minutes"], 30)
+
+    def test_skill_monitor_result_deduplicates_by_url_then_item_id(self):
+        task_id = self.db.create_skill_monitor_task(1, {
+            "name": "测试任务",
+            "keyword": "iPhone",
+        })
+        self.db.create_skill_monitor_result({
+            "task_id": task_id,
+            "user_id": 1,
+            "title": "iPhone 15",
+            "item_url": "https://example.test/item-1",
+            "raw_data": {"item_id": "item-1"},
+        })
+
+        self.assertTrue(self.db.skill_monitor_result_exists(
+            task_id, 1, "https://example.test/item-1", "different-item"
+        ))
+        self.assertTrue(self.db.skill_monitor_result_exists(
+            task_id, 1, "", "item-1"
+        ))
+        self.assertFalse(self.db.skill_monitor_result_exists(
+            task_id, 1, "https://example.test/item-2", "item-2"
+        ))
 
     def test_system_settings_section_is_saved_in_one_transaction(self):
         saved = self.db.save_system_settings_section({

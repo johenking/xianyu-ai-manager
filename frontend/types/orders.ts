@@ -22,6 +22,7 @@ export interface Order {
   quantity: number;
   amount: string;
   status: OrderStatus;
+  order_status?: OrderStatus;
   receiver_name?: string;
   receiver_phone?: string;
   receiver_address?: string;

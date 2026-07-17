@@ -1,0 +1,4 @@
+origin	https://github.com/johenking/xianyu-ai-manager.git (fetch)
+origin	https://github.com/johenking/xianyu-ai-manager.git (push)
+upstream-23star	https://github.com/23Star/xianyu-super-butler.git (fetch)
+upstream-23star	https://github.com/23Star/xianyu-super-butler.git (push)

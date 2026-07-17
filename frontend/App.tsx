@@ -1,16 +1,52 @@
-import React, { Suspense, lazy, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import Sidebar from './components/Sidebar';
-import { login, verifyToken, logout } from './services/api';
-import { ShieldCheck, ArrowRight, Loader2, User, Lock, Menu } from 'lucide-react';
+import AuthPortal from './components/AuthPortal';
+import { verifyToken, logout } from './services/api';
+import { AlertCircle, Loader2, Menu, RefreshCw } from 'lucide-react';
 
-const Dashboard = lazy(() => import('./components/Dashboard'));
-const AccountList = lazy(() => import('./components/AccountList'));
-const OrderList = lazy(() => import('./components/OrderList'));
-const CardList = lazy(() => import('./components/CardList'));
-const ItemList = lazy(() => import('./components/ItemList'));
-const Settings = lazy(() => import('./components/Settings'));
-const Keywords = lazy(() => import('./components/Keywords'));
-const SkillCenter = lazy(() => import('./components/SkillCenter'));
+const pageLoaders = {
+  dashboard: () => import('./components/Dashboard'),
+  accounts: () => import('./components/AccountList'),
+  orders: () => import('./components/OrderList'),
+  cards: () => import('./components/CardList'),
+  items: () => import('./components/ItemList'),
+  keywords: () => import('./components/Keywords'),
+  skills: () => import('./components/SkillCenter'),
+  settings: () => import('./components/Settings'),
+};
+
+const Dashboard = lazy(pageLoaders.dashboard);
+const AccountList = lazy(pageLoaders.accounts);
+const OrderList = lazy(pageLoaders.orders);
+const CardList = lazy(pageLoaders.cards);
+const ItemList = lazy(pageLoaders.items);
+const Settings = lazy(pageLoaders.settings);
+const Keywords = lazy(pageLoaders.keywords);
+const SkillCenter = lazy(pageLoaders.skills);
+
+type PageKey = keyof typeof pageLoaders;
+
+const preloadPage = (page: string) => {
+  const loader = pageLoaders[page as PageKey];
+  if (loader) {
+    void loader();
+  }
+};
+
+const preloadAppPages = () => {
+  const run = () => {
+    (Object.keys(pageLoaders) as PageKey[]).forEach((key) => {
+      if (key !== 'dashboard') {
+        void pageLoaders[key]();
+      }
+    });
+  };
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(run, { timeout: 2000 });
+  } else {
+    globalThis.setTimeout(run, 500);
+  }
+};
 
 const PageLoading: React.FC = () => (
   <div className="flex min-h-[50vh] items-center justify-center" role="status" aria-label="页面加载中">
@@ -20,56 +56,97 @@ const PageLoading: React.FC = () => (
 
 const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [checkingAuth, setCheckingAuth] = useState(true);
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [loginLoading, setLoginLoading] = useState(false);
-  const [loginError, setLoginError] = useState('');
+  const [authError, setAuthError] = useState('');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  const clearIdentity = useCallback(() => {
+      setIsLoggedIn(false);
+      setIsAdmin(false);
+      setAuthError('');
+  }, []);
+
+  const hydrateIdentity = useCallback(async () => {
+      const tokenAtStart = localStorage.getItem('auth_token');
+      if (!tokenAtStart) {
+          clearIdentity();
+          setCheckingAuth(false);
+          return;
+      }
+      setAuthError('');
+      try {
+          const response = await verifyToken();
+          if (localStorage.getItem('auth_token') !== tokenAtStart) return;
+          if (!response.authenticated) {
+              localStorage.removeItem('auth_token');
+              clearIdentity();
+              return;
+          }
+          setIsLoggedIn(true);
+          setIsAdmin(response.is_admin);
+      } catch (error) {
+          if (localStorage.getItem('auth_token') !== tokenAtStart) return;
+          setIsLoggedIn(false);
+          setIsAdmin(false);
+          setAuthError(error instanceof Error ? error.message : '身份验证暂时不可用');
+      } finally {
+          if (localStorage.getItem('auth_token') === tokenAtStart) {
+              setCheckingAuth(false);
+          }
+      }
+  }, [clearIdentity]);
+
+  const handleAuthenticated = useCallback(() => {
+      setCheckingAuth(true);
+      void hydrateIdentity();
+  }, [hydrateIdentity]);
 
   // Check auth on mount
   useEffect(() => {
       const token = localStorage.getItem('auth_token');
       if (token) {
-          verifyToken()
-            .then((res) => {
-                if (res.authenticated) {
-                    setIsLoggedIn(true);
-                } else {
-                    localStorage.removeItem('auth_token');
-                }
-            })
-            .catch(() => localStorage.removeItem('auth_token'))
-            .finally(() => setCheckingAuth(false));
+          void hydrateIdentity();
       } else {
+          clearIdentity();
           setCheckingAuth(false);
       }
 
-      const handleLogout = () => setIsLoggedIn(false);
-      window.addEventListener('auth:logout', handleLogout);
-      return () => window.removeEventListener('auth:logout', handleLogout);
-  }, []);
-
-  const handleLogin = async (e: React.FormEvent) => {
-      e.preventDefault();
-      setLoginLoading(true);
-      setLoginError('');
-
-      try {
-          const res = await login({ username, password });
-          if (res.success && res.token) {
-              localStorage.setItem('auth_token', res.token);
-              setIsLoggedIn(true);
-          } else {
-              setLoginError(res.message || '登录失败');
+      const handleLogout = () => {
+          clearIdentity();
+          window.history.replaceState({}, '', '/login');
+      };
+      const handleStorage = (event: StorageEvent) => {
+          if (event.key !== 'auth_token') return;
+          if (!event.newValue) {
+              clearIdentity();
+              setCheckingAuth(false);
+              return;
           }
-      } catch (err) {
-          setLoginError('无法连接服务器');
-      } finally {
-          setLoginLoading(false);
+          setCheckingAuth(true);
+          void hydrateIdentity();
+      };
+      window.addEventListener('auth:logout', handleLogout);
+      window.addEventListener('storage', handleStorage);
+      return () => {
+          window.removeEventListener('auth:logout', handleLogout);
+          window.removeEventListener('storage', handleStorage);
+      };
+  }, [clearIdentity, hydrateIdentity]);
+
+  useEffect(() => {
+      if (isLoggedIn) {
+          preloadAppPages();
       }
-  };
+  }, [isLoggedIn]);
+
+  const publicDocument = window.location.pathname === '/terms'
+    || window.location.pathname === '/privacy';
+
+  if (publicDocument) {
+      return <AuthPortal onAuthenticated={handleAuthenticated} />;
+  }
 
   if (checkingAuth) {
       return (
@@ -79,70 +156,23 @@ const App: React.FC = () => {
       );
   }
 
-  // Login Screen Component
+  if (authError && localStorage.getItem('auth_token')) {
+      return (
+          <div className="flex min-h-screen items-center justify-center bg-[#f5f5f7] p-6">
+              <div className="max-w-md text-center">
+                  <AlertCircle className="mx-auto h-10 w-10 text-amber-500" />
+                  <h1 className="mt-4 text-xl font-extrabold text-gray-900">身份验证暂时不可用</h1>
+                  <p className="mt-2 text-sm text-gray-500">{authError}</p>
+                  <button type="button" onClick={() => { setCheckingAuth(true); void hydrateIdentity(); }} className="mt-5 inline-flex items-center gap-2 rounded-lg bg-gray-900 px-4 py-2.5 text-sm font-bold text-white">
+                      <RefreshCw className="h-4 w-4" />重试身份验证
+                  </button>
+              </div>
+          </div>
+      );
+  }
+
   if (!isLoggedIn) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-[#F4F5F7] p-4 font-sans">
-        <div className="bg-white p-7 md:p-10 rounded-2xl shadow-[0_20px_60px_-15px_rgba(0,0,0,0.08)] w-full max-w-md border border-gray-100 animate-fade-in">
-
-          {/* Header with Logo */}
-          <div className="text-center mb-10">
-             <div className="w-24 h-24 bg-[#FFE815] rounded-[2rem] flex items-center justify-center shadow-xl shadow-yellow-200 mx-auto mb-6 transform rotate-[-6deg] hover:rotate-0 transition-all duration-500 cursor-pointer group">
-                <span className="text-black font-extrabold text-5xl group-hover:scale-110 transition-transform">闲</span>
-             </div>
-             <h2 className="text-3xl font-extrabold text-gray-900 mb-2 tracking-tight">欢迎回来</h2>
-             <p className="text-gray-500 font-medium">闲鱼智能自动发货与管家系统</p>
-          </div>
-
-          <form onSubmit={handleLogin} className="space-y-5">
-            <div className="space-y-4">
-                <div className="relative group">
-                    <User className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400 group-focus-within:text-black transition-colors" />
-                    <input
-                        type="text"
-                        placeholder="管理员账号"
-                        value={username}
-                        onChange={e => setUsername(e.target.value)}
-                        className="w-full ios-input pl-14 pr-6 py-4.5 rounded-2xl text-base h-14"
-                    />
-                </div>
-                <div className="relative group">
-                    <Lock className="absolute left-5 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400 group-focus-within:text-black transition-colors" />
-                    <input
-                        type="password"
-                        placeholder="密码"
-                        value={password}
-                        onChange={e => setPassword(e.target.value)}
-                        className="w-full ios-input pl-14 pr-6 py-4.5 rounded-2xl text-base h-14"
-                    />
-                </div>
-            </div>
-
-            {loginError && (
-                <div className="p-3 rounded-xl bg-red-50 text-red-500 text-sm text-center font-bold flex items-center justify-center gap-2">
-                    <ShieldCheck className="w-4 h-4" /> {loginError}
-                </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={loginLoading}
-              className="w-full ios-btn-primary h-14 rounded-2xl text-lg shadow-xl shadow-yellow-200 mt-2 flex items-center justify-center gap-2 group disabled:opacity-70"
-            >
-              {loginLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <>立即登录 <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" /></>}
-            </button>
-          </form>
-
-          <div className="mt-8 pt-6 border-t border-gray-100">
-             <div className="text-center">
-                 <span className="text-xs text-gray-400 font-medium tracking-widest uppercase">
-                    Xianyu Auto-Dispatch Pro v2.5
-                 </span>
-             </div>
-          </div>
-        </div>
-      </div>
-    );
+    return <AuthPortal onAuthenticated={handleAuthenticated} />;
   }
 
   // Main App Layout
@@ -155,7 +185,7 @@ const App: React.FC = () => {
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;
       case 'skills': return <SkillCenter />;
-      case 'settings': return <Settings />;
+      case 'settings': return <Settings isAdmin={isAdmin} />;
       default: return <Dashboard />;
     }
   };
@@ -165,6 +195,7 @@ const App: React.FC = () => {
       <Sidebar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        onPreloadTab={preloadPage}
         onLogout={async () => {
             try {
                 await logout();
@@ -172,7 +203,8 @@ const App: React.FC = () => {
                 // 本地退出优先，服务端会话过期后自动清理。
             }
             localStorage.removeItem('auth_token');
-            setIsLoggedIn(false);
+            window.history.replaceState({}, '', '/login');
+            clearIdentity();
         }}
         mobileOpen={mobileNavOpen}
         onMobileClose={() => setMobileNavOpen(false)}
