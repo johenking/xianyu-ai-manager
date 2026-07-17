@@ -32,9 +32,12 @@ class SkillMonitorScheduler:
             logger.info("技能中心定时监控调度器未启动（开关关闭）")
             return
         self._stopping = asyncio.Event()
-        reset_count = db_manager.reset_running_skill_monitor_tasks()
-        if reset_count:
-            logger.warning(f"已重置 {reset_count} 个重启前未完成的技能监控任务")
+        recovered_runs = db_manager.recover_stale_skill_monitor_runs()
+        recovered_deliveries = db_manager.recover_stale_skill_monitor_deliveries()
+        if recovered_runs:
+            logger.warning(f"已中断 {recovered_runs} 个租约过期的技能监控运行")
+        if recovered_deliveries:
+            logger.warning(f"已标记 {recovered_deliveries} 个结果未知的技能通知投递")
         self._task = asyncio.create_task(self._run(), name="skill-monitor-scheduler")
         logger.info("技能中心定时监控调度器已启动")
 
@@ -71,6 +74,7 @@ class SkillMonitorScheduler:
     async def run_due_once(self) -> int:
         if not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
             return 0
+        db_manager.recover_stale_skill_monitor_runs()
         due_tasks = db_manager.list_due_skill_monitor_tasks()
         if not due_tasks:
             return 0
@@ -97,7 +101,9 @@ class SkillMonitorScheduler:
 
             await execute_skill_monitor_task(task, int(task["user_id"]), scheduled_run=True)
         except Exception as exc:
-            logger.error(f"定时技能监控任务失败 task_id={task_id}: {exc}")
+            logger.error(
+                f"定时技能监控任务失败 task_id={task_id}, error={type(exc).__name__}"
+            )
         finally:
             self._running_task_ids.discard(task_id)
 

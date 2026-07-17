@@ -6626,7 +6626,13 @@ def _skill_item_matches_task(item: Dict[str, Any], task: Dict[str, Any]) -> Tupl
     return True, f'命中关键词、价格、地区过滤{publish_reason}', price
 
 
-async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Tuple[List[int], int, Dict[str, Any]]:
+async def _run_real_skill_monitor(
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    scheduled_run: bool = False,
+    run_id: Optional[int] = None,
+) -> Tuple[List[int], int, Dict[str, Any]]:
     from utils.item_search import search_xianyu_items
 
     keyword = (task.get('keyword') or '').strip()
@@ -6706,30 +6712,125 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, schedul
     return created_ids, len(raw_items), search_result
 
 
+SKILL_MONITOR_RUN_HEARTBEAT_SECONDS = 30
+
+
+async def _heartbeat_skill_monitor_run(
+    run_id: int,
+    claim_token: str,
+    stop_event: asyncio.Event,
+    lease_lost: asyncio.Event,
+    kill_switch_disabled: asyncio.Event,
+    owner_task: Optional[asyncio.Task],
+) -> None:
+    while not stop_event.is_set():
+        if not skill_monitor_feature_enabled("skill_monitor_enabled"):
+            kill_switch_disabled.set()
+            logger.warning(f"技能监控运行因全局开关关闭而中断 run_id={run_id}")
+            if owner_task is not None and not owner_task.done():
+                owner_task.cancel()
+            return
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=SKILL_MONITOR_RUN_HEARTBEAT_SECONDS,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        if db_manager.heartbeat_skill_monitor_run(run_id, claim_token):
+            continue
+        lease_lost.set()
+        logger.error(f"技能监控运行租约丢失 run_id={run_id}")
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
+        return
+
+
+def _safe_skill_run_error(exc: BaseException) -> Tuple[str, str]:
+    if isinstance(exc, HTTPException):
+        code = f"http_{exc.status_code}"
+        message = str(exc.detail or '')
+    else:
+        code = type(exc).__name__.lower()[:80]
+        message = str(exc or type(exc).__name__)
+    message = _safe_skill_notification_error(Exception(message))
+    message = re.sub(
+        r'(?i)(cookie|token|password|authorization)\s*[:=]\s*[^\s,;]+',
+        r'\1=[redacted]',
+        message,
+    )
+    return code, message[:500]
+
+
 async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Dict[str, Any]:
     if not skill_monitor_feature_enabled("skill_monitor_enabled"):
         raise HTTPException(status_code=503, detail="监控全局开关关闭")
     if scheduled_run and not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
         raise HTTPException(status_code=503, detail="监控调度开关关闭")
-    if not db_manager.mark_skill_monitor_task_running(task['id'], user_id):
+
+    claim = db_manager.claim_skill_monitor_run(
+        task['id'],
+        user_id,
+        trigger_type='scheduled' if scheduled_run else 'manual',
+        source_adapter='playwright',
+    )
+    if claim.get('state') == 'action_required':
+        raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
+    if claim.get('state') == 'disabled':
+        raise HTTPException(status_code=409, detail="监控任务或定时设置已关闭")
+    if claim.get('state') == 'not_found':
+        raise HTTPException(status_code=404, detail="监控任务不存在")
+    if claim.get('state') == 'conflict':
         raise HTTPException(status_code=409, detail="监控任务正在运行，请稍后再试")
+    if not claim.get('claimed'):
+        raise HTTPException(status_code=500, detail="无法领取监控任务运行权")
+
+    run_id = int(claim['run_id'])
+    claim_token = str(claim['claim_token'])
+    run_task = dict(task)
+    run_task['account_id'] = str(claim.get('account_id') or '')
+    stop_heartbeat = asyncio.Event()
+    lease_lost = asyncio.Event()
+    kill_switch_disabled = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_skill_monitor_run(
+            run_id,
+            claim_token,
+            stop_heartbeat,
+            lease_lost,
+            kill_switch_disabled,
+            asyncio.current_task(),
+        ),
+        name=f'skill-monitor-run-heartbeat:{run_id}',
+    )
 
     try:
-        result_ids, raw_count, search_result = await _run_real_skill_monitor(task, user_id, scheduled_run=scheduled_run)
-        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
-        db_manager.update_skill_monitor_task_run(
-            task['id'],
+        result_ids, raw_count, search_result = await _run_real_skill_monitor(
+            run_task,
             user_id,
-            status='success',
-            error='',
-            next_run_at=next_run_at,
+            scheduled_run=scheduled_run,
+            run_id=run_id,
         )
+        stop_heartbeat.set()
+        await heartbeat_task
+        next_run_at = _skill_next_run_at(run_task.get('schedule_interval_minutes')) if run_task.get('schedule_enabled') else None
+        if not db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='success',
+            raw_result_count=raw_count,
+            accepted_result_count=len(result_ids),
+            next_run_at=next_run_at,
+        ):
+            raise HTTPException(status_code=409, detail="监控运行租约已失效，结果未确认为成功")
         db_manager.log_skill_event(
             user_id,
             'monitor',
-            f"{'定时' if scheduled_run else '手动'}运行监控任务: {task['keyword']}",
+            f"{'定时' if scheduled_run else '手动'}运行监控任务",
             payload={
                 'task_id': task['id'],
+                'run_id': run_id,
                 'result_ids': result_ids,
                 'raw_count': raw_count,
                 'source': search_result.get('source'),
@@ -6746,20 +6847,58 @@ async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, sche
             "is_real_data": True,
             "scheduled_run": scheduled_run,
             "next_run_at": next_run_at,
+            "run_id": run_id,
         }
+    except asyncio.CancelledError:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if kill_switch_disabled.is_set():
+            reason_code = 'kill_switch_disabled'
+            reason_message = '监控全局开关关闭，运行已中断'
+        elif lease_lost.is_set():
+            reason_code = 'lease_lost'
+            reason_message = '运行租约丢失，已中断'
+        else:
+            reason_code = 'shutdown_interrupted'
+            reason_message = '服务停止时运行被中断'
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='interrupted',
+            error_code=reason_code,
+            error_message=reason_message,
+            next_run_at=(
+                _skill_next_run_at(run_task.get('schedule_interval_minutes'))
+                if run_task.get('schedule_enabled')
+                else None
+            ),
+        )
+        raise
     except Exception as exc:
-        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
-        message = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        db_manager.update_skill_monitor_task_run(
-            task['id'],
-            user_id,
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        next_run_at = _skill_next_run_at(run_task.get('schedule_interval_minutes')) if run_task.get('schedule_enabled') else None
+        error_code, message = _safe_skill_run_error(exc)
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
             status='failed',
-            error=str(message)[:500],
+            error_code=error_code,
+            error_message=message,
             next_run_at=next_run_at,
         )
         if isinstance(exc, HTTPException):
             raise
         raise
+    finally:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 @skills_router.get("/api/skills/monitor/tasks")

@@ -261,6 +261,35 @@ class SkillAiFilterTests(unittest.TestCase):
 
 
 class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_hard_kill_cancels_the_owner(self):
+        stop_event = asyncio.Event()
+        lease_lost = asyncio.Event()
+        kill_switch_disabled = asyncio.Event()
+        owner = Mock()
+        owner.done.return_value = False
+
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "heartbeat_skill_monitor_run",
+        ) as heartbeat_mock:
+            await reply_server._heartbeat_skill_monitor_run(
+                41,
+                "claim-token",
+                stop_event,
+                lease_lost,
+                kill_switch_disabled,
+                owner,
+            )
+
+        self.assertTrue(kill_switch_disabled.is_set())
+        self.assertFalse(lease_lost.is_set())
+        owner.cancel.assert_called_once_with()
+        heartbeat_mock.assert_not_called()
+
     async def test_global_kill_switch_blocks_before_task_claim(self):
         task = {"id": 3, "keyword": "iPhone"}
         with patch.object(
@@ -269,7 +298,7 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             return_value=False,
         ), patch.object(
             reply_server.db_manager,
-            "mark_skill_monitor_task_running",
+            "claim_skill_monitor_run",
         ) as claim_mock:
             with self.assertRaises(HTTPException) as raised:
                 await reply_server.execute_skill_monitor_task(task, 7)
@@ -290,7 +319,7 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             side_effect=enabled,
         ), patch.object(
             reply_server.db_manager,
-            "mark_skill_monitor_task_running",
+            "claim_skill_monitor_run",
         ) as claim_mock:
             with self.assertRaises(HTTPException) as raised:
                 await reply_server.execute_skill_monitor_task(
@@ -335,27 +364,89 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             "schedule_enabled": True,
             "schedule_interval_minutes": 30,
         }
+        claim = {
+            "state": "claimed",
+            "claimed": True,
+            "run_id": 41,
+            "run_token": "run-token",
+            "claim_token": "claim-token",
+            "account_id": "account-1",
+        }
         with patch.object(reply_server, "skill_monitor_feature_enabled", return_value=True), patch.object(
-            reply_server.db_manager, "mark_skill_monitor_task_running", return_value=True
+            reply_server.db_manager, "claim_skill_monitor_run", return_value=claim
         ), patch.object(
             reply_server, "_run_real_skill_monitor", new=AsyncMock(side_effect=HTTPException(502, "搜索失败"))
         ), patch.object(
-            reply_server.db_manager, "update_skill_monitor_task_run", return_value=True
-        ) as update_mock:
+            reply_server.db_manager, "finish_skill_monitor_run", return_value=True
+        ) as finish_mock:
             with self.assertRaises(HTTPException):
                 await reply_server.execute_skill_monitor_task(task, 7, scheduled_run=True)
 
-        kwargs = update_mock.call_args.kwargs
+        kwargs = finish_mock.call_args.kwargs
         self.assertEqual(kwargs["status"], "failed")
-        self.assertEqual(kwargs["error"], "搜索失败")
+        self.assertEqual(kwargs["error_message"], "搜索失败")
+        self.assertEqual(kwargs["error_code"], "http_502")
         self.assertIsNotNone(kwargs["next_run_at"])
+
+    async def test_cancelled_run_is_marked_interrupted(self):
+        started = asyncio.Event()
+
+        async def blocked_monitor(*_args, **_kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        claim = {
+            "state": "claimed",
+            "claimed": True,
+            "run_id": 42,
+            "run_token": "run-token",
+            "claim_token": "claim-token",
+            "account_id": "account-1",
+        }
+        task = {
+            "id": 3,
+            "user_id": 7,
+            "keyword": "iPhone",
+            "schedule_enabled": True,
+            "schedule_interval_minutes": 30,
+        }
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "claim_skill_monitor_run",
+            return_value=claim,
+        ), patch.object(
+            reply_server,
+            "_run_real_skill_monitor",
+            new=blocked_monitor,
+        ), patch.object(
+            reply_server.db_manager,
+            "finish_skill_monitor_run",
+            return_value=True,
+        ) as finish_mock:
+            execution = asyncio.create_task(
+                reply_server.execute_skill_monitor_task(task, 7, scheduled_run=True)
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            execution.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await execution
+
+        kwargs = finish_mock.call_args.kwargs
+        self.assertEqual(kwargs["status"], "interrupted")
+        self.assertEqual(kwargs["error_code"], "shutdown_interrupted")
 
 
 class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_and_stop_own_the_polling_task(self):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
-            scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_deliveries", return_value=0
         ), patch.object(
             scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=[]
         ):
@@ -379,6 +470,8 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
         scheduler = BlockingScheduler()
         due = [{"id": 9, "user_id": 7}]
         with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(
             scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=due
         ):
             self.assertEqual(await scheduler.run_due_once(), 1)
@@ -402,7 +495,9 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         scheduler._execute = blocking_execute
         with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
-            scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_deliveries", return_value=0
         ), patch.object(
             scheduler_module.db_manager,
             "list_due_skill_monitor_tasks",
@@ -417,15 +512,18 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_scheduler_stays_stopped_when_fail_closed_switch_is_off(self):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=False), patch.object(
-            scheduler_module.db_manager, "reset_running_skill_monitor_tasks"
-        ) as reset_mock, patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs"
+        ) as recover_runs_mock, patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_deliveries"
+        ) as recover_deliveries_mock, patch.object(
             scheduler_module.db_manager, "list_due_skill_monitor_tasks"
         ) as due_mock:
             await scheduler.start()
             self.assertFalse(scheduler.running)
             self.assertEqual(await scheduler.run_due_once(), 0)
 
-        reset_mock.assert_not_called()
+        recover_runs_mock.assert_not_called()
+        recover_deliveries_mock.assert_not_called()
         due_mock.assert_not_called()
 
 

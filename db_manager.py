@@ -10,6 +10,7 @@ import asyncio
 import io
 import base64
 import binascii
+import secrets
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
@@ -49,6 +50,9 @@ from auth_email_service import (
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
 COOKIE_REFRESH_MAX_INTERVAL_MINUTES = 10080
+SKILL_MONITOR_RUN_LEASE_SECONDS = 180
+SKILL_MONITOR_DELIVERY_LEASE_SECONDS = 60
+SKILL_MONITOR_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 class DBManager:
@@ -7492,6 +7496,698 @@ class DBManager:
                 return []
 
     # ==================== 技能中心方法 ====================
+
+    @staticmethod
+    def _new_skill_monitor_token() -> str:
+        return secrets.token_urlsafe(24)
+
+    def _insert_skill_monitor_event(
+        self,
+        cursor,
+        *,
+        idempotency_key: str,
+        event_type: str,
+        task_id: int,
+        user_id: int,
+        account_id: str = '',
+        run_id: Optional[int] = None,
+        result_id: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        retention_until: Optional[float] = None,
+    ) -> Optional[int]:
+        cursor.execute('''
+            INSERT OR IGNORE INTO skill_monitor_events (
+                event_token, idempotency_key, event_type, run_id, result_id,
+                task_id, user_id, account_id, payload_json, retention_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            self._new_skill_monitor_token(),
+            str(idempotency_key),
+            str(event_type),
+            run_id,
+            result_id,
+            int(task_id),
+            int(user_id),
+            str(account_id or ''),
+            json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+            retention_until,
+        ))
+        return int(cursor.lastrowid) if cursor.rowcount > 0 else None
+
+    def _recover_stale_skill_monitor_runs(
+        self,
+        cursor,
+        *,
+        now: float,
+        task_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        conditions = [
+            "status IN ('claimed', 'running')",
+            "(lease_expires_at IS NULL OR lease_expires_at <= ?)",
+        ]
+        params: List[Any] = [float(now)]
+        if task_id is not None:
+            conditions.append('task_id = ?')
+            params.append(int(task_id))
+        rows = cursor.execute(f'''
+            SELECT id, run_token, task_id, user_id, account_id, attempt
+            FROM skill_monitor_runs
+            WHERE {' AND '.join(conditions)}
+            ORDER BY id ASC
+        ''', params).fetchall()
+        recovered: List[Dict[str, Any]] = []
+        for row in rows:
+            run_id = int(row[0])
+            cursor.execute('''
+                UPDATE skill_monitor_runs
+                SET status = 'interrupted',
+                    claim_token = '',
+                    lease_expires_at = NULL,
+                    heartbeat_at = ?,
+                    interrupted_at = ?,
+                    finished_at = ?,
+                    error_code = 'lease_expired',
+                    error_message = '运行租约过期，已中断',
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('claimed', 'running')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ''', (now, now, now, now, run_id, now))
+            if cursor.rowcount <= 0:
+                continue
+            run = {
+                'id': run_id,
+                'run_token': str(row[1]),
+                'task_id': int(row[2]),
+                'user_id': int(row[3]),
+                'account_id': str(row[4] or ''),
+                'attempt': int(row[5] or 0),
+            }
+            recovered.append(run)
+            self._insert_skill_monitor_event(
+                cursor,
+                idempotency_key=f"run:{run['run_token']}:lease-expired:{run['attempt']}",
+                event_type='run_interrupted',
+                run_id=run_id,
+                task_id=run['task_id'],
+                user_id=run['user_id'],
+                account_id=run['account_id'],
+                payload={
+                    'reason_code': 'lease_expired',
+                    'attempt': run['attempt'],
+                },
+                retention_until=now + SKILL_MONITOR_RETENTION_SECONDS,
+            )
+            active = cursor.execute('''
+                SELECT 1 FROM skill_monitor_runs
+                WHERE task_id = ?
+                  AND status IN ('claimed', 'running')
+                  AND lease_expires_at > ?
+                LIMIT 1
+            ''', (run['task_id'], now)).fetchone()
+            if not active:
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'interrupted',
+                        last_error = '上次运行租约过期，已中断',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (run['task_id'], run['user_id']))
+        return recovered
+
+    def recover_stale_skill_monitor_runs(self, now: Optional[float] = None) -> int:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                recovered = self._recover_stale_skill_monitor_runs(
+                    cursor,
+                    now=timestamp,
+                )
+                self.conn.commit()
+                return len(recovered)
+            except Exception as e:
+                logger.error(f"恢复过期技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return 0
+
+    def claim_skill_monitor_run(
+        self,
+        task_id: int,
+        user_id: int,
+        *,
+        trigger_type: str,
+        source_adapter: str = 'playwright',
+        lease_seconds: int = SKILL_MONITOR_RUN_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Atomically create and claim one run for manual and scheduled entrypoints."""
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 3600))
+        trigger_type = 'scheduled' if trigger_type == 'scheduled' else 'manual'
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                task = cursor.execute('''
+                    SELECT id, user_id, account_id, enabled, schedule_enabled
+                    FROM skill_monitor_tasks
+                    WHERE id = ? AND user_id = ?
+                ''', (int(task_id), int(user_id))).fetchone()
+                if not task:
+                    self.conn.rollback()
+                    return {'state': 'not_found', 'claimed': False}
+                if not bool(task[3]) or (trigger_type == 'scheduled' and not bool(task[4])):
+                    self.conn.rollback()
+                    return {'state': 'disabled', 'claimed': False}
+
+                recovered = self._recover_stale_skill_monitor_runs(
+                    cursor,
+                    now=timestamp,
+                    task_id=int(task_id),
+                )
+                active = cursor.execute('''
+                    SELECT id FROM skill_monitor_runs
+                    WHERE task_id = ? AND user_id = ?
+                      AND status IN ('claimed', 'running')
+                      AND lease_expires_at > ?
+                    ORDER BY id DESC LIMIT 1
+                ''', (int(task_id), int(user_id), timestamp)).fetchone()
+                if active:
+                    self.conn.commit()
+                    return {
+                        'state': 'conflict',
+                        'claimed': False,
+                        'active_run_id': int(active[0]),
+                    }
+
+                account_id = str(task[2] or '').strip()
+                run_token = self._new_skill_monitor_token()
+                retention_until = timestamp + SKILL_MONITOR_RETENTION_SECONDS
+                recovered_from = recovered[-1] if recovered else None
+                if recovered_from is None:
+                    prior = cursor.execute('''
+                        SELECT prior.id, prior.run_token, prior.task_id,
+                               prior.user_id, prior.account_id, prior.attempt
+                        FROM skill_monitor_runs AS prior
+                        WHERE prior.task_id = ? AND prior.user_id = ?
+                          AND prior.status = 'interrupted'
+                          AND prior.error_code = 'lease_expired'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM skill_monitor_runs AS successor
+                              WHERE successor.recovered_from_run_id = prior.id
+                          )
+                        ORDER BY prior.id DESC
+                        LIMIT 1
+                    ''', (int(task_id), int(user_id))).fetchone()
+                    if prior:
+                        recovered_from = {
+                            'id': int(prior[0]),
+                            'run_token': str(prior[1]),
+                            'task_id': int(prior[2]),
+                            'user_id': int(prior[3]),
+                            'account_id': str(prior[4] or ''),
+                            'attempt': int(prior[5] or 0),
+                        }
+                attempt = int((recovered_from or {}).get('attempt') or 0) + 1
+                if not account_id:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_runs (
+                            run_token, task_id, user_id, account_id, trigger_type,
+                            source_adapter, status, attempt, finished_at,
+                            error_code, error_message, retention_until,
+                            recovered_from_run_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, '', ?, ?, 'action_required', ?, ?,
+                                  'account_required', '任务尚未绑定闲鱼账号', ?, ?, ?, ?)
+                    ''', (
+                        run_token,
+                        int(task_id),
+                        int(user_id),
+                        trigger_type,
+                        str(source_adapter or 'playwright'),
+                        attempt,
+                        timestamp,
+                        retention_until,
+                        (recovered_from or {}).get('id'),
+                        timestamp,
+                        timestamp,
+                    ))
+                    run_id = int(cursor.lastrowid)
+                    cursor.execute('''
+                        UPDATE skill_monitor_tasks
+                        SET last_status = 'action_required',
+                            last_error = '任务尚未绑定闲鱼账号',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND user_id = ?
+                    ''', (int(task_id), int(user_id)))
+                    self._insert_skill_monitor_event(
+                        cursor,
+                        idempotency_key=f'run:{run_token}:account-required',
+                        event_type='run_action_required',
+                        run_id=run_id,
+                        task_id=int(task_id),
+                        user_id=int(user_id),
+                        payload={'reason_code': 'account_required'},
+                        retention_until=retention_until,
+                    )
+                    self.conn.commit()
+                    return {
+                        'state': 'action_required',
+                        'claimed': False,
+                        'run_id': run_id,
+                        'run_token': run_token,
+                        'error_code': 'account_required',
+                    }
+
+                claim_token = self._new_skill_monitor_token()
+                lease_expires_at = timestamp + lease_seconds
+                cursor.execute('''
+                    INSERT INTO skill_monitor_runs (
+                        run_token, task_id, user_id, account_id, trigger_type,
+                        source_adapter, status, claim_token, lease_expires_at,
+                        heartbeat_at, attempt, started_at, retention_until,
+                        recovered_from_run_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    run_token,
+                    int(task_id),
+                    int(user_id),
+                    account_id,
+                    trigger_type,
+                    str(source_adapter or 'playwright'),
+                    claim_token,
+                    lease_expires_at,
+                    timestamp,
+                    attempt,
+                    timestamp,
+                    retention_until,
+                    (recovered_from or {}).get('id'),
+                    timestamp,
+                    timestamp,
+                ))
+                run_id = int(cursor.lastrowid)
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'running', last_error = '',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (int(task_id), int(user_id)))
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=f'run:{run_token}:claimed:{attempt}',
+                    event_type='run_claimed',
+                    run_id=run_id,
+                    task_id=int(task_id),
+                    user_id=int(user_id),
+                    account_id=account_id,
+                    payload={
+                        'trigger_type': trigger_type,
+                        'source_adapter': str(source_adapter or 'playwright'),
+                        'attempt': attempt,
+                    },
+                    retention_until=retention_until,
+                )
+                self.conn.commit()
+                return {
+                    'state': 'claimed',
+                    'claimed': True,
+                    'run_id': run_id,
+                    'run_token': run_token,
+                    'claim_token': claim_token,
+                    'lease_expires_at': lease_expires_at,
+                    'attempt': attempt,
+                    'account_id': account_id,
+                }
+            except Exception as e:
+                logger.error(f"领取技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'claimed': False}
+
+    def heartbeat_skill_monitor_run(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        lease_seconds: int = SKILL_MONITOR_RUN_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 3600))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_runs
+                    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    timestamp,
+                    timestamp + lease_seconds,
+                    timestamp,
+                    int(run_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"更新技能监控运行心跳失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def finish_skill_monitor_run(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        status: str,
+        raw_result_count: int = 0,
+        accepted_result_count: int = 0,
+        error_code: str = '',
+        error_message: str = '',
+        next_run_at: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        allowed_statuses = {'success', 'failed', 'interrupted', 'action_required'}
+        if status not in allowed_statuses:
+            return False
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT run_token, task_id, user_id, account_id, attempt
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(run_id), str(claim_token), timestamp)).fetchone()
+                if not row:
+                    self.conn.rollback()
+                    return False
+                cursor.execute('''
+                    UPDATE skill_monitor_runs
+                    SET status = ?, claim_token = '', lease_expires_at = NULL,
+                        heartbeat_at = ?, finished_at = ?,
+                        interrupted_at = CASE WHEN ? = 'interrupted' THEN ? ELSE interrupted_at END,
+                        raw_result_count = ?, accepted_result_count = ?,
+                        error_code = ?, error_message = ?, updated_at = ?
+                    WHERE id = ? AND claim_token = ? AND status = 'running'
+                ''', (
+                    status,
+                    timestamp,
+                    timestamp,
+                    status,
+                    timestamp,
+                    max(0, int(raw_result_count)),
+                    max(0, int(accepted_result_count)),
+                    str(error_code or '')[:80],
+                    str(error_message or '')[:500],
+                    timestamp,
+                    int(run_id),
+                    str(claim_token),
+                ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_run_at = CURRENT_TIMESTAMP,
+                        last_status = ?, last_error = ?, next_run_at = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (
+                    status,
+                    str(error_message or '')[:500],
+                    next_run_at,
+                    int(row[1]),
+                    int(row[2]),
+                ))
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=f'run:{row[0]}:finished:{status}:{row[4]}',
+                    event_type=f'run_{status}',
+                    run_id=int(run_id),
+                    task_id=int(row[1]),
+                    user_id=int(row[2]),
+                    account_id=str(row[3] or ''),
+                    payload={
+                        'status': status,
+                        'attempt': int(row[4] or 0),
+                        'raw_result_count': max(0, int(raw_result_count)),
+                        'accepted_result_count': max(0, int(accepted_result_count)),
+                        'error_code': str(error_code or '')[:80],
+                    },
+                    retention_until=timestamp + SKILL_MONITOR_RETENTION_SECONDS,
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"完成技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def get_skill_monitor_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT id, run_token, task_id, user_id, account_id, trigger_type,
+                       source_adapter, status, claim_token, lease_expires_at,
+                       heartbeat_at, attempt, started_at, finished_at,
+                       interrupted_at, recovered_from_run_id, raw_result_count,
+                       accepted_result_count, error_code, error_message,
+                       retention_until, created_at, updated_at
+                FROM skill_monitor_runs WHERE id = ?
+            ''', (int(run_id),)).fetchone()
+            if not row:
+                return None
+            keys = (
+                'id', 'run_token', 'task_id', 'user_id', 'account_id',
+                'trigger_type', 'source_adapter', 'status', 'claim_token',
+                'lease_expires_at', 'heartbeat_at', 'attempt', 'started_at',
+                'finished_at', 'interrupted_at', 'recovered_from_run_id',
+                'raw_result_count', 'accepted_result_count', 'error_code',
+                'error_message', 'retention_until', 'created_at', 'updated_at',
+            )
+            return dict(zip(keys, row))
+
+    def _recover_stale_skill_monitor_deliveries(
+        self,
+        cursor,
+        *,
+        now: float,
+    ) -> int:
+        rows = cursor.execute('''
+            SELECT id, event_id, result_id, task_id, user_id, attempt
+            FROM skill_monitor_deliveries
+            WHERE status = 'sending'
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ORDER BY id ASC
+        ''', (float(now),)).fetchall()
+        recovered = 0
+        for row in rows:
+            cursor.execute('''
+                UPDATE skill_monitor_deliveries
+                SET status = 'unknown', claim_token = '',
+                    lease_expires_at = NULL, heartbeat_at = ?,
+                    error_code = 'send_outcome_unknown',
+                    error_message = '发送租约过期，结果未知，未自动重试',
+                    updated_at = ?
+                WHERE id = ? AND status = 'sending'
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ''', (now, now, int(row[0]), now))
+            if cursor.rowcount <= 0:
+                continue
+            recovered += 1
+            self._insert_skill_monitor_event(
+                cursor,
+                idempotency_key=f'delivery:{row[0]}:unknown:{row[5]}',
+                event_type='delivery_unknown',
+                run_id=None,
+                result_id=int(row[2]),
+                task_id=int(row[3]),
+                user_id=int(row[4]),
+                payload={
+                    'delivery_id': int(row[0]),
+                    'reason_code': 'send_outcome_unknown',
+                    'attempt': int(row[5] or 0),
+                },
+                retention_until=now + SKILL_MONITOR_RETENTION_SECONDS,
+            )
+        return recovered
+
+    def recover_stale_skill_monitor_deliveries(self, now: Optional[float] = None) -> int:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                recovered = self._recover_stale_skill_monitor_deliveries(
+                    cursor,
+                    now=timestamp,
+                )
+                self.conn.commit()
+                return recovered
+            except Exception as e:
+                logger.error(f"恢复过期技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return 0
+
+    def claim_skill_monitor_delivery(
+        self,
+        *,
+        delivery_id: Optional[int] = None,
+        lease_seconds: int = SKILL_MONITOR_DELIVERY_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 600))
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                self._recover_stale_skill_monitor_deliveries(cursor, now=timestamp)
+                conditions = [
+                    "status IN ('pending', 'retry')",
+                    '(next_attempt_at IS NULL OR next_attempt_at <= ?)',
+                ]
+                params: List[Any] = [timestamp]
+                if delivery_id is not None:
+                    conditions.append('id = ?')
+                    params.append(int(delivery_id))
+                row = cursor.execute(f'''
+                    SELECT id, idempotency_key, event_id, result_id, task_id,
+                           user_id, channel_id, channel_type, destination_digest,
+                           attempt
+                    FROM skill_monitor_deliveries
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY id ASC LIMIT 1
+                ''', params).fetchone()
+                if not row:
+                    self.conn.commit()
+                    return None
+                claim_token = self._new_skill_monitor_token()
+                lease_expires_at = timestamp + lease_seconds
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET status = 'sending', claim_token = ?,
+                        lease_expires_at = ?, heartbeat_at = ?,
+                        attempt = attempt + 1, send_started_at = ?,
+                        error_code = '', error_message = '', updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'retry')
+                ''', (
+                    claim_token,
+                    lease_expires_at,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    int(row[0]),
+                ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return None
+                self.conn.commit()
+                return {
+                    'id': int(row[0]),
+                    'idempotency_key': str(row[1]),
+                    'event_id': int(row[2]),
+                    'result_id': int(row[3]),
+                    'task_id': int(row[4]),
+                    'user_id': int(row[5]),
+                    'channel_id': row[6],
+                    'channel_type': str(row[7] or ''),
+                    'destination_digest': str(row[8] or ''),
+                    'attempt': int(row[9] or 0) + 1,
+                    'claim_token': claim_token,
+                    'lease_expires_at': lease_expires_at,
+                }
+            except Exception as e:
+                logger.error(f"领取技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return None
+
+    def heartbeat_skill_monitor_delivery(
+        self,
+        delivery_id: int,
+        claim_token: str,
+        *,
+        lease_seconds: int = SKILL_MONITOR_DELIVERY_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 600))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    timestamp,
+                    timestamp + lease_seconds,
+                    timestamp,
+                    int(delivery_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"更新技能通知投递心跳失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def finish_skill_monitor_delivery(
+        self,
+        delivery_id: int,
+        claim_token: str,
+        *,
+        status: str,
+        error_code: str = '',
+        error_message: str = '',
+        next_attempt_at: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        if status not in {'sent', 'sent_unconfirmed', 'failed', 'unknown', 'retry'}:
+            return False
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET status = ?, claim_token = '', lease_expires_at = NULL,
+                        heartbeat_at = ?,
+                        sent_at = CASE WHEN ? IN ('sent', 'sent_unconfirmed') THEN ? ELSE sent_at END,
+                        confirmed_at = CASE WHEN ? = 'sent' THEN ? ELSE confirmed_at END,
+                        error_code = ?, error_message = ?, next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    status,
+                    timestamp,
+                    status,
+                    timestamp,
+                    status,
+                    timestamp,
+                    str(error_code or '')[:80],
+                    str(error_message or '')[:500],
+                    next_attempt_at,
+                    timestamp,
+                    int(delivery_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"完成技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
 
     def _skill_monitor_task_from_row(self, row) -> Dict[str, Any]:
         return {
