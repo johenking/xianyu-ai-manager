@@ -63,11 +63,17 @@ const emptyTaskForm = {
 
 const promptOrder: SkillAgentPrompt['prompt_type'][] = ['price', 'tech', 'default'];
 const capabilityTitles: Record<string, string> = {
-  manual_monitor: '手动真实监控',
-  scheduled_monitor: '定时调度',
-  ai_filter: 'AI 商品过滤',
-  notifications: '监控结果通知',
-  expert_live_reply: '专家客服策略',
+  code_present: '代码存在',
+  config_ready: '配置就绪',
+  last_real_search: '最近真实搜索',
+  last_scheduled_run: '最近定时运行',
+  last_ai_decision: '最近 AI 判断',
+  last_real_delivery: '最近真实通知',
+};
+
+const formatCapabilityTime = (observedAt?: number | null) => {
+  if (!observedAt) return '';
+  return new Date(observedAt * 1000).toLocaleString('zh-CN', { hour12: false });
 };
 
 const SkillCenter: React.FC = () => {
@@ -749,14 +755,19 @@ const SkillCenter: React.FC = () => {
         ]}
       />
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
         {(Object.entries(capabilities) as [string, SkillCapability][]).map(([key, capability]) => (
           <WorkSurface key={key} as="article" className="px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <span className="text-sm font-bold text-gray-900">{capabilityTitles[key] || key}</span>
-              <StatusBadge state={capability.available ? 'ready' : 'missing'} label={capability.label} />
+              <StatusBadge state={capability.badge_state} label={capability.label} />
             </div>
             <p className="mt-2 text-xs leading-relaxed text-gray-500">{capability.detail}</p>
+            {capability.observed_at ? (
+              <p className="mt-2 text-[11px] text-gray-400">
+                证据时间：{formatCapabilityTime(capability.observed_at)}
+              </p>
+            ) : null}
           </WorkSurface>
         ))}
       </div>

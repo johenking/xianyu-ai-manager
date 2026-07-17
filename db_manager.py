@@ -8211,6 +8211,206 @@ class DBManager:
             )
             return dict(zip(keys, row))
 
+    def record_skill_monitor_ai_decision(
+        self,
+        *,
+        run_id: int,
+        claim_token: str,
+        task_id: int,
+        user_id: int,
+        item_identity: str,
+        recommended: bool,
+        score: float,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Persist one whitelisted AI decision while the run lease is valid."""
+        timestamp = float(now if now is not None else time.time())
+        identity_digest = hashlib.sha256(
+            str(item_identity or '').encode('utf-8')
+        ).hexdigest()
+        if not item_identity:
+            return {'state': 'invalid_identity', 'recorded': False}
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                run = cursor.execute('''
+                    SELECT run_token, account_id
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND task_id = ? AND user_id = ?
+                      AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    int(run_id),
+                    int(task_id),
+                    int(user_id),
+                    str(claim_token),
+                    timestamp,
+                )).fetchone()
+                if not run:
+                    self.conn.rollback()
+                    return {'state': 'lease_lost', 'recorded': False}
+                event_id = self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=(
+                        f'run:{run[0]}:ai-decision:{identity_digest}'
+                    ),
+                    event_type='ai_decision',
+                    run_id=int(run_id),
+                    task_id=int(task_id),
+                    user_id=int(user_id),
+                    account_id=str(run[1] or ''),
+                    payload={
+                        'recommended': bool(recommended),
+                        'score': max(0.0, min(float(score or 0), 100.0)),
+                        'item_identity_digest': identity_digest,
+                    },
+                    retention_until=(
+                        timestamp + SKILL_MONITOR_RETENTION_SECONDS
+                    ),
+                )
+                self.conn.commit()
+                return {
+                    'state': 'recorded' if event_id else 'duplicate',
+                    'recorded': bool(event_id),
+                    'event_id': event_id,
+                }
+            except Exception as e:
+                logger.error(f"记录技能 AI 决策失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'recorded': False}
+
+    def get_skill_capability_evidence(self, user_id: int) -> Dict[str, Any]:
+        """Return user-scoped, non-secret evidence for the capability matrix."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                last_real_search = cursor.execute('''
+                    SELECT id, task_id, source_adapter, raw_result_count,
+                           accepted_result_count, finished_at
+                    FROM skill_monitor_runs
+                    WHERE user_id = ? AND status = 'success'
+                      AND source_adapter IN ('playwright', 'mtop')
+                      AND finished_at IS NOT NULL
+                    ORDER BY finished_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_scheduled_run = cursor.execute('''
+                    SELECT id, task_id, status, source_adapter,
+                           raw_result_count, accepted_result_count,
+                           COALESCE(finished_at, started_at, created_at)
+                    FROM skill_monitor_runs
+                    WHERE user_id = ? AND trigger_type = 'scheduled'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_ai_decision = cursor.execute('''
+                    SELECT id, run_id, task_id, payload_json, created_at
+                    FROM skill_monitor_events
+                    WHERE user_id = ? AND event_type = 'ai_decision'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_real_delivery = cursor.execute('''
+                    SELECT id, task_id, channel_type, confirmed_at
+                    FROM skill_monitor_deliveries
+                    WHERE user_id = ? AND status = 'sent'
+                      AND confirmed_at IS NOT NULL
+                    ORDER BY confirmed_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_delivery_attempt = cursor.execute('''
+                    SELECT id, status, channel_type,
+                           COALESCE(confirmed_at, sent_at, updated_at, created_at)
+                    FROM skill_monitor_deliveries
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+
+                ai_payload: Dict[str, Any] = {}
+                if last_ai_decision:
+                    try:
+                        parsed_payload = json.loads(last_ai_decision[3] or '{}')
+                        if isinstance(parsed_payload, dict):
+                            ai_payload = {
+                                'recommended': bool(
+                                    parsed_payload.get('recommended')
+                                ),
+                                'score': float(parsed_payload.get('score') or 0),
+                            }
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        ai_payload = {}
+
+                return {
+                    'last_real_search': (
+                        {
+                            'run_id': int(last_real_search[0]),
+                            'task_id': int(last_real_search[1]),
+                            'source_adapter': str(last_real_search[2] or ''),
+                            'raw_result_count': int(last_real_search[3] or 0),
+                            'accepted_result_count': int(last_real_search[4] or 0),
+                            'observed_at': float(last_real_search[5]),
+                        }
+                        if last_real_search
+                        else None
+                    ),
+                    'last_scheduled_run': (
+                        {
+                            'run_id': int(last_scheduled_run[0]),
+                            'task_id': int(last_scheduled_run[1]),
+                            'status': str(last_scheduled_run[2] or ''),
+                            'source_adapter': str(last_scheduled_run[3] or ''),
+                            'raw_result_count': int(last_scheduled_run[4] or 0),
+                            'accepted_result_count': int(last_scheduled_run[5] or 0),
+                            'observed_at': float(last_scheduled_run[6]),
+                        }
+                        if last_scheduled_run
+                        else None
+                    ),
+                    'last_ai_decision': (
+                        {
+                            'event_id': int(last_ai_decision[0]),
+                            'run_id': int(last_ai_decision[1]),
+                            'task_id': int(last_ai_decision[2]),
+                            'recommended': ai_payload.get('recommended'),
+                            'score': ai_payload.get('score'),
+                            'observed_at': float(last_ai_decision[4]),
+                        }
+                        if last_ai_decision
+                        else None
+                    ),
+                    'last_real_delivery': (
+                        {
+                            'delivery_id': int(last_real_delivery[0]),
+                            'task_id': int(last_real_delivery[1]),
+                            'channel_type': str(last_real_delivery[2] or ''),
+                            'observed_at': float(last_real_delivery[3]),
+                        }
+                        if last_real_delivery
+                        else None
+                    ),
+                    'last_delivery_attempt': (
+                        {
+                            'delivery_id': int(last_delivery_attempt[0]),
+                            'status': str(last_delivery_attempt[1] or ''),
+                            'channel_type': str(last_delivery_attempt[2] or ''),
+                            'observed_at': float(last_delivery_attempt[3]),
+                        }
+                        if last_delivery_attempt
+                        else None
+                    ),
+                }
+            except Exception as e:
+                logger.error(f"读取技能能力证据失败: {type(e).__name__}")
+                return {
+                    'last_real_search': None,
+                    'last_scheduled_run': None,
+                    'last_ai_decision': None,
+                    'last_real_delivery': None,
+                    'last_delivery_attempt': None,
+                }
+
     def _recover_stale_skill_monitor_deliveries(
         self,
         cursor,
@@ -8519,6 +8719,7 @@ class DBManager:
             'is_real_data',
             'filter_reason',
             'ai_recommended',
+            'ai_evaluated',
             'scheduled_run',
             'published_within_hours',
             'item_id',

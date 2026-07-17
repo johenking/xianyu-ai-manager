@@ -129,6 +129,8 @@ Rule-matched items can pass through the account's configured AI provider. Missin
 
 The delivery dispatcher has its own claim token, lease, heartbeat, and stale recovery. Webhook requests carry a stable idempotency key. A timeout or process loss after an external endpoint accepted a request but before the local receipt commits is recorded as `unknown`; delivery is at-least-once with receiver-side idempotency, not falsely reported as exactly-once. QQ and email are not Skill Center delivery channels.
 
+The capability API and Skill Center UI keep six claims separate: code present, configuration ready, last successful real search, last scheduled run, last persisted AI decision, and last confirmed real delivery. Each runtime claim is backed by a user-scoped run, event, or delivery row and timestamp; absent evidence is shown as never verified.
+
 ## Deployment Notes
 
 The local workspace uses port `8091`; containers commonly expose `8080` through `PORT` or `API_PORT`. A Hugging Face Spaces export needs Docker frontmatter with `app_port: 8080`, but the GitHub README does not require that frontmatter.

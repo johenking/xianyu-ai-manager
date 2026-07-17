@@ -402,4 +402,4 @@ curl -sS "$BASE_URL/api/skills/ops/browser-status" -H "Authorization: Bearer $TO
 curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" -H "Authorization: Bearer $TOKEN"
 ```
 
-`GET /api/skills/capabilities` reports whether account AI configuration and at least one supported notification channel are currently available. Capability state reflects configuration readiness; it does not claim that a future run or external notification endpoint will succeed.
+`GET /api/skills/capabilities` returns six independent evidence cards: `code_present`, `config_ready`, `last_real_search`, `last_scheduled_run`, `last_ai_decision`, and `last_real_delivery`. Code presence never implies configuration readiness. Missing persisted evidence is reported as `never`; ambiguous delivery attempts do not count as confirmed real delivery.

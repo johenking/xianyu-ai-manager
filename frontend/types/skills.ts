@@ -48,8 +48,12 @@ export interface SkillMonitorResult {
 
 export interface SkillCapability {
   available: boolean;
+  state: string;
+  badge_state: 'ready' | 'warning' | 'missing';
   label: string;
   detail: string;
+  observed_at?: number | null;
+  evidence?: Record<string, unknown> | null;
 }
 
 export interface AutoReplyDiagnostics {

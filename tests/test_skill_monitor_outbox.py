@@ -186,6 +186,114 @@ class SkillMonitorOutboxPersistenceTests(unittest.TestCase):
         self.assertEqual(created["notify_status"], "disabled")
         self.assertEqual(created["delivery_ids"], [])
 
+    def test_capability_evidence_uses_persisted_real_events_only(self):
+        self._channel("webhook", "webhook")
+        task_id, claim = self._task_and_claim()
+        decision = self.db.record_skill_monitor_ai_decision(
+            run_id=claim["run_id"],
+            claim_token=claim["claim_token"],
+            task_id=task_id,
+            user_id=1,
+            item_identity="private-item-identity",
+            recommended=False,
+            score=42,
+            now=105,
+        )
+        self.assertEqual(decision["state"], "recorded")
+
+        created = self.db.persist_skill_monitor_match(
+            self._result(task_id),
+            run_id=claim["run_id"],
+            claim_token=claim["claim_token"],
+            now=110,
+        )
+        delivery = self.db.claim_skill_monitor_delivery(
+            delivery_id=created["delivery_ids"][0],
+            now=111,
+        )
+        self.assertTrue(
+            self.db.finish_skill_monitor_delivery(
+                delivery["id"],
+                delivery["claim_token"],
+                status="sent",
+                now=112,
+            )
+        )
+        self.assertTrue(
+            self.db.finish_skill_monitor_run(
+                claim["run_id"],
+                claim["claim_token"],
+                status="success",
+                raw_result_count=8,
+                accepted_result_count=1,
+                now=113,
+            )
+        )
+
+        scheduled_task = self.db.create_skill_monitor_task(
+            1,
+            {
+                "name": "scheduled-evidence",
+                "keyword": "synthetic",
+                "account_id": "account-1",
+                "enabled": True,
+                "schedule_enabled": True,
+            },
+        )
+        scheduled = self.db.claim_skill_monitor_run(
+            scheduled_task,
+            1,
+            trigger_type="scheduled",
+            now=200,
+        )
+        self.assertTrue(
+            self.db.finish_skill_monitor_run(
+                scheduled["run_id"],
+                scheduled["claim_token"],
+                status="failed",
+                error_code="synthetic_failure",
+                now=201,
+            )
+        )
+
+        evidence = self.db.get_skill_capability_evidence(1)
+        self.assertEqual(evidence["last_real_search"]["run_id"], claim["run_id"])
+        self.assertEqual(evidence["last_real_search"]["raw_result_count"], 8)
+        self.assertEqual(evidence["last_scheduled_run"]["status"], "failed")
+        self.assertFalse(evidence["last_ai_decision"]["recommended"])
+        self.assertEqual(evidence["last_ai_decision"]["score"], 42)
+        self.assertEqual(
+            evidence["last_real_delivery"]["channel_type"],
+            "webhook",
+        )
+
+        ai_payload = self.db.conn.execute(
+            "SELECT payload_json FROM skill_monitor_events "
+            "WHERE event_type = 'ai_decision'"
+        ).fetchone()[0]
+        self.assertNotIn("private-item-identity", ai_payload)
+
+    def test_failed_ai_decision_audit_cannot_outlive_the_run_lease(self):
+        task_id, claim = self._task_and_claim(notify_enabled=False)
+        rejected = self.db.record_skill_monitor_ai_decision(
+            run_id=claim["run_id"],
+            claim_token="wrong-token",
+            task_id=task_id,
+            user_id=1,
+            item_identity="item-1",
+            recommended=True,
+            score=90,
+            now=105,
+        )
+        self.assertEqual(rejected["state"], "lease_lost")
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM skill_monitor_events "
+                "WHERE event_type = 'ai_decision'"
+            ).fetchone()[0],
+            0,
+        )
+
 
 class SkillMonitorDeliveryDispatcherTests(unittest.IsolatedAsyncioTestCase):
     def _delivery(self):

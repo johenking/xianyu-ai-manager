@@ -42,10 +42,12 @@ describe('SkillCenter loading and monitor controls', () => {
     ] as any);
     vi.mocked(getItemsByCookie).mockResolvedValue([] as any);
     vi.mocked(getSkillCapabilities).mockResolvedValue({
-      manual_monitor: { available: true, label: '可用', detail: '手动运行' },
-      scheduled_monitor: { available: true, label: '可用', detail: '单worker调度' },
-      ai_filter: { available: true, label: '可用', detail: 'AI过滤' },
-      notifications: { available: false, label: '缺少渠道', detail: '请先创建通知渠道' },
+      code_present: { available: true, state: 'present', badge_state: 'ready', label: '代码已加载', detail: '不代表真实运行通过' },
+      config_ready: { available: false, state: 'blocked', badge_state: 'missing', label: '尚未就绪', detail: '全局监控开关关闭' },
+      last_real_search: { available: false, state: 'never', badge_state: 'missing', label: '从未验证', detail: '没有真实搜索记录' },
+      last_scheduled_run: { available: false, state: 'never', badge_state: 'missing', label: '从未运行', detail: '没有定时运行记录' },
+      last_ai_decision: { available: false, state: 'never', badge_state: 'missing', label: '从未判断', detail: '没有 AI 决策' },
+      last_real_delivery: { available: false, state: 'never', badge_state: 'missing', label: '从未确认', detail: '没有通知记录' },
     });
     vi.mocked(getSkillMonitorTasks).mockResolvedValue([]);
     vi.mocked(getSkillMonitorResults).mockResolvedValue([]);
@@ -72,6 +74,11 @@ describe('SkillCenter loading and monitor controls', () => {
     expect(screen.getByPlaceholderText(/AI 商品过滤要求/)).toBeInTheDocument();
     expect(screen.getByText('定时运行')).toBeInTheDocument();
     expect(screen.getByText('命中后通知')).toBeInTheDocument();
+    expect(screen.getByText('代码存在')).toBeInTheDocument();
+    expect(screen.getByText('配置就绪')).toBeInTheDocument();
+    expect(screen.getByText('最近真实搜索')).toBeInTheDocument();
+    expect(screen.getByText('从未验证')).toBeInTheDocument();
+    expect(screen.getByText('不代表真实运行通过')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /AI 专家客服/ }));
     await waitFor(() => expect(getSkillAgentPrompts).toHaveBeenCalledTimes(1));

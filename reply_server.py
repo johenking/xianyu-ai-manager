@@ -38,7 +38,10 @@ from settings_service import (
     resolve_user_basic_settings,
     validate_skill_monitor_features,
 )
-from skill_monitor_features import skill_monitor_feature_enabled
+from skill_monitor_features import (
+    get_skill_monitor_feature_state,
+    skill_monitor_feature_enabled,
+)
 from account_session_refresh import (
     active_refresh_registry,
     is_runtime_event_active,
@@ -6418,37 +6421,175 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
 
 @skills_router.get('/api/skills/capabilities')
 def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_user)):
-    account_count = len(db_manager.get_all_cookies(current_user['user_id']))
-    user_id = current_user['user_id']
-    has_ai = _user_has_ai_configuration(user_id)
-    channels = _enabled_notification_channels(user_id)
+    user_id = int(current_user['user_id'])
+    feature_state = get_skill_monitor_feature_state(db_manager)
+    effective_flags = feature_state['effective']
+    account_ids = list(db_manager.get_all_cookies(user_id).keys())
+    ready_account_ids = {
+        account_id
+        for account_id in account_ids
+        if db_manager.get_owned_cookie_search_context(
+            user_id,
+            account_id,
+        ).get('state') == 'ready'
+    }
+    tasks = db_manager.list_skill_monitor_tasks(user_id)
+    runnable_tasks = [
+        task
+        for task in tasks
+        if task.get('enabled')
+        and str(task.get('account_id') or '') in ready_account_ids
+    ]
+    manual_ready = bool(
+        effective_flags.get('skill_monitor_enabled')
+        and runnable_tasks
+    )
+    blockers = []
+    if not effective_flags.get('skill_monitor_enabled'):
+        blockers.append('全局监控开关关闭')
+    if not ready_account_ids:
+        blockers.append('没有身份完整的所属账号')
+    if not runnable_tasks:
+        blockers.append('没有绑定可用账号的启用任务')
+
+    evidence = db_manager.get_skill_capability_evidence(user_id)
+    last_search = evidence.get('last_real_search')
+    last_scheduled = evidence.get('last_scheduled_run')
+    last_ai = evidence.get('last_ai_decision')
+    last_delivery = evidence.get('last_real_delivery')
+    last_delivery_attempt = evidence.get('last_delivery_attempt')
+    scheduled_status_labels = {
+        'success': '成功',
+        'failed': '失败',
+        'interrupted': '已中断',
+        'running': '运行中',
+        'claimed': '已领取',
+        'pending': '等待中',
+    }
+    scheduled_status = str((last_scheduled or {}).get('status') or '')
+    if last_delivery:
+        delivery_detail = (
+            f"最近一次已确认送达渠道：{last_delivery['channel_type']}"
+        )
+    elif last_delivery_attempt:
+        delivery_detail = (
+            "尚无确认送达；最近投递状态为 "
+            f"{last_delivery_attempt['status']}"
+        )
+    else:
+        delivery_detail = '尚无真实通知投递记录'
+
     return {
         'success': True,
         'data': {
-            'manual_monitor': {
+            'code_present': {
                 'available': True,
-                'label': '可用',
-                'detail': '使用Playwright执行单次真实搜索',
+                'state': 'present',
+                'badge_state': 'ready',
+                'label': '代码已加载',
+                'detail': '执行租约、结果事务和通知 outbox 代码已加载；不代表配置或真实运行通过',
             },
-            'scheduled_monitor': {
-                'available': True,
-                'label': '可用',
-                'detail': '单worker内置调度器按任务间隔运行',
+            'config_ready': {
+                'available': manual_ready,
+                'state': 'ready' if manual_ready else 'blocked',
+                'badge_state': 'ready' if manual_ready else 'missing',
+                'label': '配置就绪' if manual_ready else '尚未就绪',
+                'detail': (
+                    f"{len(runnable_tasks)} 个任务可手动执行"
+                    if manual_ready
+                    else '；'.join(blockers)
+                ),
+                'evidence': {
+                    'ready_accounts': len(ready_account_ids),
+                    'runnable_tasks': len(runnable_tasks),
+                    'global_enabled': bool(
+                        effective_flags.get('skill_monitor_enabled')
+                    ),
+                    'scheduler_enabled': bool(
+                        effective_flags.get('skill_monitor_scheduler_enabled')
+                    ),
+                    'delivery_enabled': bool(
+                        effective_flags.get('skill_monitor_delivery_enabled')
+                    ),
+                    'mtop_enabled': bool(
+                        effective_flags.get('skill_monitor_mtop_enabled')
+                    ),
+                },
             },
-            'ai_filter': {
-                'available': has_ai,
-                'label': '可用' if has_ai else '需配置AI',
-                'detail': '命中规则后调用AI判断是否推荐' if has_ai else '请先为至少一个账号配置并启用AI',
+            'last_real_search': {
+                'available': bool(last_search),
+                'state': 'success' if last_search else 'never',
+                'badge_state': 'ready' if last_search else 'missing',
+                'label': '已有真实记录' if last_search else '从未验证',
+                'detail': (
+                    f"{last_search['source_adapter']} 成功抓取 "
+                    f"{last_search['raw_result_count']} 条，命中 "
+                    f"{last_search['accepted_result_count']} 条"
+                    if last_search
+                    else '没有成功完成的 Playwright/MTop 真实搜索记录'
+                ),
+                'observed_at': (
+                    last_search.get('observed_at') if last_search else None
+                ),
+                'evidence': last_search,
             },
-            'notifications': {
-                'available': len(channels) > 0,
-                'label': '可用' if channels else '缺少渠道',
-                'detail': f'将发送到 {len(channels)} 个启用通知渠道' if channels else '请先创建并启用通知渠道',
+            'last_scheduled_run': {
+                'available': scheduled_status == 'success',
+                'state': scheduled_status or 'never',
+                'badge_state': (
+                    'ready'
+                    if scheduled_status == 'success'
+                    else ('warning' if last_scheduled else 'missing')
+                ),
+                'label': (
+                    scheduled_status_labels.get(scheduled_status, scheduled_status)
+                    if last_scheduled
+                    else '从未运行'
+                ),
+                'detail': (
+                    f"最近一次定时运行状态："
+                    f"{scheduled_status_labels.get(scheduled_status, scheduled_status)}"
+                    if last_scheduled
+                    else '没有定时任务运行记录'
+                ),
+                'observed_at': (
+                    last_scheduled.get('observed_at')
+                    if last_scheduled
+                    else None
+                ),
+                'evidence': last_scheduled,
             },
-            'expert_live_reply': {
-                'available': account_count > 0,
-                'label': '可用' if account_count > 0 else '缺少账号',
-                'detail': '价格、技术和默认专家策略同时作用于测试与正式AI回复',
+            'last_ai_decision': {
+                'available': bool(last_ai),
+                'state': 'observed' if last_ai else 'never',
+                'badge_state': 'ready' if last_ai else 'missing',
+                'label': (
+                    ('推荐' if last_ai.get('recommended') else '不推荐')
+                    if last_ai
+                    else '从未判断'
+                ),
+                'detail': (
+                    f"最近一次 AI 过滤得分：{last_ai['score']:g}"
+                    if last_ai
+                    else '没有持久化的真实 AI 过滤决策'
+                ),
+                'observed_at': (
+                    last_ai.get('observed_at') if last_ai else None
+                ),
+                'evidence': last_ai,
+            },
+            'last_real_delivery': {
+                'available': bool(last_delivery),
+                'state': 'sent' if last_delivery else 'never',
+                'badge_state': 'ready' if last_delivery else 'missing',
+                'label': '已确认送达' if last_delivery else '从未确认',
+                'detail': delivery_detail,
+                'observed_at': (
+                    last_delivery.get('observed_at')
+                    if last_delivery
+                    else None
+                ),
+                'evidence': last_delivery,
             },
         },
     }
@@ -6678,8 +6819,22 @@ async def _run_real_skill_monitor(
             continue
 
         ai_filter_result = {'recommended': True, 'score': 0, 'reason': reason}
-        if str(task.get('ai_filter') or '').strip():
+        ai_evaluated = bool(str(task.get('ai_filter') or '').strip())
+        if ai_evaluated:
             ai_filter_result = _run_skill_ai_filter(item, task, user_id)
+            decision = db_manager.record_skill_monitor_ai_decision(
+                run_id=int(run_id or 0),
+                claim_token=claim_token,
+                task_id=int(task['id']),
+                user_id=int(user_id),
+                item_identity=str(item_id or item_url or item.get('title') or ''),
+                recommended=bool(ai_filter_result.get('recommended')),
+                score=float(ai_filter_result.get('score') or 0),
+            )
+            if decision.get('state') == 'lease_lost':
+                raise HTTPException(status_code=409, detail="监控运行租约已失效")
+            if decision.get('state') not in {'recorded', 'duplicate'}:
+                raise HTTPException(status_code=500, detail="AI 判断审计记录失败")
             if not ai_filter_result.get('recommended'):
                 continue
 
@@ -6700,6 +6855,7 @@ async def _run_real_skill_monitor(
                 'source': search_result.get('source') or 'playwright',
                 'is_real_data': True,
                 'filter_reason': reason,
+                'ai_evaluated': ai_evaluated,
                 'ai_recommended': bool(ai_filter_result.get('recommended')),
                 'scheduled_run': scheduled_run,
                 'published_within_hours': task.get('published_within_hours'),

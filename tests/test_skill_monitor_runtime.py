@@ -139,6 +139,69 @@ class SkillAiFilterTests(unittest.TestCase):
         self.assertIn("配置并启用AI", raised.exception.detail)
 
 
+class SkillCapabilityMatrixTests(unittest.TestCase):
+    def test_code_presence_does_not_claim_configuration_or_real_use(self):
+        empty_evidence = {
+            "last_real_search": None,
+            "last_scheduled_run": None,
+            "last_ai_decision": None,
+            "last_real_delivery": None,
+            "last_delivery_attempt": None,
+        }
+        with (
+            patch.object(
+                reply_server,
+                "get_skill_monitor_feature_state",
+                return_value={
+                    "effective": {
+                        "skill_monitor_enabled": False,
+                        "skill_monitor_scheduler_enabled": False,
+                        "skill_monitor_delivery_enabled": False,
+                        "skill_monitor_mtop_enabled": False,
+                    }
+                },
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "get_all_cookies",
+                return_value={"account-1": "redacted"},
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "get_owned_cookie_search_context",
+                return_value={"state": "ready"},
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "list_skill_monitor_tasks",
+                return_value=[{
+                    "id": 3,
+                    "enabled": True,
+                    "account_id": "account-1",
+                }],
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "get_skill_capability_evidence",
+                return_value=empty_evidence,
+            ),
+        ):
+            data = reply_server.get_skill_capabilities({"user_id": 7})["data"]
+
+        self.assertEqual(set(data), {
+            "code_present",
+            "config_ready",
+            "last_real_search",
+            "last_scheduled_run",
+            "last_ai_decision",
+            "last_real_delivery",
+        })
+        self.assertTrue(data["code_present"]["available"])
+        self.assertFalse(data["config_ready"]["available"])
+        self.assertEqual(data["last_real_search"]["state"], "never")
+        self.assertEqual(data["last_real_delivery"]["label"], "从未确认")
+
+
 class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_hard_kill_cancels_the_owner(self):
         stop_event = asyncio.Event()
@@ -302,6 +365,82 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             claim_token="claim-token",
         )
         send_mock.assert_not_called()
+
+    async def test_rejected_ai_filter_still_records_a_lease_scoped_decision(self):
+        search_result = {
+            "is_real_data": True,
+            "source": "playwright",
+            "items": [{
+                "item_id": "item-1",
+                "title": "iPhone 15",
+                "item_url": "https://example.test/item-1",
+            }],
+        }
+        task = {
+            "id": 3,
+            "keyword": "iPhone",
+            "account_id": "account-1",
+            "ai_filter": "只保留低价商品",
+            "notify_enabled": False,
+        }
+        with (
+            patch(
+                "utils.item_search.search_xianyu_items",
+                new=AsyncMock(return_value=search_result),
+            ),
+            patch.object(
+                reply_server,
+                "_user_ai_cookie_settings",
+                return_value=("account-1", {"model_name": "test"}),
+            ),
+            patch.object(
+                reply_server,
+                "_user_has_ai_configuration",
+                return_value=True,
+            ),
+            patch.object(
+                reply_server,
+                "_run_skill_ai_filter",
+                return_value={
+                    "recommended": False,
+                    "score": 42,
+                    "reason": "not recommended",
+                },
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "skill_monitor_result_exists",
+                return_value=False,
+            ),
+            patch.object(
+                reply_server.db_manager,
+                "record_skill_monitor_ai_decision",
+                return_value={"state": "recorded", "recorded": True},
+            ) as decision_mock,
+            patch.object(
+                reply_server.db_manager,
+                "persist_skill_monitor_match",
+            ) as persist_mock,
+        ):
+            result_ids, raw_count, _ = await reply_server._run_real_skill_monitor(
+                task,
+                7,
+                run_id=41,
+                claim_token="claim-token",
+            )
+
+        self.assertEqual(result_ids, [])
+        self.assertEqual(raw_count, 1)
+        decision_mock.assert_called_once_with(
+            run_id=41,
+            claim_token="claim-token",
+            task_id=3,
+            user_id=7,
+            item_identity="item-1",
+            recommended=False,
+            score=42.0,
+        )
+        persist_mock.assert_not_called()
 
     async def test_failed_scheduled_run_is_rescheduled_and_records_error(self):
         task = {
