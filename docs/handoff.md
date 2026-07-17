@@ -1,5 +1,24 @@
 # Handoff
 
+## Monitor Integration Candidate On 2026-07-18
+
+The monitor work is isolated in `/Users/mac/Documents/Codex/integration/xianyu-monitor-20260718` on branch `codex/monitor-integration-20260718`. The immutable source baseline is commit `dd0e8f2`, tagged `codex/live-source-baseline-20260718-043547`; its provenance records 201 allowlisted source files, zero symlinks, sanitized remotes, and Stage A backup root hash `e6983cb07117c477bab2366bc26b2355789797255d5735b541b4c9ca39d3a08d`. The feature implementation ends at `53d4a5c` before this handoff-only documentation update.
+
+Stage A remains recoverable from `/Users/mac/Documents/Codex/backups/xianyu-monitor-stage-a-20260718-043547`. Stage B adds fail-closed monitor, scheduler, delivery, and experimental MTop feature flags; expand-only schema changes; persistent run and delivery claims with independent tokens, leases, heartbeats, and stale recovery; transactional first-seen events and delivery outbox rows; stable delivery idempotency keys with explicit `unknown` outcomes; Cookie revision compare-and-swap; and owner/account/revision-bound Playwright search with isolated profiles and no anonymous fallback. No complete MTop response is retained.
+
+The API and Skill Center UI now report six independent claims: `code_present`, `config_ready`, `last_real_search`, `last_scheduled_run`, `last_ai_decision`, and `last_real_delivery`. Missing evidence is rendered as never verified, never run, never judged, or never confirmed. Code presence is not configuration, runtime, AI, or delivery evidence.
+
+Local verification for the implementation commit passed:
+
+- Ruff and the project `py_compile` gate exited 0; the backend suite passed 306 of 306 tests.
+- `npm audit --audit-level=high` reported zero vulnerabilities; TypeScript exited 0; Vitest passed 17 files and 75 tests.
+- Two independent Vite builds each produced 31 assets. `verify:build` found 31 of 31 retained assets, zero orphans, and a 245,200-byte entry bundle, 71.7% smaller than the retained baseline.
+- Both exact Python lock files passed `pip-audit --no-deps --disable-pip`; a clean environment installed the revised production lock's 71 packages and imported the core runtime successfully.
+- Gitleaks reported zero findings across `dd0e8f2..53d4a5c`.
+- Local mocked UI review covered loading, empty, error, configuration-blocked, and disabled states at 1440x900 and 390x844. The desktop and mobile documents measured 1440/1440 and 390/390 client/scroll widths, all six evidence cards had no overlap or content overflow, full-scroll hit testing passed, and console/runtime errors were zero. Evidence is under `/Users/mac/Documents/Codex/evidence/xianyu-monitor-20260718/phase-b/ui-review-20260718` and is not live evidence.
+
+This branch has not been deployed. It has not used a production or dedicated test Xianyu account, made an MTop shadow request, sent a real Webhook or other notification, or called a real AI provider. No schedule or feature switch was enabled, and the existing live service does not yet expose this truthful capability matrix. The historical live evidence below belongs to the official-login deployment and must not be treated as monitor-integration deployment or real-provider acceptance.
+
 ## Source State On 2026-07-17
 
 The `codex/official-login-stability` branch starts from clean tag `v1.7.3` and replaces active custom QR, automatic-slider, and headless verification paths with one official Goofish browser service. New QR/password login uses the official parent page, existing accounts reuse `browser_data/user_<unb>`, verification stays human-operated, and listener replacement is bounded outside its account lock. Passwords, Cookies, email codes, reset grants, API keys, deployment tokens, databases, browser profiles, and live account data remain outside source control.
