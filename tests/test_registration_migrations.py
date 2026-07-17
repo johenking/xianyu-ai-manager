@@ -18,7 +18,7 @@ OLD_MIGRATIONS = (
 )
 
 
-EXPECTED_LATEST_MIGRATION = "2026071701"
+EXPECTED_LATEST_MIGRATION = "2026071801"
 
 
 def create_v150_database(
@@ -277,7 +277,14 @@ class RegistrationMigrationTests(unittest.TestCase):
 
         self.assertEqual(
             runner.run(),
-            ["2026071101", "2026071102", "2026071103", "2026071104", "2026071701"],
+            [
+                "2026071101",
+                "2026071102",
+                "2026071103",
+                "2026071104",
+                "2026071701",
+                "2026071801",
+            ],
         )
         self.assertEqual(
             table_columns(connection, "users")
@@ -468,7 +475,13 @@ class RegistrationMigrationTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.run(),
-            ["2026071102", "2026071103", "2026071104", "2026071701"],
+            [
+                "2026071102",
+                "2026071103",
+                "2026071104",
+                "2026071701",
+                "2026071801",
+            ],
         )
         self.assertEqual(
             connection.execute(
@@ -524,7 +537,7 @@ class RegistrationMigrationTests(unittest.TestCase):
         )
         self.assertEqual(
             migrated.run(),
-            ["2026071103", "2026071104", "2026071701"],
+            ["2026071103", "2026071104", "2026071701", "2026071801"],
         )
         settings = dict(connection.execute("SELECT key, value FROM system_settings"))
         self.assertEqual(settings["registration_enabled"], "false")

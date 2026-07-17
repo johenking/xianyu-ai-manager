@@ -354,6 +354,281 @@ def _official_session_identity_v1(cursor: sqlite3.Cursor, _db_path: str) -> None
     )
 
 
+def _skill_monitor_durable_workflows_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Add fail-closed monitor controls and durable workflow state.
+
+    This migration is deliberately expand-only. Existing task/result rows are
+    retained; a separate identity map gives new writes deterministic
+    deduplication without deleting legacy duplicates.
+    """
+    cursor.executemany(
+        """
+        INSERT INTO system_settings (key, value, description)
+        VALUES (?, 'false', ?)
+        ON CONFLICT(key) DO UPDATE SET
+            value = 'false',
+            description = excluded.description,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            (
+                "skill_monitor_enabled",
+                "Global fail-closed kill switch for all monitor execution",
+            ),
+            (
+                "skill_monitor_scheduler_enabled",
+                "Allow scheduled monitor runs when the global switch is enabled",
+            ),
+            (
+                "skill_monitor_delivery_enabled",
+                "Allow monitor outbox delivery when the global switch is enabled",
+            ),
+            (
+                "skill_monitor_mtop_enabled",
+                "Allow the experimental MTop search adapter when the global switch is enabled",
+            ),
+        ),
+    )
+
+    cookies_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cookies'"
+    ).fetchone()
+    if cookies_exists:
+        _add_column(
+            cursor,
+            "cookies",
+            "cookie_revision INTEGER NOT NULL DEFAULT 0",
+        )
+
+    tasks_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'skill_monitor_tasks'"
+    ).fetchone()
+    results_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'skill_monitor_results'"
+    ).fetchone()
+    if results_exists:
+        _add_column(cursor, "skill_monitor_results", "item_id TEXT NOT NULL DEFAULT ''")
+        _add_column(cursor, "skill_monitor_results", "run_id INTEGER")
+        _add_column(
+            cursor,
+            "skill_monitor_results",
+            "source_adapter TEXT NOT NULL DEFAULT ''",
+        )
+        _add_column(cursor, "skill_monitor_results", "first_seen_at REAL")
+        _add_column(cursor, "skill_monitor_results", "retention_until REAL")
+        cursor.execute(
+            """
+            UPDATE skill_monitor_results
+            SET item_id = CASE
+                    WHEN json_valid(raw_data)
+                    THEN COALESCE(json_extract(raw_data, '$.item_id'), '')
+                    ELSE ''
+                END,
+                first_seen_at = COALESCE(
+                    first_seen_at,
+                    CAST(strftime('%s', created_at) AS REAL)
+                )
+            WHERE COALESCE(item_id, '') = '' OR first_seen_at IS NULL
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skill_monitor_results_item_identity "
+            "ON skill_monitor_results(task_id, user_id, item_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skill_monitor_results_run "
+            "ON skill_monitor_results(run_id, id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skill_monitor_results_retention "
+            "ON skill_monitor_results(retention_until)"
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_token TEXT NOT NULL UNIQUE,
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL DEFAULT '',
+            trigger_type TEXT NOT NULL DEFAULT 'manual',
+            source_adapter TEXT NOT NULL DEFAULT 'playwright',
+            status TEXT NOT NULL DEFAULT 'pending',
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at REAL,
+            heartbeat_at REAL,
+            attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+            started_at REAL,
+            finished_at REAL,
+            interrupted_at REAL,
+            recovered_from_run_id INTEGER,
+            raw_result_count INTEGER NOT NULL DEFAULT 0 CHECK (raw_result_count >= 0),
+            accepted_result_count INTEGER NOT NULL DEFAULT 0 CHECK (accepted_result_count >= 0),
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            retention_until REAL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            FOREIGN KEY (task_id) REFERENCES skill_monitor_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (recovered_from_run_id) REFERENCES skill_monitor_runs(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_runs_claimable "
+        "ON skill_monitor_runs(status, lease_expires_at, created_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_runs_task_history "
+        "ON skill_monitor_runs(task_id, user_id, created_at DESC, id DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_runs_retention "
+        "ON skill_monitor_runs(retention_until)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_token TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL,
+            run_id INTEGER,
+            result_id INTEGER,
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            retention_until REAL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            FOREIGN KEY (run_id) REFERENCES skill_monitor_runs(id) ON DELETE SET NULL,
+            FOREIGN KEY (result_id) REFERENCES skill_monitor_results(id) ON DELETE CASCADE,
+            FOREIGN KEY (task_id) REFERENCES skill_monitor_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_events_run "
+        "ON skill_monitor_events(run_id, created_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_events_result "
+        "ON skill_monitor_events(result_id, created_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_events_retention "
+        "ON skill_monitor_events(retention_until)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_result_identities (
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            identity_type TEXT NOT NULL,
+            identity_value TEXT NOT NULL,
+            result_id INTEGER NOT NULL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            PRIMARY KEY (task_id, user_id, identity_type, identity_value),
+            FOREIGN KEY (task_id) REFERENCES skill_monitor_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (result_id) REFERENCES skill_monitor_results(id) ON DELETE CASCADE
+        ) WITHOUT ROWID
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_result_identities_result "
+        "ON skill_monitor_result_identities(result_id)"
+    )
+    if results_exists:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO skill_monitor_result_identities (
+                task_id, user_id, identity_type, identity_value, result_id
+            )
+            SELECT task_id, user_id, 'item_url', TRIM(item_url), id
+            FROM skill_monitor_results
+            WHERE TRIM(COALESCE(item_url, '')) <> ''
+            ORDER BY id ASC
+            """
+        )
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO skill_monitor_result_identities (
+                task_id, user_id, identity_type, identity_value, result_id
+            )
+            SELECT task_id, user_id, 'item_id', TRIM(item_id), id
+            FROM skill_monitor_results
+            WHERE TRIM(COALESCE(item_id, '')) <> ''
+            ORDER BY id ASC
+            """
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            event_id INTEGER NOT NULL,
+            result_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            channel_id INTEGER,
+            channel_type TEXT NOT NULL DEFAULT '',
+            destination_digest TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            claim_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at REAL,
+            heartbeat_at REAL,
+            attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+            next_attempt_at REAL,
+            send_started_at REAL,
+            sent_at REAL,
+            confirmed_at REAL,
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            retention_until REAL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+            FOREIGN KEY (event_id) REFERENCES skill_monitor_events(id) ON DELETE CASCADE,
+            FOREIGN KEY (result_id) REFERENCES skill_monitor_results(id) ON DELETE CASCADE,
+            FOREIGN KEY (task_id) REFERENCES skill_monitor_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (channel_id) REFERENCES notification_channels(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_deliveries_claimable "
+        "ON skill_monitor_deliveries(status, next_attempt_at, lease_expires_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_deliveries_claim_token "
+        "ON skill_monitor_deliveries(claim_token)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_deliveries_user_history "
+        "ON skill_monitor_deliveries(user_id, created_at DESC, id DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_deliveries_retention "
+        "ON skill_monitor_deliveries(retention_until)"
+    )
+
+    if tasks_exists:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_skill_monitor_tasks_owner_account "
+            "ON skill_monitor_tasks(user_id, account_id, id)"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -369,6 +644,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026071701",
         "official_session_identity_v1",
         _official_session_identity_v1,
+    ),
+    Migration(
+        "2026071801",
+        "skill_monitor_durable_workflows_v1",
+        _skill_monitor_durable_workflows_v1,
     ),
 )
 

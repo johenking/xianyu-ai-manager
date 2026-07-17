@@ -9,6 +9,15 @@ import skill_monitor_scheduler as scheduler_module
 
 
 class SkillNotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.feature_patcher = patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        )
+        self.feature_patcher.start()
+        self.addCleanup(self.feature_patcher.stop)
+
     @staticmethod
     def _successful_response(payload):
         response = Mock()
@@ -130,6 +139,40 @@ class SkillNotificationTests(unittest.TestCase):
         self.assertNotIn(secret_url, error)
         self.assertIn("[redacted-url]", error)
 
+    def test_notification_kill_switch_blocks_every_send(self):
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server,
+            "_enabled_notification_channels",
+        ) as channels_mock, patch.object(
+            reply_server,
+            "_send_skill_notification_to_channel",
+        ) as send_mock, patch.object(
+            reply_server.db_manager,
+            "update_skill_monitor_result_notification",
+            return_value=True,
+        ) as update_mock:
+            status, error = reply_server._notify_skill_monitor_result(
+                {"notify_enabled": True, "keyword": "iPhone"},
+                7,
+                11,
+                {"title": "iPhone 15"},
+            )
+
+        self.assertEqual(status, "disabled_by_kill_switch")
+        self.assertIn("开关关闭", error)
+        channels_mock.assert_not_called()
+        send_mock.assert_not_called()
+        update_mock.assert_called_once_with(
+            11,
+            7,
+            "disabled_by_kill_switch",
+            error,
+        )
+
     def test_platform_webhooks_use_their_native_payloads(self):
         cases = [
             (
@@ -218,6 +261,48 @@ class SkillAiFilterTests(unittest.TestCase):
 
 
 class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_kill_switch_blocks_before_task_claim(self):
+        task = {"id": 3, "keyword": "iPhone"}
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "mark_skill_monitor_task_running",
+        ) as claim_mock:
+            with self.assertRaises(HTTPException) as raised:
+                await reply_server.execute_skill_monitor_task(task, 7)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("全局开关关闭", raised.exception.detail)
+        claim_mock.assert_not_called()
+
+    async def test_scheduler_kill_switch_blocks_scheduled_run_before_claim(self):
+        task = {"id": 3, "keyword": "iPhone"}
+
+        def enabled(key):
+            return key == "skill_monitor_enabled"
+
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            side_effect=enabled,
+        ), patch.object(
+            reply_server.db_manager,
+            "mark_skill_monitor_task_running",
+        ) as claim_mock:
+            with self.assertRaises(HTTPException) as raised:
+                await reply_server.execute_skill_monitor_task(
+                    task,
+                    7,
+                    scheduled_run=True,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("调度开关关闭", raised.exception.detail)
+        claim_mock.assert_not_called()
+
     async def test_existing_result_is_not_inserted_or_notified_again(self):
         search_result = {
             "is_real_data": True,
@@ -250,7 +335,9 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             "schedule_enabled": True,
             "schedule_interval_minutes": 30,
         }
-        with patch.object(reply_server.db_manager, "mark_skill_monitor_task_running", return_value=True), patch.object(
+        with patch.object(reply_server, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            reply_server.db_manager, "mark_skill_monitor_task_running", return_value=True
+        ), patch.object(
             reply_server, "_run_real_skill_monitor", new=AsyncMock(side_effect=HTTPException(502, "搜索失败"))
         ), patch.object(
             reply_server.db_manager, "update_skill_monitor_task_run", return_value=True
@@ -267,7 +354,9 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
 class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_and_stop_own_the_polling_task(self):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
-        with patch.object(scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0), patch.object(
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0
+        ), patch.object(
             scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=[]
         ):
             await scheduler.start()
@@ -289,7 +378,9 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         scheduler = BlockingScheduler()
         due = [{"id": 9, "user_id": 7}]
-        with patch.object(scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=due):
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=due
+        ):
             self.assertEqual(await scheduler.run_due_once(), 1)
             await asyncio.sleep(0)
             self.assertEqual(await scheduler.run_due_once(), 0)
@@ -310,7 +401,9 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         scheduler._execute = blocking_execute
-        with patch.object(scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0), patch.object(
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0
+        ), patch.object(
             scheduler_module.db_manager,
             "list_due_skill_monitor_tasks",
             side_effect=[[{"id": 9, "user_id": 7}], []],
@@ -320,6 +413,20 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
             await scheduler.stop()
 
         self.assertTrue(cancelled.is_set())
+
+    async def test_scheduler_stays_stopped_when_fail_closed_switch_is_off(self):
+        scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=False), patch.object(
+            scheduler_module.db_manager, "reset_running_skill_monitor_tasks"
+        ) as reset_mock, patch.object(
+            scheduler_module.db_manager, "list_due_skill_monitor_tasks"
+        ) as due_mock:
+            await scheduler.start()
+            self.assertFalse(scheduler.running)
+            self.assertEqual(await scheduler.run_due_once(), 0)
+
+        reset_mock.assert_not_called()
+        due_mock.assert_not_called()
 
 
 class SkillMonitorApiValidationTests(unittest.TestCase):

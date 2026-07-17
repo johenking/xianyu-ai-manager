@@ -38,6 +38,7 @@ from settings_service import (
     resolve_user_basic_settings,
     validate_skill_monitor_features,
 )
+from skill_monitor_features import skill_monitor_feature_enabled
 from account_session_refresh import (
     active_refresh_registry,
     is_runtime_event_active,
@@ -6388,6 +6389,11 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
 def _notify_skill_monitor_result(task: Dict[str, Any], user_id: int, result_id: int, result_payload: Dict[str, Any]) -> Tuple[str, str]:
     if not task.get('notify_enabled'):
         return 'disabled', ''
+    if not skill_monitor_feature_enabled("skill_monitor_delivery_enabled"):
+        status = 'disabled_by_kill_switch'
+        error = '监控通知全局开关关闭'
+        db_manager.update_skill_monitor_result_notification(result_id, user_id, status, error)
+        return status, error
 
     channels = _enabled_notification_channels(user_id)
     if not channels:
@@ -6701,6 +6707,10 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, schedul
 
 
 async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Dict[str, Any]:
+    if not skill_monitor_feature_enabled("skill_monitor_enabled"):
+        raise HTTPException(status_code=503, detail="监控全局开关关闭")
+    if scheduled_run and not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+        raise HTTPException(status_code=503, detail="监控调度开关关闭")
     if not db_manager.mark_skill_monitor_task_running(task['id'], user_id):
         raise HTTPException(status_code=409, detail="监控任务正在运行，请稍后再试")
 

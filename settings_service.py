@@ -15,6 +15,10 @@ BOOLEAN_SETTING_KEYS = {
     "item_sync_enabled",
     "smtp_use_tls",
     "smtp_use_ssl",
+    "skill_monitor_enabled",
+    "skill_monitor_scheduler_enabled",
+    "skill_monitor_delivery_enabled",
+    "skill_monitor_mtop_enabled",
 }
 
 INTEGER_SETTING_KEYS = {

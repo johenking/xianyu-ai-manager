@@ -14,6 +14,7 @@ from config import COOKIES_LIST
 from db_manager import db_manager
 from session_registry import initialize_session_registry
 from skill_monitor_scheduler import skill_monitor_scheduler
+from skill_monitor_features import skill_monitor_feature_enabled
 from account_session_refresh import remove_verification_image
 
 
@@ -96,7 +97,10 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     if env_cookie and "default" not in manager.cookies:
         await manager._add_cookie_async("default", env_cookie)
 
-    await skill_monitor_scheduler.start()
+    if skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+        await skill_monitor_scheduler.start()
+    else:
+        logger.info("技能中心定时监控调度器保持关闭（全局/调度开关未启用）")
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 

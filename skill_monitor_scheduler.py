@@ -8,6 +8,7 @@ from typing import Optional, Set
 from loguru import logger
 
 from db_manager import db_manager
+from skill_monitor_features import skill_monitor_feature_enabled
 
 
 class SkillMonitorScheduler:
@@ -26,6 +27,9 @@ class SkillMonitorScheduler:
 
     async def start(self) -> None:
         if self.running:
+            return
+        if not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+            logger.info("技能中心定时监控调度器未启动（开关关闭）")
             return
         self._stopping = asyncio.Event()
         reset_count = db_manager.reset_running_skill_monitor_tasks()
@@ -65,6 +69,8 @@ class SkillMonitorScheduler:
                 continue
 
     async def run_due_once(self) -> int:
+        if not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+            return 0
         due_tasks = db_manager.list_due_skill_monitor_tasks()
         if not due_tasks:
             return 0

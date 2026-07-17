@@ -30,12 +30,16 @@ class SettingsServiceTests(unittest.TestCase):
             "ai_api_key": "sk-private-value",
             "smtp_password": "mail-private-value",
             "ai_model": "deepseek-chat",
+            "skill_monitor_enabled": "false",
+            "skill_monitor_scheduler_enabled": "true",
         })
 
         self.assertIs(result["registration_enabled"], False)
         self.assertIs(result["item_sync_enabled"], True)
         self.assertEqual(result["item_sync_interval"], 600)
         self.assertEqual(result["item_sync_max_pages"], 5)
+        self.assertIs(result["skill_monitor_enabled"], False)
+        self.assertIs(result["skill_monitor_scheduler_enabled"], True)
         self.assertNotIn("sk-private-value", str(result))
         self.assertNotIn("mail-private-value", str(result))
         self.assertTrue(result["ai_api_key_configured"])
@@ -51,6 +55,47 @@ class SettingsServiceTests(unittest.TestCase):
 
     def test_monitor_features_are_runtime_validated(self):
         self.assertIsNone(validate_skill_monitor_features(notify_enabled=True, ai_filter="低风险卖家"))
+
+    def test_monitor_durable_schema_and_feature_defaults_are_present(self):
+        self.assertEqual(self.db.schema_version, "2026071801")
+        settings = self.db.get_all_system_settings()
+        for key in (
+            "skill_monitor_enabled",
+            "skill_monitor_scheduler_enabled",
+            "skill_monitor_delivery_enabled",
+            "skill_monitor_mtop_enabled",
+        ):
+            self.assertEqual(settings[key], "false")
+
+        tables = {
+            row[0]
+            for row in self.db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        self.assertTrue(
+            {
+                "skill_monitor_runs",
+                "skill_monitor_events",
+                "skill_monitor_result_identities",
+                "skill_monitor_deliveries",
+            }.issubset(tables)
+        )
+        cookie_columns = {
+            row[1] for row in self.db.conn.execute("PRAGMA table_info(cookies)")
+        }
+        result_columns = {
+            row[1]
+            for row in self.db.conn.execute(
+                "PRAGMA table_info(skill_monitor_results)"
+            )
+        }
+        self.assertIn("cookie_revision", cookie_columns)
+        self.assertTrue(
+            {"item_id", "run_id", "source_adapter", "retention_until"}.issubset(
+                result_columns
+            )
+        )
 
     def test_skill_monitor_task_scheduler_fields_round_trip(self):
         task_id = self.db.create_skill_monitor_task(1, {
