@@ -1736,21 +1736,14 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                show_browser = False
-                try:
-                    account_info = db_manager.get_cookie_details(self.cookie_id) or {}
-                    show_browser = bool(account_info.get('show_browser'))
-                except Exception as browser_flag_error:
-                    logger.debug(f"【{self.cookie_id}】读取滑块浏览器显示设置失败: {browser_flag_error}")
-
                 # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
                 slider_stealth = XianyuSliderStealth(
                     # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
                     user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
                     enable_learning=True,  # 启用学习功能
-                    headless=not show_browser
+                    headless=True
                 )
-                logger.info(f"【{self.cookie_id}】滑块验证浏览器模式: {'可见' if show_browser else '无头'}")
+                logger.info(f"【{self.cookie_id}】后台滑块验证使用无头浏览器")
 
                 # 在线程池中执行滑块验证
                 import asyncio
