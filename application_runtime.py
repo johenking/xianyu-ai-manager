@@ -15,6 +15,7 @@ from db_manager import db_manager
 from session_registry import initialize_session_registry
 from skill_monitor_scheduler import skill_monitor_scheduler
 from skill_monitor_features import skill_monitor_feature_enabled
+from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
 from account_session_refresh import remove_verification_image
 
 
@@ -101,12 +102,17 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
         await skill_monitor_scheduler.start()
     else:
         logger.info("技能中心定时监控调度器保持关闭（全局/调度开关未启用）")
+    if skill_monitor_feature_enabled("skill_monitor_delivery_enabled"):
+        await skill_monitor_delivery_dispatcher.start()
+    else:
+        logger.info("技能监控通知 dispatcher 保持关闭（全局/通知开关未启用）")
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
     await skill_monitor_scheduler.stop()
+    await skill_monitor_delivery_dispatcher.stop()
 
     manager = cookie_manager_module.manager
     if manager is not None:

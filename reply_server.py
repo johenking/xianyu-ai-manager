@@ -6305,6 +6305,17 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
     if result_payload.get('item_url'):
         lines.append(f"链接：{result_payload['item_url']}")
     message = "\n".join(lines)
+    idempotency_key = str(
+        result_payload.get('_delivery_idempotency_key') or ''
+    ).strip()
+    idempotency_headers = (
+        {
+            'Idempotency-Key': idempotency_key,
+            'X-Idempotency-Key': idempotency_key,
+        }
+        if idempotency_key
+        else {}
+    )
 
     timeout = 10
     if channel_type in {'webhook', 'wechat', 'dingtalk', 'ding_talk', 'feishu', 'lark'}:
@@ -6313,6 +6324,8 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             raise ValueError("Webhook通知缺少url")
 
         request_kwargs: Dict[str, Any] = {}
+        if idempotency_headers:
+            request_kwargs['headers'] = idempotency_headers
         if channel_type == 'wechat':
             payload = {'msgtype': 'text', 'text': {'content': message}}
         elif channel_type in {'dingtalk', 'ding_talk'}:
@@ -6350,6 +6363,8 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             payload = config.get('payload_template')
         if not isinstance(payload, dict):
             payload = {'title': title, 'text': message, 'message': message, 'item_url': result_payload.get('item_url')}
+        if channel_type == 'webhook' and idempotency_key:
+            payload.setdefault('idempotency_key', idempotency_key)
         response = requests.post(url, json=payload, timeout=timeout, **request_kwargs)
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
@@ -6363,7 +6378,11 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             if not key:
                 raise ValueError("Bark通知缺少url或device_key")
             url = f"{server}/{key}/{quote(title)}/{quote(message)}"
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers=idempotency_headers or None,
+        )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
         return
@@ -6378,49 +6397,13 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             f"{api_base}/bot{token}/sendMessage",
             json={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': False},
             timeout=timeout,
+            headers=idempotency_headers or None,
         )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
         return
 
     raise ValueError(f"暂不支持的通知渠道类型: {channel_type}")
-
-
-def _notify_skill_monitor_result(task: Dict[str, Any], user_id: int, result_id: int, result_payload: Dict[str, Any]) -> Tuple[str, str]:
-    if not task.get('notify_enabled'):
-        return 'disabled', ''
-    if not skill_monitor_feature_enabled("skill_monitor_delivery_enabled"):
-        status = 'disabled_by_kill_switch'
-        error = '监控通知全局开关关闭'
-        db_manager.update_skill_monitor_result_notification(result_id, user_id, status, error)
-        return status, error
-
-    channels = _enabled_notification_channels(user_id)
-    if not channels:
-        db_manager.update_skill_monitor_result_notification(result_id, user_id, 'skipped_no_channel', '没有启用的通知渠道')
-        return 'skipped_no_channel', '没有启用的通知渠道'
-
-    errors = []
-    sent_count = 0
-    for channel in channels:
-        try:
-            _send_skill_notification_to_channel(channel, task, result_payload)
-            sent_count += 1
-        except Exception as exc:
-            errors.append(
-                f"{channel.get('name') or channel.get('type')}: {_safe_skill_notification_error(exc)}"
-            )
-
-    error = "；".join(errors)[:500]
-    if sent_count == len(channels):
-        status = 'sent'
-    elif sent_count > 0:
-        status = 'partial'
-    else:
-        status = 'failed'
-        error = error or '通知发送失败'
-    db_manager.update_skill_monitor_result_notification(result_id, user_id, status, error)
-    return status, error
 
 
 @skills_router.get('/api/skills/capabilities')
@@ -6632,6 +6615,7 @@ async def _run_real_skill_monitor(
     *,
     scheduled_run: bool = False,
     run_id: Optional[int] = None,
+    claim_token: str = '',
 ) -> Tuple[List[int], int, Dict[str, Any]]:
     from utils.item_search import search_xianyu_items
 
@@ -6682,6 +6666,7 @@ async def _run_real_skill_monitor(
             'price': price,
             'region': item.get('area') or item.get('region') or '',
             'item_url': item_url,
+            'item_id': item_id,
             'item_image': item.get('main_image') or item.get('item_image') or '',
             'seller_name': item.get('seller_name') or '',
             'ai_score': ai_filter_result.get('score') or 0,
@@ -6690,9 +6675,7 @@ async def _run_real_skill_monitor(
             'raw_data': {
                 'source': search_result.get('source') or 'playwright',
                 'is_real_data': True,
-                'keyword': keyword,
                 'filter_reason': reason,
-                'ai_filter': task.get('ai_filter') or '',
                 'ai_recommended': bool(ai_filter_result.get('recommended')),
                 'scheduled_run': scheduled_run,
                 'published_within_hours': task.get('published_within_hours'),
@@ -6701,13 +6684,18 @@ async def _run_real_skill_monitor(
                 'want_count': item.get('want_count'),
             }
         }
-        result_id = db_manager.create_skill_monitor_result(result_payload)
-        if result_id:
-            notify_status, notify_error = _notify_skill_monitor_result(task, user_id, result_id, result_payload)
-            if notify_error:
-                result_payload.setdefault('raw_data', {})['notify_error'] = notify_error
-            result_payload['notify_status'] = notify_status
-            created_ids.append(result_id)
+        persistence = db_manager.persist_skill_monitor_match(
+            result_payload,
+            run_id=int(run_id or 0),
+            claim_token=claim_token,
+        )
+        if persistence.get('state') == 'lease_lost':
+            raise HTTPException(status_code=409, detail="监控运行租约已失效")
+        if persistence.get('state') == 'error':
+            raise HTTPException(status_code=500, detail="监控结果事务提交失败")
+        if persistence.get('created'):
+            result_payload['notify_status'] = persistence.get('notify_status')
+            created_ids.append(int(persistence['result_id']))
 
     return created_ids, len(raw_items), search_result
 
@@ -6811,6 +6799,7 @@ async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, sche
             user_id,
             scheduled_run=scheduled_run,
             run_id=run_id,
+            claim_token=claim_token,
         )
         stop_heartbeat.set()
         await heartbeat_task

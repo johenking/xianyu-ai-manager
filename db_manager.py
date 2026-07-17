@@ -8015,7 +8015,42 @@ class DBManager:
                 },
                 retention_until=now + SKILL_MONITOR_RETENTION_SECONDS,
             )
+            self._refresh_skill_monitor_result_notify_status(
+                cursor,
+                int(row[2]),
+            )
         return recovered
+
+    @staticmethod
+    def _refresh_skill_monitor_result_notify_status(cursor, result_id: int) -> str:
+        statuses = [
+            str(row[0])
+            for row in cursor.execute('''
+                SELECT status FROM skill_monitor_deliveries
+                WHERE result_id = ?
+                ORDER BY id ASC
+            ''', (int(result_id),)).fetchall()
+        ]
+        if not statuses:
+            status = 'skipped_no_channel'
+        elif all(value == 'sent' for value in statuses):
+            status = 'sent'
+        elif any(value in {'pending', 'retry', 'sending'} for value in statuses):
+            status = 'queued'
+        elif any(value == 'sent' for value in statuses):
+            status = 'partial_unknown' if any(
+                value in {'unknown', 'sent_unconfirmed'} for value in statuses
+            ) else 'partial'
+        elif any(value in {'unknown', 'sent_unconfirmed'} for value in statuses):
+            status = 'unknown'
+        else:
+            status = 'failed'
+        cursor.execute('''
+            UPDATE skill_monitor_results
+            SET notify_status = ?
+            WHERE id = ?
+        ''', (status, int(result_id)))
+        return status
 
     def recover_stale_skill_monitor_deliveries(self, now: Optional[float] = None) -> int:
         timestamp = float(now if now is not None else time.time())
@@ -8155,8 +8190,18 @@ class DBManager:
             return False
         timestamp = float(now if now is not None else time.time())
         with self.lock:
+            cursor = self.conn.cursor()
             try:
-                cursor = self.conn.cursor()
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT idempotency_key, result_id, task_id, user_id, attempt
+                    FROM skill_monitor_deliveries
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(delivery_id), str(claim_token), timestamp)).fetchone()
+                if not row:
+                    self.conn.rollback()
+                    return False
                 cursor.execute('''
                     UPDATE skill_monitor_deliveries
                     SET status = ?, claim_token = '', lease_expires_at = NULL,
@@ -8182,12 +8227,325 @@ class DBManager:
                     str(claim_token),
                     timestamp,
                 ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=(
+                        f'delivery:{delivery_id}:finished:{int(row[4] or 0)}:{status}'
+                    ),
+                    event_type=f'delivery_{status}',
+                    result_id=int(row[1]),
+                    task_id=int(row[2]),
+                    user_id=int(row[3]),
+                    payload={
+                        'delivery_id': int(delivery_id),
+                        'status': status,
+                        'attempt': int(row[4] or 0),
+                        'error_code': str(error_code or '')[:80],
+                    },
+                    retention_until=timestamp + SKILL_MONITOR_RETENTION_SECONDS,
+                )
+                self._refresh_skill_monitor_result_notify_status(
+                    cursor,
+                    int(row[1]),
+                )
                 self.conn.commit()
-                return cursor.rowcount == 1
+                return True
             except Exception as e:
                 logger.error(f"完成技能通知投递失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
+
+    def persist_skill_monitor_match(
+        self,
+        result_data: Dict[str, Any],
+        *,
+        run_id: int,
+        claim_token: str,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Commit result, first-seen event, and delivery outbox atomically."""
+        timestamp = float(now if now is not None else time.time())
+        task_id = int(result_data.get('task_id') or 0)
+        user_id = int(result_data.get('user_id') or 0)
+        item_id = str(result_data.get('item_id') or '').strip()[:256]
+        item_url = str(result_data.get('item_url') or '').strip()[:2000]
+        if not task_id or not user_id or not (item_id or item_url):
+            return {'state': 'invalid_identity', 'created': False}
+
+        safe_metadata_keys = {
+            'source',
+            'is_real_data',
+            'filter_reason',
+            'ai_recommended',
+            'scheduled_run',
+            'published_within_hours',
+            'item_id',
+            'publish_time',
+            'want_count',
+        }
+        raw_data = result_data.get('raw_data')
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        safe_raw_data = {
+            key: raw_data[key]
+            for key in safe_metadata_keys
+            if key in raw_data
+        }
+        safe_raw_data['item_id'] = item_id
+        source_adapter = str(
+            result_data.get('source_adapter')
+            or safe_raw_data.get('source')
+            or 'playwright'
+        )[:40]
+        identity_parts = []
+        if item_id:
+            identity_parts.append(('item_id', item_id))
+        if item_url:
+            identity_parts.append(('item_url', item_url))
+        primary_identity = identity_parts[0]
+        identity_digest = hashlib.sha256(
+            f'{task_id}:{user_id}:{primary_identity[0]}:{primary_identity[1]}'.encode('utf-8')
+        ).hexdigest()
+        event_key = f'result-first-seen:v1:{identity_digest}'
+        retention_until = timestamp + SKILL_MONITOR_RETENTION_SECONDS
+
+        supported_channel_types = (
+            'webhook',
+            'wechat',
+            'dingtalk',
+            'ding_talk',
+            'feishu',
+            'lark',
+            'bark',
+            'telegram',
+        )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                run = cursor.execute('''
+                    SELECT run_token, account_id, source_adapter
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND task_id = ? AND user_id = ?
+                      AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    int(run_id),
+                    task_id,
+                    user_id,
+                    str(claim_token),
+                    timestamp,
+                )).fetchone()
+                if not run:
+                    self.conn.rollback()
+                    return {'state': 'lease_lost', 'created': False}
+
+                for identity_type, identity_value in identity_parts:
+                    existing = cursor.execute('''
+                        SELECT result_id FROM skill_monitor_result_identities
+                        WHERE task_id = ? AND user_id = ?
+                          AND identity_type = ? AND identity_value = ?
+                    ''', (
+                        task_id,
+                        user_id,
+                        identity_type,
+                        identity_value,
+                    )).fetchone()
+                    if existing:
+                        self.conn.rollback()
+                        return {
+                            'state': 'duplicate',
+                            'created': False,
+                            'result_id': int(existing[0]),
+                        }
+
+                task = cursor.execute('''
+                    SELECT notify_enabled FROM skill_monitor_tasks
+                    WHERE id = ? AND user_id = ?
+                ''', (task_id, user_id)).fetchone()
+                if not task:
+                    self.conn.rollback()
+                    return {'state': 'not_found', 'created': False}
+                notify_enabled = bool(task[0])
+                channels = []
+                if notify_enabled:
+                    placeholders = ','.join('?' for _ in supported_channel_types)
+                    channels = cursor.execute(f'''
+                        SELECT id, type FROM notification_channels
+                        WHERE user_id = ? AND enabled = 1
+                          AND LOWER(type) IN ({placeholders})
+                        ORDER BY id ASC
+                    ''', (user_id, *supported_channel_types)).fetchall()
+                notify_status = (
+                    'queued'
+                    if channels
+                    else ('skipped_no_channel' if notify_enabled else 'disabled')
+                )
+                cursor.execute('''
+                    INSERT INTO skill_monitor_results (
+                        task_id, user_id, title, price, region, item_url,
+                        item_image, seller_name, ai_score, ai_reason,
+                        notify_status, raw_data, item_id, run_id,
+                        source_adapter, first_seen_at, retention_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    task_id,
+                    user_id,
+                    str(result_data.get('title') or '')[:500],
+                    result_data.get('price'),
+                    str(result_data.get('region') or '')[:200],
+                    item_url,
+                    str(result_data.get('item_image') or '')[:2000],
+                    str(result_data.get('seller_name') or '')[:300],
+                    max(0, min(100, int(result_data.get('ai_score') or 0))),
+                    str(result_data.get('ai_reason') or '')[:500],
+                    notify_status,
+                    json.dumps(safe_raw_data, ensure_ascii=False, sort_keys=True),
+                    item_id,
+                    int(run_id),
+                    str(run[2] or source_adapter)[:40],
+                    timestamp,
+                    retention_until,
+                ))
+                result_id = int(cursor.lastrowid)
+                for identity_type, identity_value in identity_parts:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_result_identities (
+                            task_id, user_id, identity_type,
+                            identity_value, result_id
+                        ) VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        task_id,
+                        user_id,
+                        identity_type,
+                        identity_value,
+                        result_id,
+                    ))
+                event_id = self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=event_key,
+                    event_type='result_first_seen',
+                    run_id=int(run_id),
+                    result_id=result_id,
+                    task_id=task_id,
+                    user_id=user_id,
+                    account_id=str(run[1] or ''),
+                    payload={
+                        'identity_type': primary_identity[0],
+                        'identity_digest': identity_digest,
+                        'source_adapter': str(run[2] or source_adapter)[:40],
+                    },
+                    retention_until=retention_until,
+                )
+                if event_id is None:
+                    raise sqlite3.IntegrityError('first-seen event collision')
+
+                delivery_ids: List[int] = []
+                for channel_id, channel_type in channels:
+                    delivery_digest = hashlib.sha256(
+                        f'{event_key}:channel:{int(channel_id)}'.encode('utf-8')
+                    ).hexdigest()
+                    destination_digest = hashlib.sha256(
+                        f'{user_id}:{int(channel_id)}:{str(channel_type).lower()}'.encode('utf-8')
+                    ).hexdigest()
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_deliveries (
+                            idempotency_key, event_id, result_id, task_id,
+                            user_id, channel_id, channel_type,
+                            destination_digest, status, retention_until
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    ''', (
+                        f'delivery:v1:{delivery_digest}',
+                        int(event_id),
+                        result_id,
+                        task_id,
+                        user_id,
+                        int(channel_id),
+                        str(channel_type).lower()[:40],
+                        destination_digest,
+                        retention_until,
+                    ))
+                    delivery_ids.append(int(cursor.lastrowid))
+                self.conn.commit()
+                return {
+                    'state': 'created',
+                    'created': True,
+                    'result_id': result_id,
+                    'event_id': int(event_id),
+                    'delivery_ids': delivery_ids,
+                    'notify_status': notify_status,
+                }
+            except Exception as e:
+                logger.error(f"事务化保存技能监控结果失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'created': False}
+
+    def get_skill_monitor_delivery_context(
+        self,
+        delivery_id: int,
+        claim_token: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT d.id, d.idempotency_key, d.user_id, d.channel_id,
+                       d.channel_type, d.attempt,
+                       r.id, r.title, r.price, r.region, r.item_url,
+                       r.item_image, r.seller_name, r.ai_score, r.ai_reason,
+                       t.id, t.name, t.keyword, t.notify_enabled,
+                       c.id, c.name, c.type, c.config, c.enabled, c.user_id
+                FROM skill_monitor_deliveries AS d
+                JOIN skill_monitor_results AS r
+                  ON r.id = d.result_id AND r.user_id = d.user_id
+                JOIN skill_monitor_tasks AS t
+                  ON t.id = d.task_id AND t.user_id = d.user_id
+                LEFT JOIN notification_channels AS c
+                  ON c.id = d.channel_id AND c.user_id = d.user_id
+                WHERE d.id = ? AND d.status = 'sending'
+                  AND d.claim_token = ?
+            ''', (int(delivery_id), str(claim_token))).fetchone()
+            if not row:
+                return None
+            channel = None
+            if row[19] is not None:
+                channel = {
+                    'id': int(row[19]),
+                    'name': str(row[20] or ''),
+                    'type': str(row[21] or ''),
+                    'config': row[22],
+                    'enabled': bool(row[23]),
+                    'user_id': int(row[24]),
+                }
+            return {
+                'delivery': {
+                    'id': int(row[0]),
+                    'idempotency_key': str(row[1]),
+                    'user_id': int(row[2]),
+                    'channel_id': row[3],
+                    'channel_type': str(row[4] or ''),
+                    'attempt': int(row[5] or 0),
+                },
+                'result': {
+                    'id': int(row[6]),
+                    'title': str(row[7] or ''),
+                    'price': row[8],
+                    'region': str(row[9] or ''),
+                    'item_url': str(row[10] or ''),
+                    'item_image': str(row[11] or ''),
+                    'seller_name': str(row[12] or ''),
+                    'ai_score': int(row[13] or 0),
+                    'ai_reason': str(row[14] or ''),
+                },
+                'task': {
+                    'id': int(row[15]),
+                    'name': str(row[16] or ''),
+                    'keyword': str(row[17] or ''),
+                    'notify_enabled': bool(row[18]),
+                },
+                'channel': channel,
+            }
 
     def _skill_monitor_task_from_row(self, row) -> Dict[str, Any]:
         return {

@@ -228,6 +228,16 @@ class SkillMonitorLeaseTests(unittest.TestCase):
             (delivery_id,),
         ).fetchone()
         self.assertEqual(row, ("unknown", "", "send_outcome_unknown"))
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT notify_status FROM skill_monitor_results
+                WHERE id = (SELECT result_id FROM skill_monitor_deliveries WHERE id = ?)
+                """,
+                (delivery_id,),
+            ).fetchone()[0],
+            "unknown",
+        )
         self.assertIsNone(
             self.db.claim_skill_monitor_delivery(
                 delivery_id=delivery_id,
@@ -267,6 +277,16 @@ class SkillMonitorLeaseTests(unittest.TestCase):
         self.assertEqual(row[1], "")
         self.assertEqual(row[2], 110)
         self.assertEqual(row[3], 110)
+        self.assertEqual(
+            self.db.conn.execute(
+                """
+                SELECT notify_status FROM skill_monitor_results
+                WHERE id = (SELECT result_id FROM skill_monitor_deliveries WHERE id = ?)
+                """,
+                (delivery_id,),
+            ).fetchone()[0],
+            "sent",
+        )
 
 
 if __name__ == "__main__":
