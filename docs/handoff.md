@@ -4,6 +4,73 @@
 
 The monitor work is isolated in `/Users/mac/Documents/Codex/integration/xianyu-monitor-20260718` on branch `codex/monitor-integration-20260718`. The immutable source baseline is commit `dd0e8f2`, tagged `codex/live-source-baseline-20260718-043547`; its provenance records 201 allowlisted source files, zero symlinks, sanitized remotes, and Stage A backup root hash `e6983cb07117c477bab2366bc26b2355789797255d5735b541b4c9ca39d3a08d`. Stage B and its evidence record end at `0272de1`; Stage C is the following isolated offline-integration commit.
 
+### Skill Center refresh fencing on 2026-07-19
+
+The Skill Center keeps the accepted v1.7.3 shell, tokens, and shared
+`PageHeader`, `WorkSurface`, `StatusBadge`, and `InlineNotice` components. No
+shared UI component, stylesheet, API, schema, database, or live runtime was
+changed. The monitor snapshot fetch is now side-effect free; accounts,
+capabilities, tasks, and results commit together only for the latest mounted
+request generation. Effect cleanup invalidates the development StrictMode
+probe and real unmounts, stale success/error/finally paths cannot write state,
+and the test-account fallback uses a functional state update so refresh does
+not replace an operator selection. A failed refresh after a successful
+snapshot keeps the prior data with an explicit “current display is the last
+successful data” notice; the next successful refresh clears that notice.
+
+The pre-fix focused reproduction passed 10 of 13 tests and failed the three
+race/stale-state cases: an older StrictMode response overwrote the newer
+snapshot, an older rejection surfaced after a newer success, and retained
+data lacked a stale marker whose error also survived recovery. Fresh post-fix
+local checks passed:
+
+- `cd frontend && npm test -- SkillCenter.test.tsx` — exit 0, 1 file and 13 of
+  13 tests. The deferred tests cover older success/rejection fencing,
+  unmount, monitor rejection propagation, stale/recovery UI, a real refresh
+  action, one tasks/results request per non-StrictMode refresh, and preservation
+  of the selected test account.
+- `cd frontend && npm run typecheck` — exit 0; `npm test` — exit 0, 17 files
+  and 84 of 84 tests. `npm audit --audit-level=high` — exit 0, zero
+  vulnerabilities.
+- With the integration worktree as the current directory and the existing
+  local dependency runtime at `/Users/mac/Documents/咸鱼监控台/.venv`,
+  `ruff check .` and the project `py_compile` gate exited 0;
+  `python -m unittest discover -s tests -v` exited 0 with 335 of 335 tests.
+  The integration worktree intentionally contains no `.venv`.
+- Two independent `npm run build` executions against the exact working source
+  each produced 31 assets. The project `npm run verify:build` script exited 0
+  against that repository-external output: two retained 31-asset generations,
+  31 asset files, zero orphans, and a 245,200-byte entry bundle (71.7% below
+  the retained baseline). Both Python lock files passed `pip-audit --no-deps
+  --disable-pip` with no known vulnerabilities. Gitleaks 8.30.1 scanned a
+  symlink-preserving archive of all 230 current tracked files (about 4.23 MB)
+  with the repository allowlist and reported no leaks.
+
+Fresh browser evidence is under
+`/Users/mac/Documents/Codex/evidence/xianyu-skill-center-ui-20260719-022100`
+and is local mocked production-build evidence only. It contains 43 files,
+zero symlinks, mode-0700 directories, mode-0600 files, a passing SHA-256
+manifest, and manifest hash
+`8ec5a39bab80fb0788a38851149ddb8ae81a2b49e7cb83f845376b9487801135`.
+A loopback synthetic API
+and a browser rule that blocked every non-loopback request covered 1440x900
+and 390x844 stale-error and recovered states, full-page scrolling, and the
+existing disabled monitor controls. Both viewports reached the bottom; their
+document and main content scroll widths equalled their client widths. The
+mobile segmented navigation retained its existing internal horizontal scroll,
+and its final segment was reachable. There were zero console warnings/errors,
+page errors, failed network requests, blocked external attempts, unknown API
+routes, or successful external requests. Each production-preview initial load
+called accounts, capabilities, monitor tasks, and monitor results exactly once.
+Development StrictMode still intentionally starts two effect rounds, while the
+deferred regression tests prove that only the newest generation can commit.
+
+This refresh-fencing evidence did not deploy live, select or read either
+existing Xianyu account, issue a Playwright or MTop search, enable a schedule,
+send a notification, or call an AI provider. The dedicated-test-account gate,
+the `iPhone 15 Pro` official-page canary, shadow comparison, and real value
+acceptance therefore remain blocked/unverified.
+
 Stage A remains recoverable from `/Users/mac/Documents/Codex/backups/xianyu-monitor-stage-a-20260718-043547`. Stage B adds fail-closed monitor, scheduler, delivery, and experimental MTop feature flags; expand-only schema changes; persistent run and delivery claims with independent tokens, leases, heartbeats, and stale recovery; transactional first-seen events and delivery outbox rows; stable delivery idempotency keys with explicit `unknown` outcomes; Cookie revision compare-and-swap; and owner/account/revision-bound Playwright search with isolated profiles and no anonymous fallback. No complete MTop response is retained.
 
 Stage C adds a default-off, offline-testable MTop adapter without selecting it from manual or scheduled monitor execution. It provides a fixed-endpoint request contract, response-size and schema validation, item-field allowlisting, deterministic pagination/filter/sort normalization, account/global budgets, bounded jitter and `Retry-After`, a persistent circuit breaker with one leased half-open probe, Cookie revision CAS, a normalized shadow comparator, and strict lease-scoped AI JSON parsing. The runtime monitor path still explicitly claims `source_adapter=playwright`; the MTop adapter has made no real request.

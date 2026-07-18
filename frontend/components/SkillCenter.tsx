@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Bot,
@@ -48,6 +48,11 @@ import { IconAction, PageHeader, SegmentedNav, WorkSurface } from './ui/Protecte
 
 type SkillTab = 'monitor' | 'agent' | 'ops';
 
+type SkillLoadError = {
+  message: string;
+  stale: boolean;
+};
+
 const emptyTaskForm = {
   name: '',
   keyword: '',
@@ -75,6 +80,14 @@ const capabilityTitles: Record<string, string> = {
 const formatCapabilityTime = (observedAt?: number | null) => {
   if (!observedAt) return '';
   return new Date(observedAt * 1000).toLocaleString('zh-CN', { hour12: false });
+};
+
+const fetchMonitorSnapshot = async () => {
+  const [tasks, results] = await Promise.all([
+    getSkillMonitorTasks(),
+    getSkillMonitorResults(),
+  ]);
+  return { tasks, results };
 };
 
 const MTopOfflineContractPanel: React.FC<{
@@ -209,11 +222,15 @@ const SkillCenter: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [runningTaskId, setRunningTaskId] = useState<number | null>(null);
   const [statusText, setStatusText] = useState('');
+  const [loadError, setLoadError] = useState<SkillLoadError | null>(null);
   const [loadedTabs, setLoadedTabs] = useState<Record<SkillTab, boolean>>({
     monitor: false,
     agent: false,
     ops: false,
   });
+  const requestGeneration = useRef(0);
+  const mountedRef = useRef(false);
+  const hasSuccessfulSnapshot = useRef(false);
 
   const promptMap = useMemo(() => {
     return prompts.reduce<Record<string, SkillAgentPrompt>>((acc, prompt) => {
@@ -223,16 +240,6 @@ const SkillCenter: React.FC = () => {
   }, [prompts]);
 
   const mtopOfflineContract = capabilities.code_present?.evidence?.offline_mtop_adapter;
-
-  const loadMonitor = async () => {
-    const [taskList, resultList] = await Promise.all([
-      getSkillMonitorTasks(),
-      getSkillMonitorResults(),
-    ]);
-    setTasks(taskList);
-    setResults(resultList);
-    setLoadedTabs((current) => ({ ...current, monitor: true }));
-  };
 
   const loadAgent = async () => {
     setPrompts(await getSkillAgentPrompts());
@@ -251,29 +258,44 @@ const SkillCenter: React.FC = () => {
     setLoadedTabs((current) => ({ ...current, ops: true }));
   };
 
-  const loadAll = async () => {
+  const loadAll = useCallback(async () => {
+    if (!mountedRef.current) return;
+    const generation = ++requestGeneration.current;
     setLoading(true);
     try {
-      const [accountList, capabilityList] = await Promise.all([
+      const [accountList, capabilityList, monitorSnapshot] = await Promise.all([
         getAccountDetails(),
         getSkillCapabilities(),
-        loadMonitor(),
+        fetchMonitorSnapshot(),
       ]);
+      if (!mountedRef.current || generation !== requestGeneration.current) return;
       setAccounts(accountList);
       setCapabilities(capabilityList);
-      if (!testAccountId && accountList.length > 0) {
-        setTestAccountId(accountList[0].id);
-      }
+      setTasks(monitorSnapshot.tasks);
+      setResults(monitorSnapshot.results);
+      setLoadedTabs((current) => ({ ...current, monitor: true }));
+      setTestAccountId((current) => current || accountList[0]?.id || '');
+      hasSuccessfulSnapshot.current = true;
+      setLoadError(null);
     } catch (error) {
-      setStatusText(error instanceof Error ? error.message : '加载失败');
+      if (!mountedRef.current || generation !== requestGeneration.current) return;
+      setLoadError({
+        message: error instanceof Error ? error.message : '加载失败',
+        stale: hasSuccessfulSnapshot.current,
+      });
     } finally {
-      setLoading(false);
+      if (mountedRef.current && generation === requestGeneration.current) setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadAll();
-  }, []);
+    mountedRef.current = true;
+    void loadAll();
+    return () => {
+      mountedRef.current = false;
+      requestGeneration.current += 1;
+    };
+  }, [loadAll]);
 
   useEffect(() => {
     if (activeSkill === 'agent' && !loadedTabs.agent) {
@@ -328,10 +350,9 @@ const SkillCenter: React.FC = () => {
       });
       setTaskForm(emptyTaskForm);
       setStatusText('监控任务已创建');
-      await loadMonitor();
+      await loadAll();
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : '创建失败');
-    } finally {
       setLoading(false);
     }
   };
@@ -341,7 +362,7 @@ const SkillCenter: React.FC = () => {
     try {
       const result = await runSkillMonitorTask(taskId);
       setStatusText(result.message || `真实监控完成，命中 ${result.created_count || 0} 条`);
-      await loadMonitor();
+      await loadAll();
       if (loadedTabs.ops) {
         await loadOps();
       }
@@ -360,11 +381,9 @@ const SkillCenter: React.FC = () => {
         schedule_interval_minutes: task.schedule_interval_minutes || 60,
       });
       setStatusText(!task.schedule_enabled ? '已开启定时监控' : '已关闭定时监控');
-      await loadMonitor();
-      setCapabilities(await getSkillCapabilities());
+      await loadAll();
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : '更新定时状态失败');
-    } finally {
       setLoading(false);
     }
   };
@@ -881,6 +900,14 @@ const SkillCenter: React.FC = () => {
       </div>
 
       <MTopOfflineContractPanel contract={mtopOfflineContract} loading={loading} />
+
+      {loadError && (
+        <InlineNotice tone="error">
+          {loadError.stale
+            ? `刷新失败，当前显示上次成功数据：${loadError.message}`
+            : loadError.message}
+        </InlineNotice>
+      )}
 
       {statusText && (
         <div className="rounded-xl border border-yellow-200 bg-yellow-50 px-5 py-3 text-sm font-bold text-gray-700">

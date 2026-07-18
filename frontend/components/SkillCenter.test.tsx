@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { StrictMode } from 'react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SkillCenter from './SkillCenter';
 import {
@@ -80,27 +81,50 @@ const offlineMTopContract = {
   },
 } as const;
 
+const buildCapabilities = (detail = '不代表真实运行通过') => ({
+  code_present: {
+    available: true,
+    state: 'present',
+    badge_state: 'ready',
+    label: '代码已加载',
+    detail,
+    evidence: { offline_mtop_adapter: offlineMTopContract },
+  },
+  config_ready: { available: false, state: 'blocked', badge_state: 'missing', label: '尚未就绪', detail: '全局监控开关关闭' },
+  last_real_search: { available: false, state: 'never', badge_state: 'missing', label: '从未验证', detail: '没有真实搜索记录' },
+  last_scheduled_run: { available: false, state: 'never', badge_state: 'missing', label: '从未运行', detail: '没有定时运行记录' },
+  last_ai_decision: { available: false, state: 'never', badge_state: 'missing', label: '从未判断', detail: '没有 AI 决策' },
+  last_real_delivery: { available: false, state: 'never', badge_state: 'missing', label: '从未确认', detail: '没有通知记录' },
+}) as any;
+
+const monitorTask = (id: number, name: string) => ({
+  id,
+  name,
+  keyword: name,
+  published_within_hours: 24,
+  notify_enabled: false,
+  enabled: true,
+  schedule_enabled: false,
+  schedule_interval_minutes: 30,
+}) as any;
+
+const deferred = <T,>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+};
+
 describe('SkillCenter loading and monitor controls', () => {
   beforeEach(() => {
     vi.mocked(getAccountDetails).mockResolvedValue([
       { id: 'account-1', remark: '账号一', nickname: '账号一' },
     ] as any);
     vi.mocked(getItemsByCookie).mockResolvedValue([] as any);
-    vi.mocked(getSkillCapabilities).mockResolvedValue({
-      code_present: {
-        available: true,
-        state: 'present',
-        badge_state: 'ready',
-        label: '代码已加载',
-        detail: '不代表真实运行通过',
-        evidence: { offline_mtop_adapter: offlineMTopContract },
-      },
-      config_ready: { available: false, state: 'blocked', badge_state: 'missing', label: '尚未就绪', detail: '全局监控开关关闭' },
-      last_real_search: { available: false, state: 'never', badge_state: 'missing', label: '从未验证', detail: '没有真实搜索记录' },
-      last_scheduled_run: { available: false, state: 'never', badge_state: 'missing', label: '从未运行', detail: '没有定时运行记录' },
-      last_ai_decision: { available: false, state: 'never', badge_state: 'missing', label: '从未判断', detail: '没有 AI 决策' },
-      last_real_delivery: { available: false, state: 'never', badge_state: 'missing', label: '从未确认', detail: '没有通知记录' },
-    });
+    vi.mocked(getSkillCapabilities).mockResolvedValue(buildCapabilities());
     vi.mocked(getSkillMonitorTasks).mockResolvedValue([]);
     vi.mocked(getSkillMonitorResults).mockResolvedValue([]);
     vi.mocked(getSkillAgentPrompts).mockResolvedValue([] as any);
@@ -214,6 +238,184 @@ describe('SkillCenter loading and monitor controls', () => {
 
     expect(await screen.findByText('synthetic capability failure')).toBeInTheDocument();
     expect(screen.getByText(/离线状态证据未返回/)).toBeInTheDocument();
+  });
+
+  it('keeps the newest StrictMode snapshot when an older request completes last', async () => {
+    const firstAccounts = deferred<any[]>();
+    const secondAccounts = deferred<any[]>();
+    const firstCapabilities = deferred<any>();
+    const secondCapabilities = deferred<any>();
+    const firstTasks = deferred<any[]>();
+    const secondTasks = deferred<any[]>();
+    const firstResults = deferred<any[]>();
+    const secondResults = deferred<any[]>();
+
+    vi.mocked(getAccountDetails)
+      .mockImplementationOnce(() => firstAccounts.promise)
+      .mockImplementationOnce(() => secondAccounts.promise);
+    vi.mocked(getSkillCapabilities)
+      .mockImplementationOnce(() => firstCapabilities.promise)
+      .mockImplementationOnce(() => secondCapabilities.promise);
+    vi.mocked(getSkillMonitorTasks)
+      .mockImplementationOnce(() => firstTasks.promise)
+      .mockImplementationOnce(() => secondTasks.promise);
+    vi.mocked(getSkillMonitorResults)
+      .mockImplementationOnce(() => firstResults.promise)
+      .mockImplementationOnce(() => secondResults.promise);
+
+    render(<StrictMode><SkillCenter /></StrictMode>);
+    await waitFor(() => expect(getSkillCapabilities).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondAccounts.resolve([{ id: 'new-account', remark: '最新账号' }] as any);
+      secondCapabilities.resolve(buildCapabilities('最新能力证据'));
+      secondTasks.resolve([monitorTask(2, '最新任务')]);
+      secondResults.resolve([]);
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('最新任务')).toBeInTheDocument();
+    expect(screen.getByText('最新能力证据')).toBeInTheDocument();
+
+    await act(async () => {
+      firstAccounts.resolve([{ id: 'old-account', remark: '旧账号' }] as any);
+      firstCapabilities.resolve(buildCapabilities('旧能力证据'));
+      firstTasks.resolve([monitorTask(1, '旧任务')]);
+      firstResults.resolve([]);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('最新任务')).toBeInTheDocument();
+    expect(screen.getByText('最新能力证据')).toBeInTheDocument();
+    expect(screen.queryByText('旧任务')).not.toBeInTheDocument();
+    expect(screen.queryByText('旧能力证据')).not.toBeInTheDocument();
+  });
+
+  it('ignores a stale rejection after the newest StrictMode request succeeds', async () => {
+    const firstAccounts = deferred<any[]>();
+    const secondAccounts = deferred<any[]>();
+    const firstCapabilities = deferred<any>();
+    const secondCapabilities = deferred<any>();
+    const firstTasks = deferred<any[]>();
+    const secondTasks = deferred<any[]>();
+    const firstResults = deferred<any[]>();
+    const secondResults = deferred<any[]>();
+
+    vi.mocked(getAccountDetails)
+      .mockImplementationOnce(() => firstAccounts.promise)
+      .mockImplementationOnce(() => secondAccounts.promise);
+    vi.mocked(getSkillCapabilities)
+      .mockImplementationOnce(() => firstCapabilities.promise)
+      .mockImplementationOnce(() => secondCapabilities.promise);
+    vi.mocked(getSkillMonitorTasks)
+      .mockImplementationOnce(() => firstTasks.promise)
+      .mockImplementationOnce(() => secondTasks.promise);
+    vi.mocked(getSkillMonitorResults)
+      .mockImplementationOnce(() => firstResults.promise)
+      .mockImplementationOnce(() => secondResults.promise);
+
+    render(<StrictMode><SkillCenter /></StrictMode>);
+    await waitFor(() => expect(getSkillCapabilities).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondAccounts.resolve([{ id: 'new-account', remark: '最新账号' }] as any);
+      secondCapabilities.resolve(buildCapabilities('最新能力证据'));
+      secondTasks.resolve([monitorTask(2, '最新任务')]);
+      secondResults.resolve([]);
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('最新任务')).toBeInTheDocument();
+
+    await act(async () => {
+      firstAccounts.resolve([{ id: 'old-account', remark: '旧账号' }] as any);
+      firstTasks.resolve([monitorTask(1, '旧任务')]);
+      firstResults.resolve([]);
+      firstCapabilities.reject(new Error('过期请求失败'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('最新任务')).toBeInTheDocument();
+    expect(screen.queryByText('旧任务')).not.toBeInTheDocument();
+    expect(screen.queryByText('过期请求失败')).not.toBeInTheDocument();
+  });
+
+  it('does not start account item loading after an unresolved mount is unmounted', async () => {
+    const accounts = deferred<any[]>();
+    const capabilities = deferred<any>();
+    const tasks = deferred<any[]>();
+    const results = deferred<any[]>();
+    vi.mocked(getAccountDetails).mockReturnValue(accounts.promise);
+    vi.mocked(getSkillCapabilities).mockReturnValue(capabilities.promise);
+    vi.mocked(getSkillMonitorTasks).mockReturnValue(tasks.promise);
+    vi.mocked(getSkillMonitorResults).mockReturnValue(results.promise);
+
+    const view = render(<SkillCenter />);
+    view.unmount();
+
+    await act(async () => {
+      accounts.resolve([{ id: 'late-account', remark: '迟到账号' }] as any);
+      capabilities.resolve(buildCapabilities());
+      tasks.resolve([]);
+      results.resolve([]);
+      await Promise.resolve();
+    });
+
+    expect(getItemsByCookie).not.toHaveBeenCalled();
+  });
+
+  it('propagates monitor snapshot failures through the initial fail-closed load', async () => {
+    vi.mocked(getSkillMonitorTasks).mockRejectedValueOnce(new Error('监控快照加载失败'));
+    render(<SkillCenter />);
+
+    expect(await screen.findByText('监控快照加载失败')).toBeInTheDocument();
+    expect(screen.getByText(/离线状态证据未返回/)).toBeInTheDocument();
+  });
+
+  it('marks retained data stale after refresh failure and clears the error on recovery', async () => {
+    vi.mocked(getSkillMonitorTasks).mockResolvedValue([monitorTask(3, '保留任务')]);
+    render(<SkillCenter />);
+    expect(await screen.findByText('保留任务')).toBeInTheDocument();
+
+    vi.mocked(getSkillCapabilities).mockRejectedValueOnce(new Error('刷新能力失败'));
+    fireEvent.click(screen.getByRole('button', { name: '刷新状态' }));
+
+    expect(await screen.findByText('刷新失败，当前显示上次成功数据：刷新能力失败')).toBeInTheDocument();
+    expect(screen.getByText('保留任务')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新状态' }));
+    await waitFor(() => {
+      expect(screen.queryByText(/刷新失败，当前显示上次成功数据/)).not.toBeInTheDocument();
+    });
+    expect(screen.getByText('保留任务')).toBeInTheDocument();
+  });
+
+  it('starts a fresh non-StrictMode request from the refresh action', async () => {
+    render(<SkillCenter />);
+    await screen.findByPlaceholderText('监控关键词');
+    vi.mocked(getSkillMonitorTasks).mockClear();
+    vi.mocked(getSkillMonitorResults).mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新状态' }));
+
+    await waitFor(() => expect(getSkillMonitorTasks).toHaveBeenCalledTimes(1));
+    expect(getSkillMonitorResults).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the user-selected test account after a successful refresh', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([
+      { id: 'account-1', remark: '账号一', nickname: '账号一' },
+      { id: 'account-2', remark: '账号二', nickname: '账号二' },
+    ] as any);
+    render(<SkillCenter />);
+    await screen.findByPlaceholderText('监控关键词');
+
+    fireEvent.click(screen.getByRole('button', { name: /AI 专家客服/ }));
+    const accountSelect = await screen.findByDisplayValue('账号一');
+    fireEvent.change(accountSelect, { target: { value: 'account-2' } });
+    expect(screen.getByDisplayValue('账号二')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '刷新状态' }));
+    await waitFor(() => expect(getAccountDetails).toHaveBeenCalledTimes(2));
+    expect(screen.getByDisplayValue('账号二')).toBeInTheDocument();
   });
 
   it('uses the protected-page navigation across every skill view', async () => {
