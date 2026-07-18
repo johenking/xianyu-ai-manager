@@ -10,6 +10,56 @@ Stage C adds a default-off, offline-testable MTop adapter without selecting it f
 
 The API and Skill Center UI now report six independent claims: `code_present`, `config_ready`, `last_real_search`, `last_scheduled_run`, `last_ai_decision`, and `last_real_delivery`. Missing evidence is rendered as never verified, never run, never judged, or never confirmed. Code presence is not configuration, runtime, AI, or delivery evidence.
 
+Stage F adds an internal-only mocked search-provider seam for offline runtime
+acceptance. Injected runs are forced to source_adapter=mocked,
+provider_mode=mocked, evidence_scope=mocked_provider, and
+is_real_data=false; the production default remains Playwright with the real
+data gate. Mocked results and loopback deliveries are excluded from
+last_real_search and last_real_delivery. The delivery dispatcher now fences
+every still-owned sending claim to unknown synchronously during shutdown
+before cancelling worker tasks, so a slow transport cannot leave a permanent
+sending row.
+
+Fresh Stage F local runtime acceptance passed on 2026-07-18 with
+scripts/stage_f_offline_runtime_acceptance.py. Evidence is outside the
+repository at
+/Users/mac/Documents/Codex/evidence/xianyu-monitor-stage-f-20260718-154307-51511;
+the evidence directory is mode 0700, its files are mode 0600, and its root
+hash is
+3811e17fcbeae4066b8c1b2fba8080267b8c73abb6d4b26b69afa674ddb2869a.
+The run used a disposable DB, three temporary 0600 keys, one disabled
+synthetic account, a local Idempotency-Key receiver, and a sandbox profile
+whose non-loopback canary was blocked (exit 6). The real scheduler loop
+completed 2 raw -> 1 accepted result, first-seen event, outbox claim, and
+loopback sent delivery; truthful real-search and real-delivery candidates
+remained zero. Graceful shutdown recorded
+interrupted/shutdown_interrupted for the run and
+unknown/dispatcher_interrupted for the slow delivery. After SIGKILL, stale
+run recovery recorded interrupted/lease_expired, stale delivery recovery
+recorded unknown/send_outcome_unknown, a successor run reached attempt 2 with
+the correct predecessor, no delivery remained sending, and all five
+old-token writes were rejected. Every worker was a single process on
+127.0.0.1:18091; health was 200, migration was 2026071802, integrity was ok,
+foreign-key violations were 0, and all temporary runtime data was removed.
+
+Current capability matrix after Stage F:
+
+- code present — local: monitor, scheduler, outbox, leases, mocked seam, and
+  MTop offline contract are present in this branch.
+- config ready — unverified/not live: production flags remain default-off and
+  no approved dedicated account, real notification endpoint, or real AI
+  configuration is available.
+- last real search — never/real unverified: Stage F used only the mocked
+  provider; no Playwright or MTop shadow request was made.
+- last scheduled run — mocked/local only: the scheduler loop completed in the
+  disposable DB, with source_adapter=mocked.
+- last AI decision — mocked contract only/no real decision: Stage F disabled
+  AI calls; existing fake-provider tests are not provider acceptance.
+- last real delivery — never/real unverified: the only delivery was to the
+  loopback Idempotency-Key receiver and is excluded from real evidence.
+- MTop shadow and value acceptance — unverified/blocked: the dedicated test
+  account and official-page non-empty canary have not been supplied.
+
 Fresh Stage C local verification on 2026-07-18 passed:
 
 - `ruff check .` and the project `py_compile` gate exited 0; `python -m unittest discover -s tests -v` passed 330 of 330 tests. The Stage C monitor-only discovery passed 61 of 61 tests.
@@ -20,7 +70,7 @@ Fresh Stage C local verification on 2026-07-18 passed:
 - A fresh database reached `2026071802` with 43 application tables, 9 migration rows, `integrity_check=ok`, zero foreign-key violations, both new tables, and both retention indexes. The exact pre-Stage-C source at `0272de1` opened a copy of that expanded database with the same schema version, row counts, integrity result, and foreign-key result.
 - Local mocked UI review covered default-off, loading, empty, missing-evidence, and synthetic error states at 1440x900 and 390x844. Default and loading runs had zero console warnings/errors, page errors, failed requests, blocked external attempts, or successful external requests; the intentional error fixture produced only its expected local HTTP 500 resource message. Full-scroll document/main widths were 1440/1440 and 390/390, and the MTop panel stayed inside the content rail. Evidence is under `/Users/mac/Documents/Codex/evidence/xianyu-monitor-stage-c-ui-20260718-075104` and is local mocked evidence only.
 
-This branch has not been deployed. It has not read or called either existing Xianyu account, used a production or dedicated test Cookie, made an MTop or Playwright shadow request, sent a real Webhook or other notification, or called a real AI provider. No schedule, delivery dispatcher, AI provider, or MTop feature switch was enabled, and the existing live service does not yet expose this truthful capability matrix. The registered `iPhone 15 Pro` canary remains `unverified`; the historical live evidence below belongs to the official-login deployment and must not be treated as monitor-integration deployment or real-provider acceptance.
+This branch has not been deployed. It has not read or called either existing Xianyu account, used a production or dedicated test Cookie, made an MTop or Playwright shadow request, sent a real Webhook or other notification, or called a real AI provider. Schedule and delivery switches were enabled only inside the disposable Stage F harness; they remain unchanged and default-off in live. The existing live service does not yet expose this truthful capability matrix. The registered `iPhone 15 Pro` canary remains `unverified`; the historical live evidence below belongs to the official-login deployment and must not be treated as monitor-integration or real-provider acceptance.
 
 ## Source State On 2026-07-17
 

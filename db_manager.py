@@ -8725,11 +8725,17 @@ class DBManager:
                     LIMIT 1
                 ''', (int(user_id),)).fetchone()
                 last_real_delivery = cursor.execute('''
-                    SELECT id, task_id, channel_type, confirmed_at
+                    SELECT d.id, d.task_id, d.channel_type, d.confirmed_at
                     FROM skill_monitor_deliveries
-                    WHERE user_id = ? AND status = 'sent'
-                      AND confirmed_at IS NOT NULL
-                    ORDER BY confirmed_at DESC, id DESC
+                    AS d
+                    JOIN skill_monitor_results AS r
+                      ON r.id = d.result_id AND r.user_id = d.user_id
+                    WHERE d.user_id = ? AND d.status = 'sent'
+                      AND d.confirmed_at IS NOT NULL
+                      AND r.source_adapter IN ('playwright', 'mtop')
+                      AND COALESCE(json_extract(r.raw_data, '$.is_real_data'), 0) = 1
+                      AND COALESCE(json_extract(r.raw_data, '$.provider_mode'), 'real') <> 'mocked'
+                    ORDER BY d.confirmed_at DESC, d.id DESC
                     LIMIT 1
                 ''', (int(user_id),)).fetchone()
                 last_delivery_attempt = cursor.execute('''
@@ -9138,6 +9144,8 @@ class DBManager:
             'item_id',
             'publish_time',
             'want_count',
+            'provider_mode',
+            'evidence_scope',
         }
         raw_data = result_data.get('raw_data')
         if not isinstance(raw_data, dict):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 import requests
 from loguru import logger
@@ -24,6 +24,7 @@ class SkillMonitorDeliveryDispatcher:
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self._execution_tasks: Set[asyncio.Task] = set()
+        self._active_claims: Dict[int, str] = {}
 
     @property
     def running(self) -> bool:
@@ -54,12 +55,31 @@ class SkillMonitorDeliveryDispatcher:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Persist the shutdown outcome before cancelling worker tasks. A
+        # graceful server timeout can cancel the lifespan coroutine before an
+        # in-flight worker reaches its CancelledError handler; leaving a row
+        # in sending would otherwise require stale-lease recovery.
+        for delivery_id, claim_token in list(self._active_claims.items()):
+            try:
+                db_manager.finish_skill_monitor_delivery(
+                    delivery_id,
+                    claim_token,
+                    status="unknown",
+                    error_code="dispatcher_interrupted",
+                    error_message="服务停止时通知发送结果未知",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "服务停止时无法确认技能通知结果 "
+                    f"delivery_id={delivery_id}, error={type(exc).__name__}"
+                )
         tasks = list(self._execution_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._execution_tasks.clear()
+        self._active_claims.clear()
         logger.info("技能监控通知 dispatcher 已停止")
 
     async def _run(self) -> None:
@@ -91,8 +111,16 @@ class SkillMonitorDeliveryDispatcher:
                 self._execute(delivery),
                 name=f"skill-monitor-delivery:{delivery['id']}",
             )
+            delivery_id = int(delivery["id"])
+            self._active_claims[delivery_id] = str(delivery["claim_token"])
             self._execution_tasks.add(task)
             task.add_done_callback(self._execution_tasks.discard)
+            task.add_done_callback(
+                lambda _task, claim_id=delivery_id: self._active_claims.pop(
+                    claim_id,
+                    None,
+                )
+            )
             started += 1
         return started
 

@@ -328,6 +328,8 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
         search_result = {
             "is_real_data": True,
             "source": "playwright",
+            "provider_mode": "untrusted-provider-label",
+            "evidence_scope": "untrusted-evidence-label",
             "items": [
                 {
                     "item_id": "item-1",
@@ -377,12 +379,138 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
         payload = persist_mock.call_args.args[0]
         self.assertEqual(payload["item_id"], "item-1")
         self.assertNotIn("keyword", payload["raw_data"])
+        self.assertEqual(payload["raw_data"]["provider_mode"], "real")
+        self.assertEqual(payload["raw_data"]["evidence_scope"], "real_provider")
         persist_mock.assert_called_once_with(
             payload,
             run_id=41,
             claim_token="claim-token",
         )
         send_mock.assert_not_called()
+
+    async def test_injected_provider_is_forced_to_mocked_evidence(self):
+        task = {
+            "id": 3,
+            "keyword": "synthetic",
+            "account_id": "account-1",
+            "notify_enabled": False,
+        }
+        persisted = {
+            "state": "created",
+            "created": True,
+            "result_id": 17,
+            "event_id": 18,
+            "delivery_ids": [],
+            "notify_status": "disabled",
+        }
+
+        async def injected_provider(**_kwargs):
+            # A fixture must not be able to self-promote by returning true.
+            return {
+                "is_real_data": True,
+                "source": "fixture-that-lies",
+                "items": [{
+                    "item_id": "mock-item-1",
+                    "title": "synthetic item",
+                    "item_url": "https://example.invalid/mock-item-1",
+                }],
+            }
+
+        with patch.object(
+            reply_server.db_manager,
+            "skill_monitor_result_exists",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "persist_skill_monitor_match",
+            return_value=persisted,
+        ) as persist_mock:
+            result_ids, raw_count, search_result = (
+                await reply_server._run_real_skill_monitor(
+                    task,
+                    7,
+                    run_id=41,
+                    claim_token="claim-token",
+                    search_provider=injected_provider,
+                )
+            )
+
+        self.assertEqual(result_ids, [17])
+        self.assertEqual(raw_count, 1)
+        self.assertFalse(search_result["is_real_data"])
+        self.assertEqual(search_result["provider_mode"], "mocked")
+        self.assertEqual(search_result["evidence_scope"], "mocked_provider")
+        payload = persist_mock.call_args.args[0]
+        self.assertEqual(payload["source_adapter"], "mocked")
+        self.assertFalse(payload["raw_data"]["is_real_data"])
+        self.assertEqual(payload["raw_data"]["provider_mode"], "mocked")
+        self.assertEqual(payload["raw_data"]["evidence_scope"], "mocked_provider")
+        self.assertEqual(payload["raw_data"]["source"], "mocked")
+
+    async def test_execute_with_injected_provider_claims_mocked_adapter(self):
+        task = {
+            "id": 3,
+            "keyword": "synthetic",
+            "schedule_enabled": True,
+            "schedule_interval_minutes": 15,
+        }
+        claim = {
+            "state": "claimed",
+            "claimed": True,
+            "run_id": 41,
+            "run_token": "run-token",
+            "claim_token": "claim-token",
+            "account_id": "account-1",
+        }
+        search_provider = AsyncMock()
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "claim_skill_monitor_run",
+            return_value=claim,
+        ) as claim_mock, patch.object(
+            reply_server,
+            "_run_real_skill_monitor",
+            new=AsyncMock(
+                return_value=(
+                    [19],
+                    2,
+                    {
+                        "source": "mocked",
+                        "is_real_data": False,
+                        "provider_mode": "mocked",
+                        "evidence_scope": "mocked_provider",
+                    },
+                )
+            ),
+        ) as monitor_mock, patch.object(
+            reply_server.db_manager,
+            "finish_skill_monitor_run",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "log_skill_event",
+        ):
+            result = await reply_server.execute_skill_monitor_task(
+                task,
+                7,
+                scheduled_run=True,
+                search_provider=search_provider,
+            )
+
+        self.assertFalse(result["is_real_data"])
+        self.assertEqual(result["provider_mode"], "mocked")
+        self.assertEqual(result["evidence_scope"], "mocked_provider")
+        claim_mock.assert_called_once_with(
+            3,
+            7,
+            trigger_type="scheduled",
+            source_adapter="mocked",
+        )
+        self.assertIs(monitor_mock.call_args.kwargs["search_provider"], search_provider)
 
     async def test_rejected_ai_filter_still_records_a_lease_scoped_decision(self):
         search_result = {
@@ -545,6 +673,21 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_injected_task_executor_is_used_by_the_scheduler_loop(self):
+        executor = AsyncMock(return_value={"success": True})
+        scheduler = scheduler_module.SkillMonitorScheduler(
+            poll_interval_seconds=3600,
+            task_executor=executor,
+        )
+
+        await scheduler._execute({"id": 9, "user_id": 7})
+
+        executor.assert_awaited_once_with(
+            {"id": 9, "user_id": 7},
+            7,
+            scheduled_run=True,
+        )
+
     async def test_start_and_stop_own_the_polling_task(self):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(

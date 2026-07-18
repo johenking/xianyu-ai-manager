@@ -5,7 +5,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
-from typing import List, Tuple, Optional, Dict, Any, Literal
+from typing import Awaitable, Callable, List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import quote, unquote
 import hashlib
@@ -6847,20 +6847,32 @@ async def _run_real_skill_monitor(
     scheduled_run: bool = False,
     run_id: Optional[int] = None,
     claim_token: str = '',
+    search_provider: Optional[
+        Callable[..., Awaitable[Dict[str, Any]]]
+    ] = None,
 ) -> Tuple[List[int], int, Dict[str, Any]]:
-    from utils.item_search import search_xianyu_items
+    provider_is_mocked = search_provider is not None
+    if search_provider is None:
+        from utils.item_search import search_xianyu_items
+
+        search_provider = search_xianyu_items
 
     keyword = (task.get('keyword') or '').strip()
     account_id = str(task.get('account_id') or '').strip()
     if not account_id:
         raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
+    if provider_is_mocked and str(task.get('ai_filter') or '').strip():
+        raise HTTPException(
+            status_code=409,
+            detail="离线模拟搜索不允许调用真实 AI Provider",
+        )
     if str(task.get('ai_filter') or '').strip():
         _user_ai_cookie_settings(user_id, account_id)
         if not _user_has_ai_configuration(user_id):
             raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
 
     page_size = 20
-    search_result = await search_xianyu_items(
+    search_result = await search_provider(
         keyword=keyword,
         user_id=user_id,
         account_id=account_id,
@@ -6868,6 +6880,8 @@ async def _run_real_skill_monitor(
         page_size=page_size,
     )
 
+    if not isinstance(search_result, dict):
+        raise HTTPException(status_code=502, detail="闲鱼搜索返回结构无效")
     if not search_result or search_result.get('error'):
         error_message = (search_result or {}).get('error') or '真实搜索没有返回结果'
         error_code = str((search_result or {}).get('error_code') or '')
@@ -6877,8 +6891,29 @@ async def _run_real_skill_monitor(
             raise HTTPException(status_code=403, detail="监控任务绑定的闲鱼账号不可用")
         raise HTTPException(status_code=502, detail=f"闲鱼真实搜索失败: {error_message}")
 
-    if not search_result.get('is_real_data'):
+    search_result = dict(search_result)
+    if provider_is_mocked:
+        # This path is an internal test seam only.  Never allow a fixture to
+        # promote itself into real-provider evidence.
+        search_result.update(
+            {
+                'source': 'mocked',
+                'is_real_data': False,
+                'provider_mode': 'mocked',
+                'evidence_scope': 'mocked_provider',
+            }
+        )
+    elif not search_result.get('is_real_data'):
         raise HTTPException(status_code=502, detail="闲鱼搜索没有返回真实数据，已阻止写入样例结果")
+    else:
+        # Keep evidence labels controlled by the adapter boundary rather than
+        # trusting arbitrary provider response fields.
+        search_result.update(
+            {
+                'provider_mode': 'real',
+                'evidence_scope': 'real_provider',
+            }
+        )
 
     raw_items = search_result.get('items') or []
     created_ids: List[int] = []
@@ -6937,9 +6972,20 @@ async def _run_real_skill_monitor(
             'ai_score': ai_filter_result.get('score') or 0,
             'ai_reason': ai_filter_result.get('reason') or reason,
             'notify_status': 'pending' if task.get('notify_enabled') else 'disabled',
+            'source_adapter': 'mocked' if provider_is_mocked else 'playwright',
             'raw_data': {
-                'source': search_result.get('source') or 'playwright',
-                'is_real_data': True,
+                'source': search_result.get('source') or (
+                    'mocked' if provider_is_mocked else 'playwright'
+                ),
+                'is_real_data': not provider_is_mocked,
+                'provider_mode': search_result.get(
+                    'provider_mode',
+                    'mocked' if provider_is_mocked else 'real',
+                ),
+                'evidence_scope': search_result.get(
+                    'evidence_scope',
+                    'mocked_provider' if provider_is_mocked else 'real_provider',
+                ),
                 'filter_reason': reason,
                 'ai_evaluated': ai_evaluated,
                 'ai_recommended': bool(ai_filter_result.get('recommended')),
@@ -7017,17 +7063,26 @@ def _safe_skill_run_error(exc: BaseException) -> Tuple[str, str]:
     return code, message[:500]
 
 
-async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Dict[str, Any]:
+async def execute_skill_monitor_task(
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    scheduled_run: bool = False,
+    search_provider: Optional[
+        Callable[..., Awaitable[Dict[str, Any]]]
+    ] = None,
+) -> Dict[str, Any]:
     if not skill_monitor_feature_enabled("skill_monitor_enabled"):
         raise HTTPException(status_code=503, detail="监控全局开关关闭")
     if scheduled_run and not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
         raise HTTPException(status_code=503, detail="监控调度开关关闭")
 
+    provider_is_mocked = search_provider is not None
     claim = db_manager.claim_skill_monitor_run(
         task['id'],
         user_id,
         trigger_type='scheduled' if scheduled_run else 'manual',
-        source_adapter='playwright',
+        source_adapter='mocked' if provider_is_mocked else 'playwright',
     )
     if claim.get('state') == 'action_required':
         raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
@@ -7066,6 +7121,7 @@ async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, sche
             scheduled_run=scheduled_run,
             run_id=run_id,
             claim_token=claim_token,
+            search_provider=search_provider,
         )
         stop_heartbeat.set()
         await heartbeat_task
@@ -7094,12 +7150,23 @@ async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, sche
         )
         return {
             "success": True,
-            "message": f"真实监控完成，抓取 {raw_count} 条，命中 {len(result_ids)} 条",
+            "message": (
+                f"{'离线模拟' if provider_is_mocked else '真实'}监控完成，"
+                f"抓取 {raw_count} 条，命中 {len(result_ids)} 条"
+            ),
             "result_ids": result_ids,
             "created_count": len(result_ids),
             "raw_count": raw_count,
             "source": search_result.get('source'),
-            "is_real_data": True,
+            "is_real_data": not provider_is_mocked,
+            "provider_mode": search_result.get(
+                'provider_mode',
+                'mocked' if provider_is_mocked else 'real',
+            ),
+            "evidence_scope": search_result.get(
+                'evidence_scope',
+                'mocked_provider' if provider_is_mocked else 'real_provider',
+            ),
             "scheduled_run": scheduled_run,
             "next_run_at": next_run_at,
             "run_id": run_id,

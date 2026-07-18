@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from loguru import logger
 
@@ -11,11 +11,20 @@ from db_manager import db_manager
 from skill_monitor_features import skill_monitor_feature_enabled
 
 
+SkillMonitorTaskExecutor = Callable[..., Awaitable[Dict[str, Any]]]
+
+
 class SkillMonitorScheduler:
     """Polls SQLite for due monitor tasks and runs them in the app event loop."""
 
-    def __init__(self, poll_interval_seconds: int = 30):
+    def __init__(
+        self,
+        poll_interval_seconds: int = 30,
+        *,
+        task_executor: Optional[SkillMonitorTaskExecutor] = None,
+    ):
         self.poll_interval_seconds = poll_interval_seconds
+        self.task_executor = task_executor
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self._running_task_ids: Set[int] = set()
@@ -97,9 +106,12 @@ class SkillMonitorScheduler:
     async def _execute(self, task: dict) -> None:
         task_id = int(task["id"])
         try:
-            from reply_server import execute_skill_monitor_task
+            executor = self.task_executor
+            if executor is None:
+                from reply_server import execute_skill_monitor_task
 
-            await execute_skill_monitor_task(task, int(task["user_id"]), scheduled_run=True)
+                executor = execute_skill_monitor_task
+            await executor(task, int(task["user_id"]), scheduled_run=True)
         except Exception as exc:
             logger.error(
                 f"定时技能监控任务失败 task_id={task_id}, error={type(exc).__name__}"

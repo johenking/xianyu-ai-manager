@@ -273,6 +273,78 @@ class SkillMonitorOutboxPersistenceTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertNotIn("private-item-identity", ai_payload)
 
+    def test_mocked_delivery_is_not_reported_as_real_delivery(self):
+        self._channel("webhook", "webhook")
+        task_id = self.db.create_skill_monitor_task(
+            1,
+            {
+                "name": "mocked-evidence",
+                "keyword": "synthetic-keyword",
+                "account_id": "account-1",
+                "notify_enabled": True,
+                "schedule_enabled": True,
+            },
+        )
+        claim = self.db.claim_skill_monitor_run(
+            task_id,
+            1,
+            trigger_type="scheduled",
+            source_adapter="mocked",
+            now=100,
+        )
+        result_data = self._result(task_id, suffix="mocked")
+        result_data["source_adapter"] = "mocked"
+        result_data["raw_data"].update(
+            {
+                "source": "mocked",
+                "is_real_data": False,
+                "provider_mode": "mocked",
+                "evidence_scope": "mocked_provider",
+            }
+        )
+        created = self.db.persist_skill_monitor_match(
+            result_data,
+            run_id=claim["run_id"],
+            claim_token=claim["claim_token"],
+            now=110,
+        )
+        delivery = self.db.claim_skill_monitor_delivery(
+            delivery_id=created["delivery_ids"][0],
+            now=111,
+        )
+        self.assertTrue(
+            self.db.finish_skill_monitor_delivery(
+                delivery["id"],
+                delivery["claim_token"],
+                status="sent",
+                now=112,
+            )
+        )
+        self.assertTrue(
+            self.db.finish_skill_monitor_run(
+                claim["run_id"],
+                claim["claim_token"],
+                status="success",
+                raw_result_count=1,
+                accepted_result_count=1,
+                now=113,
+            )
+        )
+
+        evidence = self.db.get_skill_capability_evidence(1)
+        self.assertIsNone(evidence["last_real_search"])
+        self.assertIsNone(evidence["last_real_delivery"])
+        self.assertEqual(evidence["last_delivery_attempt"]["status"], "sent")
+
+        raw_data = json.loads(
+            self.db.conn.execute(
+                "SELECT raw_data FROM skill_monitor_results WHERE id = ?",
+                (created["result_id"],),
+            ).fetchone()[0]
+        )
+        self.assertEqual(raw_data["provider_mode"], "mocked")
+        self.assertEqual(raw_data["evidence_scope"], "mocked_provider")
+
     def test_failed_ai_decision_audit_cannot_outlive_the_run_lease(self):
         task_id, claim = self._task_and_claim(notify_enabled=False)
         rejected = self.db.record_skill_monitor_ai_decision(
@@ -423,6 +495,27 @@ class SkillMonitorDeliveryDispatcherTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await dispatcher.run_once(), 0)
 
         recover_mock.assert_not_called()
+
+    async def test_stop_fences_inflight_delivery_before_cancelling_worker(self):
+        dispatcher = dispatcher_module.SkillMonitorDeliveryDispatcher()
+        blocker = asyncio.create_task(asyncio.Event().wait())
+        dispatcher._execution_tasks.add(blocker)
+        dispatcher._active_claims = {11: "claim-token"}
+        with patch.object(
+            dispatcher_module.db_manager,
+            "finish_skill_monitor_delivery",
+            return_value=True,
+        ) as finish_mock:
+            await dispatcher.stop()
+
+        finish_mock.assert_called_once_with(
+            11,
+            "claim-token",
+            status="unknown",
+            error_code="dispatcher_interrupted",
+            error_message="服务停止时通知发送结果未知",
+        )
+        self.assertFalse(dispatcher._execution_tasks)
 
 
 if __name__ == "__main__":
