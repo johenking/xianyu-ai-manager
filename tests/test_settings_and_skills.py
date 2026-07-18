@@ -57,7 +57,7 @@ class SettingsServiceTests(unittest.TestCase):
         self.assertIsNone(validate_skill_monitor_features(notify_enabled=True, ai_filter="低风险卖家"))
 
     def test_monitor_durable_schema_and_feature_defaults_are_present(self):
-        self.assertEqual(self.db.schema_version, "2026071801")
+        self.assertEqual(self.db.schema_version, "2026071802")
         settings = self.db.get_all_system_settings()
         for key in (
             "skill_monitor_enabled",
@@ -79,6 +79,8 @@ class SettingsServiceTests(unittest.TestCase):
                 "skill_monitor_events",
                 "skill_monitor_result_identities",
                 "skill_monitor_deliveries",
+                "skill_monitor_request_budgets",
+                "skill_monitor_mtop_breakers",
             }.issubset(tables)
         )
         cookie_columns = {

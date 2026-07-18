@@ -49,7 +49,7 @@ Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.syst
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py skill_monitor_mtop_adapter.py skill_monitor_shadow.py skill_monitor_ai_contract.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -193,6 +193,18 @@ The scheduler runs inside the one Uvicorn worker and polls every 30 seconds. Kee
 5. Interpret `partial` as at least one successful and at least one failed channel; inspect `raw_data.notify_error` for per-channel errors.
 6. A repeated item is intentionally skipped when the same task already stored its URL or platform item ID.
 7. After a service restart, a task left in `running` becomes `failed` with an interruption error and can run again on its next schedule.
+
+### Stage C MTop gate
+
+The MTop adapter is not connected to monitor execution yet. Keep both DB feature switches and `SKILL_MONITOR_MTOP_NETWORK_ALLOWED=false` on live. Environment permission alone is insufficient, and a response is discarded if any gate closes while the request is in flight.
+
+Before a future canary, require one explicitly approved dedicated account; never select either existing account by convenience. Confirm `iPhone 15 Pro`, latest, unrestricted region/price, one page is non-empty on the official page, then run near-time Playwright/MTop shadow comparison in an isolated environment. Require recall/Jaccard and price/region/rank differences within the documented thresholds. Zero hits do not prove the canary works.
+
+`request_budget_exhausted` reports a bounded retry interval and consumes no extra slot. `risk_control`, `action_required`, `revision_conflict`, and identity errors stop immediately; do not rotate accounts or bypass verification. `response_schema_invalid`, `response_too_large`, and `response_items_invalid` indicate protocol drift and must block promotion. Do not save a full response to troubleshoot; use safe structure counts and error codes.
+
+Migration `2026071802` only adds `skill_monitor_request_budgets`, `skill_monitor_mtop_breakers`, and their retention indexes. Previous source can ignore the tables, so source rollback does not require dropping them. Never drop or rename them during rollback. Budget rows retain only digests and expire one day after the fixed window; breaker rows retain digest/counters/safe codes for 30 days; monitor workflow evidence keeps the existing 30-day policy.
+
+The offline Webhook test binds `127.0.0.1` and verifies stable `Idempotency-Key` behavior. It is not proof of real HTTPS delivery. The offline AI tests use a fake provider and are not proof of a configured model. See [Stage C Offline MTop Acceptance](stage-c-offline-acceptance.md).
 
 Smoke-test a task manually before enabling its schedule:
 

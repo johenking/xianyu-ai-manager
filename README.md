@@ -25,7 +25,7 @@
 
 | 能力声明 | 证据规则 |
 | --- | --- |
-| `code_present` | 只说明租约、结果事务和通知 outbox 代码已加载 |
+| `code_present` | 只说明租约、结果事务、通知 outbox 和离线 MTop 契约代码已加载 |
 | `config_ready` | 全局开关已开，并且存在身份完整、归属正确的账号和可运行任务 |
 | `last_real_search` | 最近一次持久化的成功 Playwright/MTop 真实搜索 |
 | `last_scheduled_run` | 最近一次持久化的定时运行及其真实状态 |
@@ -33,6 +33,8 @@
 | `last_real_delivery` | 最近一次已确认送达；`unknown` 不算确认成功 |
 
 监控执行、调度、通知和实验性 MTop 开关均默认关闭并 fail-closed。手动和定时入口共用持久化领取、租约、心跳和过期恢复；结果首次发现事件与通知 outbox 在同一事务提交。通知采用 at-least-once 和稳定幂等键，已发送但本地回执未提交的模糊结果记录为 `unknown`，不承诺无法证明的 exactly-once。
+
+Stage C 只加入默认断开的 MTop 离线适配器：固定端点、字段白名单、schema 校验、Cookie revision CAS、账号级/全局持久预算、带 half-open 租约的持久熔断、`Retry-After`、jitter、分页/筛选/排序规范化和 shadow 比较器。`code_present.evidence.offline_mtop_adapter` 会显示三重开关、绝对限制和候选 canary，但仍不是第七项真实能力。候选词 `iPhone 15 Pro` 当前为 `unverified`；由于没有已批准的专用测试账号，本分支未发真实闲鱼请求，shadow 与端到端价值验收均保持阻断。详见 [Stage C 离线验收](docs/stage-c-offline-acceptance.md)。
 
 ## AI 上下文优先级
 
@@ -153,7 +155,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py skill_monitor_mtop_adapter.py skill_monitor_shadow.py skill_monitor_ai_contract.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 
@@ -168,11 +170,11 @@ npm run verify:build
 
 ## 来源与许可
 
-本项目以 [zhinianboke/xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 为主要上游进行修改，上游使用 AGPL-3.0。本项目同样使用 [AGPL-3.0](LICENSE)。
+本项目以 [zhinianboke/xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 为主要上游进行修改，上游使用 AGPL-3.0。本项目同样使用 [AGPL-3.0](LICENSE)。Stage C 的 PC 搜索请求结构固定参考提交为 `0553ea131243651631445baeba9cca403a0324d2`。
 
 技能中心是独立安全重写，设计参考：
 
-- [Usagi-org/ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor)：监控流程
+- [Usagi-org/ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor) `f85d140b6b45029d9a0925feb96dad733b41396d`：分页停止和失败保护思路（未复制 MIT 表达性代码）
 - [shaxiu/XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent)：专家策略
 - [GuDong2003/xianyu-auto-reply-fix](https://github.com/GuDong2003/xianyu-auto-reply-fix)：诊断思路
 

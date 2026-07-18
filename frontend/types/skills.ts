@@ -53,7 +53,55 @@ export interface SkillCapability {
   label: string;
   detail: string;
   observed_at?: number | null;
-  evidence?: Record<string, unknown> | null;
+  evidence?: {
+    offline_mtop_adapter?: SkillMTopOfflineContract;
+    [key: string]: unknown;
+  } | null;
+}
+
+export interface SkillMTopOfflineContract {
+  contract_version: string;
+  code_present: boolean;
+  evidence_scope: 'code_and_configuration_only';
+  gate: {
+    master_enabled: boolean;
+    mtop_enabled: boolean;
+    network_allowed: boolean;
+    executable: boolean;
+    fail_closed: boolean;
+  };
+  limits: {
+    page_size: number;
+    max_pages: number;
+    max_results: number;
+    max_runtime_seconds: number;
+    request_timeout_seconds: number;
+    max_attempts_per_page: number;
+    max_response_bytes: number;
+    global_requests_per_window: number;
+    account_requests_per_window: number;
+    budget_window_seconds: number;
+    base_backoff_seconds: number;
+    max_backoff_seconds: number;
+    failure_threshold: number;
+    failure_cooldown_seconds: number;
+    probe_lease_seconds: number;
+  };
+  canary: {
+    keyword: string;
+    sort: 'latest';
+    region: string;
+    min_price: number | null;
+    max_price: number | null;
+    pages: number;
+    verification: 'unverified';
+  };
+  real_acceptance: {
+    state: 'blocked';
+    blocker_code: 'dedicated_test_account_required';
+    shadow_verified: boolean;
+    value_verified: boolean;
+  };
 }
 
 export interface AutoReplyDiagnostics {

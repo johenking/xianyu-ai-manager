@@ -6205,28 +6205,12 @@ def _user_has_ai_configuration(user_id: int) -> bool:
     return _user_ai_cookie_settings(user_id)[0] is not None
 
 
-def _json_from_model_text(text: str) -> Dict[str, Any]:
-    cleaned = (text or '').strip()
-    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(0)
-    try:
-        value = json.loads(cleaned)
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        lowered = cleaned.lower()
-        return {
-            'recommended': any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')),
-            'score': 80 if any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')) else 20,
-            'reason': cleaned[:200] or 'AI未返回可解析理由',
-        }
-
-
-def _run_skill_ai_filter(item: Dict[str, Any], task: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+def _prepare_skill_ai_filter_request(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+) -> Tuple[Any, Dict[str, Any], List[Dict[str, str]]]:
     ai_filter = str(task.get('ai_filter') or '').strip()
-    if not ai_filter:
-        return {'recommended': True, 'score': 0, 'reason': ''}
-
     cookie_id, settings = _user_ai_cookie_settings(user_id, task.get('account_id') or '')
     if not cookie_id or not settings:
         raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
@@ -6257,16 +6241,106 @@ def _run_skill_ai_filter(item: Dict[str, Any], task: Dict[str, Any], user_id: in
             'content': f"筛选要求：{ai_filter}\n商品信息：{json.dumps(item_summary, ensure_ascii=False)}",
         },
     ]
+    return client, settings, messages
+
+
+def _run_skill_ai_filter(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    run_id: int = 0,
+    claim_token: str = '',
+) -> Dict[str, Any]:
+    from skill_monitor_ai_contract import (
+        SkillMonitorAIError,
+        parse_skill_monitor_ai_decision,
+    )
+
+    if not str(task.get('ai_filter') or '').strip():
+        return {'recommended': True, 'score': 0, 'reason': ''}
+    client, settings, messages = _prepare_skill_ai_filter_request(
+        item,
+        task,
+        user_id,
+    )
+    if run_id and not db_manager.skill_monitor_run_claim_is_current(
+        run_id,
+        claim_token,
+    ):
+        raise HTTPException(status_code=409, detail="监控运行租约已失效")
     raw = ai_reply_engine._call_openai_api(client, settings, messages, max_tokens=220, temperature=0.1)
-    parsed = _json_from_model_text(raw)
-    score = parsed.get('score', 0)
+    if run_id and not db_manager.skill_monitor_run_claim_is_current(
+        run_id,
+        claim_token,
+    ):
+        raise HTTPException(status_code=409, detail="监控运行租约已失效")
     try:
-        score = max(0, min(100, int(float(score))))
-    except (TypeError, ValueError):
-        score = 0
-    recommended = bool(parsed.get('recommended')) and score >= 50
-    reason = str(parsed.get('reason') or raw or '').strip()[:300]
-    return {'recommended': recommended, 'score': score, 'reason': reason or 'AI筛选完成'}
+        parsed = parse_skill_monitor_ai_decision(raw)
+    except SkillMonitorAIError as exc:
+        raise HTTPException(status_code=502, detail=exc.safe_message) from exc
+    return {
+        'recommended': parsed.recommended and parsed.score >= 50,
+        'score': parsed.score,
+        'reason': parsed.reason,
+    }
+
+
+async def _run_skill_ai_filter_bounded(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    run_id: int,
+    claim_token: str,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    from skill_monitor_ai_contract import (
+        SkillMonitorAIError,
+        evaluate_skill_monitor_ai_decision,
+    )
+
+    if not str(task.get('ai_filter') or '').strip():
+        return {'recommended': True, 'score': 0, 'reason': ''}
+    client, settings, messages = _prepare_skill_ai_filter_request(
+        item,
+        task,
+        user_id,
+    )
+
+    async def provider_call() -> str:
+        return await asyncio.to_thread(
+            ai_reply_engine._call_openai_api,
+            client,
+            settings,
+            messages,
+            max_tokens=220,
+            temperature=0.1,
+        )
+
+    def lease_is_current() -> bool:
+        return db_manager.skill_monitor_run_claim_is_current(
+            run_id,
+            claim_token,
+        )
+
+    try:
+        decision = await evaluate_skill_monitor_ai_decision(
+            provider_call,
+            lease_is_current,
+            timeout_seconds=timeout_seconds,
+        )
+    except SkillMonitorAIError as exc:
+        if exc.code == 'ai_lease_lost':
+            raise HTTPException(status_code=409, detail="监控运行租约已失效") from exc
+        if exc.code == 'ai_timeout':
+            raise HTTPException(status_code=504, detail=exc.safe_message) from exc
+        raise HTTPException(status_code=502, detail=exc.safe_message) from exc
+    return {
+        'recommended': decision.recommended and decision.score >= 50,
+        'score': decision.score,
+        'reason': decision.reason,
+    }
 
 
 def _raise_skill_notification_api_error(response: Any, channel_type: str) -> None:
@@ -6421,6 +6495,8 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
 
 @skills_router.get('/api/skills/capabilities')
 def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_user)):
+    from skill_monitor_mtop_adapter import get_mtop_offline_contract_status
+
     user_id = int(current_user['user_id'])
     feature_state = get_skill_monitor_feature_state(db_manager)
     effective_flags = feature_state['effective']
@@ -6478,6 +6554,7 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
         )
     else:
         delivery_detail = '尚无真实通知投递记录'
+    mtop_offline_contract = get_mtop_offline_contract_status(db_manager)
 
     return {
         'success': True,
@@ -6487,7 +6564,10 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                 'state': 'present',
                 'badge_state': 'ready',
                 'label': '代码已加载',
-                'detail': '执行租约、结果事务和通知 outbox 代码已加载；不代表配置或真实运行通过',
+                'detail': '执行租约、结果事务、通知 outbox 与离线 MTop 契约代码已加载；不代表配置或真实运行通过',
+                'evidence': {
+                    'offline_mtop_adapter': mtop_offline_contract,
+                },
             },
             'config_ready': {
                 'available': manual_ready,
@@ -6821,7 +6901,13 @@ async def _run_real_skill_monitor(
         ai_filter_result = {'recommended': True, 'score': 0, 'reason': reason}
         ai_evaluated = bool(str(task.get('ai_filter') or '').strip())
         if ai_evaluated:
-            ai_filter_result = _run_skill_ai_filter(item, task, user_id)
+            ai_filter_result = await _run_skill_ai_filter_bounded(
+                item,
+                task,
+                user_id,
+                run_id=int(run_id or 0),
+                claim_token=claim_token,
+            )
             decision = db_manager.record_skill_monitor_ai_decision(
                 run_id=int(run_id or 0),
                 claim_token=claim_token,

@@ -41,6 +41,7 @@ import {
   SkillMonitorTask,
   SkillOpsHealth,
   SkillCapability,
+  SkillMTopOfflineContract,
 } from '../types';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import { IconAction, PageHeader, SegmentedNav, WorkSurface } from './ui/ProtectedPage';
@@ -74,6 +75,111 @@ const capabilityTitles: Record<string, string> = {
 const formatCapabilityTime = (observedAt?: number | null) => {
   if (!observedAt) return '';
   return new Date(observedAt * 1000).toLocaleString('zh-CN', { hour12: false });
+};
+
+const MTopOfflineContractPanel: React.FC<{
+  contract?: SkillMTopOfflineContract;
+  loading: boolean;
+}> = ({ contract, loading }) => {
+  if (loading && !contract) {
+    return (
+      <WorkSurface as="section" className="px-5 py-4" aria-busy="true">
+        <div role="status" className="flex min-h-16 items-center gap-3 text-sm font-bold text-gray-500">
+          <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+          MTop 离线状态加载中
+        </div>
+      </WorkSurface>
+    );
+  }
+
+  if (!contract) {
+    return (
+      <WorkSurface as="section" className="px-5 py-4">
+        <InlineNotice tone="error">
+          离线状态证据未返回；不得据此启用 MTop 或声称真实验收通过。
+        </InlineNotice>
+      </WorkSurface>
+    );
+  }
+
+  const gateRows = [
+    { label: '全局监控', enabled: contract.gate.master_enabled },
+    { label: 'MTop 适配器', enabled: contract.gate.mtop_enabled },
+    { label: '网络许可', enabled: contract.gate.network_allowed },
+  ];
+  const budgetMinutes = Math.max(1, Math.round(contract.limits.budget_window_seconds / 60));
+
+  return (
+    <WorkSurface as="section" className="overflow-hidden" >
+      <div className="flex flex-col gap-3 border-b border-gray-100 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-950 text-[#FFE815]">
+            <ShieldCheck className="h-5 w-5" />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-base font-extrabold text-gray-950">MTop 离线适配器</h3>
+            <p className="mt-0.5 text-xs leading-5 text-gray-500">仅报告代码与配置状态，不代表真实搜索可用</p>
+          </div>
+        </div>
+        <StatusBadge
+          state={contract.gate.executable ? 'ready' : 'warning'}
+          label={contract.gate.executable ? '执行门槛已开启' : '默认关闭'}
+        />
+      </div>
+
+      <div className="divide-y divide-gray-100">
+        <div className="grid gap-3 px-5 py-4 lg:grid-cols-[160px_1fr] lg:items-center">
+          <div>
+            <p className="text-sm font-extrabold text-gray-900">三重执行门槛</p>
+            <p className="mt-1 text-xs text-gray-500">任一关闭即禁止外发请求</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {gateRows.map((gate) => (
+              <span
+                key={gate.label}
+                className={`inline-flex min-h-9 items-center rounded-full border px-3 text-xs font-bold ${gate.enabled ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-gray-200 bg-gray-50 text-gray-600'}`}
+              >
+                {gate.label} · {gate.enabled ? '开启' : '关闭'}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid gap-3 px-5 py-4 lg:grid-cols-[160px_1fr] lg:items-center">
+          <div>
+            <p className="text-sm font-extrabold text-gray-900">请求安全预算</p>
+            <p className="mt-1 text-xs text-gray-500">账号级与全局同时计数</p>
+          </div>
+          <p className="text-sm leading-6 text-gray-600">
+            单账号 {contract.limits.account_requests_per_window} 次 / {budgetMinutes} 分钟，
+            全局 {contract.limits.global_requests_per_window} 次 / {budgetMinutes} 分钟；
+            最多 {contract.limits.max_pages} 页、{contract.limits.max_results} 条、
+            {contract.limits.max_runtime_seconds} 秒；连续 {contract.limits.failure_threshold} 次失败
+            熔断 {Math.round(contract.limits.failure_cooldown_seconds / 60)} 分钟。
+          </p>
+        </div>
+
+        <div className="grid gap-3 px-5 py-4 lg:grid-cols-[160px_1fr] lg:items-center">
+          <div>
+            <p className="text-sm font-extrabold text-gray-900">Canary 候选</p>
+            <p className="mt-1 text-xs text-gray-500">真实账号验收前不晋级</p>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-sm leading-6 text-gray-700">
+              “{contract.canary.keyword}” · 最新排序 · 不限地区/价格 · {contract.canary.pages} 页
+            </p>
+            <StatusBadge state="missing" label="未验证" />
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-amber-50/70 px-5 py-4">
+        <InlineNotice>
+          当前缺少已批准的专用测试账号；shadow 对照与“搜索→过滤→去重→持久化→受控通知”价值验收均保持阻断。
+        </InlineNotice>
+      </div>
+    </WorkSurface>
+  );
 };
 
 const SkillCenter: React.FC = () => {
@@ -115,6 +221,8 @@ const SkillCenter: React.FC = () => {
       return acc;
     }, {});
   }, [prompts]);
+
+  const mtopOfflineContract = capabilities.code_present?.evidence?.offline_mtop_adapter;
 
   const loadMonitor = async () => {
     const [taskList, resultList] = await Promise.all([
@@ -771,6 +879,8 @@ const SkillCenter: React.FC = () => {
           </WorkSurface>
         ))}
       </div>
+
+      <MTopOfflineContractPanel contract={mtopOfflineContract} loading={loading} />
 
       {statusText && (
         <div className="rounded-xl border border-yellow-200 bg-yellow-50 px-5 py-3 text-sm font-bold text-gray-700">

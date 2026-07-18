@@ -629,6 +629,59 @@ def _skill_monitor_durable_workflows_v1(
         )
 
 
+def _skill_monitor_mtop_offline_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Add the fixed-window request budget used by the disabled MTop adapter.
+
+    The migration is expand-only. It does not alter existing task, result,
+    account, run, event, or delivery rows, so code from the prior release can
+    continue to use an expanded database.
+    """
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_request_budgets (
+            scope_type TEXT NOT NULL CHECK (scope_type IN ('global', 'account')),
+            scope_digest TEXT NOT NULL,
+            window_started_at REAL NOT NULL,
+            window_seconds INTEGER NOT NULL CHECK (window_seconds > 0),
+            request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
+            retention_until REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (scope_type, scope_digest)
+        ) WITHOUT ROWID
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_request_budgets_retention "
+        "ON skill_monitor_request_budgets(retention_until)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_monitor_mtop_breakers (
+            scope_digest TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'closed'
+                CHECK (state IN ('closed', 'open', 'half_open')),
+            consecutive_failures INTEGER NOT NULL DEFAULT 0
+                CHECK (consecutive_failures >= 0),
+            opened_until REAL,
+            probe_token TEXT NOT NULL DEFAULT '',
+            probe_lease_expires_at REAL,
+            last_error_code TEXT NOT NULL DEFAULT '',
+            last_failure_at REAL,
+            last_success_at REAL,
+            retention_until REAL NOT NULL,
+            updated_at REAL NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_monitor_mtop_breakers_retention "
+        "ON skill_monitor_mtop_breakers(retention_until)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -649,6 +702,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026071801",
         "skill_monitor_durable_workflows_v1",
         _skill_monitor_durable_workflows_v1,
+    ),
+    Migration(
+        "2026071802",
+        "skill_monitor_mtop_offline_v1",
+        _skill_monitor_mtop_offline_v1,
     ),
 )
 

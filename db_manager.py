@@ -53,6 +53,8 @@ COOKIE_REFRESH_MAX_INTERVAL_MINUTES = 10080
 SKILL_MONITOR_RUN_LEASE_SECONDS = 180
 SKILL_MONITOR_DELIVERY_LEASE_SECONDS = 60
 SKILL_MONITOR_RETENTION_SECONDS = 30 * 24 * 60 * 60
+SKILL_MONITOR_BUDGET_RETENTION_SECONDS = 24 * 60 * 60
+SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 class DBManager:
@@ -7739,6 +7741,417 @@ class DBManager:
     @staticmethod
     def _new_skill_monitor_token() -> str:
         return secrets.token_urlsafe(24)
+
+    def claim_skill_monitor_request_budget(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        global_limit: int,
+        account_limit: int,
+        window_seconds: int,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Atomically consume one global and one owner/account request slot.
+
+        Only a digest of the owner/account binding is persisted. A denied claim
+        consumes neither budget, and failures stay fail-closed.
+        """
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_global_limit = max(1, min(int(global_limit), 10000))
+            normalized_account_limit = max(1, min(int(account_limit), 10000))
+            normalized_window = max(1, min(int(window_seconds), 86400))
+        except (TypeError, ValueError):
+            return {
+                'allowed': False,
+                'reason': 'invalid_budget_identity',
+                'retry_after': 0.0,
+            }
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {
+                'allowed': False,
+                'reason': 'invalid_budget_identity',
+                'retry_after': 0.0,
+            }
+
+        timestamp = float(now if now is not None else time.time())
+        scopes = (
+            (
+                'global',
+                hashlib.sha256(b'skill-monitor-mtop-global-v1').hexdigest(),
+                normalized_global_limit,
+            ),
+            (
+                'account',
+                hashlib.sha256(
+                    f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+                ).hexdigest(),
+                normalized_account_limit,
+            ),
+        )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    'DELETE FROM skill_monitor_request_budgets '
+                    'WHERE retention_until <= ?',
+                    (timestamp,),
+                )
+                states: List[Dict[str, Any]] = []
+                for scope_type, scope_digest, limit in scopes:
+                    row = cursor.execute('''
+                        SELECT window_started_at, window_seconds, request_count
+                        FROM skill_monitor_request_budgets
+                        WHERE scope_type = ? AND scope_digest = ?
+                    ''', (scope_type, scope_digest)).fetchone()
+                    if (
+                        not row
+                        or int(row[1] or 0) != normalized_window
+                        or float(row[0]) + normalized_window <= timestamp
+                    ):
+                        window_started_at = timestamp
+                        request_count = 0
+                    else:
+                        window_started_at = float(row[0])
+                        request_count = int(row[2] or 0)
+                    states.append({
+                        'scope_type': scope_type,
+                        'scope_digest': scope_digest,
+                        'limit': limit,
+                        'window_started_at': window_started_at,
+                        'request_count': request_count,
+                    })
+
+                blocked = [state for state in states if state['request_count'] >= state['limit']]
+                if blocked:
+                    retry_after = max(
+                        0.0,
+                        max(
+                            state['window_started_at'] + normalized_window - timestamp
+                            for state in blocked
+                        ),
+                    )
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'reason': 'request_budget_exhausted',
+                        'retry_after': retry_after,
+                        'global_count': states[0]['request_count'],
+                        'global_limit': normalized_global_limit,
+                        'account_count': states[1]['request_count'],
+                        'account_limit': normalized_account_limit,
+                        'window_seconds': normalized_window,
+                    }
+
+                for state in states:
+                    next_count = state['request_count'] + 1
+                    retention_until = (
+                        state['window_started_at']
+                        + normalized_window
+                        + SKILL_MONITOR_BUDGET_RETENTION_SECONDS
+                    )
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_request_budgets (
+                            scope_type, scope_digest, window_started_at,
+                            window_seconds, request_count, retention_until,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(scope_type, scope_digest) DO UPDATE SET
+                            window_started_at = excluded.window_started_at,
+                            window_seconds = excluded.window_seconds,
+                            request_count = excluded.request_count,
+                            retention_until = excluded.retention_until,
+                            updated_at = excluded.updated_at
+                    ''', (
+                        state['scope_type'],
+                        state['scope_digest'],
+                        state['window_started_at'],
+                        normalized_window,
+                        next_count,
+                        retention_until,
+                        timestamp,
+                    ))
+                    state['request_count'] = next_count
+                self.conn.commit()
+                return {
+                    'allowed': True,
+                    'reason': '',
+                    'retry_after': 0.0,
+                    'global_count': states[0]['request_count'],
+                    'global_limit': normalized_global_limit,
+                    'account_count': states[1]['request_count'],
+                    'account_limit': normalized_account_limit,
+                    'window_seconds': normalized_window,
+                }
+            except Exception as exc:
+                logger.error(
+                    f"领取技能监控请求预算失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {
+                    'allowed': False,
+                    'reason': 'request_budget_unavailable',
+                    'retry_after': 0.0,
+                }
+
+    def claim_skill_monitor_mtop_circuit_probe(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        probe_lease_seconds: int,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fail closed while open and single-flight the half-open probe."""
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_lease = max(15, min(int(probe_lease_seconds), 600))
+        except (TypeError, ValueError):
+            return {'allowed': False, 'state': 'invalid_identity', 'retry_after': 0.0}
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {'allowed': False, 'state': 'invalid_identity', 'retry_after': 0.0}
+        timestamp = float(now if now is not None else time.time())
+        scope_digest = hashlib.sha256(
+            f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+        ).hexdigest()
+        retention_until = timestamp + SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    'DELETE FROM skill_monitor_mtop_breakers WHERE retention_until <= ?',
+                    (timestamp,),
+                )
+                row = cursor.execute('''
+                    SELECT state, consecutive_failures, opened_until,
+                           probe_token, probe_lease_expires_at
+                    FROM skill_monitor_mtop_breakers
+                    WHERE scope_digest = ?
+                ''', (scope_digest,)).fetchone()
+                if not row:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_mtop_breakers (
+                            scope_digest, state, consecutive_failures,
+                            retention_until, updated_at
+                        ) VALUES (?, 'closed', 0, ?, ?)
+                    ''', (scope_digest, retention_until, timestamp))
+                    self.conn.commit()
+                    return {
+                        'allowed': True,
+                        'state': 'closed',
+                        'probe_token': '',
+                        'retry_after': 0.0,
+                    }
+
+                state = str(row[0] or 'closed')
+                opened_until = float(row[2] or 0.0)
+                probe_lease_expires_at = float(row[4] or 0.0)
+                if state == 'closed':
+                    cursor.execute('''
+                        UPDATE skill_monitor_mtop_breakers
+                        SET retention_until = ?, updated_at = ?
+                        WHERE scope_digest = ?
+                    ''', (retention_until, timestamp, scope_digest))
+                    self.conn.commit()
+                    return {
+                        'allowed': True,
+                        'state': 'closed',
+                        'probe_token': '',
+                        'retry_after': 0.0,
+                    }
+                if state == 'open' and opened_until > timestamp:
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'state': 'open',
+                        'probe_token': '',
+                        'retry_after': opened_until - timestamp,
+                        'consecutive_failures': int(row[1] or 0),
+                    }
+                if state == 'half_open' and probe_lease_expires_at > timestamp:
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'state': 'half_open',
+                        'probe_token': '',
+                        'retry_after': probe_lease_expires_at - timestamp,
+                        'consecutive_failures': int(row[1] or 0),
+                    }
+
+                probe_token = self._new_skill_monitor_token()
+                probe_lease_expires_at = timestamp + normalized_lease
+                cursor.execute('''
+                    UPDATE skill_monitor_mtop_breakers
+                    SET state = 'half_open', probe_token = ?,
+                        probe_lease_expires_at = ?, retention_until = ?,
+                        updated_at = ?
+                    WHERE scope_digest = ?
+                ''', (
+                    probe_token,
+                    probe_lease_expires_at,
+                    retention_until,
+                    timestamp,
+                    scope_digest,
+                ))
+                self.conn.commit()
+                return {
+                    'allowed': True,
+                    'state': 'half_open',
+                    'probe_token': probe_token,
+                    'retry_after': 0.0,
+                    'consecutive_failures': int(row[1] or 0),
+                }
+            except Exception as exc:
+                logger.error(
+                    f"领取 MTop 熔断探针失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {
+                    'allowed': False,
+                    'state': 'breaker_unavailable',
+                    'probe_token': '',
+                    'retry_after': 0.0,
+                }
+
+    def record_skill_monitor_mtop_circuit_outcome(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        success: bool,
+        error_code: str = '',
+        failure_threshold: int,
+        cooldown_seconds: int,
+        probe_token: str = '',
+        force_open: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_threshold = max(1, min(int(failure_threshold), 20))
+            normalized_cooldown = max(60, min(int(cooldown_seconds), 86400))
+        except (TypeError, ValueError):
+            return {'recorded': False, 'state': 'invalid_identity'}
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {'recorded': False, 'state': 'invalid_identity'}
+        normalized_error_code = ''.join(
+            character
+            for character in str(error_code or '').lower()
+            if character.isalnum() or character == '_'
+        )[:80]
+        timestamp = float(now if now is not None else time.time())
+        scope_digest = hashlib.sha256(
+            f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+        ).hexdigest()
+        retention_until = timestamp + SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT state, consecutive_failures, probe_token
+                    FROM skill_monitor_mtop_breakers
+                    WHERE scope_digest = ?
+                ''', (scope_digest,)).fetchone()
+                if not row:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_mtop_breakers (
+                            scope_digest, state, consecutive_failures,
+                            retention_until, updated_at
+                        ) VALUES (?, 'closed', 0, ?, ?)
+                    ''', (scope_digest, retention_until, timestamp))
+                    row = ('closed', 0, '')
+                state = str(row[0] or 'closed')
+                if state == 'half_open' and str(row[2] or '') != str(probe_token or ''):
+                    self.conn.rollback()
+                    return {'recorded': False, 'state': 'probe_lost'}
+
+                if success:
+                    cursor.execute('''
+                        UPDATE skill_monitor_mtop_breakers
+                        SET state = 'closed', consecutive_failures = 0,
+                            opened_until = NULL, probe_token = '',
+                            probe_lease_expires_at = NULL,
+                            last_error_code = '', last_success_at = ?,
+                            retention_until = ?, updated_at = ?
+                        WHERE scope_digest = ?
+                    ''', (timestamp, retention_until, timestamp, scope_digest))
+                    self.conn.commit()
+                    return {
+                        'recorded': True,
+                        'state': 'closed',
+                        'consecutive_failures': 0,
+                    }
+
+                failures = int(row[1] or 0) + 1
+                should_open = bool(
+                    force_open
+                    or state == 'half_open'
+                    or failures >= normalized_threshold
+                )
+                next_state = 'open' if should_open else 'closed'
+                opened_until = (
+                    timestamp + normalized_cooldown if should_open else None
+                )
+                cursor.execute('''
+                    UPDATE skill_monitor_mtop_breakers
+                    SET state = ?, consecutive_failures = ?,
+                        opened_until = ?, probe_token = '',
+                        probe_lease_expires_at = NULL,
+                        last_error_code = ?, last_failure_at = ?,
+                        retention_until = ?, updated_at = ?
+                    WHERE scope_digest = ?
+                ''', (
+                    next_state,
+                    failures,
+                    opened_until,
+                    normalized_error_code or 'unknown_error',
+                    timestamp,
+                    retention_until,
+                    timestamp,
+                    scope_digest,
+                ))
+                self.conn.commit()
+                return {
+                    'recorded': True,
+                    'state': next_state,
+                    'consecutive_failures': failures,
+                    'opened_until': opened_until,
+                }
+            except Exception as exc:
+                logger.error(
+                    f"记录 MTop 熔断结果失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {'recorded': False, 'state': 'breaker_unavailable'}
+
+    def skill_monitor_run_claim_is_current(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            try:
+                row = self.conn.execute('''
+                    SELECT 1 FROM skill_monitor_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(run_id), str(claim_token), timestamp)).fetchone()
+                return bool(row)
+            except Exception as exc:
+                logger.error(
+                    f"核对技能监控运行租约失败: {type(exc).__name__}"
+                )
+                return False
 
     def _insert_skill_monitor_event(
         self,

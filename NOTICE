@@ -5,6 +5,8 @@ This project is a modified work based primarily on:
   zhinianboke/xianyu-auto-reply
   https://github.com/zhinianboke/xianyu-auto-reply
   Licensed under the GNU Affero General Public License v3.0.
+  Stage C search-request behavior was reviewed at fixed commit:
+  0553ea131243651631445baeba9cca403a0324d2
 
 Major modifications in this distribution include:
   - responsive account, settings, product, order and skill-center interfaces;
@@ -15,10 +17,16 @@ Major modifications in this distribution include:
   - removal of sensitive values from runtime logs and public exports.
 
 The Skill Center is an independent safe rewrite informed by ideas from:
-  - Usagi-org/ai-goofish-monitor (monitoring workflow)
+  - Usagi-org/ai-goofish-monitor (monitoring workflow), fixed at
+    f85d140b6b45029d9a0925feb96dad733b41396d (MIT)
   - shaxiu/XianyuAutoAgent (expert strategy design)
   - GuDong2003/xianyu-auto-reply-fix (diagnostic approach)
 
 No claim is made that those projects endorse this distribution. Their names
 and links are provided for attribution and provenance only. See each upstream
 repository for its own license and notices.
+
+The Stage C implementation uses the Usagi project as a behavioral reference
+for pagination stopping and failure guarding. No MIT expression from that
+fixed source was copied into the Stage C files, so no additional MIT source
+notice is incorporated into the distribution.

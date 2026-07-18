@@ -390,7 +390,9 @@ Create and list monitor tasks at `/api/skills/monitor/tasks`, update one with `P
 
 Global monitor, scheduler, delivery, and experimental MTop switches default off. The schedule interval must be at least 15 minutes. Task responses include `next_run_at`, `last_status`, `last_error`, and `last_run_at`. Manual and scheduled runs share one persistent claim/lease; an overlap returns HTTP 409, and stale or shutdown-interrupted attempts remain auditable.
 
-AI filtering requires an owned account with an enabled provider, API key, base URL, and model. Missing configuration fails the run explicitly. Results are deduplicated across runs by task and `item_url`, falling back to platform item ID. Existing matches are not inserted or notified again.
+The Stage C MTop adapter is present only as a disabled offline contract and is not selected by the task run route. It requires the global DB switch, MTop DB switch, and `SKILL_MONITOR_MTOP_NETWORK_ALLOWED=true` before every request/retry. Do not set these for live until a dedicated test account passes shadow and value acceptance. The candidate `iPhone 15 Pro` / latest / unrestricted region and price / one page remains `unverified`.
+
+AI filtering requires an owned account with an enabled provider, API key, base URL, and model. Missing configuration fails the run explicitly. Monitor decisions must be exact JSON with `recommended`, integer `score`, and bounded `reason`; timeout, refusal, non-JSON, extra fields, or a lost lease fails the run instead of becoming an action. Results are deduplicated across runs by task and `item_url`, falling back to platform item ID. Existing matches are not inserted or notified again.
 
 Accepted item data, its first-seen event, and delivery outbox records commit together. The dispatcher separately claims each delivery with a lease. Generic Webhooks receive a stable `Idempotency-Key`; an ambiguous send is stored as `unknown` and is not automatically retried. QQ and email channel records are not used by Skill Center monitoring.
 
@@ -403,3 +405,5 @@ curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" -H "Authorization: Bear
 ```
 
 `GET /api/skills/capabilities` returns six independent evidence cards: `code_present`, `config_ready`, `last_real_search`, `last_scheduled_run`, `last_ai_decision`, and `last_real_delivery`. Code presence never implies configuration readiness. Missing persisted evidence is reported as `never`; ambiguous delivery attempts do not count as confirmed real delivery.
+
+`code_present.evidence.offline_mtop_adapter` is optional backward-compatible metadata, not another capability claim. It reports `gate`, absolute `limits`, the `unverified` canary, and `real_acceptance.blocker_code=dedicated_test_account_required`. Clients must treat missing metadata as fail-closed and must not infer live readiness from it. The complete offline contract is in [Stage C Offline MTop Acceptance](stage-c-offline-acceptance.md).

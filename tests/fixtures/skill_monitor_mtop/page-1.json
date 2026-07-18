@@ -1,0 +1,56 @@
+{
+  "ret": ["SUCCESS::调用成功"],
+  "data": {
+    "resultInfo": {"hasNextPage": true},
+    "resultList": [
+      {
+        "fixture_only_unknown": "must-not-survive",
+        "data": {
+          "item": {
+            "main": {
+              "exContent": {
+                "itemId": "synthetic-item-1",
+                "title": "Synthetic iPhone 15 Pro A",
+                "price": [{"text": "¥"}, {"text": "5200"}],
+                "area": "杭州",
+                "userNickName": "synthetic-seller-a",
+                "picUrl": "https://img.example.test/a.jpg",
+                "unknown_private_field": "drop-me"
+              },
+              "clickParam": {
+                "args": {
+                  "item_id": "synthetic-item-1",
+                  "publishTime": "1700000002000",
+                  "wantNum": "12"
+                }
+              },
+              "targetUrl": "fleamarket://item?id=synthetic-item-1"
+            }
+          }
+        }
+      },
+      {
+        "data": {
+          "item": {
+            "main": {
+              "exContent": {
+                "itemId": "synthetic-item-2",
+                "title": "Synthetic iPhone 15 Pro B",
+                "area": "上海",
+                "userNickName": "synthetic-seller-b",
+                "detailParams": {"soldPrice": "4800"}
+              },
+              "clickParam": {
+                "args": {
+                  "publishTime": "1700000001000",
+                  "wantNum": "4"
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "synthetic_unknown_top_level": {"drop": true}
+}

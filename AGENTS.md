@@ -9,7 +9,7 @@ This is a FastAPI + SQLite + React/Vite application for Xianyu account operation
 ```bash
 source .venv/bin/activate
 ruff check .
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py skill_monitor_scheduler.py skill_monitor_mtop_adapter.py skill_monitor_shadow.py skill_monitor_ai_contract.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 python -m unittest discover -s tests -v
 
 cd frontend

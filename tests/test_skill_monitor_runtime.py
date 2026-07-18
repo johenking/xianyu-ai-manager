@@ -185,6 +185,17 @@ class SkillCapabilityMatrixTests(unittest.TestCase):
                 "get_skill_capability_evidence",
                 return_value=empty_evidence,
             ),
+            patch(
+                "skill_monitor_mtop_adapter.get_mtop_offline_contract_status",
+                return_value={
+                    "contract_version": "stage-c-offline-v1",
+                    "gate": {"executable": False},
+                    "canary": {"verification": "unverified"},
+                    "real_acceptance": {
+                        "blocker_code": "dedicated_test_account_required"
+                    },
+                },
+            ),
         ):
             data = reply_server.get_skill_capabilities({"user_id": 7})["data"]
 
@@ -200,6 +211,13 @@ class SkillCapabilityMatrixTests(unittest.TestCase):
         self.assertFalse(data["config_ready"]["available"])
         self.assertEqual(data["last_real_search"]["state"], "never")
         self.assertEqual(data["last_real_delivery"]["label"], "从未确认")
+        offline = data["code_present"]["evidence"]["offline_mtop_adapter"]
+        self.assertFalse(offline["gate"]["executable"])
+        self.assertEqual(offline["canary"]["verification"], "unverified")
+        self.assertEqual(
+            offline["real_acceptance"]["blocker_code"],
+            "dedicated_test_account_required",
+        )
 
 
 class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -400,12 +418,12 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 reply_server,
-                "_run_skill_ai_filter",
-                return_value={
+                "_run_skill_ai_filter_bounded",
+                new=AsyncMock(return_value={
                     "recommended": False,
                     "score": 42,
                     "reason": "not recommended",
-                },
+                }),
             ),
             patch.object(
                 reply_server.db_manager,

@@ -1,0 +1,29 @@
+{
+  "ret": ["SUCCESS::调用成功"],
+  "data": {
+    "resultInfo": {"hasNextPage": false},
+    "resultList": [
+      {
+        "data": {
+          "item": {
+            "main": {
+              "exContent": {
+                "itemId": "synthetic-item-3",
+                "title": "Synthetic iPhone 15 Pro C",
+                "area": "杭州",
+                "userNickName": "synthetic-seller-c",
+                "detailParams": {"soldPrice": "4500"}
+              },
+              "clickParam": {
+                "args": {
+                  "publishTime": "1700000003000",
+                  "wantNum": "8"
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

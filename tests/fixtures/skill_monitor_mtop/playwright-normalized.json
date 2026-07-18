@@ -1,0 +1,16 @@
+[
+  {
+    "item_id": "synthetic-item-3",
+    "title": "Synthetic iPhone 15 Pro C",
+    "price": 4500,
+    "region": "杭州",
+    "item_url": "https://www.goofish.com/item?id=synthetic-item-3"
+  },
+  {
+    "item_id": "synthetic-item-1",
+    "title": "Synthetic iPhone 15 Pro A",
+    "price": 5200,
+    "region": "杭州",
+    "item_url": "https://www.goofish.com/item?id=synthetic-item-1"
+  }
+]
