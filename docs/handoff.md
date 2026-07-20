@@ -1,5 +1,57 @@
 # Handoff
 
+## Live rollout attempt and hard rollback on 2026-07-20
+
+The dark-deployment candidate at `b027c4b` was staged, migrated, and then
+rolled back before acceptance because the original LaunchAgent could not spawn
+its Python runtime. This is a deployment-environment blocker, not evidence that
+the candidate application started or failed:
+
+- The external rollout backup is
+  `/Users/mac/Documents/Codex/backups/xianyu-monitor-rollout-20260720-110814`.
+  Its final manifest covers 2,453 files (including 13 migration-rehearsal
+  files), has root SHA-256
+  `0bea0c78f08c4a93407df9f4172d8646c48d63f4a4a94f7bb2eb2d0cd2ffeaad`,
+  contains zero symlinks, and passed full file-hash and 0700/0600 permission
+  verification.
+- The candidate staging copy ran under `sandbox-exec` with outbound networking
+  denied, `env -i`, one worker, and `127.0.0.1:18092`. `/health`,
+  `/health/live`, and `/health/ready` returned 200 with migration
+  `2026071802`; the candidate entry bundle and all referenced assets returned
+  200. It had zero account listeners, schedules, delivery channels, Cookie
+  refreshes, or remote sockets and shut down gracefully.
+- The live source preconditions matched immutable baseline `dd0e8f2`. The
+  allowlisted runtime files and candidate static entry were copied, the live DB
+  migrated from `2026071701` to `2026071802`, and all four monitor flags were
+  explicitly false. Before restart, SQLite integrity was `ok`, foreign-key
+  violations were zero, all new workflow/outbox tables were empty, and the two
+  accounts, two listener flags, one Cookie-refresh setting, two old tasks, zero
+  schedules, zero notification channels, three key hashes, uploads, and legacy
+  static helper were unchanged.
+- `launchctl` then reported `EX_CONFIG 78` without starting the application or
+  updating its application logs. Fresh unified-log evidence identified the
+  actual error as `posix_spawn(.../.venv/bin/python): Operation not permitted`.
+  A system-Python probe exited 0, while a shell-to-Anaconda probe with the live
+  `Documents` working directory stopped at `getcwd: ... Operation not
+  permitted`; this confirms a macOS TCC/Files-and-Folders restriction on the
+  current runtime location. All probes were stopped and removed.
+- The bound rollback condition was therefore applied. Runtime source, generated
+  static assets, SQLite, all three keys, configuration, LaunchAgent definition,
+  browser profiles, and uploads now match the immutable pre-rollout set. The DB
+  is back at `2026071701` with SHA-256
+  `8397593b8d3e088399d12acd278d110f848c880413766ce346d914d436a55fa7`,
+  integrity `ok`, and zero foreign-key violations. The LaunchAgent is unloaded
+  and port 8091 is not listening, matching the pre-rollout outage state.
+
+Redacted evidence is under
+`/Users/mac/Documents/Codex/evidence/xianyu-monitor-rollout-20260720-1134`.
+No production search, MTop request, Webhook, AI call, schedule, or monitor
+delivery was enabled. The candidate remains offline-only and must not be called
+deployed. Before another rollout, move the persistent runtime out of the
+macOS-protected `Documents` tree (preferred) or complete and verify the required
+macOS privacy grant, then take a fresh external backup and repeat the full
+staging/migration/rollback gates.
+
 ## Monitor Integration Candidate On 2026-07-18
 
 The monitor work is isolated in `/Users/mac/Documents/Codex/integration/xianyu-monitor-20260718` on branch `codex/monitor-integration-20260718`. The immutable source baseline is commit `dd0e8f2`, tagged `codex/live-source-baseline-20260718-043547`; its provenance records 201 allowlisted source files, zero symlinks, sanitized remotes, and Stage A backup root hash `e6983cb07117c477bab2366bc26b2355789797255d5735b541b4c9ca39d3a08d`. Stage B and its evidence record end at `0272de1`; Stage C is the following isolated offline-integration commit.
