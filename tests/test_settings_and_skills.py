@@ -105,6 +105,7 @@ class SettingsServiceTests(unittest.TestCase):
             "keyword": "iPhone",
             "notify_enabled": True,
             "ai_filter": "只保留低价商品",
+            "account_id": "synthetic-account",
             "schedule_enabled": True,
             "schedule_interval_minutes": 5,
             "next_run_at": "2000-01-01 00:00:00",

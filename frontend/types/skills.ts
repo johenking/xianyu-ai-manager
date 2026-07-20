@@ -15,7 +15,7 @@ export interface SkillMonitorTask {
   schedule_enabled?: boolean;
   schedule_interval_minutes?: number;
   next_run_at?: string | null;
-  last_status?: 'idle' | 'running' | 'success' | 'failed';
+  last_status?: 'idle' | 'running' | 'success' | 'failed' | 'interrupted' | 'action_required';
   last_error?: string | null;
   last_run_at?: string | null;
   created_at?: string;
@@ -33,7 +33,7 @@ export interface SkillMonitorResult {
   seller_name?: string;
   ai_score: number;
   ai_reason?: string;
-  notify_status: 'pending' | 'disabled' | 'skipped_no_channel' | 'sent' | 'partial' | 'failed';
+  notify_status: 'pending' | 'queued' | 'disabled' | 'skipped_no_channel' | 'sent' | 'sent_unconfirmed' | 'partial' | 'partial_unknown' | 'unknown' | 'failed';
   raw_data?: {
     source?: string;
     is_real_data?: boolean;
@@ -55,8 +55,26 @@ export interface SkillCapability {
   observed_at?: number | null;
   evidence?: {
     offline_mtop_adapter?: SkillMTopOfflineContract;
+    ready_accounts?: number;
+    runnable_tasks?: number;
+    ready_account_ids?: string[];
+    runnable_task_ids?: number[];
+    global_enabled?: boolean;
+    scheduler_enabled?: boolean;
+    delivery_enabled?: boolean;
+    mtop_enabled?: boolean;
+    operation_gates?: {
+      manual_run?: SkillOperationGate;
+      schedule_activation?: SkillOperationGate;
+      delivery_activation?: SkillOperationGate;
+    };
     [key: string]: unknown;
   } | null;
+}
+
+export interface SkillOperationGate {
+  enabled: boolean;
+  reason_code: string;
 }
 
 export interface SkillMTopOfflineContract {

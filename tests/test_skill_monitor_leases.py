@@ -170,6 +170,160 @@ class SkillMonitorLeaseTests(unittest.TestCase):
         run = self.db.get_skill_monitor_run(claim["run_id"])
         self.assertEqual(run["status"], "action_required")
         self.assertEqual(run["error_code"], "account_required")
+        task = self.db.get_skill_monitor_task(task_id, 1)
+        self.assertFalse(task["schedule_enabled"])
+        self.assertIsNone(task["next_run_at"])
+        self.assertEqual(self.db.list_due_skill_monitor_tasks(), [])
+
+    def test_action_required_finish_pauses_schedule_atomically(self):
+        task_id = self._task()
+        claim = self.db.claim_skill_monitor_run(
+            task_id,
+            1,
+            trigger_type="scheduled",
+            now=100,
+        )
+        self.assertTrue(claim["claimed"])
+        self.assertTrue(
+            self.db.finish_skill_monitor_run(
+                claim["run_id"],
+                claim["claim_token"],
+                status="action_required",
+                error_code="risk_control",
+                error_message="平台要求人工处理",
+                next_run_at="2099-01-01 00:00:00",
+                now=101,
+            )
+        )
+        task = self.db.get_skill_monitor_task(task_id, 1)
+        self.assertFalse(task["schedule_enabled"])
+        self.assertIsNone(task["next_run_at"])
+
+    def test_expired_monitor_records_are_cleaned_without_touching_future_rows(self):
+        task_id = self._task(scheduled=False)
+        expired_delivery = self._delivery(task_id, suffix="expired")
+        future_delivery = self._delivery(task_id, suffix="future")
+        self.db.conn.executescript(
+            """
+            UPDATE skill_monitor_results
+            SET retention_until = CASE
+                WHEN item_url LIKE '%%expired%%' THEN 0 ELSE 9999 END;
+            UPDATE skill_monitor_events
+            SET retention_until = CASE
+                WHEN result_id IN (
+                    SELECT id FROM skill_monitor_results WHERE item_url LIKE '%%expired%%'
+                ) THEN 0 ELSE 9999 END;
+            UPDATE skill_monitor_deliveries
+            SET retention_until = CASE
+                WHEN id = %d THEN 0 ELSE 9999 END,
+                status = CASE WHEN id = %d THEN 'sent' ELSE status END;
+            """ % (expired_delivery, expired_delivery)
+        )
+        self.db.conn.commit()
+
+        result = self.db.cleanup_expired_skill_monitor_records(now=1000)
+
+        self.assertGreater(result["deliveries"], 0)
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM skill_monitor_deliveries WHERE id = ?",
+                (expired_delivery,),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM skill_monitor_deliveries WHERE id = ?",
+                (future_delivery,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM skill_monitor_results WHERE item_url LIKE '%expired%'"
+            ).fetchone()[0],
+            0,
+        )
+        repeated = self.db.cleanup_expired_skill_monitor_records(now=1000)
+        self.assertEqual(repeated["deliveries"], 0)
+        self.assertEqual(repeated["events"], 0)
+        self.assertEqual(repeated["results"], 0)
+        self.assertEqual(
+            self.db.conn.execute("PRAGMA integrity_check").fetchone()[0],
+            "ok",
+        )
+        self.assertEqual(
+            self.db.conn.execute("PRAGMA foreign_key_check").fetchall(),
+            [],
+        )
+
+    def test_cleanup_preserves_active_leases_and_legacy_null_retention(self):
+        task_id = self._task(scheduled=False)
+        run = self.db.claim_skill_monitor_run(
+            task_id,
+            1,
+            trigger_type="manual",
+            lease_seconds=60,
+            now=100,
+        )
+        delivery_id = self._delivery(task_id, suffix="active")
+        delivery = self.db.claim_skill_monitor_delivery(
+            delivery_id=delivery_id,
+            lease_seconds=60,
+            now=100,
+        )
+        legacy_result_id = self.db.create_skill_monitor_result({
+            "task_id": task_id,
+            "user_id": 1,
+            "title": "legacy-retention",
+            "item_url": "https://example.test/legacy-retention",
+        })
+        self.db.conn.execute(
+            "UPDATE skill_monitor_runs SET retention_until = 0 WHERE id = ?",
+            (run["run_id"],),
+        )
+        self.db.conn.execute(
+            "UPDATE skill_monitor_deliveries SET retention_until = 0 WHERE id = ?",
+            (delivery_id,),
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO skill_monitor_request_budgets (
+                scope_type, scope_digest, window_started_at, window_seconds,
+                request_count, retention_until, updated_at
+            ) VALUES ('global', 'expired-budget', 0, 60, 1, 0, 0)
+            """
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO skill_monitor_mtop_breakers (
+                scope_digest, state, consecutive_failures,
+                retention_until, updated_at
+            ) VALUES ('expired-breaker', 'closed', 0, 0, 0)
+            """
+        )
+        self.db.conn.commit()
+
+        result = self.db.cleanup_expired_skill_monitor_records(now=120)
+
+        self.assertEqual(result["request_budgets"], 1)
+        self.assertEqual(result["mtop_breakers"], 1)
+        self.assertIsNotNone(self.db.get_skill_monitor_run(run["run_id"]))
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT status FROM skill_monitor_deliveries WHERE id = ?",
+                (delivery_id,),
+            ).fetchone()[0],
+            "sending",
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT retention_until FROM skill_monitor_results WHERE id = ?",
+                (legacy_result_id,),
+            ).fetchone()[0],
+            None,
+        )
+        self.assertTrue(delivery["claim_token"])
 
     def test_concurrent_run_claims_have_one_winner(self):
         task_id = self._task()

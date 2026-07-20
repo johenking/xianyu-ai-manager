@@ -4,6 +4,64 @@
 
 The monitor work is isolated in `/Users/mac/Documents/Codex/integration/xianyu-monitor-20260718` on branch `codex/monitor-integration-20260718`. The immutable source baseline is commit `dd0e8f2`, tagged `codex/live-source-baseline-20260718-043547`; its provenance records 201 allowlisted source files, zero symlinks, sanitized remotes, and Stage A backup root hash `e6983cb07117c477bab2366bc26b2355789797255d5735b541b4c9ca39d3a08d`. Stage B and its evidence record end at `0272de1`; Stage C is the following isolated offline-integration commit.
 
+## Monitor hardening and dark-deployment candidate on 2026-07-20
+
+This candidate is still isolated on the integration branch and has not been
+deployed to live. It adds the minimum hardening found in the pre-deployment
+audit:
+
+- risk-control/captcha detection is fail-closed and never invokes a slider
+  solver; an account action-required result atomically pauses its schedule;
+- empty-account claims atomically write an auditable `action_required` run,
+  clear `schedule_enabled`/`next_run_at`, and due-task polling excludes blank
+  account bindings;
+- expired monitor deliveries, events, result identities/results, runs,
+  request budgets, and MTop breaker rows are cleaned child-first by a
+  local-only startup janitor plus a six-hour loop; `retention_until IS NULL`
+  and live run/delivery leases are preserved, and cleanup is idempotent;
+- schedule creation/activation, notification activation, and account binding
+  are enforced at the API boundary as well as in the UI. The Skill Center
+  derives run/schedule/delivery gates from capability evidence, keeps the
+  existing shell/tokens/components unchanged, and leaves the emergency
+  “close an already-enabled schedule” action available while dark;
+- the truthful six-field capability matrix now includes ready account/task
+  identifiers and explicit operation-gate evidence. Code presence still does
+  not imply configuration, real search, scheduled execution, AI judgment, or
+  confirmed delivery.
+
+Fresh verification for this candidate:
+
+- `ruff check .` and the complete project compilation list exited 0;
+  `python -m unittest discover -s tests -v` exited 0 with **349 tests**.
+- `cd frontend && npm run typecheck` exited 0; `npm test` exited 0 with
+  **17 files / 87 tests**; `npm test -- SkillCenter.test.tsx` exited 0 with
+  **16 tests**. `npm audit --audit-level=high` found 0 vulnerabilities.
+- Two independent production builds were byte-identical at the retained
+  entry/manifest hashes; `npm run verify:build` exited 0 with 31 assets,
+  zero orphans, and a 245,200-byte entry bundle (71.7% below baseline).
+  Build evidence is under
+  `/Users/mac/Documents/Codex/evidence/xianyu-monitor-build-20260720`.
+- `pip-audit --disable-pip --no-deps -r requirements.lock` and the same
+  command for `requirements-dev.lock` both exited 0 with no known
+  vulnerabilities. Gitleaks 8.30.1 scanned the current worktree and exited 0.
+- Fresh mocked production-build UI evidence is under
+  `/Users/mac/Documents/Codex/evidence/xianyu-skill-center-dark-ui-20260720-105635`.
+  Both 1440x900 and 390x844 reached the bottom with equal document/client
+  widths, no console/page/request errors, no blocked or successful external
+  requests, and one initial request per Skill Center endpoint. Runtime
+  assertions confirmed run, schedule activation, schedule/notification form
+  switches were disabled while dark, while creating an unscheduled draft
+  remained enabled. The evidence is local/mocked only.
+
+The rollout gate remains: no dedicated test account is available, so no
+Playwright/MTop search, shadow comparison, real Webhook, real AI call, or
+schedule enablement is permitted. The proposed live state keeps all four
+monitor flags false, preserves the two existing account listeners, Cookie
+refresh, and item sync, and requires a fresh external backup plus migration
+rehearsal before any service restart. Rollback is the pre-deployment source,
+SQLite, keys, browser-data, static, uploads, configuration, and LaunchAgent
+snapshot as one set.
+
 ### Skill Center refresh fencing on 2026-07-19
 
 The Skill Center keeps the accepted v1.7.3 shell, tokens, and shared

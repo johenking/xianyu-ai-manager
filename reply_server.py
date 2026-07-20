@@ -6155,6 +6155,81 @@ SKILL_NOTIFICATION_CHANNEL_TYPES = {
     'telegram',
 }
 
+
+class SkillMonitorActionRequired(HTTPException):
+    """A run outcome that must pause scheduling until an operator intervenes."""
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        detail: str,
+        status_code: int = 409,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        normalized_reason = re.sub(
+            r'[^a-z0-9_]+',
+            '_',
+            str(reason_code or 'account_action_required').strip().lower(),
+        ).strip('_')
+        self.reason_code = normalized_reason[:80] or 'account_action_required'
+
+
+def _require_skill_monitor_feature(feature_key: str, detail: str) -> None:
+    if not skill_monitor_feature_enabled(feature_key):
+        raise HTTPException(status_code=503, detail=detail)
+
+
+def _require_skill_monitor_account_ready(
+    user_id: int,
+    account_id: str,
+) -> Dict[str, Any]:
+    normalized_account_id = str(account_id or '').strip()
+    if not normalized_account_id:
+        raise HTTPException(status_code=409, detail="请先绑定所属闲鱼账号")
+    context = db_manager.get_owned_cookie_search_context(
+        int(user_id),
+        normalized_account_id,
+    )
+    state = str(context.get('state') or 'error')
+    if state == 'ownership_mismatch':
+        raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+    if state == 'not_found':
+        raise HTTPException(status_code=409, detail="绑定的闲鱼账号不存在")
+    if state != 'ready':
+        raise HTTPException(
+            status_code=409,
+            detail="闲鱼账号身份不完整，请先完成账号登录恢复",
+        )
+    return context
+
+
+def _require_skill_monitor_schedule_ready(
+    user_id: int,
+    account_id: str,
+) -> Dict[str, Any]:
+    _require_skill_monitor_feature(
+        'skill_monitor_enabled',
+        '监控全局开关关闭，暂不能开启定时监控',
+    )
+    _require_skill_monitor_feature(
+        'skill_monitor_scheduler_enabled',
+        '监控调度开关关闭，暂不能开启定时监控',
+    )
+    return _require_skill_monitor_account_ready(user_id, account_id)
+
+
+def _require_skill_monitor_delivery_ready() -> None:
+    _require_skill_monitor_feature(
+        'skill_monitor_enabled',
+        '监控全局开关关闭，暂不能开启监控通知',
+    )
+    _require_skill_monitor_feature(
+        'skill_monitor_delivery_enabled',
+        '监控通知开关关闭，暂不能开启监控通知',
+    )
+
+
 def _skill_interval_minutes(value: Any) -> int:
     try:
         return max(15, int(value or 60))
@@ -6538,6 +6613,7 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
         'success': '成功',
         'failed': '失败',
         'interrupted': '已中断',
+        'action_required': '需要处理',
         'running': '运行中',
         'claimed': '已领取',
         'pending': '等待中',
@@ -6582,6 +6658,10 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                 'evidence': {
                     'ready_accounts': len(ready_account_ids),
                     'runnable_tasks': len(runnable_tasks),
+                    'ready_account_ids': sorted(ready_account_ids),
+                    'runnable_task_ids': sorted(
+                        int(task['id']) for task in runnable_tasks
+                    ),
                     'global_enabled': bool(
                         effective_flags.get('skill_monitor_enabled')
                     ),
@@ -6594,6 +6674,66 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                     'mtop_enabled': bool(
                         effective_flags.get('skill_monitor_mtop_enabled')
                     ),
+                    'operation_gates': {
+                        'manual_run': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                            ),
+                            'reason_code': (
+                                ''
+                                if effective_flags.get('skill_monitor_enabled')
+                                else 'monitor_disabled'
+                            ),
+                        },
+                        'schedule_activation': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                                and effective_flags.get(
+                                    'skill_monitor_scheduler_enabled'
+                                )
+                            ),
+                            'reason_code': (
+                                ''
+                                if (
+                                    effective_flags.get('skill_monitor_enabled')
+                                    and effective_flags.get(
+                                        'skill_monitor_scheduler_enabled'
+                                    )
+                                )
+                                else (
+                                    'monitor_disabled'
+                                    if not effective_flags.get(
+                                        'skill_monitor_enabled'
+                                    )
+                                    else 'scheduler_disabled'
+                                )
+                            ),
+                        },
+                        'delivery_activation': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                                and effective_flags.get(
+                                    'skill_monitor_delivery_enabled'
+                                )
+                            ),
+                            'reason_code': (
+                                ''
+                                if (
+                                    effective_flags.get('skill_monitor_enabled')
+                                    and effective_flags.get(
+                                        'skill_monitor_delivery_enabled'
+                                    )
+                                )
+                                else (
+                                    'monitor_disabled'
+                                    if not effective_flags.get(
+                                        'skill_monitor_enabled'
+                                    )
+                                    else 'delivery_disabled'
+                                )
+                            ),
+                        },
+                    },
                 },
             },
             'last_real_search': {
@@ -6886,9 +7026,20 @@ async def _run_real_skill_monitor(
         error_message = (search_result or {}).get('error') or '真实搜索没有返回结果'
         error_code = str((search_result or {}).get('error_code') or '')
         if error_code in {'action_required', 'revision_conflict'}:
-            raise HTTPException(status_code=409, detail=f"闲鱼账号需要处理: {error_message}")
+            raise SkillMonitorActionRequired(
+                reason_code=(
+                    error_message
+                    if error_code == 'action_required'
+                    else error_code
+                ),
+                detail=f"闲鱼账号需要处理: {error_message}",
+            )
         if error_code in {'ownership_mismatch', 'not_found'}:
-            raise HTTPException(status_code=403, detail="监控任务绑定的闲鱼账号不可用")
+            raise SkillMonitorActionRequired(
+                reason_code=error_code,
+                detail="监控任务绑定的闲鱼账号不可用",
+                status_code=403,
+            )
         raise HTTPException(status_code=502, detail=f"闲鱼真实搜索失败: {error_message}")
 
     search_result = dict(search_result)
@@ -7198,6 +7349,21 @@ async def execute_skill_monitor_task(
             ),
         )
         raise
+    except SkillMonitorActionRequired as exc:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        _, message = _safe_skill_run_error(exc)
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='action_required',
+            error_code=exc.reason_code,
+            error_message=message,
+            next_run_at=None,
+        )
+        raise
     except Exception as exc:
         stop_heartbeat.set()
         if not heartbeat_task.done():
@@ -7240,8 +7406,10 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
             raise HTTPException(status_code=400, detail="关键词不能为空")
         if task.schedule_interval_minutes < 15:
             raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
-        if task.notify_enabled and not _enabled_notification_channels(current_user['user_id']):
-            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
+        if task.notify_enabled:
+            _require_skill_monitor_delivery_ready()
+            if not _enabled_notification_channels(current_user['user_id']):
+                raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
         try:
             validate_skill_monitor_features(
                 notify_enabled=task.notify_enabled,
@@ -7250,10 +7418,16 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        if task.account_id:
-            user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-            if task.account_id not in user_cookies:
-                raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+        if task.schedule_enabled:
+            _require_skill_monitor_schedule_ready(
+                current_user['user_id'],
+                task.account_id,
+            )
+        elif task.account_id:
+            _require_skill_monitor_account_ready(
+                current_user['user_id'],
+                task.account_id,
+            )
 
         task_payload = task.dict()
         task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task.schedule_interval_minutes)
@@ -7293,16 +7467,38 @@ def update_skill_monitor_task(task_id: int, task: SkillMonitorTaskUpdate, curren
             if task_payload['schedule_interval_minutes'] is not None and task_payload['schedule_interval_minutes'] < 15:
                 raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
             task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task_payload['schedule_interval_minutes'])
-        if task_payload.get('notify_enabled') and not _enabled_notification_channels(current_user['user_id']):
-            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
-        account_id = task_payload.get('account_id')
-        if account_id:
-            user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-            if account_id not in user_cookies:
-                raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+        enabling_notification = bool(
+            task_payload.get('notify_enabled') is True
+            and not existing.get('notify_enabled')
+        )
+        if enabling_notification:
+            _require_skill_monitor_delivery_ready()
+            if not _enabled_notification_channels(current_user['user_id']):
+                raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
+
+        effective_account_id = str(
+            task_payload.get('account_id', existing.get('account_id')) or ''
+        ).strip()
+        if 'account_id' in task_payload and not effective_account_id:
+            task_payload['schedule_enabled'] = False
+            task_payload['next_run_at'] = None
 
         schedule_enabled = task_payload.get('schedule_enabled', existing.get('schedule_enabled'))
         interval = task_payload.get('schedule_interval_minutes', existing.get('schedule_interval_minutes') or 60)
+        enabling_schedule = bool(
+            task_payload.get('schedule_enabled') is True
+            and not existing.get('schedule_enabled')
+        )
+        if enabling_schedule:
+            _require_skill_monitor_schedule_ready(
+                current_user['user_id'],
+                effective_account_id,
+            )
+        elif 'account_id' in task_payload and effective_account_id:
+            _require_skill_monitor_account_ready(
+                current_user['user_id'],
+                effective_account_id,
+            )
         if schedule_enabled and ('next_run_at' not in task_payload or not task_payload.get('next_run_at')):
             task_payload['next_run_at'] = _skill_next_run_at(interval)
         if not schedule_enabled and task_payload.get('schedule_enabled') is False:

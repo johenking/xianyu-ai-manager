@@ -8390,6 +8390,8 @@ class DBManager:
                         UPDATE skill_monitor_tasks
                         SET last_status = 'action_required',
                             last_error = '任务尚未绑定闲鱼账号',
+                            schedule_enabled = 0,
+                            next_run_at = NULL,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE id = ? AND user_id = ?
                     ''', (int(task_id), int(user_id)))
@@ -8567,12 +8569,22 @@ class DBManager:
                 cursor.execute('''
                     UPDATE skill_monitor_tasks
                     SET last_run_at = CURRENT_TIMESTAMP,
-                        last_status = ?, last_error = ?, next_run_at = ?,
+                        last_status = ?, last_error = ?,
+                        schedule_enabled = CASE
+                            WHEN ? = 'action_required' THEN 0
+                            ELSE schedule_enabled
+                        END,
+                        next_run_at = CASE
+                            WHEN ? = 'action_required' THEN NULL
+                            ELSE ?
+                        END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND user_id = ?
                 ''', (
                     status,
                     str(error_message or '')[:500],
+                    status,
+                    status,
                     next_run_at,
                     int(row[1]),
                     int(row[2]),
@@ -8926,6 +8938,251 @@ class DBManager:
                 logger.error(f"恢复过期技能通知投递失败: {type(e).__name__}")
                 self.conn.rollback()
                 return 0
+
+    def cleanup_expired_skill_monitor_records(
+        self,
+        *,
+        now: Optional[float] = None,
+        batch_size: int = 500,
+        max_batches: int = 20,
+    ) -> Dict[str, int]:
+        """Delete expired monitor audit data without touching active leases.
+
+        Rows without a retention deadline are legacy/operator evidence and stay
+        untouched. Children are removed before parents, and stale run/delivery
+        leases are recovered in the same transaction before retention checks.
+        """
+        timestamp = float(now if now is not None else time.time())
+        normalized_batch_size = max(1, min(int(batch_size), 5000))
+        normalized_max_batches = max(1, min(int(max_batches), 100))
+        deleted = {
+            'deliveries': 0,
+            'events': 0,
+            'result_identities': 0,
+            'results': 0,
+            'runs': 0,
+            'request_budgets': 0,
+            'mtop_breakers': 0,
+            'recovered_runs': 0,
+            'recovered_deliveries': 0,
+        }
+
+        def _delete_ids(cursor, table: str, ids: List[int]) -> int:
+            if not ids:
+                return 0
+            placeholders = ','.join('?' for _ in ids)
+            cursor.execute(
+                f'DELETE FROM {table} WHERE id IN ({placeholders})',
+                tuple(ids),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                deleted['recovered_runs'] = len(
+                    self._recover_stale_skill_monitor_runs(
+                        cursor,
+                        now=timestamp,
+                    )
+                )
+                deleted['recovered_deliveries'] = (
+                    self._recover_stale_skill_monitor_deliveries(
+                        cursor,
+                        now=timestamp,
+                    )
+                )
+
+                for _ in range(normalized_max_batches):
+                    batch_changes = 0
+
+                    delivery_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT id
+                            FROM skill_monitor_deliveries
+                            WHERE retention_until IS NOT NULL
+                              AND retention_until <= ?
+                              AND NOT (
+                                  status = 'sending'
+                                  AND lease_expires_at > ?
+                              )
+                            ORDER BY id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_deliveries',
+                        delivery_ids,
+                    )
+                    deleted['deliveries'] += count
+                    batch_changes += count
+
+                    event_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT event.id
+                            FROM skill_monitor_events AS event
+                            WHERE event.retention_until IS NOT NULL
+                              AND event.retention_until <= ?
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_deliveries AS delivery
+                                  WHERE delivery.event_id = event.id
+                              )
+                            ORDER BY event.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_events',
+                        event_ids,
+                    )
+                    deleted['events'] += count
+                    batch_changes += count
+
+                    result_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT result.id
+                            FROM skill_monitor_results AS result
+                            WHERE result.retention_until IS NOT NULL
+                              AND result.retention_until <= ?
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_events AS event
+                                  WHERE event.result_id = result.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_deliveries AS delivery
+                                  WHERE delivery.result_id = result.id
+                              )
+                            ORDER BY result.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    if result_ids:
+                        placeholders = ','.join('?' for _ in result_ids)
+                        cursor.execute(
+                            'DELETE FROM skill_monitor_result_identities '
+                            f'WHERE result_id IN ({placeholders})',
+                            tuple(result_ids),
+                        )
+                        identity_count = max(0, int(cursor.rowcount or 0))
+                        deleted['result_identities'] += identity_count
+                        batch_changes += identity_count
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_results',
+                        result_ids,
+                    )
+                    deleted['results'] += count
+                    batch_changes += count
+
+                    run_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT run.id
+                            FROM skill_monitor_runs AS run
+                            WHERE run.retention_until IS NOT NULL
+                              AND run.retention_until <= ?
+                              AND NOT (
+                                  run.status IN ('claimed', 'running')
+                                  AND run.lease_expires_at > ?
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_events AS event
+                                  WHERE event.run_id = run.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_results AS result
+                                  WHERE result.run_id = run.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_runs AS successor
+                                  WHERE successor.recovered_from_run_id = run.id
+                              )
+                            ORDER BY run.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_runs',
+                        run_ids,
+                    )
+                    deleted['runs'] += count
+                    batch_changes += count
+
+                    cursor.execute('''
+                        DELETE FROM skill_monitor_request_budgets
+                        WHERE retention_until <= ?
+                    ''', (timestamp,))
+                    count = max(0, int(cursor.rowcount or 0))
+                    deleted['request_budgets'] += count
+                    batch_changes += count
+
+                    breaker_digests = [
+                        str(row[0])
+                        for row in cursor.execute('''
+                            SELECT scope_digest
+                            FROM skill_monitor_mtop_breakers
+                            WHERE retention_until <= ?
+                              AND NOT (
+                                  state = 'half_open'
+                                  AND probe_lease_expires_at > ?
+                              )
+                            ORDER BY scope_digest ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    if breaker_digests:
+                        placeholders = ','.join('?' for _ in breaker_digests)
+                        cursor.execute(
+                            'DELETE FROM skill_monitor_mtop_breakers '
+                            f'WHERE scope_digest IN ({placeholders})',
+                            tuple(breaker_digests),
+                        )
+                        count = max(0, int(cursor.rowcount or 0))
+                        deleted['mtop_breakers'] += count
+                        batch_changes += count
+
+                    if batch_changes == 0:
+                        break
+
+                self.conn.commit()
+                return deleted
+            except Exception as exc:
+                logger.error(
+                    f"清理技能监控留存记录失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {key: 0 for key in deleted}
 
     def claim_skill_monitor_delivery(
         self,
@@ -9586,6 +9843,7 @@ class DBManager:
                     FROM skill_monitor_tasks
                     WHERE enabled = 1
                       AND schedule_enabled = 1
+                      AND TRIM(COALESCE(account_id, '')) <> ''
                       AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
                       AND COALESCE(last_status, 'idle') != 'running'
                     ORDER BY COALESCE(next_run_at, created_at) ASC, id ASC

@@ -81,21 +81,62 @@ const offlineMTopContract = {
   },
 } as const;
 
-const buildCapabilities = (detail = '不代表真实运行通过') => ({
-  code_present: {
-    available: true,
-    state: 'present',
-    badge_state: 'ready',
-    label: '代码已加载',
-    detail,
-    evidence: { offline_mtop_adapter: offlineMTopContract },
-  },
-  config_ready: { available: false, state: 'blocked', badge_state: 'missing', label: '尚未就绪', detail: '全局监控开关关闭' },
-  last_real_search: { available: false, state: 'never', badge_state: 'missing', label: '从未验证', detail: '没有真实搜索记录' },
-  last_scheduled_run: { available: false, state: 'never', badge_state: 'missing', label: '从未运行', detail: '没有定时运行记录' },
-  last_ai_decision: { available: false, state: 'never', badge_state: 'missing', label: '从未判断', detail: '没有 AI 决策' },
-  last_real_delivery: { available: false, state: 'never', badge_state: 'missing', label: '从未确认', detail: '没有通知记录' },
-}) as any;
+const buildCapabilities = (
+  detail = '不代表真实运行通过',
+  options: {
+    monitorEnabled?: boolean;
+    schedulerEnabled?: boolean;
+    deliveryEnabled?: boolean;
+    readyAccountIds?: string[];
+    runnableTaskIds?: number[];
+  } = {},
+) => {
+  const monitorEnabled = options.monitorEnabled ?? false;
+  const schedulerEnabled = options.schedulerEnabled ?? false;
+  const deliveryEnabled = options.deliveryEnabled ?? false;
+  const readyAccountIds = options.readyAccountIds ?? ['account-1'];
+  const runnableTaskIds = options.runnableTaskIds ?? [];
+  return {
+    code_present: {
+      available: true,
+      state: 'present',
+      badge_state: 'ready',
+      label: '代码已加载',
+      detail,
+      evidence: { offline_mtop_adapter: offlineMTopContract },
+    },
+    config_ready: {
+      available: monitorEnabled && runnableTaskIds.length > 0,
+      state: monitorEnabled ? 'ready' : 'blocked',
+      badge_state: monitorEnabled ? 'ready' : 'missing',
+      label: monitorEnabled ? '配置就绪' : '尚未就绪',
+      detail: monitorEnabled ? '监控操作门槛已开启' : '全局监控开关关闭',
+      evidence: {
+        ready_account_ids: readyAccountIds,
+        runnable_task_ids: runnableTaskIds,
+        global_enabled: monitorEnabled,
+        scheduler_enabled: schedulerEnabled,
+        delivery_enabled: deliveryEnabled,
+        mtop_enabled: false,
+        operation_gates: {
+          manual_run: { enabled: monitorEnabled, reason_code: monitorEnabled ? '' : 'monitor_disabled' },
+          schedule_activation: {
+            enabled: monitorEnabled && schedulerEnabled,
+            reason_code: monitorEnabled && schedulerEnabled ? '' : 'scheduler_disabled',
+          },
+          delivery_activation: {
+            enabled: monitorEnabled && deliveryEnabled,
+            reason_code: monitorEnabled && deliveryEnabled ? '' : 'delivery_disabled',
+          },
+        },
+      },
+    },
+    last_real_search: { available: false, state: 'never', badge_state: 'missing', label: '从未验证', detail: '没有真实搜索记录' },
+    last_scheduled_run: { available: false, state: 'never', badge_state: 'missing', label: '从未运行', detail: '没有定时运行记录' },
+    last_ai_decision: { available: false, state: 'never', badge_state: 'missing', label: '从未判断', detail: '没有 AI 决策' },
+    last_real_delivery: { available: false, state: 'never', badge_state: 'missing', label: '从未确认', detail: '没有通知记录' },
+  } as any;
+};
 
 const monitorTask = (id: number, name: string) => ({
   id,
@@ -166,11 +207,22 @@ describe('SkillCenter loading and monitor controls', () => {
   });
 
   it('creates a scheduled task with AI and notification settings', async () => {
+    vi.mocked(getSkillCapabilities).mockResolvedValue(buildCapabilities(
+      '不代表真实运行通过',
+      {
+        monitorEnabled: true,
+        schedulerEnabled: true,
+        deliveryEnabled: true,
+      },
+    ));
     vi.mocked(createSkillMonitorTask).mockResolvedValue({ success: true, id: 7, message: 'ok' });
     render(<SkillCenter />);
 
     const keyword = await screen.findByPlaceholderText('监控关键词');
     fireEvent.change(keyword, { target: { value: 'iPhone' } });
+    fireEvent.change(screen.getByDisplayValue('不绑定账号'), {
+      target: { value: 'account-1' },
+    });
     fireEvent.change(screen.getByPlaceholderText(/AI 商品过滤要求/), {
       target: { value: '只保留低价商品' },
     });
@@ -189,10 +241,19 @@ describe('SkillCenter loading and monitor controls', () => {
   });
 
   it('updates the schedule state for an existing task', async () => {
+    vi.mocked(getSkillCapabilities).mockResolvedValue(buildCapabilities(
+      '不代表真实运行通过',
+      {
+        monitorEnabled: true,
+        schedulerEnabled: true,
+        runnableTaskIds: [9],
+      },
+    ));
     vi.mocked(getSkillMonitorTasks).mockResolvedValue([{
       id: 9,
       name: '手机监控',
       keyword: 'iPhone',
+      account_id: 'account-1',
       published_within_hours: 24,
       notify_enabled: false,
       enabled: true,
@@ -209,6 +270,65 @@ describe('SkillCenter loading and monitor controls', () => {
       schedule_interval_minutes: 30,
     }));
     expect(await screen.findByText('已开启定时监控')).toBeInTheDocument();
+  });
+
+  it('keeps run, schedule activation, and notification disabled while dark', async () => {
+    vi.mocked(getSkillCapabilities).mockResolvedValue(buildCapabilities(
+      '不代表真实运行通过',
+      { runnableTaskIds: [9] },
+    ));
+    vi.mocked(getSkillMonitorTasks).mockResolvedValue([{
+      ...monitorTask(9, '暗部署任务'),
+      account_id: 'account-1',
+    }] as any);
+    render(<SkillCenter />);
+
+    expect(await screen.findByText(/当前可创建不运行的任务草稿/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '开启定时' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: '定时运行' })).toBeDisabled();
+    expect(screen.getByRole('switch', { name: '命中后通知' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /创建监控任务/ })).toBeEnabled();
+  });
+
+  it('keeps an unbound task disabled after global gates open', async () => {
+    vi.mocked(getSkillCapabilities).mockResolvedValue(buildCapabilities(
+      '不代表真实运行通过',
+      {
+        monitorEnabled: true,
+        schedulerEnabled: true,
+        deliveryEnabled: true,
+        runnableTaskIds: [],
+      },
+    ));
+    vi.mocked(getSkillMonitorTasks).mockResolvedValue([{
+      ...monitorTask(11, '未绑定任务'),
+      account_id: '',
+    }] as any);
+    render(<SkillCenter />);
+
+    expect(await screen.findByText('未绑定任务')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '运行' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '开启定时' })).toBeDisabled();
+  });
+
+  it('still allows an already-enabled schedule to be turned off while dark', async () => {
+    vi.mocked(getSkillMonitorTasks).mockResolvedValue([{
+      ...monitorTask(12, '待关闭任务'),
+      account_id: 'account-1',
+      schedule_enabled: true,
+    }] as any);
+    vi.mocked(updateSkillMonitorTask).mockResolvedValue({ success: true, message: 'ok' });
+    render(<SkillCenter />);
+
+    const disableSchedule = await screen.findByRole('button', { name: '关闭定时' });
+    expect(disableSchedule).toBeEnabled();
+    fireEvent.click(disableSchedule);
+
+    await waitFor(() => expect(updateSkillMonitorTask).toHaveBeenCalledWith(12, {
+      schedule_enabled: false,
+      schedule_interval_minutes: 30,
+    }));
   });
 
   it('shows loading and fail-closed missing evidence states', async () => {

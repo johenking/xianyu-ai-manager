@@ -240,6 +240,39 @@ const SkillCenter: React.FC = () => {
   }, [prompts]);
 
   const mtopOfflineContract = capabilities.code_present?.evidence?.offline_mtop_adapter;
+  const configEvidence = capabilities.config_ready?.evidence;
+  const readyAccountIds = useMemo(
+    () => new Set((configEvidence?.ready_account_ids || []).map(String)),
+    [configEvidence],
+  );
+  const runnableTaskIds = useMemo(
+    () => new Set((configEvidence?.runnable_task_ids || []).map(Number)),
+    [configEvidence],
+  );
+  const manualRunEnabled = configEvidence?.operation_gates?.manual_run?.enabled === true;
+  const scheduleActivationEnabled = configEvidence?.operation_gates?.schedule_activation?.enabled === true;
+  const deliveryActivationEnabled = configEvidence?.operation_gates?.delivery_activation?.enabled === true;
+  const taskFormAccountReady = readyAccountIds.has(taskForm.account_id);
+  const taskCanRun = (task: SkillMonitorTask) => (
+    manualRunEnabled && runnableTaskIds.has(task.id)
+  );
+  const taskCanEnableSchedule = (task: SkillMonitorTask) => (
+    scheduleActivationEnabled && runnableTaskIds.has(task.id)
+  );
+  const createTaskBlocked = loading
+    || (taskForm.schedule_enabled && (!scheduleActivationEnabled || !taskFormAccountReady))
+    || (taskForm.notify_enabled && !deliveryActivationEnabled);
+  const monitorOperationNotice = !capabilities.config_ready
+    ? '监控能力证据尚未加载，运行、定时和通知操作保持关闭。'
+    : !manualRunEnabled
+      ? '监控全局开关关闭；当前可创建不运行的任务草稿，运行、开启定时和监控通知保持关闭。'
+      : readyAccountIds.size === 0
+        ? '没有身份完整的所属账号；任务运行和定时开启保持关闭。'
+        : !scheduleActivationEnabled
+          ? '监控调度开关关闭；手动运行按任务账号状态开放，定时开启保持关闭。'
+          : !deliveryActivationEnabled
+            ? '监控通知开关关闭；通知操作保持关闭。'
+            : '';
 
   const loadAgent = async () => {
     setPrompts(await getSkillAgentPrompts());
@@ -460,6 +493,12 @@ const SkillCenter: React.FC = () => {
           </div>
         </div>
 
+        {monitorOperationNotice && (
+          <div className="mb-4">
+            <InlineNotice>{monitorOperationNotice}</InlineNotice>
+          </div>
+        )}
+
         <div className="space-y-4">
           <input
             value={taskForm.name}
@@ -530,6 +569,7 @@ const SkillCenter: React.FC = () => {
                 label="定时运行"
                 checked={taskForm.schedule_enabled}
                 onChange={(schedule_enabled) => setTaskForm({ ...taskForm, schedule_enabled })}
+                disabled={!scheduleActivationEnabled || !taskFormAccountReady}
               />
             </div>
             <div className="flex items-center justify-between gap-3 rounded-xl bg-gray-50 px-4 py-3 text-sm font-bold text-gray-700">
@@ -538,6 +578,7 @@ const SkillCenter: React.FC = () => {
                 label="命中后通知"
                 checked={taskForm.notify_enabled}
                 onChange={(notify_enabled) => setTaskForm({ ...taskForm, notify_enabled })}
+                disabled={!deliveryActivationEnabled}
               />
             </div>
           </div>
@@ -560,7 +601,7 @@ const SkillCenter: React.FC = () => {
           </InlineNotice>
           <button
             onClick={handleCreateTask}
-            disabled={loading}
+            disabled={createTaskBlocked}
             className="w-full ios-btn-primary h-12 rounded-xl font-bold flex items-center justify-center gap-2"
           >
             {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Radar className="w-4 h-4" />}
@@ -605,14 +646,24 @@ const SkillCenter: React.FC = () => {
                 <div className="flex flex-wrap gap-2">
                   <button
                     onClick={() => handleToggleTaskSchedule(task)}
-                    disabled={loading}
+                    disabled={loading || (!task.schedule_enabled && !taskCanEnableSchedule(task))}
+                    title={
+                      task.schedule_enabled || taskCanEnableSchedule(task)
+                        ? undefined
+                        : '需开启全局与调度开关，并绑定身份完整的所属账号'
+                    }
                     className="ios-btn-secondary rounded-xl px-4 py-2 text-sm font-bold"
                   >
                     {task.schedule_enabled ? '关闭定时' : '开启定时'}
                   </button>
                   <button
                     onClick={() => handleRunTask(task.id)}
-                    disabled={runningTaskId === task.id}
+                    disabled={loading || runningTaskId === task.id || !taskCanRun(task)}
+                    title={
+                      taskCanRun(task)
+                        ? undefined
+                        : '需开启监控全局开关，并绑定身份完整的所属账号'
+                    }
                     className="ios-btn-primary flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-bold"
                   >
                     {runningTaskId === task.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}

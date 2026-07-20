@@ -16,6 +16,7 @@ from session_registry import initialize_session_registry
 from skill_monitor_scheduler import skill_monitor_scheduler
 from skill_monitor_features import skill_monitor_feature_enabled
 from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
+from skill_monitor_retention_janitor import skill_monitor_retention_janitor
 from account_session_refresh import remove_verification_image
 
 
@@ -98,6 +99,7 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     if env_cookie and "default" not in manager.cookies:
         await manager._add_cookie_async("default", env_cookie)
 
+    await skill_monitor_retention_janitor.start()
     if skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
         await skill_monitor_scheduler.start()
     else:
@@ -113,6 +115,7 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
 async def stop_runtime() -> None:
     await skill_monitor_scheduler.stop()
     await skill_monitor_delivery_dispatcher.stop()
+    await skill_monitor_retention_janitor.stop()
 
     manager = cookie_manager_module.manager
     if manager is not None:

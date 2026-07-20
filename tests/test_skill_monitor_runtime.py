@@ -218,6 +218,18 @@ class SkillCapabilityMatrixTests(unittest.TestCase):
             offline["real_acceptance"]["blocker_code"],
             "dedicated_test_account_required",
         )
+        config_evidence = data["config_ready"]["evidence"]
+        self.assertEqual(config_evidence["ready_account_ids"], ["account-1"])
+        self.assertEqual(config_evidence["runnable_task_ids"], [3])
+        self.assertFalse(
+            config_evidence["operation_gates"]["manual_run"]["enabled"]
+        )
+        self.assertFalse(
+            config_evidence["operation_gates"]["schedule_activation"]["enabled"]
+        )
+        self.assertFalse(
+            config_evidence["operation_gates"]["delivery_activation"]["enabled"]
+        )
 
 
 class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -620,6 +632,53 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["error_code"], "http_502")
         self.assertIsNotNone(kwargs["next_run_at"])
 
+    async def test_account_action_required_pauses_schedule_without_retry_time(self):
+        task = {
+            "id": 3,
+            "user_id": 7,
+            "keyword": "synthetic",
+            "account_id": "account-1",
+            "schedule_enabled": True,
+            "schedule_interval_minutes": 30,
+        }
+        claim = {
+            "state": "claimed",
+            "claimed": True,
+            "run_id": 41,
+            "run_token": "run-token",
+            "claim_token": "claim-token",
+            "account_id": "account-1",
+        }
+        provider = AsyncMock(return_value={
+            "error": "risk_control",
+            "error_code": "action_required",
+        })
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "claim_skill_monitor_run",
+            return_value=claim,
+        ), patch.object(
+            reply_server.db_manager,
+            "finish_skill_monitor_run",
+            return_value=True,
+        ) as finish_mock:
+            with self.assertRaises(reply_server.SkillMonitorActionRequired):
+                await reply_server.execute_skill_monitor_task(
+                    task,
+                    7,
+                    scheduled_run=True,
+                    search_provider=provider,
+                )
+
+        kwargs = finish_mock.call_args.kwargs
+        self.assertEqual(kwargs["status"], "action_required")
+        self.assertEqual(kwargs["error_code"], "risk_control")
+        self.assertIsNone(kwargs["next_run_at"])
+
     async def test_cancelled_run_is_marked_interrupted(self):
         started = asyncio.Event()
 
@@ -787,6 +846,187 @@ class SkillMonitorApiValidationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("不能少于15分钟", raised.exception.detail)
+
+    def test_unscheduled_draft_can_be_created_while_monitor_is_dark(self):
+        task = reply_server.SkillMonitorTaskIn(keyword="synthetic")
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "create_skill_monitor_task",
+            return_value=17,
+        ) as create_mock, patch.object(
+            reply_server.db_manager,
+            "log_skill_event",
+        ):
+            result = reply_server.create_skill_monitor_task(
+                task,
+                {"user_id": 7},
+            )
+
+        self.assertEqual(result["id"], 17)
+        create_mock.assert_called_once()
+
+    def test_schedule_activation_is_blocked_by_the_global_gate(self):
+        task = reply_server.SkillMonitorTaskUpdate(schedule_enabled=True)
+        with patch.object(
+            reply_server.db_manager,
+            "get_skill_monitor_task",
+            return_value={
+                "id": 3,
+                "account_id": "account-1",
+                "schedule_enabled": False,
+                "schedule_interval_minutes": 60,
+            },
+        ), patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "update_skill_monitor_task",
+        ) as update_mock:
+            with self.assertRaises(HTTPException) as raised:
+                reply_server.update_skill_monitor_task(
+                    3,
+                    task,
+                    {"user_id": 7},
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("全局开关关闭", raised.exception.detail)
+        update_mock.assert_not_called()
+
+    def test_schedule_activation_requires_a_ready_owned_account(self):
+        task = reply_server.SkillMonitorTaskUpdate(schedule_enabled=True)
+        existing = {
+            "id": 3,
+            "account_id": "account-1",
+            "schedule_enabled": False,
+            "schedule_interval_minutes": 60,
+        }
+        with patch.object(
+            reply_server.db_manager,
+            "get_skill_monitor_task",
+            return_value=existing,
+        ), patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "get_owned_cookie_search_context",
+            return_value={
+                "state": "action_required",
+                "reason": "account_identity_incomplete",
+            },
+        ), patch.object(
+            reply_server.db_manager,
+            "update_skill_monitor_task",
+        ) as update_mock:
+            with self.assertRaises(HTTPException) as raised:
+                reply_server.update_skill_monitor_task(
+                    3,
+                    task,
+                    {"user_id": 7},
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("身份不完整", raised.exception.detail)
+        update_mock.assert_not_called()
+
+    def test_schedule_activation_succeeds_only_after_all_gates_pass(self):
+        task = reply_server.SkillMonitorTaskUpdate(schedule_enabled=True)
+        existing = {
+            "id": 3,
+            "account_id": "account-1",
+            "schedule_enabled": False,
+            "schedule_interval_minutes": 60,
+        }
+        with patch.object(
+            reply_server.db_manager,
+            "get_skill_monitor_task",
+            return_value=existing,
+        ), patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=True,
+        ), patch.object(
+            reply_server.db_manager,
+            "get_owned_cookie_search_context",
+            return_value={"state": "ready", "account_id": "account-1"},
+        ), patch.object(
+            reply_server.db_manager,
+            "update_skill_monitor_task",
+            return_value=True,
+        ) as update_mock:
+            result = reply_server.update_skill_monitor_task(
+                3,
+                task,
+                {"user_id": 7},
+            )
+
+        self.assertTrue(result["success"])
+        payload = update_mock.call_args.args[2]
+        self.assertTrue(payload["schedule_enabled"])
+        self.assertIsNotNone(payload["next_run_at"])
+
+    def test_schedule_can_be_disabled_while_global_gate_is_off(self):
+        task = reply_server.SkillMonitorTaskUpdate(schedule_enabled=False)
+        existing = {
+            "id": 3,
+            "account_id": "account-1",
+            "schedule_enabled": True,
+            "schedule_interval_minutes": 60,
+        }
+        with patch.object(
+            reply_server.db_manager,
+            "get_skill_monitor_task",
+            return_value=existing,
+        ), patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "update_skill_monitor_task",
+            return_value=True,
+        ) as update_mock:
+            result = reply_server.update_skill_monitor_task(
+                3,
+                task,
+                {"user_id": 7},
+            )
+
+        self.assertTrue(result["success"])
+        payload = update_mock.call_args.args[2]
+        self.assertFalse(payload["schedule_enabled"])
+        self.assertIsNone(payload["next_run_at"])
+
+    def test_notification_activation_is_blocked_by_delivery_gate(self):
+        task = reply_server.SkillMonitorTaskIn(
+            keyword="synthetic",
+            notify_enabled=True,
+        )
+        with patch.object(
+            reply_server,
+            "skill_monitor_feature_enabled",
+            return_value=False,
+        ), patch.object(
+            reply_server.db_manager,
+            "create_skill_monitor_task",
+        ) as create_mock:
+            with self.assertRaises(HTTPException) as raised:
+                reply_server.create_skill_monitor_task(
+                    task,
+                    {"user_id": 7},
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("全局开关关闭", raised.exception.detail)
+        create_mock.assert_not_called()
 
 
 if __name__ == "__main__":
