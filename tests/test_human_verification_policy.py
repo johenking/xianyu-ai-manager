@@ -7,6 +7,10 @@ from XianyuAutoAsync import XianyuLive, _mask_account_ids_in_log, log_captcha_ev
 
 
 class HumanVerificationPolicyTests(unittest.TestCase):
+    def test_live_runtime_has_no_automatic_captcha_entrypoint(self):
+        self.assertFalse(hasattr(XianyuLive, "_need_captcha_verification"))
+        self.assertFalse(hasattr(XianyuLive, "_handle_captcha_verification"))
+
     def test_token_refresh_does_not_invoke_automatic_slider_solver(self):
         source = inspect.getsource(XianyuLive.refresh_token)
 

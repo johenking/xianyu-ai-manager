@@ -1,5 +1,8 @@
 import os
+import inspect
+import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -26,6 +29,56 @@ def ready_context(
 
 
 class ItemSearchAccountBindingTests(unittest.IsolatedAsyncioTestCase):
+    def test_search_risk_handler_has_no_automation_or_remote_control(self):
+        source = inspect.getsource(item_search.XianyuSearcher.handle_slider_verification)
+        self.assertNotIn("solve_slider", source)
+        self.assertNotIn("XianyuSliderStealth", source)
+        self.assertNotIn("captcha_controller", source)
+
+    async def test_risk_control_is_reported_without_invoking_slider_solver(self):
+        class VisibleElement:
+            async def is_visible(self):
+                return True
+
+        class RiskPage:
+            def __init__(self):
+                self.main_frame = object()
+                self.frames = [self.main_frame]
+
+            async def content(self):
+                return "<div id='nc_1_n1z'>verification</div>"
+
+            async def query_selector(self, selector):
+                return VisibleElement() if selector == "#nc_1_n1z" else None
+
+        class ForbiddenSlider:
+            calls = 0
+
+            def __init__(self, **_kwargs):
+                self.__class__.calls += 1
+
+        fake_slider_module = types.ModuleType("utils.xianyu_slider_stealth")
+        fake_slider_module.XianyuSliderStealth = ForbiddenSlider
+        searcher = item_search.XianyuSearcher(
+            user_id=7,
+            account_id="account-1",
+            account_context=ready_context(),
+        )
+
+        with (
+            patch.object(item_search.asyncio, "sleep", new=AsyncMock()),
+            patch.dict(
+                sys.modules,
+                {"utils.xianyu_slider_stealth": fake_slider_module},
+            ),
+        ):
+            with self.assertRaises(item_search.SearchAccountBindingError) as raised:
+                await searcher.handle_slider_verification(RiskPage())
+
+        self.assertEqual(raised.exception.state, "action_required")
+        self.assertEqual(raised.exception.reason, "risk_control")
+        self.assertEqual(ForbiddenSlider.calls, 0)
+
     async def test_cross_user_binding_fails_before_playwright_starts(self):
         with (
             patch.object(
