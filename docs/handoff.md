@@ -1,11 +1,74 @@
 # Handoff
 
+## Successful relocation dark deployment and final verification on 2026-07-20
+
+The persistent runtime now lives at
+`/Users/mac/Library/Application Support/XianyuManager`. The user-domain
+LaunchAgent `gui/501/com.cxywjx.xianyu-manager` is running one `Start.py`
+worker from that directory with port `8091`. This is a runtime overlay, not a
+clean git checkout: the deployed backend runtime files are the `b027c4b`
+candidate and the served static bundle is the fresh integration build. The
+target's retained `frontend/` source is not the served artifact and must not be
+rebuilt in place; future builds must use this integration worktree.
+
+Fresh redacted evidence is in
+`/Users/mac/Documents/Codex/evidence/xianyu-monitor-relocation-20260720-1229/post-deployment-verification.md`
+(mode `0600`, SHA-256
+`d8fb57c55d679771df7fe1ce7e38703c1cd57e187435a9d7999b73968a0a1dbe`). It
+records the exact commands and results below:
+
+- Local and public `/health`, `/health/live`, and `/health/ready` all returned
+  200; health/readiness reported migration `2026071802`. Local/public HTML,
+  entry JS, CSS, and `SkillCenter-DJ5GJnVm.js` matched the deployed files and
+  each other byte-for-byte. The Skill Center chunk contains the six-field
+  capability matrix, MTop offline panel, and stale-refresh notice from the
+  reviewed UI build.
+- Read-only SQLite checks after restart were `integrity_check=ok` and
+  foreign-key violations `0`; there are 2 accounts, 2 enabled listeners, 1
+  Cookie refresh schedule, global item sync enabled, 2 old monitor tasks with
+  blank account bindings, 0 monitor schedules, 0 notification channels, and
+  0 monitor runs/events/results/deliveries. All four monitor switches remain
+  `false`; both refresh states remain `action_required`.
+- The relocated target initially retained vulnerable, unused
+  `blackboxprotobuf 1.0.1`/`protobuf 3.10.0` packages. After a separate
+  mode-`0700` dependency rollback snapshot, the integration dependency input
+  and locks were copied, both packages were removed, `pip check` passed, and a
+  direct target-venv `pip-audit` reported no known vulnerabilities. The
+  LaunchAgent was then gracefully booted out and bootstrapped again; the new
+  worker became ready after two seconds of polling.
+- The final restart log window had zero ERROR/CRITICAL records, zero
+  tracebacks, and zero MTop, monitor-notification, or monitor-AI call markers.
+  No browser child or test/sandbox process remained. A 30-second observation
+  measured CPU average `0.11%`, maximum `0.20%`, constant RSS `166,992 KiB`,
+  and zero growth under explicit 200%-CPU/2-GiB absolute gates.
+- The Stage A backup and rollout rollback snapshot remain immutable and
+  hash-verified outside the repository. The dependency-remediation snapshot is
+  `/Users/mac/Documents/Codex/backups/xianyu-monitor-dependency-fix-20260720-130158`.
+
+The truthful live capability matrix is now:
+
+- `code_present`: live — monitor workflow, persistent run/delivery leases,
+  transactional result/event/outbox, account-bound Playwright contract,
+  default-off MTop adapter, shadow comparator, Cookie CAS, API, and reviewed
+  Skill Center bundle are present;
+- `config_ready`: false — all monitor switches are off, tasks have no account
+  binding, and no dedicated test account or real notification configuration is
+  approved;
+- `last_real_search`: never verified;
+- `last_scheduled_run`: none in live (Stage F was mocked/local only);
+- `last_ai_decision`: none for the monitor workflow;
+- `last_real_delivery`: none (loopback tests are excluded).
+
+No existing account was selected for monitor search. The dedicated-test-account
+gate therefore still blocks the `iPhone 15 Pro` canary, Playwright/MTop shadow,
+real Webhook, real monitor AI, schedule enablement, and delivery enablement.
+
 ## Live rollout attempt and hard rollback on 2026-07-20
 
-The dark-deployment candidate at `b027c4b` was staged, migrated, and then
-rolled back before acceptance because the original LaunchAgent could not spawn
-its Python runtime. This is a deployment-environment blocker, not evidence that
-the candidate application started or failed:
+The first dark-deployment attempt for candidate `b027c4b` was staged, migrated,
+and then rolled back before acceptance because the original LaunchAgent could
+not spawn its Python runtime. This was a deployment-environment blocker, not
+evidence that the candidate application started or failed:
 
 - The external rollout backup is
   `/Users/mac/Documents/Codex/backups/xianyu-monitor-rollout-20260720-110814`.
@@ -46,11 +109,11 @@ the candidate application started or failed:
 Redacted evidence is under
 `/Users/mac/Documents/Codex/evidence/xianyu-monitor-rollout-20260720-1134`.
 No production search, MTop request, Webhook, AI call, schedule, or monitor
-delivery was enabled. The candidate remains offline-only and must not be called
-deployed. Before another rollout, move the persistent runtime out of the
-macOS-protected `Documents` tree (preferred) or complete and verify the required
-macOS privacy grant, then take a fresh external backup and repeat the full
-staging/migration/rollback gates.
+delivery was enabled. At the conclusion of that failed attempt, the candidate
+was offline-only and was not deployed. The later relocation deployment at the
+top of this handoff moved the persistent runtime out of the macOS-protected
+`Documents` tree and repeated the backup, migration, restart, and rollback
+gates.
 
 ## Monitor Integration Candidate On 2026-07-18
 
@@ -58,9 +121,10 @@ The monitor work is isolated in `/Users/mac/Documents/Codex/integration/xianyu-m
 
 ## Monitor hardening and dark-deployment candidate on 2026-07-20
 
-This candidate is still isolated on the integration branch and has not been
-deployed to live. It adds the minimum hardening found in the pre-deployment
-audit:
+At the time of this pre-deployment verification, the candidate was isolated on
+the integration branch. It is now dark-deployed under the default-off controls
+recorded at the top of this handoff. It adds the minimum hardening found in the
+pre-deployment audit:
 
 - risk-control/captcha detection is fail-closed and never invokes a slider
   solver; an account action-required result atomically pauses its schedule;
@@ -105,14 +169,14 @@ Fresh verification for this candidate:
   switches were disabled while dark, while creating an unscheduled draft
   remained enabled. The evidence is local/mocked only.
 
-The rollout gate remains: no dedicated test account is available, so no
-Playwright/MTop search, shadow comparison, real Webhook, real AI call, or
-schedule enablement is permitted. The proposed live state keeps all four
-monitor flags false, preserves the two existing account listeners, Cookie
-refresh, and item sync, and requires a fresh external backup plus migration
-rehearsal before any service restart. Rollback is the pre-deployment source,
-SQLite, keys, browser-data, static, uploads, configuration, and LaunchAgent
-snapshot as one set.
+The pre-deployment rollout gate was later satisfied by the relocation deployment
+recorded above. The dedicated-test-account gate remains: no Playwright/MTop
+search, shadow comparison, real Webhook, real monitor AI, schedule enablement,
+or delivery enablement is permitted. The live state keeps all four monitor
+flags false and preserves the two existing account listeners, Cookie refresh,
+and item sync. Rollback remains the pre-deployment source, SQLite, keys,
+browser-data, static, uploads, configuration, and LaunchAgent snapshot as one
+set.
 
 ### Skill Center refresh fencing on 2026-07-19
 
@@ -175,9 +239,10 @@ called accounts, capabilities, monitor tasks, and monitor results exactly once.
 Development StrictMode still intentionally starts two effect rounds, while the
 deferred regression tests prove that only the newest generation can commit.
 
-This refresh-fencing evidence did not deploy live, select or read either
-existing Xianyu account, issue a Playwright or MTop search, enable a schedule,
-send a notification, or call an AI provider. The dedicated-test-account gate,
+This refresh-fencing evidence did not select or read either existing Xianyu
+account, issue a Playwright or MTop search, enable a schedule, send a
+notification, or call an AI provider. Its exact reviewed static output is now
+the served dark-deployment bundle, while the dedicated-test-account gate,
 the `iPhone 15 Pro` official-page canary, shadow comparison, and real value
 acceptance therefore remain blocked/unverified.
 
@@ -219,11 +284,11 @@ old-token writes were rejected. Every worker was a single process on
 127.0.0.1:18091; health was 200, migration was 2026071802, integrity was ok,
 foreign-key violations were 0, and all temporary runtime data was removed.
 
-Current capability matrix after Stage F:
+Stage F capability matrix at the time of local acceptance:
 
 - code present — local: monitor, scheduler, outbox, leases, mocked seam, and
   MTop offline contract are present in this branch.
-- config ready — unverified/not live: production flags remain default-off and
+- config ready — unverified/local: production flags remain default-off and
   no approved dedicated account, real notification endpoint, or real AI
   configuration is available.
 - last real search — never/real unverified: Stage F used only the mocked
@@ -247,7 +312,16 @@ Fresh Stage C local verification on 2026-07-18 passed:
 - A fresh database reached `2026071802` with 43 application tables, 9 migration rows, `integrity_check=ok`, zero foreign-key violations, both new tables, and both retention indexes. The exact pre-Stage-C source at `0272de1` opened a copy of that expanded database with the same schema version, row counts, integrity result, and foreign-key result.
 - Local mocked UI review covered default-off, loading, empty, missing-evidence, and synthetic error states at 1440x900 and 390x844. Default and loading runs had zero console warnings/errors, page errors, failed requests, blocked external attempts, or successful external requests; the intentional error fixture produced only its expected local HTTP 500 resource message. Full-scroll document/main widths were 1440/1440 and 390/390, and the MTop panel stayed inside the content rail. Evidence is under `/Users/mac/Documents/Codex/evidence/xianyu-monitor-stage-c-ui-20260718-075104` and is local mocked evidence only.
 
-This branch has not been deployed. It has not read or called either existing Xianyu account, used a production or dedicated test Cookie, made an MTop or Playwright shadow request, sent a real Webhook or other notification, or called a real AI provider. Schedule and delivery switches were enabled only inside the disposable Stage F harness; they remain unchanged and default-off in live. The existing live service does not yet expose this truthful capability matrix. The registered `iPhone 15 Pro` canary remains `unverified`; the historical live evidence below belongs to the official-login deployment and must not be treated as monitor-integration or real-provider acceptance.
+The monitor integration is now dark-deployed, but it has not read or called
+either existing Xianyu account, used a production or dedicated test Cookie,
+made an MTop or Playwright shadow request, sent a real Webhook or other
+notification, or called a real monitor AI provider. Schedule and delivery
+switches were enabled only inside the disposable Stage F harness; they remain
+unchanged and default-off in live. The live service now exposes the truthful
+capability matrix, with real-search, scheduled-run, AI-decision, and delivery
+claims still unverified. The registered `iPhone 15 Pro` canary remains
+`unverified`; the historical live evidence below belongs to the official-login
+deployment and must not be treated as real-provider acceptance.
 
 ## Source State On 2026-07-17
 
