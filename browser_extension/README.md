@@ -14,3 +14,10 @@
 
 每个配对码五分钟内有效且只能使用一次。扩展导入后，后台仍会调用真实平台接口
 确认登录态和账号 `unb`，验证通过后才保存并启动监听。
+
+## 构建与校验
+
+在 `frontend/` 目录运行 `npm run build:extension`，会以固定文件顺序和时间戳生成
+`dist/xianyu-cookie-importer.zip`，并复制同一字节流到
+`static/downloads/xianyu-cookie-importer.zip`。随后运行 `npm run verify:extension`
+校验扩展源码与两个归档的 SHA-256 一致性。

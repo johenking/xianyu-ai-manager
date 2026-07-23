@@ -16,7 +16,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 216)
+        self.assertEqual(len(signatures), 224)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -47,6 +47,17 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/api/admin/registration/invites"), signatures)
         self.assertIn(("PUT", "/api/admin/registration/limit"), signatures)
         self.assertIn(("POST", "/api/settings/verify/smtp/confirm"), signatures)
+        self.assertIn(("POST", "/api/official-login/sessions"), signatures)
+        self.assertIn(("GET", "/api/official-login/sessions/{session_id}"), signatures)
+        self.assertIn(("POST", "/api/official-login/sessions/{session_id}/show-browser"), signatures)
+        self.assertIn(("POST", "/api/official-login/sessions/{session_id}/cancel"), signatures)
+        self.assertIn(("POST", "/api/accounts/{cookie_id}/session-refresh/show-browser"), signatures)
+        self.assertIn(("POST", "/official-window-login"), signatures)
+        self.assertIn(("GET", "/official-window-login/check/{session_id}"), signatures)
+        self.assertIn(("POST", "/official-window-login/cancel/{session_id}"), signatures)
+        self.assertNotIn(("POST", "/qr-login/refresh-cookies"), signatures)
+        self.assertNotIn(("POST", "/qr-login/reset-cooldown/{cookie_id}"), signatures)
+        self.assertNotIn(("GET", "/qr-login/cooldown-status/{cookie_id}"), signatures)
 
     async def test_lifespan_starts_and_stops_runtime_on_the_same_loop(self):
         app = create_app()

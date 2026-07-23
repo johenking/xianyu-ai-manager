@@ -22,8 +22,6 @@ bcrypt==5.0.0
     # via
     #   -r requirements.in
     #   passlib
-blackboxprotobuf==1.0.1
-    # via -r requirements.in
 certifi==2026.6.17
     # via
     #   httpcore
@@ -119,8 +117,6 @@ propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
-protobuf==3.10.0
-    # via blackboxprotobuf
 psutil==7.2.2
     # via
     #   -r requirements.in
@@ -163,11 +159,8 @@ requests==2.34.2
     #   tldextract
 requests-file==3.0.1
     # via tldextract
-setuptools==83.0.0
-    # via protobuf
 six==1.17.0
     # via
-    #   protobuf
     #   pyexecjs
     #   python-dateutil
 sniffio==1.3.1

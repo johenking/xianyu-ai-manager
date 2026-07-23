@@ -2,6 +2,34 @@
 
 All notable changes are documented here. This project follows Semantic Versioning.
 
+## [Unreleased]
+
+## [1.8.0] - 2026-07-23
+
+### Added
+
+- Add five account-login entry points: API QR, official SMS window, official password login, local Chrome extension import, and manual Cookie fallback.
+- Add owner-scoped official-login sessions, stable `unb` identity matching, explicit browser display and cancellation, QR terminal-state retention, and migrations through `2026072301`.
+- Add fail-closed Skill Center scheduling, AI filtering, durable run leases, delivery outbox processing, retention cleanup, and account-bound catalog monitoring.
+
+### Changed
+
+- Make password login with valid encrypted credentials the only automatic-renewal source; QR, SMS, extension, manual Cookie, and historical sources enter `manual_reauth_required` without repeated browser launches.
+- Use installed headed Chrome with one account-specific profile, keep human SMS, QR, face, and risk-control steps user-operated, and persist a session only after real identity and Cookie validation.
+- Preserve account-linked configuration when the same `unb` logs in again, reject cross-identity Cookie updates with HTTP 409, and route every reauthentication notice to its matching login action.
+- Rebuild account management around capability labels, five login panels, six reauthentication actions, and once-per-expiry reminder aggregation.
+
+### Fixed
+
+- Remove the three legacy QR refresh and cooldown routes plus the unreachable automatic slider path.
+- Keep expired QR sessions stable for at least five minutes before cleanup, and preserve retryability for profile-in-use, cancellation, temporary browser, and transient platform-probe failures.
+- Fence ordinary automatic delivery behind a fresh platform order check and keep item monitoring bound to the task owner's account and Cookie revision.
+
+### Security
+
+- Remove automatic slider handling, headless login refresh, User-Agent overrides, anti-detection injection, and public verification-URL exposure from active login paths.
+- Redact Cookie values, Tokens, passwords, verification URLs, stable account identities, and sensitive browser errors from SQL logs, runtime session state, APIs, and operational logs.
+
 ## [1.7.3] - 2026-07-12
 
 ### Changed

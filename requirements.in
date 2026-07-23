@@ -10,7 +10,6 @@ requests>=2.31.0
 httpx>=0.25.0
 PyYAML>=6.0.0
 PyExecJS>=1.5.1
-blackboxprotobuf>=1.0.1
 psutil>=5.9.0
 python-multipart>=0.0.6
 openai>=1.50.0

@@ -32,8 +32,8 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
-| Official password login | `POST /password-login`, `GET /password-login/check/{session_id}` |
-| Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `PUT /cookies/{cid}/cookie-refresh-settings` |
+| Official account login | API QR through `/qr-login/*`; visible SMS/password Chrome through `POST /api/official-login/sessions`, `GET .../{session_id}`, `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
+| Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Dashboard and orders | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
 | Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
@@ -290,26 +290,52 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`.
-- Official password login: `POST /password-login`, then poll `GET /password-login/check/{session_id}`.
+- Default API QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The QR image is rendered locally from the official `codeContent`; it is not a browser screenshot.
+- Visible official window: create explicit `sms` or `password` sessions through `/api/official-login/sessions`. SMS codes are entered only on the official page.
+- Local Chrome extension: create a five-minute, owner-bound, single-use pairing through `/api/browser-extension/pairings`, then import from the local extension.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
-Start an official password login without supplying an account ID:
+Start the default API QR session:
 
 ```bash
-curl -sS -X POST "$BASE_URL/password-login" \
+curl -sS -X POST "$BASE_URL/qr-login/generate" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. If the response becomes `verification_required`, show the user the safe verification image when present and call `POST /qr-login/continue/{session_id}` only after an explicit local-user action. An expired QR remains queryable for at least five minutes and repeatedly returns `status='expired'` with “二维码已过期，请重新扫码” before becoming `not_found`.
+
+Start a visible SMS session without collecting the code in the application:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"sms","account":"<optional-phone>","show_browser":true}'
+```
+
+The user requests and enters the SMS code on the official page. The application never receives or stores the code. Poll `GET /api/official-login/sessions/{session_id}`. The safe response contains state, a fixed message, optional safe screenshot path, expiry, and account metadata only. Valid states are `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, `success`, `expired`, `failed`, `cancelled`, and `interrupted`. Show or cancel the same local system-Chrome session through `POST .../{session_id}/show-browser` and `POST .../{session_id}/cancel`.
+
+Start an explicit password session without supplying an account ID:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
+    "mode":"password",
     "account":"<xianyu-account-or-phone>",
     "password":"<password>",
-    "show_browser":true
+    "show_browser":false
   }'
 ```
 
-The request returns a `session_id`. Poll `/password-login/check/{session_id}` until `success`, `verification_required`, `failed`, `timeout`, `cancelled`, or `interrupted`. Legacy clients may still send `account_id`, but the backend ignores it and resolves the account from the authenticated Cookie's real `unb`. Re-login updates the existing account within the same backend user, preserving its settings and related data.
+Legacy clients may still send `account_id`, but the backend ignores it and resolves the account from the authenticated Cookie's real `unb`. Re-login updates the existing account within the same backend user, preserving its settings and related data.
 
-On first success, the browser session is stored as `browser_data/user_<unb>`, and the password is encrypted with the independent account-credential key. Status and account-detail responses never return the password or ciphertext. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+Every successful browser binding stores the session as `browser_data/user_<unb>`. After an explicit password-mode login succeeds, the submitted password is encrypted with the independent account-credential key; QR and SMS sessions do not create a saved password. Status and account-detail responses never return the password or ciphertext. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+
+`POST /cookies` accepts a compatibility `id` field but ignores it for identity. The Cookie must contain `unb` and at least one core session field; the response returns the actual `account_id` selected from the real `unb`. `PUT /cookies/{cid}` rejects a different Cookie `unb` with HTTP 409 and `account_identity_mismatch` without changing the record or its related data.
+
+`GET /cookies/details` includes `login_method`, `login_method_label`, `auto_refresh_supported`, `reauth_required`, `reauth_action`, `last_login_at`, `last_validated_at`, and `last_expired_at`. It never exposes passwords, ciphertext, full Cookies, Tokens, or verification URLs.
 
 Read or trigger structured refresh state:
 
@@ -321,7 +347,9 @@ curl -sS -X POST "$BASE_URL/api/accounts/$COOKIE_ID/session-refresh" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Manual refresh, scheduled refresh, and expired-session recovery use the same official profile. The service first reuses `browser_data/user_<unb>`; a valid profile can renew without another QR scan. It uses saved credentials only after the profile has fully logged out. Manual refresh requires the account listener to be running. Scheduled preventive refresh is configured per account and defaults to off:
+The status response includes `state` and `browser_active`. `action_required` is passive and means no official browser exists; present one “start verification” action. `verification_required` exposes local show/cancel controls only when `browser_active` is `true`. `manual_reauth_required` is a stable terminal state: route the user through `reauth_action` and do not keep calling refresh.
+
+Only `login_method='password'` with a valid login account and stored encrypted password supports automatic refresh. Manual refresh and a genuinely due scheduled refresh use the same official profile. The service first reuses `browser_data/user_<unb>`; only after that profile is completely logged out may it decrypt the saved credentials and perform official password login. Non-password sources return `manual_reauth_required` immediately and do not start Chrome. Manual refresh requires the account listener to be running. Scheduled preventive refresh is configured per account and defaults to off:
 
 ```bash
 curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/cookie-refresh-settings" \
@@ -330,13 +358,13 @@ curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/cookie-refresh-settings" \
   -d '{"cookie_refresh_enabled":false,"cookie_refresh_interval_minutes":1440}'
 ```
 
-When enabled, `cookie_refresh_interval_minutes` must be between 60 and 10080. Turning scheduled refresh off does not disable manual refresh or refreshes triggered by an expired session.
+When enabled, `cookie_refresh_interval_minutes` must be between 60 and 10080. Accounts without automatic-refresh capability cannot enable the schedule. Password renewal errors that require human action, including invalid or missing credentials, identity mismatch, verification/login timeout, and official-page structure mismatch, persist `manual_reauth_required`; later manual, scheduled, and runtime triggers do not reopen Chrome. `profile_in_use`, temporary browser/probe failures, and cancellation remain retryable.
 
-A `verification_required` state means the platform requires human verification; it is not a refresh failure that can be bypassed. The backend keeps the same profile open visibly for up to 15 minutes and may return a safe screenshot path, but it never exposes the official verification URL. After verification, success is shown only when the login and security surfaces disappear and the backend detects both the expected `unb` and a valid session Cookie. Cancel with `POST .../session-refresh/cancel`.
+A `verification_required` state means the platform requires human verification in an existing browser Worker. The backend keeps the same headed system-Chrome context open for up to 15 minutes and may return a safe screenshot path, but it never exposes the official verification URL. Use `POST .../session-refresh/show-browser` after an explicit local-user action. Success requires the expected `unb` and a real message `accessToken`; the Cookie and actual browser User-Agent must be saved and one listener generation installed before the browser closes. Cancel with `POST .../session-refresh/cancel` while `browser_active` remains true.
 
 An active refresh is account-scoped and single-flight. Repeated `POST .../session-refresh` requests return the current persisted status and do not queue another browser session. Listener restarts restore the latest attempt or success as the scheduled-refresh anchor and set a fresh item-sync anchor, so a successful manual refresh cannot immediately trigger scheduled renewal or item-detail browser work.
 
-The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. QR and manual Cookie binding remain recovery options, but normal renewal should reuse the persisted official profile instead of repeatedly asking for QR login.
+The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. QR, SMS, Chrome extension, and manual Cookie binding remain human recovery options. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes have been removed and are intentionally absent from OpenAPI.
 
 ## Recent Order Sync
 

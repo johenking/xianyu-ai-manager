@@ -1,11 +1,12 @@
 {
   "name": "xianyu-ai-manager-frontend",
   "private": true,
-  "version": "1.7.3",
+  "version": "1.8.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "npm run build:extension && vite build",
+    "build:extension": "python3 ../browser_extension/scripts/build-package.py",
     "typecheck": "tsc --noEmit",
     "verify:build": "node scripts/verifyBuildOutput.mjs",
     "verify:extension": "node ../browser_extension/scripts/verify-package.mjs",
