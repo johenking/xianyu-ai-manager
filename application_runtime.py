@@ -14,6 +14,10 @@ from config import COOKIES_LIST
 from db_manager import db_manager
 from session_registry import initialize_session_registry
 from skill_monitor_scheduler import skill_monitor_scheduler
+from skill_monitor_features import skill_monitor_feature_enabled
+from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
+from skill_monitor_retention_janitor import skill_monitor_retention_janitor
+from account_session_refresh import remove_verification_image
 
 
 def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
@@ -34,9 +38,33 @@ def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
     return keywords
 
 
+def _normalize_orphaned_refresh_states() -> int:
+    """A restarted process has no browser worker for persisted active states."""
+    normalized = 0
+    for cookie_id in db_manager.get_all_cookies():
+        status = db_manager.get_account_session_refresh(cookie_id) or {}
+        if status.get("state") not in {"refreshing", "verification_required"}:
+            continue
+        remove_verification_image(
+            str(status.get("verification_image_url") or "").lstrip("/")
+        )
+        db_manager.update_account_session_refresh(
+            cookie_id,
+            state="action_required",
+            trigger=status.get("trigger") or "service_restart",
+            message="服务已重启，请手动开始一次验证",
+            error_code="browser_session_missing",
+        )
+        normalized += 1
+    return normalized
+
+
 async def start_runtime() -> cookie_manager_module.CookieManager:
     loop = asyncio.get_running_loop()
     initialize_session_registry(db_manager).cleanup()
+    normalized_refreshes = _normalize_orphaned_refresh_states()
+    if normalized_refreshes:
+        logger.info(f"已归一化 {normalized_refreshes} 个遗留的浏览器验证状态")
     manager = cookie_manager_module.manager
     if manager is None:
         manager = cookie_manager_module.CookieManager(loop)
@@ -71,13 +99,23 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     if env_cookie and "default" not in manager.cookies:
         await manager._add_cookie_async("default", env_cookie)
 
-    await skill_monitor_scheduler.start()
+    await skill_monitor_retention_janitor.start()
+    if skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+        await skill_monitor_scheduler.start()
+    else:
+        logger.info("技能中心定时监控调度器保持关闭（全局/调度开关未启用）")
+    if skill_monitor_feature_enabled("skill_monitor_delivery_enabled"):
+        await skill_monitor_delivery_dispatcher.start()
+    else:
+        logger.info("技能监控通知 dispatcher 保持关闭（全局/通知开关未启用）")
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
     await skill_monitor_scheduler.stop()
+    await skill_monitor_delivery_dispatcher.stop()
+    await skill_monitor_retention_janitor.stop()
 
     manager = cookie_manager_module.manager
     if manager is not None:

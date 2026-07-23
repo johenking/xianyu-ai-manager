@@ -58,6 +58,7 @@ class SettingsServiceTests(unittest.TestCase):
             "keyword": "iPhone",
             "notify_enabled": True,
             "ai_filter": "只保留低价商品",
+            "account_id": "account-1",
             "schedule_enabled": True,
             "schedule_interval_minutes": 5,
             "next_run_at": "2000-01-01 00:00:00",
@@ -66,6 +67,7 @@ class SettingsServiceTests(unittest.TestCase):
         task = self.db.get_skill_monitor_task(task_id, 1)
         self.assertTrue(task["notify_enabled"])
         self.assertEqual(task["ai_filter"], "只保留低价商品")
+        self.assertEqual(task["account_id"], "account-1")
         self.assertTrue(task["schedule_enabled"])
         self.assertEqual(task["schedule_interval_minutes"], 15)
         self.assertEqual(task["last_status"], "idle")

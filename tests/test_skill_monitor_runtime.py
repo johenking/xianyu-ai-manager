@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi import HTTPException
 
 import reply_server
+import skill_monitor_delivery_dispatcher as delivery_module
 import skill_monitor_scheduler as scheduler_module
 
 
@@ -29,106 +30,6 @@ class SkillNotificationTests(unittest.TestCase):
             result = reply_server._enabled_notification_channels(7)
 
         self.assertEqual([channel["id"] for channel in result], [1, 4])
-
-    def test_notification_attempts_every_supported_channel_and_records_partial(self):
-        channels = [
-            {"id": 1, "name": "Webhook", "type": "webhook"},
-            {"id": 2, "name": "Bark", "type": "bark"},
-            {"id": 3, "name": "Telegram", "type": "telegram"},
-        ]
-        with patch.object(reply_server, "_enabled_notification_channels", return_value=channels), patch.object(
-            reply_server,
-            "_send_skill_notification_to_channel",
-            side_effect=[None, ValueError("bad key"), None],
-        ) as send_mock, patch.object(
-            reply_server.db_manager,
-            "update_skill_monitor_result_notification",
-            return_value=True,
-        ) as update_mock:
-            status, error = reply_server._notify_skill_monitor_result(
-                {"notify_enabled": True, "keyword": "iPhone"},
-                7,
-                11,
-                {"title": "iPhone 15"},
-            )
-
-        self.assertEqual(send_mock.call_count, 3)
-        self.assertEqual(status, "partial")
-        self.assertIn("Bark: bad key", error)
-        update_mock.assert_called_once_with(11, 7, "partial", error)
-
-    def test_notification_records_sent_only_after_all_channels_succeed(self):
-        channels = [
-            {"id": 1, "name": "Webhook", "type": "webhook"},
-            {"id": 2, "name": "Bark", "type": "bark"},
-        ]
-        with patch.object(reply_server, "_enabled_notification_channels", return_value=channels), patch.object(
-            reply_server, "_send_skill_notification_to_channel"
-        ) as send_mock, patch.object(
-            reply_server.db_manager,
-            "update_skill_monitor_result_notification",
-            return_value=True,
-        ) as update_mock:
-            status, error = reply_server._notify_skill_monitor_result(
-                {"notify_enabled": True, "keyword": "iPhone"},
-                7,
-                11,
-                {"title": "iPhone 15"},
-            )
-
-        self.assertEqual(send_mock.call_count, 2)
-        self.assertEqual((status, error), ("sent", ""))
-        update_mock.assert_called_once_with(11, 7, "sent", "")
-
-    def test_notification_records_failed_after_every_channel_fails(self):
-        channels = [
-            {"id": 1, "name": "Webhook", "type": "webhook"},
-            {"id": 2, "name": "Bark", "type": "bark"},
-        ]
-        with patch.object(reply_server, "_enabled_notification_channels", return_value=channels), patch.object(
-            reply_server,
-            "_send_skill_notification_to_channel",
-            side_effect=[ValueError("bad url"), ValueError("bad key")],
-        ) as send_mock, patch.object(
-            reply_server.db_manager,
-            "update_skill_monitor_result_notification",
-            return_value=True,
-        ) as update_mock:
-            status, error = reply_server._notify_skill_monitor_result(
-                {"notify_enabled": True, "keyword": "iPhone"},
-                7,
-                11,
-                {"title": "iPhone 15"},
-            )
-
-        self.assertEqual(send_mock.call_count, 2)
-        self.assertEqual(status, "failed")
-        self.assertIn("Webhook: bad url", error)
-        self.assertIn("Bark: bad key", error)
-        update_mock.assert_called_once_with(11, 7, "failed", error)
-
-    def test_notification_error_redacts_webhook_urls(self):
-        channels = [{"id": 1, "name": "Webhook", "type": "webhook"}]
-        secret_url = "https://example.test/hooks/private-token"
-        with patch.object(reply_server, "_enabled_notification_channels", return_value=channels), patch.object(
-            reply_server,
-            "_send_skill_notification_to_channel",
-            side_effect=ValueError(f"403 Client Error for url: {secret_url}"),
-        ), patch.object(
-            reply_server.db_manager,
-            "update_skill_monitor_result_notification",
-            return_value=True,
-        ):
-            status, error = reply_server._notify_skill_monitor_result(
-                {"notify_enabled": True, "keyword": "iPhone"},
-                7,
-                11,
-                {"title": "iPhone 15"},
-            )
-
-        self.assertEqual(status, "failed")
-        self.assertNotIn(secret_url, error)
-        self.assertIn("[redacted-url]", error)
 
     def test_platform_webhooks_use_their_native_payloads(self):
         cases = [
@@ -175,6 +76,66 @@ class SkillNotificationTests(unittest.TestCase):
                     {"keyword": "iPhone"},
                     {"title": "iPhone 15"},
                 )
+
+
+class SkillDeliveryDispatcherTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _delivery():
+        return {
+            "id": 17,
+            "claim_token": "claim-token",
+            "channel_type": "webhook",
+            "idempotency_key": "delivery-key",
+        }
+
+    @staticmethod
+    def _context():
+        return {
+            "channel": {"id": 1, "type": "webhook", "enabled": True},
+            "task": {"id": 3, "notify_enabled": True, "keyword": "iPhone"},
+            "result": {"id": 11, "title": "iPhone 15"},
+        }
+
+    async def test_successful_delivery_finishes_as_sent(self):
+        dispatcher = delivery_module.SkillMonitorDeliveryDispatcher()
+        with patch.object(delivery_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            delivery_module.db_manager,
+            "get_skill_monitor_delivery_context",
+            return_value=self._context(),
+        ), patch.object(
+            reply_server, "_send_skill_notification_to_channel"
+        ) as send_mock, patch.object(
+            delivery_module.db_manager,
+            "finish_skill_monitor_delivery",
+            return_value=True,
+        ) as finish_mock:
+            await dispatcher._execute(self._delivery())
+
+        send_mock.assert_called_once()
+        finish_mock.assert_called_once_with(17, "claim-token", status="sent")
+
+    async def test_delivery_error_is_redacted_and_finishes_failed(self):
+        dispatcher = delivery_module.SkillMonitorDeliveryDispatcher()
+        secret_url = "https://example.test/hooks/private-token"
+        with patch.object(delivery_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            delivery_module.db_manager,
+            "get_skill_monitor_delivery_context",
+            return_value=self._context(),
+        ), patch.object(
+            reply_server,
+            "_send_skill_notification_to_channel",
+            side_effect=ValueError(f"403 Client Error for url: {secret_url}"),
+        ), patch.object(
+            delivery_module.db_manager,
+            "finish_skill_monitor_delivery",
+            return_value=True,
+        ) as finish_mock:
+            await dispatcher._execute(self._delivery())
+
+        kwargs = finish_mock.call_args.kwargs
+        self.assertEqual(kwargs["status"], "failed")
+        self.assertNotIn(secret_url, kwargs["error_message"])
+        self.assertIn("[redacted-url]", kwargs["error_message"])
 
 
 class SkillAiFilterTests(unittest.TestCase):
@@ -224,7 +185,12 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             "source": "playwright",
             "items": [{"item_id": "item-1", "title": "iPhone 15", "item_url": "https://example.test/item-1"}],
         }
-        task = {"id": 3, "keyword": "iPhone", "notify_enabled": True}
+        task = {
+            "id": 3,
+            "keyword": "iPhone",
+            "notify_enabled": True,
+            "account_id": "account-1",
+        }
 
         with patch("utils.item_search.search_xianyu_items", new=AsyncMock(return_value=search_result)), patch.object(
             reply_server.db_manager,
@@ -232,15 +198,14 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             return_value=True,
             create=True,
         ) as exists_mock, patch.object(
-            reply_server.db_manager, "create_skill_monitor_result"
-        ) as create_mock, patch.object(reply_server, "_notify_skill_monitor_result") as notify_mock:
+            reply_server.db_manager, "persist_skill_monitor_match"
+        ) as persist_mock:
             result_ids, raw_count, _ = await reply_server._run_real_skill_monitor(task, 7)
 
         self.assertEqual(result_ids, [])
         self.assertEqual(raw_count, 1)
         exists_mock.assert_called_once_with(3, 7, "https://example.test/item-1", "item-1")
-        create_mock.assert_not_called()
-        notify_mock.assert_not_called()
+        persist_mock.assert_not_called()
 
     async def test_failed_scheduled_run_is_rescheduled_and_records_error(self):
         task = {
@@ -250,24 +215,39 @@ class SkillMonitorExecutionTests(unittest.IsolatedAsyncioTestCase):
             "schedule_enabled": True,
             "schedule_interval_minutes": 30,
         }
-        with patch.object(reply_server.db_manager, "mark_skill_monitor_task_running", return_value=True), patch.object(
+        claim = {
+            "claimed": True,
+            "run_id": 41,
+            "claim_token": "claim-token",
+            "account_id": "account-1",
+        }
+        with patch.object(reply_server, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            reply_server.db_manager, "claim_skill_monitor_run", return_value=claim
+        ), patch.object(
             reply_server, "_run_real_skill_monitor", new=AsyncMock(side_effect=HTTPException(502, "搜索失败"))
         ), patch.object(
-            reply_server.db_manager, "update_skill_monitor_task_run", return_value=True
-        ) as update_mock:
+            reply_server.db_manager, "finish_skill_monitor_run", return_value=True
+        ) as finish_mock:
             with self.assertRaises(HTTPException):
                 await reply_server.execute_skill_monitor_task(task, 7, scheduled_run=True)
 
-        kwargs = update_mock.call_args.kwargs
+        args = finish_mock.call_args.args
+        kwargs = finish_mock.call_args.kwargs
+        self.assertEqual(args, (41, "claim-token"))
         self.assertEqual(kwargs["status"], "failed")
-        self.assertEqual(kwargs["error"], "搜索失败")
+        self.assertEqual(kwargs["error_code"], "http_502")
+        self.assertEqual(kwargs["error_message"], "搜索失败")
         self.assertIsNotNone(kwargs["next_run_at"])
 
 
 class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_and_stop_own_the_polling_task(self):
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
-        with patch.object(scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0), patch.object(
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_deliveries", return_value=0
+        ), patch.object(
             scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=[]
         ):
             await scheduler.start()
@@ -289,7 +269,9 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         scheduler = BlockingScheduler()
         due = [{"id": 9, "user_id": 7}]
-        with patch.object(scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=due):
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(scheduler_module.db_manager, "list_due_skill_monitor_tasks", return_value=due):
             self.assertEqual(await scheduler.run_due_once(), 1)
             await asyncio.sleep(0)
             self.assertEqual(await scheduler.run_due_once(), 0)
@@ -310,8 +292,11 @@ class SkillMonitorSchedulerTests(unittest.IsolatedAsyncioTestCase):
 
         scheduler = scheduler_module.SkillMonitorScheduler(poll_interval_seconds=3600)
         scheduler._execute = blocking_execute
-        with patch.object(scheduler_module.db_manager, "reset_running_skill_monitor_tasks", return_value=0), patch.object(
-            scheduler_module.db_manager,
+        with patch.object(scheduler_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_runs", return_value=0
+        ), patch.object(
+            scheduler_module.db_manager, "recover_stale_skill_monitor_deliveries", return_value=0
+        ), patch.object(scheduler_module.db_manager,
             "list_due_skill_monitor_tasks",
             side_effect=[[{"id": 9, "user_id": 7}], []],
         ):
