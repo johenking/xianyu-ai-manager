@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 
 interface RemoteImageProps {
   src?: string;
@@ -8,13 +8,9 @@ interface RemoteImageProps {
 }
 
 const RemoteImage: React.FC<RemoteImageProps> = ({ src, alt, className, fallback }) => {
-  const [failed, setFailed] = useState(false);
+  const [failedSrc, setFailedSrc] = useState<string | undefined>();
 
-  useEffect(() => {
-    setFailed(false);
-  }, [src]);
-
-  if (!src || failed) {
+  if (!src || failedSrc === src) {
     return <>{fallback}</>;
   }
 
@@ -26,7 +22,7 @@ const RemoteImage: React.FC<RemoteImageProps> = ({ src, alt, className, fallback
       loading="lazy"
       decoding="async"
       referrerPolicy="no-referrer"
-      onError={() => setFailed(true)}
+      onError={() => setFailedSrc(src)}
     />
   );
 };
