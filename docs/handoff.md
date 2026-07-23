@@ -1,5 +1,69 @@
 # Handoff
 
+## v1.8.0 Production Release On 2026-07-23
+
+The audited application payload was merged through PRs `#30` and `#31` and
+deployed from commit `f6fb00ecab788946627588e82e2c9a315d173560`. The final
+docs-only release merge does not change application, frontend, extension,
+migration, or dependency content. The authoritative final release SHA is the
+commit resolved by both `origin/main` and the annotated `v1.8.0^{}` tag; this
+document is part of that tagged commit.
+
+GitHub and clean-worktree gates:
+
+- PR `#30` merged the production synchronization through ordinary merge commit
+  `dd5807c3d8078f4f04934376f0d10ddfe1a79d03`. Its PR CI run
+  `30017648878` passed.
+- PR `#31` fixed the `RemoteImage` source-change race and merged through
+  ordinary merge commit `f6fb00ecab788946627588e82e2c9a315d173560`. Its PR CI
+  run `30021408943` and subsequent `main` push CI run `30021629945` both
+  passed all `secrets` and `test` jobs.
+- The final code gates passed Ruff, the explicit Python compilation list, 302
+  backend tests with an isolated `DB_PATH`, TypeScript, 18 frontend files with
+  87 tests, 6 extension tests, and two production builds.
+- `npm audit --audit-level=high` reported zero vulnerabilities. Build and
+  extension verification passed; the build retained two generations of 32
+  assets with zero orphans. OpenAPI contained 186 paths and 224 methods, all
+  required login/session routes were present, and all three retired QR
+  refresh/cooldown routes were absent.
+
+Production deployment and rollback evidence:
+
+- The stopped-service rollback snapshot is
+  `backups/v1.8.0-final-pre-deploy-20260723-235008`. It contains 2,191
+  hash-listed files plus the manifest, an integrity-checked SQLite backup, all
+  three local encryption keys, four complete browser profiles, 49 uploads, the
+  prior static site, the LaunchAgent plist, a source archive, and a verified Git
+  bundle. The earlier alignment snapshot
+  `backups/v1.8.0-pre-align-20260723-230353` and local rollback branch
+  `codex/prod-pre-align-20260723` at
+  `e76c24a74f40cfa51c8151d84f30265d305fb2e9` are retained.
+- Production was advanced with `git merge --ff-only`; no reset or working-tree
+  overwrite was used. The formal virtual environment then passed the same 302
+  backend tests against an isolated database. The formal frontend passed 87
+  tests, 6 extension tests, zero-high-severity audit, TypeScript, two builds,
+  build verification, and extension verification.
+- The LaunchAgent became ready in three seconds with working directory
+  `/Users/mac/Library/Application Support/XianyuManager`,
+  `WEB_CONCURRENCY=1`, one process listening on `8091`, and no listeners on
+  `8092` or `8093`. Local and public readiness reported migration
+  `2026072301`.
+- Local and public `/`, `/login`, `/register`, `/forgot-password`, `/terms`,
+  and `/privacy` returned 200 and matched the deployed HTML byte-for-byte. The
+  referenced `index-pN18c_Tf.js`, `index-kJg_YYPB.css`, and extension ZIP all
+  returned 200 locally and publicly and matched disk. The extension ZIP SHA-256
+  is `373a1b9ebb424ce3276b71a3818def994d04c367066e93947c2e161ebf32f106`.
+- Database integrity remained `ok`. Account/key/profile/upload counts remained
+  `1/3/4/49`; item, order, knowledge-profile, AI-profile, monitor-task, and user
+  counts remained `106/63/12/2/2/2`. The 49 upload files matched the rollback
+  snapshot exactly, with aggregate content SHA-256
+  `887cc8b078dfa1ee3860af1790401663008470d108e294789ad8057bd4988f63`.
+- A byte-offset scan covered 128 new lines across the three production logs.
+  Cookie assignments, raw `unb`, Tokens, bearer values, passwords, session
+  secrets, QR content, verification URLs, known stored sensitive values,
+  tracebacks, and error-level records each had zero matches. No real secret or
+  account material was printed during acceptance.
+
 ## v1.8.0 Sync Candidate On 2026-07-23
 
 The `codex/sync-production-20260723` branch starts from GitHub `main` at
@@ -25,9 +89,9 @@ Candidate gates completed before the release commit:
   are now built reproducibly from ten allowlisted files; two consecutive builds
   produced the same SHA-256 and package verification passed.
 
-Do not describe this candidate as the GitHub or production release until the PR
-checks, merge commit, rollback backup, formal deployment, local/public health,
-asset equality, data-count preservation, and post-start log scan are all recorded.
+These candidate results are retained as pre-release evidence. The GitHub,
+rollback, deployment, local/public health, asset-equality, data-preservation, and
+post-start log gates completed in the production release record above.
 
 ## Source State On 2026-07-17
 
