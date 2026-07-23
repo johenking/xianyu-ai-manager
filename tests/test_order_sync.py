@@ -41,6 +41,17 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(result["code"], "session_expired")
         self.assertTrue(result["requires_login"])
 
+    def test_platform_token_error_variants_require_login(self):
+        for value in (
+            "FAIL_SYS_TOKEN_EXPIRED::令牌过期",
+            "FAIL_SYS_TOKEN_EXOIRED::Token expired",
+            "FAIL_SYS_USER_VALIDATE::mini_login",
+        ):
+            with self.subTest(value=value):
+                result = classify_platform_error([value])
+                self.assertEqual(result["code"], "session_expired")
+                self.assertTrue(result["requires_login"])
+
     def test_api_payload_preserves_session_failure_instead_of_returning_unknown(self):
         result = parse_order_api_payload({"ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"]})
 
@@ -87,7 +98,7 @@ class OrderStatusNormalizationTests(unittest.TestCase):
                             "createTime": "2026-07-02 12:00:00",
                         },
                         "buyerInfoVO": {"buyerId": "buyer-merchant"},
-                        "priceVO": {"totalPrice": "¥35.00"},
+                        "priceVO": {"totalPrice": "¥35.00", "buyNum": "3"},
                     }],
                 }
             },
@@ -100,6 +111,20 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(order["buyer_id"], "buyer-merchant")
         self.assertEqual(order["order_status"], "completed")
         self.assertEqual(order["amount"], "35.00")
+        self.assertEqual(order["quantity"], "3")
+
+    def test_merchant_refund_flag_overrides_non_refund_status(self):
+        order = normalize_order_record({
+            "commonData": {
+                "orderId": "order-refund",
+                "orderStatus": "已发货",
+                "inRefund": "true",
+            },
+            "priceVO": {"buyNum": 2},
+        }, "account-1")
+
+        self.assertEqual(order["order_status"], "refunding")
+        self.assertEqual(order["quantity"], "2")
 
     def test_detail_fetcher_uses_shared_refund_mapping(self):
         fetcher = OrderFetcherOptimized("account-1", "unb=account-1")
@@ -408,6 +433,75 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["requires_login"])
         self.assertEqual(result["error_code"], "session_expired")
+
+    async def test_recent_order_client_merges_set_cookie_and_retries_once(self):
+        cookie_values = []
+
+        async def page_loader(**kwargs):
+            cookie_values.append(kwargs["cookie_string"])
+            if len(cookie_values) == 1:
+                return {
+                    "ret": ["FAIL_SYS_TOKEN_EXPIRED::令牌过期"],
+                    "_cookie_updates": {"_m_h5_tk": "fresh_token_suffix"},
+                }
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {"module": {"items": [], "nextPage": "false"}},
+            }
+
+        client = XianyuOrderListClient(page_loader=page_loader)
+        result = await client.discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=expired_token_suffix",
+            user_agent="Synthetic-UA",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(cookie_values), 2)
+        self.assertIn("_m_h5_tk=fresh_token_suffix", cookie_values[1])
+        self.assertIn("_m_h5_tk=fresh_token_suffix", result["updated_cookie_string"])
+
+    async def test_recent_order_client_rejects_cookie_identity_change(self):
+        async def page_loader(**_kwargs):
+            return {
+                "ret": ["FAIL_SYS_TOKEN_EXPIRED::令牌过期"],
+                "_cookie_updates": {"unb": "account-2"},
+            }
+
+        result = await XianyuOrderListClient(page_loader=page_loader).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=expired_token_suffix",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "account_identity_mismatch")
+
+    async def test_coordinator_persists_refreshed_cookie_without_returning_it(self):
+        updates = []
+
+        async def discoverer(**_kwargs):
+            return {
+                "success": True,
+                "orders": [],
+                "updated_cookie_string": "unb=account-1; cookie2=fresh",
+            }
+
+        async def cookie_updater(cookie_id, cookie_string):
+            updates.append((cookie_id, cookie_string))
+            return True
+
+        result = await OrderSyncCoordinator(
+            self.db,
+            discoverer=discoverer,
+            cookie_updater=cookie_updater,
+        ).sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=old",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(updates, [("account-1", "unb=account-1; cookie2=fresh")])
+        self.assertNotIn("updated_cookie_string", result)
 
     async def test_detail_recheck_advances_shipped_and_completed_orders(self):
         self.db.insert_or_update_order(

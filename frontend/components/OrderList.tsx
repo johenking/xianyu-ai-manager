@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, OrderSyncResponse } from '../types';
 import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems } from '../services/api';
 import { Search, MoreHorizontal, Truck, RefreshCw, Copy, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, Phone, MapPin, Upload, ExternalLink, Trash2 } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
+import RemoteImage from './ui/RemoteImage';
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   const styles = {
@@ -41,7 +42,6 @@ const OrderList: React.FC = () => {
   const [orders, setOrders] = useState<Order[]>([]);
   const [allOrders, setAllOrders] = useState<Order[]>([]); // 保存所有订单用于搜索
   const [items, setItems] = useState<Item[]>([]);
-  const [itemNames, setItemNames] = useState<Record<string, string>>({});
   const [filter, setFilter] = useState('all');
   const [searchText, setSearchText] = useState(''); // 搜索文本
   const [page, setPage] = useState(1);
@@ -74,6 +74,14 @@ const OrderList: React.FC = () => {
   const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [syncResult, setSyncResult] = useState<OrderSyncResponse | null>(null);
+  const itemNames = useMemo(
+    () => Object.fromEntries(
+      items
+        .filter((item) => Boolean(item.item_id))
+        .map((item) => [item.item_id, item.item_title || item.item_id])
+    ),
+    [items]
+  );
 
   // 搜索过滤订单
   const filterOrders = (ordersToFilter: Order[]): Order[] => {
@@ -164,28 +172,17 @@ const OrderList: React.FC = () => {
       return '未知商品';
   };
 
-  // 从商品列表构建商品ID到商品名的映射
-  const buildItemNamesMap = () => {
-      const namesMap: Record<string, string> = {};
-      items.forEach(item => {
-          // 使用 item_id 作为键，商品标题作为值
-          if (item.item_id) {
-              namesMap[item.item_id] = item.item_title || item.item_id;
-          }
-      });
-      setItemNames(namesMap);
-  };
-
   useEffect(() => {
     loadOrders();
-    // 加载商品列表
+  }, [filter, page, searchText]);
+
+  useEffect(() => {
     getItems().then((itemsList) => {
       setItems(itemsList);
-      buildItemNamesMap();
     }).catch((e) => {
       console.error('加载商品列表失败:', e);
     });
-  }, [filter, page, searchText]);
+  }, []);
 
   const handleSync = async () => {
       setLoading(true);
@@ -486,11 +483,12 @@ const OrderList: React.FC = () => {
                   <td className="px-6 py-5">
                     <div className="flex items-center gap-5">
                       <div className="w-14 h-14 rounded-xl bg-gray-100 overflow-hidden shadow-sm border border-gray-100 flex-shrink-0">
-                        {order.item_image ? (
-                            <img src={order.item_image} alt="" className="w-full h-full object-cover" />
-                        ) : (
-                            <div className="w-full h-full flex items-center justify-center text-gray-300"><PackageCheck /></div>
-                        )}
+                        <RemoteImage
+                          src={order.item_image}
+                          alt={order.item_title || '订单商品图片'}
+                          className="w-full h-full object-cover"
+                          fallback={<div className="w-full h-full flex items-center justify-center text-gray-300"><PackageCheck /></div>}
+                        />
                       </div>
                       <div className="min-w-0">
                         <div className="font-bold text-gray-900 line-clamp-1 text-sm">
@@ -678,9 +676,16 @@ const OrderList: React.FC = () => {
               <div className="space-y-4">
                 <h4 className="text-lg font-bold text-gray-800">商品信息</h4>
                 <div className="p-4 bg-gray-50 rounded-xl flex items-center gap-4">
-                  {selectedOrder.item_image && (
-                    <img src={selectedOrder.item_image} alt="" className="w-20 h-20 rounded-xl object-cover border border-gray-200" />
-                  )}
+                  <RemoteImage
+                    src={selectedOrder.item_image}
+                    alt={selectedOrder.item_title || '订单商品图片'}
+                    className="w-20 h-20 rounded-xl object-cover border border-gray-200"
+                    fallback={(
+                      <div className="w-20 h-20 rounded-xl border border-gray-200 bg-white flex items-center justify-center text-gray-300">
+                        <PackageCheck className="w-7 h-7" />
+                      </div>
+                    )}
+                  />
                   <div className="flex-1">
                     <div className="font-bold text-gray-900 mb-1">
                       {getItemNameById(selectedOrder.item_id, selectedOrder.item_title)}

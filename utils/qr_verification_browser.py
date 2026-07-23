@@ -9,9 +9,10 @@ API 扫码遇到风控时，只会返回一个验证页 URL；真正给用户扫
 
 import os
 import shutil
-import tempfile
 import time
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -38,15 +39,50 @@ def remove_public_screenshot(public_path: Optional[str]) -> None:
             os.remove(full_path)
             logger.info(f"已删除扫码二次验证截图: {filename}")
     except Exception as exc:
-        logger.warning(f"删除扫码二次验证截图失败: {filename}, 错误: {exc}")
+        logger.warning(
+            f"删除扫码二次验证截图失败: {filename}, 错误类型: {type(exc).__name__}"
+        )
 
 
 class QRVerificationBrowser:
     """在后台浏览器中承载扫码二次验证。"""
 
-    def __init__(self, headless: bool = True):
-        self.headless = headless
+    def __init__(self, profile_root: Path | str = "browser_data"):
+        self.profile_root = Path(profile_root)
         os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    @staticmethod
+    def _safe_key(value: str) -> str:
+        normalized = "".join(ch for ch in str(value or "") if ch.isalnum() or ch in "._-")
+        return normalized.strip("._") or uuid.uuid4().hex
+
+    def profile_path_for_session(self, session_id: str) -> Path:
+        return self.profile_root / f".qr_{self._safe_key(session_id)[:48]}"
+
+    def discard_profile(self, session_id: str) -> None:
+        shutil.rmtree(self.profile_path_for_session(session_id), ignore_errors=True)
+
+    def promote_profile(self, session_id: str, unb: str) -> Path:
+        source = self.profile_path_for_session(session_id)
+        target = self.profile_root / f"user_{self._safe_key(unb)}"
+        backup = target.with_name(f"{target.name}.backup-{uuid.uuid4().hex}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        moved_existing = False
+        try:
+            if target.exists():
+                os.replace(target, backup)
+                moved_existing = True
+            os.replace(source, target)
+        except Exception:
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            if moved_existing and backup.exists():
+                os.replace(backup, target)
+            raise
+        else:
+            if backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+        return target
 
     def run(
         self,
@@ -65,8 +101,10 @@ class QRVerificationBrowser:
             }
 
         safe_session_id = session_id.replace("-", "")[:12]
-        user_data_dir = tempfile.mkdtemp(prefix=f"xianyu_qr_verify_{safe_session_id}_")
+        user_data_dir = self.profile_path_for_session(session_id)
+        user_data_dir.mkdir(parents=True, exist_ok=True)
         screenshot_path: Optional[str] = None
+        preserve_profile = False
 
         try:
             from playwright.sync_api import sync_playwright
@@ -79,27 +117,15 @@ class QRVerificationBrowser:
 
             with sync_playwright() as playwright:
                 context = playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    headless=self.headless,
+                    str(user_data_dir),
+                    headless=False,
+                    channel=os.getenv("XIANYU_BROWSER_CHANNEL", "chrome"),
+                    chromium_sandbox=True,
                     args=self._browser_args(),
                     viewport={"width": 1280, "height": 860},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
                     locale="zh-CN",
-                    ignore_https_errors=True,
-                    extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
                 )
                 page = context.pages[0] if context.pages else context.new_page()
-                page.add_init_script(
-                    """
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    window.chrome = window.chrome || { runtime: {} };
-                    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
-                    """
-                )
 
                 self._add_initial_cookies(context, initial_cookies or {})
 
@@ -134,6 +160,7 @@ class QRVerificationBrowser:
 
                     cookies = self._cookies_to_dict(context.cookies())
                     if self._has_login_cookie(cookies):
+                        preserve_profile = True
                         logger.info(
                             f"扫码二次验证已获取登录 Cookie: session={session_id}, "
                             f"cookie_count={len(cookies)}, has_unb={bool(cookies.get('unb'))}"
@@ -152,11 +179,15 @@ class QRVerificationBrowser:
                             page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=45000)
                             time.sleep(3)
                         except Exception as exc:
-                            logger.debug(f"扫码二次验证成功后跳转闲鱼页面失败: session={session_id}, 错误: {exc}")
+                            logger.debug(
+                                f"扫码二次验证成功后跳转闲鱼页面失败: "
+                                f"session={session_id}, 错误类型: {type(exc).__name__}"
+                            )
 
                     if self._looks_logged_in(page):
                         cookies = self._cookies_to_dict(context.cookies())
                         if cookies:
+                            preserve_profile = True
                             logger.info(
                                 f"扫码二次验证检测到页面登录态: session={session_id}, "
                                 f"cookie_count={len(cookies)}, has_unb={bool(cookies.get('unb'))}"
@@ -189,36 +220,28 @@ class QRVerificationBrowser:
                 }
 
         except Exception as exc:
-            logger.error(f"扫码二次验证浏览器异常: session={session_id}, 错误: {exc}")
+            logger.error(
+                f"扫码二次验证浏览器异常: session={session_id}, "
+                f"错误类型: {type(exc).__name__}"
+            )
             return {
                 "status": "failed",
                 "screenshot_path": screenshot_path,
-                "message": str(exc),
+                "message": "安全验证浏览器处理失败，请重新生成二维码",
             }
         finally:
-            try:
-                shutil.rmtree(user_data_dir, ignore_errors=True)
-            except Exception as exc:
-                logger.debug(f"清理扫码二次验证浏览器目录失败: {exc}")
+            if not preserve_profile:
+                try:
+                    shutil.rmtree(user_data_dir, ignore_errors=True)
+                except Exception as exc:
+                    logger.debug(
+                        f"清理扫码二次验证浏览器目录失败: {type(exc).__name__}"
+                    )
 
     def _browser_args(self) -> list:
         return [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-web-security",
-            "--disable-features=VizDisplayCompositor,TranslateUI",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-extensions",
-            "--disable-plugins",
-            "--disable-sync",
-            "--disable-translate",
-            "--disable-popup-blocking",
-            "--disable-notifications",
             "--lang=zh-CN",
             "--window-size=1280,860",
-            "--force-color-profile=srgb",
         ]
 
     def _add_initial_cookies(self, context, cookies: Dict[str, str]) -> None:
@@ -245,7 +268,9 @@ class QRVerificationBrowser:
             context.add_cookies(cookies_to_add)
             logger.info(f"扫码二次验证浏览器已注入初始 Cookie 字段数: {len(cookies)}")
         except Exception as exc:
-            logger.debug(f"扫码二次验证浏览器注入初始 Cookie 失败: {exc}")
+            logger.debug(
+                f"扫码二次验证浏览器注入初始 Cookie 失败: {type(exc).__name__}"
+            )
 
     def _wait_for_verification_content(self, page, session_id: str, timeout: int = 30) -> bool:
         """等待阿里身份验证页把二维码或验证内容真正渲染出来。"""
@@ -440,7 +465,10 @@ class QRVerificationBrowser:
             logger.info(f"扫码二次验证截图已保存: {filename}")
             return f"/static/uploads/images/{filename}"
         except Exception as exc:
-            logger.warning(f"扫码二次验证截图失败: session={session_id}, 错误: {exc}")
+            logger.warning(
+                f"扫码二次验证截图失败: session={session_id}, "
+                f"错误类型: {type(exc).__name__}"
+            )
             return None
 
     def _find_ready_iframe_element(self, page):

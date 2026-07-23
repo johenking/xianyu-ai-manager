@@ -13,6 +13,7 @@ services:
     volumes:
       # 数据持久化
       - ./data:/app/data:rw
+      - ./browser_data:/app/browser_data:rw
       - ./logs:/app/logs:rw
       - ./global_config.yml:/app/global_config.yml:ro
       # 可选：如果需要自定义配置

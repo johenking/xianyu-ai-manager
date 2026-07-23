@@ -17,6 +17,7 @@ data/
 backups/
 logs/
 realtime.log
+realtime*.log
 browser_data/
 playwright-state/
 trajectory_history/
@@ -86,7 +87,6 @@ keywords_*.xlsx
 *.swo
 *~
 
-# Local agent metadata
+# Local agent working directories
 .claude/
 .spec-workflow/
-AGENTS.md

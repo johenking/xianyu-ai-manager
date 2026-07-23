@@ -1,0 +1,114 @@
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #171717;
+  background: #f7f7f5;
+}
+
+body {
+  width: 360px;
+  margin: 0;
+}
+
+main {
+  padding: 18px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.brand-icon {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 auto;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.brand p,
+.hint {
+  margin: 4px 0 0;
+  color: #707070;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: 1px solid #d8d8d3;
+  border-radius: 12px;
+  padding: 10px 12px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #fff;
+}
+
+textarea:focus {
+  outline: 2px solid #ffe815;
+  border-color: #171717;
+}
+
+.status {
+  margin: 14px 0;
+  padding: 11px 12px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #e5e5df;
+  color: #555;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.status.success {
+  background: #ecfdf3;
+  border-color: #b7ebc6;
+  color: #166534;
+}
+
+.status.error {
+  background: #fff1f1;
+  border-color: #f1b7b7;
+  color: #9f2424;
+}
+
+.actions {
+  display: grid;
+  gap: 8px;
+}
+
+button {
+  min-height: 42px;
+  border: 0;
+  border-radius: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.primary {
+  background: #ffe815;
+  color: #171717;
+}
+
+.secondary {
+  background: #e9e9e5;
+  color: #333;
+}

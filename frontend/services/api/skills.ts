@@ -20,6 +20,10 @@ export const createSkillMonitorTask = async (data: Partial<SkillMonitorTask>): P
   return post('/api/skills/monitor/tasks', data);
 };
 
+export const updateSkillMonitorTask = async (taskId: number, data: Partial<SkillMonitorTask>): Promise<{ success: boolean; message: string }> => {
+  return put(`/api/skills/monitor/tasks/${taskId}`, data);
+};
+
 export const runSkillMonitorTask = async (taskId: number): Promise<{
   success: boolean;
   message: string;
@@ -28,6 +32,8 @@ export const runSkillMonitorTask = async (taskId: number): Promise<{
   raw_count: number;
   source?: string;
   is_real_data?: boolean;
+  scheduled_run?: boolean;
+  next_run_at?: string | null;
 }> => {
   return post(`/api/skills/monitor/tasks/${taskId}/run`, {});
 };

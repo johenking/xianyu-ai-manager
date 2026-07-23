@@ -26,31 +26,35 @@ ps -axo pid,ppid,command | rg 'cloudflared|Start.py|uvicorn|xianyu'
 curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 ```
 
-The current live runtime path is `/Users/mac/Documents/Codex/2026-06-09/github-23star-xianyu-super-butler-https-3/work/xianyu-super-butler`; it tracks `https://github.com/johenking/xianyu-ai-manager.git` as `origin`. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
+Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
+
+The official-login stability change adds migration `2026071701` for `cookies.browser_user_agent`. The migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, official-login status endpoints, account listeners, Cookie schedules, and Skill scheduler. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
 
 ## Backup Before Risky Changes
 
-Back up the live SQLite database before migrations, account identity changes, or bulk data operations:
+Back up the live SQLite database before migrations, account identity changes, authentication deployments, or bulk data operations:
 
 ```bash
-mkdir -p backups
+mkdir -p data/backups
 STAMP=$(date +%Y%m%d-%H%M%S)
-sqlite3 data/xianyu_data.db ".backup 'backups/xianyu_data_${STAMP}.db'"
-shasum -a 256 data/xianyu_data.db "backups/xianyu_data_${STAMP}.db"
+sqlite3 data/xianyu_data.db ".backup 'data/backups/xianyu_data_${STAMP}.db'"
+sqlite3 "data/backups/xianyu_data_${STAMP}.db" "PRAGMA integrity_check;"
+shasum -a 256 "data/backups/xianyu_data_${STAMP}.db"
 ```
 
-Back up `data/.ai_provider_key` with the database when `AI_PROVIDER_ENCRYPTION_KEY` is not supplied by the environment. Never commit either file.
+Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with the database when their environment keys are not supplied. The system-secret key protects SMTP authorization codes and derives authentication HMAC digests; losing it prevents existing encrypted SMTP settings and one-time authentication records from being reused. Before replacing authentication code or profiles, stop the service and copy all of `browser_data/`; a live Chromium profile is not a reliable filesystem backup. Do not delete unmatched `user_*` profiles during cleanup because their identity may not yet be reconciled.
 
 ## Verification
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py reply_server.py XianyuAutoAsync.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 python -m unittest discover -s tests -v
 ruff check .
 
 cd frontend
+npm audit --audit-level=high
 npm run typecheck
 npm test
 npm run build
@@ -59,6 +63,8 @@ npm run verify:build
 ```
 
 The frontend build writes to `static/`. It keeps the current and previous successful asset generations and disables source maps unless `VITE_BUILD_SOURCEMAP=true`. A production build alone does not restart the backend.
+
+The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
 
 Basic smoke tests:
 
@@ -76,6 +82,9 @@ After login, verify settings and operations with a bearer token:
 curl -sS http://127.0.0.1:8091/api/settings/summary \
   -H "Authorization: Bearer $TOKEN"
 
+curl -sS 'http://127.0.0.1:8091/api/dashboard/summary?range=7days' \
+  -H "Authorization: Bearer $TOKEN"
+
 curl -sS http://127.0.0.1:8091/api/skills/ops/health \
   -H "Authorization: Bearer $TOKEN"
 ```
@@ -88,6 +97,7 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `JWT_SECRET_KEY` | Signs backend session tokens; use an independent random value. |
 | `AI_PROVIDER_ENCRYPTION_KEY` | Encrypts provider API keys. If absent, a local key file is generated under `data/`. |
 | `ACCOUNT_CREDENTIAL_ENCRYPTION_KEY` | Encrypts stored Xianyu login passwords with an independent key. |
+| `SYSTEM_SECRET_ENCRYPTION_KEY` | Encrypts SMTP authorization codes and derives purpose-isolated authentication digests. |
 | `PORT` | Cloud web port override. |
 | `API_PORT` | Alternative web port used by `entrypoint.sh` and `Start.py`. |
 | `API_HOST` | Bind host, usually `0.0.0.0` in containers. |
@@ -98,6 +108,25 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `VITE_BUILD_SOURCEMAP` | Set to `true` only when a production source map is explicitly required. |
 
 Do not commit secrets. Put deployment tokens, model keys, SMTP credentials, and Xianyu Cookies in platform secret stores or the Web UI.
+
+## Direct Registration Rollout
+
+Registration is disabled on new installations and is forced disabled by migration `2026071103`. Keep it closed while configuring the system:
+
+1. In “系统与 AI”, use the QQ preset or enter the SMTP server, port, sender address, authorization code, TLS/SSL mode, and an independent public support email. QQ uses `smtp.qq.com:465`, SSL on, STARTTLS off.
+2. Start SMTP verification. This saves the candidate configuration as unverified and sends a six-digit code to the support email.
+3. Read the code from that real mailbox and enter it in the settings page within 10 minutes. Connection or send success alone is not acceptance.
+4. Confirm the ordinary-user limit. The default is 20; the administrator is excluded and disabled ordinary users still count.
+5. Open registration only after the status card reports receipt-confirmed SMTP and remaining capacity.
+6. Complete one real registration, automatic login, service-restart session restore, username-or-email login, password reset, and old-session rejection before leaving registration open.
+
+Changing any SMTP field invalidates the verified fingerprint, consumes pending SMTP challenges, and closes registration. The final available slot also closes registration automatically; increasing the limit requires a manual reopen. SMTP errors never generate a usable authentication challenge, and there is no third-party mail fallback.
+
+After a registration or password-reset email is sent successfully, the public UI must not fetch another CAPTCHA immediately. Once the cooldown ends, the user must explicitly request a resend, solve the newly fetched CAPTCHA, and submit it before a second email can be sent.
+
+The default authentication limits are 30 image CAPTCHAs per IP per hour; one email send per email per 60 seconds, five per email per hour, and 20 per IP per hour; five attempts per 10-minute challenge; five failed logins per account or IP in 15 minutes followed by a 15-minute cooldown; and 10 registration failures per IP per hour. HTTP 429 responses include `retry_after`.
+
+`CF-Connecting-IP`, `X-Forwarded-For`, and `X-Real-IP` are ignored unless the direct peer belongs to the comma-separated IP/CIDR list in the `auth_trusted_proxies` system setting. Configure only proxies you operate; leaving the setting empty is safer than trusting arbitrary forwarded headers. Database rate events contain HMAC digests rather than raw addresses, emails, or account identifiers.
 
 ## Container And Hugging Face Deployment
 
@@ -115,7 +144,9 @@ sdk: docker
 app_port: 8080
 ```
 
-Persist and protect the database, logs, uploads, and provider encryption key. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
+Persist and protect the database, logs, uploads, all three local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
+
+API QR generation and ordinary scanning do not launch a browser. SMS login, explicit password login, QR secondary verification, and password renewal use the installed system Chrome in headed mode because Goofish rejects headless Chromium. Automatic renewal is available only to password accounts with valid stored credentials. The current container entrypoint does not provide system Chrome or a virtual display, so do not claim Docker or cloud login renewal works until the browser, display/Xvfb, and human-verification workflow have been tested on that deployment.
 
 ## AI And Knowledge Diagnostics
 
@@ -132,20 +163,45 @@ For provider issues, refresh the profile model list and test the exact selected 
 
 ## Xianyu Session Troubleshooting
 
-Symptoms include missing message Tokens, expired Cookies, or a `verification_required` refresh state.
+Symptoms include missing message Tokens, expired Cookies, passive `action_required`, active `verification_required`, or stable `manual_reauth_required`.
 
 Recommended order:
 
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
-2. Keep the account listener running, then trigger `/session-refresh` once.
-3. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
-4. Complete the account-page verification when required; platform verification cannot be bypassed.
-5. Re-login locally or update the existing Cookie if refresh cannot recover it.
-6. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
+2. Confirm `cookies.xianyu_unb` and `cookies.login_method` are present. Only `password` plus a valid username and encrypted password supports automatic renewal; that path tries `browser_data/user_<unb>` first.
+3. Keep the account listener running. In `action_required`, trigger `/session-refresh` exactly once; repeated Token or connection failures must not create a browser. In `manual_reauth_required`, use the returned `reauth_action` and do not keep calling refresh.
+4. Wait for `verification_required` with `browser_active=true`, then use the account-page “open on this Mac” action and complete login in that same official browser session; background polling continues without a completion button.
+5. Complete any platform verification when required; the headed browser session waits for up to 15 minutes.
+6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off, is disabled for non-password sources, and should use conservative intervals such as 24 hours or longer.
+7. Use API QR, a visible SMS official window, explicit password login, the local Chrome extension, or a matching manual Cookie when the saved profile cannot recover the session. Never update an existing record with a different Cookie `unb`; the API must return HTTP 409 `account_identity_mismatch`.
+
+For a password-account manual-refresh acceptance check, keep the account's scheduled refresh disabled, click start once, and observe the same window through the full human step. It must remain open until the real message Token succeeds, the Cookie and actual browser User-Agent are saved, and one listener replacement finishes. Then observe processes and status for at least 15 minutes: there must be no later browser, validation popup, scheduled refresh, or immediate item-detail Playwright session. Active duplicate requests return the current status instead of queuing work.
+8. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
-QR is the recommended login method. Password login is a compatibility path tied to the current Xianyu page structure; when it fails after a platform change, update the existing account through QR or Cookie instead of deleting it.
+Do not switch the renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Background renewal launches the installed system Chrome in headed mode, positions it off-screen, and moves the same session back on-screen only after an explicit user action. Do not override its User-Agent or add web-security/anti-detection flags. Invalid/missing credentials, identity mismatch, verification/login timeout, or official-page structure mismatch must persist `manual_reauth_required`; `profile_in_use`, temporary browser/probe failures, and cancellation remain retryable. Password login still depends on the current official page structure; when that flow breaks, use QR, SMS, extension, or matching Cookie recovery without deleting the account.
+
+API QR expiry is an explicit terminal result. After the first `expired` response, repeated polling must return `status='expired'` and “二维码已过期，请重新扫码” for at least five minutes before the session becomes `not_found`; associated verification screenshots must be removed on schedule. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes are intentionally removed.
+
+## Skill Monitor Troubleshooting
+
+The scheduler runs inside the one Uvicorn worker and polls every 30 seconds. Keep `WEB_CONCURRENCY=1`; multiple processes can race on the same SQLite task state.
+
+1. Read `/api/skills/monitor/tasks` and check `schedule_enabled`, `next_run_at`, `last_status`, and `last_error`.
+2. Confirm the interval is at least 15 minutes and the task is enabled.
+3. For AI filtering, verify the bound account has an enabled provider, key, base URL, and model that passed a generated-reply test.
+4. For notifications, enable at least one supported Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channel. QQ and email are not Skill Center senders.
+5. Interpret `partial` as at least one successful and at least one failed channel; inspect `raw_data.notify_error` for per-channel errors.
+6. A repeated item is intentionally skipped when the same task already stored its URL or platform item ID.
+7. After a service restart, a task left in `running` becomes `failed` with an interruption error and can run again on its next schedule.
+
+Smoke-test a task manually before enabling its schedule:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks/$TASK_ID/run" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ## Order Sync Troubleshooting
 
@@ -158,6 +214,21 @@ tmux capture-pane -t xianyu-butler -p -S -500
 rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
 ```
 
-Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, passwords, provider keys, or verification URLs.
+Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, provider keys, verification URLs, the default administrator password, email OTPs, password-reset grant IDs or tokens, full email addresses, or any password. Use masked email values, digests, request IDs, and exception classes for correlation instead.
 
 Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard logs out unexpectedly, check browser `localStorage.auth_token`, call `/verify`, confirm the same `DB_PATH` is in use, and verify that the session row still exists.
+
+### Password Reset Acceptance
+
+1. Keep the same ordinary user logged in in window A and sign in again in private window B.
+2. Confirm two unexpired sessions exist for that user without printing their Token values.
+3. Open `/forgot-password`, solve CAPTCHA, and request the email code. Confirm the successful send does not fetch another CAPTCHA; after cooldown, confirm an explicit resend requires a newly fetched CAPTCHA.
+4. Enter the six-digit code and confirm the UI completes `POST /api/auth/password-reset/verify-code` before displaying the new-password fields. Do not print or persist the returned grant; the public UI must keep it only in component memory.
+5. Submit the new password and confirm `POST /api/auth/password-reset` consumes the grant. A second use of the same grant must fail.
+6. Refresh A and B. Both old sessions must return to login, and the database must show zero sessions for that user before the first new login.
+7. Confirm the old password fails. Confirm the new password works once with the username and once with the email.
+8. Confirm other users and the administrator were not logged out. Never place passwords, verification codes, reset grants, or full email addresses in logs, screenshots, shell history, or chat.
+
+For an ordinary-user dashboard that does not finish loading, verify `/verify` returns `is_admin: false` and call `/api/dashboard/summary` with that user's Token. The page must not request `/admin/stats`; a 403 or 500 from the summary should end in a visible retry state. Migration `2026071104` adds `idx_orders_cookie_created_at` and `idx_orders_status_created_at`; verify them with `PRAGMA index_list(orders)` when summary latency regresses.
+
+When account-level `cookie_refresh_enabled` is false, Token, Session, and connection failures must not launch Chrome. The refresh status should be passive `action_required` with `browser_active=false`; only the account page's explicit start action may launch the official browser.

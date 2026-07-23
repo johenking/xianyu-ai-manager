@@ -99,8 +99,33 @@
   "/api/accounts/{cookie_id}/session-refresh/cancel": [
     "POST"
   ],
+  "/api/accounts/{cookie_id}/session-refresh/show-browser": [
+    "POST"
+  ],
   "/api/accounts/{cookie_id}/session-status": [
     "GET"
+  ],
+  "/api/admin/registration/enabled": [
+    "PUT"
+  ],
+  "/api/admin/registration/invites": [
+    "GET",
+    "POST"
+  ],
+  "/api/admin/registration/invites/{invite_id}": [
+    "DELETE"
+  ],
+  "/api/admin/registration/limit": [
+    "PUT"
+  ],
+  "/api/admin/registration/status": [
+    "GET"
+  ],
+  "/api/admin/registration/users": [
+    "GET"
+  ],
+  "/api/admin/registration/users/{user_id}": [
+    "PUT"
   ],
   "/api/ai/providers": [
     "GET",
@@ -115,6 +140,30 @@
   ],
   "/api/ai/providers/{profile_id}/test": [
     "POST"
+  ],
+  "/api/auth/captcha": [
+    "POST"
+  ],
+  "/api/auth/email-code": [
+    "POST"
+  ],
+  "/api/auth/password-reset": [
+    "POST"
+  ],
+  "/api/auth/password-reset/verify-code": [
+    "POST"
+  ],
+  "/api/auth/registration-config": [
+    "GET"
+  ],
+  "/api/browser-extension/import": [
+    "POST"
+  ],
+  "/api/browser-extension/pairings": [
+    "POST"
+  ],
+  "/api/browser-extension/pairings/{pairing_id}": [
+    "GET"
   ],
   "/api/captcha/check_completion": [
     "POST"
@@ -144,6 +193,9 @@
   "/api/check-default-password": [
     "GET"
   ],
+  "/api/dashboard/summary": [
+    "GET"
+  ],
   "/api/default-reply/{cid}": [
     "DELETE",
     "GET",
@@ -154,6 +206,18 @@
   ],
   "/api/diagnostics/auto-reply/{cookie_id}": [
     "GET"
+  ],
+  "/api/official-login/sessions": [
+    "POST"
+  ],
+  "/api/official-login/sessions/{session_id}": [
+    "GET"
+  ],
+  "/api/official-login/sessions/{session_id}/cancel": [
+    "POST"
+  ],
+  "/api/official-login/sessions/{session_id}/show-browser": [
+    "POST"
   ],
   "/api/orders": [
     "GET"
@@ -184,6 +248,15 @@
   "/api/settings/summary": [
     "GET"
   ],
+  "/api/settings/user-basic": [
+    "PUT"
+  ],
+  "/api/settings/user-summary": [
+    "GET"
+  ],
+  "/api/settings/verify/smtp/confirm": [
+    "POST"
+  ],
   "/api/settings/verify/{section}": [
     "POST"
   ],
@@ -205,6 +278,9 @@
   "/api/skills/monitor/tasks": [
     "GET",
     "POST"
+  ],
+  "/api/skills/monitor/tasks/{task_id}": [
+    "PUT"
   ],
   "/api/skills/monitor/tasks/{task_id}/run": [
     "POST"
@@ -443,6 +519,15 @@
     "GET",
     "PUT"
   ],
+  "/official-window-login": [
+    "POST"
+  ],
+  "/official-window-login/cancel/{session_id}": [
+    "POST"
+  ],
+  "/official-window-login/check/{session_id}": [
+    "GET"
+  ],
   "/password-login": [
     "POST"
   ],
@@ -455,16 +540,7 @@
   "/qr-login/continue/{session_id}": [
     "POST"
   ],
-  "/qr-login/cooldown-status/{cookie_id}": [
-    "GET"
-  ],
   "/qr-login/generate": [
-    "POST"
-  ],
-  "/qr-login/refresh-cookies": [
-    "POST"
-  ],
-  "/qr-login/reset-cooldown/{cookie_id}": [
     "POST"
   ],
   "/register": [

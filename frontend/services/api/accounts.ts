@@ -27,6 +27,15 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     show_browser: item.show_browser,
     cookie_refresh_enabled: item.cookie_refresh_enabled,
     cookie_refresh_interval_minutes: item.cookie_refresh_interval_minutes,
+    login_method: item.login_method,
+    login_method_label: item.login_method_label,
+    auto_refresh_supported: Boolean(item.auto_refresh_supported),
+    reauth_required: Boolean(item.reauth_required),
+    reauth_action: item.reauth_action,
+    last_login_at: item.last_login_at ?? null,
+    last_validated_at: item.last_validated_at ?? null,
+    last_expired_at: item.last_expired_at ?? null,
+    reauth_updated_at: item.reauth_updated_at ?? null,
     nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
     avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
     ai_enabled: false, // 需要从AI设置API获取
@@ -50,6 +59,7 @@ export interface QRLoginStatusResponse {
   status: QRLoginStatus;
   session_id?: string;
   message?: string;
+  error_code?: string;
   verification_url?: string;
   verification_qr_code_url?: string;
   verification_screenshot_path?: string | null;
@@ -61,18 +71,96 @@ export interface QRLoginStatusResponse {
 }
 
 export interface PasswordLoginStatusResponse {
-  status: 'processing' | 'success' | 'failed' | 'verification_required' | 'not_found' | 'forbidden' | 'error';
+  status:
+    | 'processing'
+    | 'success'
+    | 'failed'
+    | 'verification_required'
+    | 'timeout'
+    | 'cancelled'
+    | 'interrupted'
+    | 'not_found'
+    | 'forbidden'
+    | 'error';
   message?: string;
   error?: string;
+  error_code?: string;
   account_id?: string;
   is_new_account?: boolean;
   cookie_count?: number;
-  verification_url?: string | null;
   screenshot_path?: string | null;
   qr_code_url?: string | null;
 }
 
-export const addAccountCookie = async (data: { id: string; value: string }): Promise<ApiResponse> => {
+export type BrowserExtensionPairingStatus =
+  | 'waiting'
+  | 'received'
+  | 'validating'
+  | 'success'
+  | 'failed'
+  | 'expired';
+
+export interface BrowserExtensionPairing {
+  pairing_id: string;
+  pairing_code?: string;
+  status: BrowserExtensionPairingStatus;
+  message: string;
+  error_code?: string;
+  account_id?: string;
+  expires_at: number;
+  local_import_url?: string;
+}
+
+export type OfficialLoginState =
+  | 'preparing'
+  | 'waiting_user'
+  | 'verification_required'
+  | 'persisting'
+  | 'restarting_listener'
+  | 'success'
+  | 'expired'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+export interface OfficialLoginSessionResponse {
+  success?: boolean;
+  session_id: string;
+  mode?: 'qr' | 'password' | 'sms';
+  state: OfficialLoginState;
+  message: string;
+  error_code: string;
+  qr_image_url?: string;
+  verification_image_url?: string;
+  account_id?: string;
+  is_new_account?: boolean;
+  created_at?: number;
+  updated_at?: number;
+  expires_at?: number;
+}
+
+export const createOfficialLoginSession = async (data: {
+  mode: 'qr' | 'password' | 'sms';
+  account?: string;
+  password?: string;
+  show_browser?: boolean;
+}): Promise<OfficialLoginSessionResponse> => {
+  return post('/api/official-login/sessions', data);
+};
+
+export const getOfficialLoginSession = async (sessionId: string): Promise<OfficialLoginSessionResponse> => {
+  return get(`/api/official-login/sessions/${sessionId}`);
+};
+
+export const showOfficialLoginBrowser = async (sessionId: string): Promise<ApiResponse> => {
+  return post(`/api/official-login/sessions/${sessionId}/show-browser`, {});
+};
+
+export const cancelOfficialLoginSession = async (sessionId: string): Promise<ApiResponse> => {
+  return post(`/api/official-login/sessions/${sessionId}/cancel`, {});
+};
+
+export const addAccountCookie = async (data: { id?: string; value: string }): Promise<ApiResponse & { account_id?: string }> => {
   return post('/cookies', data);
 };
 
@@ -88,8 +176,17 @@ export const continueQRLoginAfterVerification = async (sessionId: string): Promi
   return post(`/qr-login/continue/${sessionId}`, {});
 };
 
+export const createBrowserExtensionPairing = async (): Promise<BrowserExtensionPairing> => {
+  const response = await post<{ success: boolean; data: BrowserExtensionPairing }>('/api/browser-extension/pairings', {});
+  return response.data;
+};
+
+export const getBrowserExtensionPairing = async (pairingId: string): Promise<BrowserExtensionPairing> => {
+  const response = await get<{ success: boolean; data: BrowserExtensionPairing }>(`/api/browser-extension/pairings/${pairingId}`);
+  return response.data;
+};
+
 export const passwordLogin = async (data: {
-  account_id: string;
   account: string;
   password: string;
   show_browser?: boolean;
@@ -160,4 +257,8 @@ export const refreshAccountSession = async (cookieId: string): Promise<{ success
 
 export const cancelAccountSessionRefresh = async (cookieId: string): Promise<ApiResponse> => {
   return post(`/api/accounts/${cookieId}/session-refresh/cancel`, {});
+};
+
+export const showAccountSessionRefreshBrowser = async (cookieId: string): Promise<ApiResponse> => {
+  return post(`/api/accounts/${cookieId}/session-refresh/show-browser`, {});
 };

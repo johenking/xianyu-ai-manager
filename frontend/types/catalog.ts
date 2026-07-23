@@ -37,7 +37,11 @@ export interface Item {
   item_title?: string;
   item_description?: string;
   item_price?: string;
-  item_image?: string; // Inferred from common usage, though not explicitly in list model sometimes
+  item_image?: string;
+  platform_item_status?: number | null;
+  catalog_active?: boolean;
+  catalog_last_seen_at?: string | null;
+  catalog_metadata?: string;
   item_category?: string;
   item_detail?: string;
   is_multi_spec?: number | boolean;
@@ -80,11 +84,26 @@ export interface OrderAnalytics {
     total_amount: number;
     total_orders: number;
   };
-  daily_stats: Array<{ date: string; amount: number }>;
+  daily_stats: Array<{ date: string; amount: number; order_count?: number }>;
   item_stats?: Array<{
     item_id: string;
     order_count: number;
     total_amount: number;
     avg_amount: number;
   }>;
+}
+
+export interface DashboardSummary {
+  success: boolean;
+  scope: 'user' | 'system';
+  range: {
+    start_date: string;
+    end_date: string;
+    previous_start_date: string;
+    previous_end_date: string;
+  };
+  stats: AdminStats;
+  current: OrderAnalytics;
+  previous: OrderAnalytics;
+  item_names: Record<string, string>;
 }

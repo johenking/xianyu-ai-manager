@@ -12,6 +12,7 @@ import {
 import { BookOpen, Box, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 import AITrainingLab from './AITrainingLab';
+import RemoteImage from './ui/RemoteImage';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
@@ -238,13 +239,16 @@ const ItemList: React.FC = () => {
                       </button>
                   </div>
                   <div className="aspect-[16/10] sm:aspect-square bg-gray-100 rounded-2xl mb-4 overflow-hidden relative">
-                      {item.item_image ? (
-                          <img src={item.item_image} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
-                      ) : (
+                      <RemoteImage
+                        src={item.item_image}
+                        alt={item.item_title || '商品图片'}
+                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                        fallback={(
                           <div className="w-full h-full flex items-center justify-center text-gray-300">
                               <Box className="w-10 h-10" />
                           </div>
-                      )}
+                        )}
+                      />
                       <div className="absolute top-2 left-2 bg-black/50 backdrop-blur-md text-white text-xs font-bold px-2 py-1 rounded-lg">
                           ¥{item.item_price}
                       </div>
