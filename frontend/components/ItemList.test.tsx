@@ -92,7 +92,7 @@ describe('ItemList account filtering', () => {
     expect(image).toHaveAttribute('src', 'https://img.alicdn.com/account-one.jpg');
     expect(image).toHaveAttribute('referrerpolicy', 'no-referrer');
     fireEvent.error(image);
-    expect(screen.queryByRole('img', { name: '账号一商品' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('img', { name: '账号一商品' })).not.toBeInTheDocument());
     expect(screen.queryByText('账号二商品')).not.toBeInTheDocument();
     expect(getItemsByCookie).toHaveBeenCalledWith('account-1');
     expect(getItems).not.toHaveBeenCalled();
