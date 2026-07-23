@@ -18,7 +18,7 @@ OLD_MIGRATIONS = (
 )
 
 
-EXPECTED_LATEST_MIGRATION = "2026071104"
+EXPECTED_LATEST_MIGRATION = MIGRATIONS[-1].version
 
 
 def create_v150_database(
@@ -277,7 +277,7 @@ class RegistrationMigrationTests(unittest.TestCase):
 
         self.assertEqual(
             runner.run(),
-            ["2026071101", "2026071102", "2026071103", "2026071104"],
+            [migration.version for migration in MIGRATIONS[2:]],
         )
         self.assertEqual(
             table_columns(connection, "users")
@@ -466,7 +466,14 @@ class RegistrationMigrationTests(unittest.TestCase):
             str(self.db_path),
             backup_enabled=False,
         )
-        self.assertEqual(runner.run(), ["2026071102", "2026071103", "2026071104"])
+        self.assertEqual(
+            runner.run(),
+            [
+                migration.version
+                for migration in MIGRATIONS
+                if migration.version > "2026071101"
+            ],
+        )
         self.assertEqual(
             connection.execute(
                 "SELECT username_normalized, email_normalized FROM users"
@@ -519,7 +526,14 @@ class RegistrationMigrationTests(unittest.TestCase):
             str(self.db_path),
             backup_enabled=False,
         )
-        self.assertEqual(migrated.run(), ["2026071103", "2026071104"])
+        self.assertEqual(
+            migrated.run(),
+            [
+                migration.version
+                for migration in MIGRATIONS
+                if migration.version > "2026071102"
+            ],
+        )
         settings = dict(connection.execute("SELECT key, value FROM system_settings"))
         self.assertEqual(settings["registration_enabled"], "false")
         self.assertEqual(settings["registration_user_limit"], "20")

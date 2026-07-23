@@ -4,9 +4,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from loguru import logger
+
 from utils.xianyu_official_login import (
+    GOOFISH_LOGIN_URL,
     OfficialLoginWorker,
     XianyuOfficialLoginService,
+)
+from utils.xianyu_session_probe import (
+    PROBE_SUCCESS,
+    PROBE_VERIFICATION_REQUIRED,
+    SessionProbeResult,
+    parse_cookie_string,
 )
 
 
@@ -19,10 +28,11 @@ def authenticated_cookies(unb: str = "123456"):
 
 
 class FakeElement:
-    def __init__(self, *, text="", checked=None, on_click=None):
+    def __init__(self, *, text="", checked=None, on_click=None, on_screenshot=None):
         self.text = text
         self.checked = checked
         self.on_click = on_click
+        self.on_screenshot = on_screenshot
         self.clicked = 0
         self.filled = []
         self.visible = True
@@ -48,6 +58,12 @@ class FakeElement:
     def inner_text(self):
         return self.text
 
+    def screenshot(self, path, **kwargs):
+        del kwargs
+        Path(path).write_bytes(b"element")
+        if self.on_screenshot:
+            self.on_screenshot()
+
 
 class FakeLocator:
     def __init__(self, element=None):
@@ -68,6 +84,7 @@ class FakePage:
         self.frames = []
         self.url = "https://www.goofish.com/im"
         self.goto_calls = []
+        self.user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36"
 
     def query_selector(self, selector):
         return self.selectors.get(selector)
@@ -86,13 +103,22 @@ class FakePage:
         del kwargs
         Path(path).write_bytes(b"verification")
 
+    def add_init_script(self, script):
+        del script
+
+    def evaluate(self, expression):
+        if expression == "navigator.userAgent":
+            return self.user_agent
+        return False
+
 
 class FakeContext:
-    def __init__(self, page, cookies=None):
+    def __init__(self, page, cookies=None, cdp_session=None):
         self.pages = [page]
         self.cookies_data = list(cookies or [])
         self.added_cookies = []
         self.closed = False
+        self.cdp_session = cdp_session
 
     def cookies(self, urls=None):
         del urls
@@ -108,6 +134,27 @@ class FakeContext:
 
     def close(self):
         self.closed = True
+
+    def new_cdp_session(self, page):
+        del page
+        if self.cdp_session is None:
+            raise RuntimeError("CDP unavailable")
+        return self.cdp_session
+
+
+class FakeCDPSession:
+    def __init__(self):
+        self.calls = []
+        self.detached = False
+
+    def send(self, method, params=None):
+        self.calls.append((method, params))
+        if method == "Browser.getWindowForTarget":
+            return {"windowId": 17}
+        return {}
+
+    def detach(self):
+        self.detached = True
 
 
 class FakeChromium:
@@ -211,6 +258,13 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def make_service(self, factory, **kwargs):
+        def successful_probe(cookie_string, _browser_user_agent):
+            return SessionProbeResult(
+                status=PROBE_SUCCESS,
+                cookies=parse_cookie_string(cookie_string),
+                access_token="synthetic-access-token",
+            )
+
         return XianyuOfficialLoginService(
             profile_root=self.profile_root,
             verification_root=self.verification_root,
@@ -218,6 +272,8 @@ class XianyuOfficialLoginTests(unittest.TestCase):
             poll_interval=kwargs.pop("poll_interval", 0.001),
             login_timeout=kwargs.pop("login_timeout", 0.05),
             verification_timeout=kwargs.pop("verification_timeout", 0.02),
+            probe_interval=kwargs.pop("probe_interval", 0.001),
+            session_validator=kwargs.pop("session_validator", successful_probe),
             **kwargs,
         )
 
@@ -245,6 +301,13 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertTrue((self.profile_root / "user_9988").is_dir())
         self.assertEqual(list(self.profile_root.glob(".login_*")), [])
 
+        launch_options = factory.launches[0][1]
+        self.assertEqual(launch_options["channel"], "chrome")
+        self.assertNotIn("user_agent", launch_options)
+        self.assertNotIn("--disable-blink-features=AutomationControlled", launch_options["args"])
+        self.assertNotIn("--disable-web-security", launch_options["args"])
+        self.assertEqual(context.pages[0].goto_calls[0][0], GOOFISH_LOGIN_URL)
+
     def test_refresh_reuses_canonical_profile_without_password(self):
         page = FakePage()
         context = FakeContext(page, authenticated_cookies("9988"))
@@ -260,18 +323,93 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertFalse(result.used_password)
         self.assertEqual(factory.launches[0][0], self.profile_root / "user_9988")
 
-    def test_authenticated_cookies_do_not_override_a_visible_login_form(self):
-        context, _ = make_password_context(unb="9988")
-        context.cookies_data = authenticated_cookies("9988")
+    def test_validated_handoff_finishes_before_the_browser_is_closed(self):
+        page = FakePage()
+        context = FakeContext(page, authenticated_cookies("9988"))
         service = self.make_service(SequencePlaywrightFactory([context]))
+        observed = []
 
         result = service.refresh_session(
             profile_unb="9988",
             current_cookie="unb=9988; cookie2=old",
+            on_validated=lambda validated: observed.append(
+                (validated.access_token, validated.browser_user_agent, context.closed)
+            ),
         )
 
-        self.assertEqual(result.status, "failed")
-        self.assertEqual(result.error_code, "no_credentials")
+        self.assertTrue(result.succeeded)
+        self.assertEqual(
+            observed,
+            [(
+                "synthetic-access-token",
+                page.user_agent,
+                False,
+            )],
+        )
+        self.assertTrue(context.closed)
+
+    def test_token_verification_keeps_one_context_and_opens_each_verification_url_once(self):
+        page = FakePage()
+        context = FakeContext(page, authenticated_cookies("9988"))
+        calls = 0
+        verification_url = "https://passport.goofish.com/iv/check"
+
+        def probe(cookie_string, _browser_user_agent):
+            nonlocal calls
+            calls += 1
+            cookies = parse_cookie_string(cookie_string)
+            if calls < 3:
+                return SessionProbeResult(
+                    status=PROBE_VERIFICATION_REQUIRED,
+                    cookies=cookies,
+                    verification_url=verification_url,
+                    error_code="human_verification_required",
+                )
+            return SessionProbeResult(
+                status=PROBE_SUCCESS,
+                cookies=cookies,
+                access_token="validated-token",
+            )
+
+        service = self.make_service(
+            SequencePlaywrightFactory([context]),
+            session_validator=probe,
+            verification_timeout=0.05,
+        )
+        statuses = []
+
+        result = service.refresh_session(
+            profile_unb="9988",
+            current_cookie="unb=9988; cookie2=old",
+            on_status=statuses.append,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.access_token, "validated-token")
+        self.assertEqual(
+            [url for url, _options in page.goto_calls],
+            ["https://www.goofish.com/im", verification_url],
+        )
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0].status, "verification_required")
+        self.assertTrue(context.closed)
+
+    def test_authenticated_cookies_do_not_override_a_visible_login_form(self):
+        context, _ = make_password_context(unb="9988")
+        context.cookies_data = authenticated_cookies("9988")
+        service = self.make_service(SequencePlaywrightFactory([context]))
+        statuses = []
+
+        result = service.refresh_session(
+            profile_unb="9988",
+            current_cookie="unb=9988; cookie2=old",
+            on_status=statuses.append,
+        )
+
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(result.error_code, "login_timeout")
+        self.assertEqual(statuses[0].status, "verification_required")
+        self.assertEqual(statuses[0].error_code, "reauth_required")
 
     def test_refresh_rejects_a_profile_logged_into_another_unb(self):
         page = FakePage()
@@ -287,21 +425,27 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertEqual(result.error_code, "account_mismatch")
         self.assertEqual(result.unb, "other-unb")
 
-    def test_refresh_falls_back_to_saved_credentials_in_same_profile(self):
+    def test_refresh_waits_for_manual_login_without_using_saved_credentials(self):
         context, elements = make_password_context(unb="9988")
         factory = SequencePlaywrightFactory([context])
         service = self.make_service(factory)
+        statuses = []
 
         result = service.refresh_session(
             profile_unb="9988",
             current_cookie="unb=9988; cookie2=expired",
             account="seller@example.com",
             password="secret",
+            allow_password=False,
+            on_status=statuses.append,
         )
 
-        self.assertTrue(result.succeeded)
-        self.assertTrue(result.used_password)
-        self.assertEqual(elements["password_tab"].clicked, 1)
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(result.error_code, "login_timeout")
+        self.assertEqual(statuses[0].status, "verification_required")
+        self.assertEqual(statuses[0].error_code, "reauth_required")
+        self.assertFalse(result.used_password)
+        self.assertEqual(elements["password_tab"].clicked, 0)
         self.assertEqual(factory.launches[0][0], self.profile_root / "user_9988")
 
     def test_wrong_password_returns_official_error(self):
@@ -318,30 +462,62 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertEqual(result.error_code, "invalid_credentials")
         self.assertEqual(result.message, "账号或密码错误")
 
-    def test_verification_reopens_visible_browser_and_times_out(self):
+    def test_verification_reopens_visible_browser_only_after_user_request(self):
         first_context, _ = make_password_context(security=True)
-        second_page = FakePage()
-        second_page.selectors[".nc-container"] = FakeElement()
-        second_context = FakeContext(second_page)
-        factory = SequencePlaywrightFactory([first_context, second_context])
+        cdp_session = FakeCDPSession()
+        first_context.cdp_session = cdp_session
+        factory = SequencePlaywrightFactory([first_context])
         statuses = []
         service = self.make_service(factory)
+        worker = OfficialLoginWorker()
+        worker.request_visible()
 
         result = service.login_with_password(
             account="seller@example.com",
             password="secret",
             show_browser=False,
+            worker=worker,
             on_status=statuses.append,
         )
 
         self.assertEqual(result.status, "timeout")
         self.assertEqual(result.error_code, "verification_timeout")
         self.assertTrue(Path(result.verification_image_path).is_file())
-        self.assertEqual([launch[1]["headless"] for launch in factory.launches], [False, False])
+        self.assertNotIn("seller", Path(result.verification_image_path).name)
+        self.assertEqual([launch[1]["headless"] for launch in factory.launches], [False])
         self.assertIn("--window-position=-32000,-32000", factory.launches[0][1]["args"])
-        self.assertNotIn("--window-position=-32000,-32000", factory.launches[1][1]["args"])
+        self.assertEqual(
+            [method for method, _ in cdp_session.calls],
+            ["Browser.getWindowForTarget", "Browser.setWindowBounds"],
+        )
+        self.assertTrue(cdp_session.detached)
         self.assertEqual(len(statuses), 1)
         self.assertEqual(statuses[0].status, "verification_required")
+
+    def test_qr_session_upgrades_to_verification_when_official_page_changes(self):
+        page = FakePage()
+        context = FakeContext(page)
+
+        def switch_to_security():
+            page.selectors.pop(".qrcode-img", None)
+            page.selectors[".nc-container"] = FakeElement()
+
+        page.selectors[".qrcode-img"] = FakeElement(on_screenshot=switch_to_security)
+        statuses = []
+        service = self.make_service(SequencePlaywrightFactory([context]))
+
+        result = service.login_with_qr(
+            show_browser=False,
+            on_status=statuses.append,
+        )
+
+        self.assertEqual(result.status, "timeout")
+        self.assertEqual(result.error_code, "verification_timeout")
+        self.assertEqual(
+            [status.status for status in statuses],
+            ["waiting_user", "verification_required"],
+        )
+        self.assertTrue(Path(result.verification_image_path).is_file())
 
     def test_pre_cancelled_worker_stops_before_browser_launch(self):
         factory = SequencePlaywrightFactory([])
@@ -380,6 +556,33 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertEqual((target / "old.txt").read_text(encoding="utf-8"), "old")
         self.assertTrue((temporary / "new.txt").is_file())
         self.assertEqual(list(self.profile_root.glob("user_9988.backup-*")), [])
+
+    def test_browser_failures_do_not_log_or_return_sensitive_material(self):
+        class SensitiveFailureFactory:
+            def __call__(self):
+                raise RuntimeError(
+                    "cookies={'unb': 'COOKIE_IDENTITY', 'cookie2': 'COOKIE_SECRET'} "
+                    "token='TOKEN_SECRET' password='PASSWORD_SECRET' "
+                    "https://passport.goofish.com/verify?id=VERIFY_SECRET"
+                )
+
+        messages = []
+        sink_id = logger.add(lambda message: messages.append(str(message)), format="{message}")
+        try:
+            result = self.make_service(SensitiveFailureFactory()).login_with_qr()
+        finally:
+            logger.remove(sink_id)
+
+        combined = f"{result} {' '.join(messages)}"
+        for secret in (
+            "COOKIE_IDENTITY",
+            "COOKIE_SECRET",
+            "TOKEN_SECRET",
+            "PASSWORD_SECRET",
+            "VERIFY_SECRET",
+            "passport.goofish.com",
+        ):
+            self.assertNotIn(secret, combined)
 
 
 if __name__ == "__main__":

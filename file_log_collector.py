@@ -12,6 +12,11 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
 
+
+def _secure_log_opener(path, flags):
+    return os.open(path, flags, 0o600)
+
+
 class FileLogCollector:
     """基于文件监控的日志收集器"""
 
@@ -67,8 +72,10 @@ class FileLogCollector:
                 rotation="10 MB",
                 retention="3 days",  # 从7天改为3天，减少磁盘占用
                 enqueue=False,  # 改为False，避免队列延迟
-                buffering=1     # 行缓冲，立即写入
+                buffering=1,    # 行缓冲，立即写入
+                opener=_secure_log_opener,
             )
+            os.chmod(self.log_file, 0o600)
 
             logger.info("文件日志收集器已启动")
 

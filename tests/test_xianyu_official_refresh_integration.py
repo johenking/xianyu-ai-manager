@@ -7,31 +7,69 @@ from account_session_refresh import active_refresh_registry
 from cookie_manager import CookieManager
 from XianyuAutoAsync import XianyuLive
 from utils.xianyu_official_login import OfficialLoginResult
+from utils.xianyu_session_probe import (
+    PROBE_EXPIRED,
+    PROBE_RETRYABLE_ERROR,
+    PROBE_SUCCESS,
+    PROBE_VERIFICATION_REQUIRED,
+    SessionProbeResult,
+)
 
 
 class FakeRefreshDatabase:
-    def __init__(self):
+    def __init__(self, *, login_method="password", username="seller@example.com", password="secret"):
         self.updates = []
-
-    def get_account_session_refresh(self, cookie_id):
-        del cookie_id
-        return {
+        self.status = {
             "state": "idle",
             "verification_image_url": "",
         }
+        self.expired_calls = 0
+        self.validated_calls = 0
+        self.cas_calls = 0
+        self.details = {
+            "value": "unb=9988; cookie2=old",
+            "xianyu_unb": "9988",
+            "username": username,
+            "password": password,
+            "show_browser": False,
+            "user_id": 7,
+            "cookie_revision": 3,
+            "login_method": login_method,
+            "browser_user_agent": "",
+        }
+
+    def get_account_session_refresh(self, cookie_id):
+        del cookie_id
+        return dict(self.status)
 
     def update_account_session_refresh(self, cookie_id, **kwargs):
         self.updates.append((cookie_id, kwargs))
+        self.status.update(kwargs)
         return True
 
     def get_cookie_details(self, cookie_id):
         del cookie_id
+        return dict(self.details)
+
+    def mark_cookie_expired(self, cookie_id):
+        del cookie_id
+        self.expired_calls += 1
+        return True
+
+    def mark_cookie_validated(self, cookie_id):
+        del cookie_id
+        self.validated_calls += 1
+        return True
+
+    def compare_and_swap_cookie_session(self, cookie_id, **kwargs):
+        del cookie_id
+        self.cas_calls += 1
+        self.details["value"] = kwargs["cookie_value"]
+        self.details["browser_user_agent"] = kwargs.get("browser_user_agent", "")
+        self.details["cookie_revision"] += 1
         return {
-            "value": "unb=9988; cookie2=old",
-            "xianyu_unb": "9988",
-            "username": "",
-            "password": "",
-            "show_browser": False,
+            "state": "updated",
+            "cookie_revision": self.details["cookie_revision"],
         }
 
 
@@ -56,6 +94,19 @@ class FakeOfficialRefreshService:
         return "; ".join(f"{name}={value}" for name, value in cookies.items())
 
 
+class FailingOfficialRefreshService(FakeOfficialRefreshService):
+    error_code = "invalid_credentials"
+    status = "failed"
+
+    def refresh_session(self, **kwargs):
+        self.calls.append(kwargs)
+        return OfficialLoginResult(
+            status=self.status,
+            error_code=self.error_code,
+            message="sensitive provider message",
+        )
+
+
 class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         active_refresh_registry.unregister("account-1")
@@ -65,14 +116,20 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         active_refresh_registry.unregister("account-1")
         active_refresh_registry.consume_cancelled("account-1")
 
-    async def test_refresh_uses_persistent_profile_even_without_saved_credentials(self):
+    async def test_password_refresh_uses_persistent_profile_and_saved_credentials(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
+        live.user_id = 7
         live.cookies_str = "unb=9988; cookie2=old"
         live.cookies = {"unb": "9988", "cookie2": "old"}
+        live.pending_verification_url = ""
         live._update_cookies_and_restart = AsyncMock(return_value=True)
         live.send_token_refresh_notification = AsyncMock()
         database = FakeRefreshDatabase()
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            cookies={"unb": "9988", "cookie2": "old"},
+        ))
 
         with (
             patch("db_manager.db_manager", database),
@@ -80,6 +137,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "utils.xianyu_official_login.XianyuOfficialLoginService",
                 FakeOfficialRefreshService,
             ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
         ):
             success = await live._try_password_login_refresh("手动立即刷新")
 
@@ -87,18 +145,29 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeOfficialRefreshService.calls), 1)
         refresh_call = FakeOfficialRefreshService.calls[0]
         self.assertEqual(refresh_call["profile_unb"], "9988")
-        self.assertEqual(refresh_call["account"], "")
-        self.assertEqual(refresh_call["password"], "")
+        self.assertEqual(refresh_call["account"], "seller@example.com")
+        self.assertEqual(refresh_call["password"], "secret")
+        self.assertTrue(refresh_call["allow_password"])
         live._update_cookies_and_restart.assert_awaited_once_with(
-            "unb=9988; cookie2=renewed; _m_h5_tk=token"
+            "unb=9988; cookie2=renewed; _m_h5_tk=token",
+            browser_user_agent=unittest.mock.ANY,
+            access_token="",
+            expected_revision=3,
+            expected_xianyu_unb="9988",
         )
         self.assertEqual(database.updates[-1][1]["state"], "success")
+        self.assertEqual(database.validated_calls, 1)
 
-    async def test_token_failure_does_not_open_browser_when_auto_refresh_is_disabled(self):
+    async def test_non_password_login_freezes_without_probe_or_browser(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
+        live.user_id = 7
         live.cookie_refresh_enabled = False
-        database = FakeRefreshDatabase()
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live.last_token_refresh_status = ""
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        probe = AsyncMock()
 
         with (
             patch("db_manager.db_manager", database),
@@ -106,15 +175,235 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "utils.xianyu_official_login.XianyuOfficialLoginService",
                 FakeOfficialRefreshService,
             ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
         ):
-            success = await live._try_password_login_refresh("令牌/Session过期")
+            first = await live._try_password_login_refresh("令牌/Session过期")
+            second = await live._try_password_login_refresh("连续连接失败5次")
 
-        self.assertFalse(success)
+        self.assertFalse(first)
+        self.assertFalse(second)
         self.assertEqual(FakeOfficialRefreshService.calls, [])
         self.assertEqual(
             database.updates[-1][1]["error_code"],
-            "automatic_refresh_disabled",
+            "manual_reauth_required",
         )
+        self.assertEqual(database.updates[-1][1]["state"], "manual_reauth_required")
+        self.assertEqual(database.expired_calls, 1)
+        probe.assert_not_awaited()
+        live.send_token_refresh_notification.assert_not_awaited()
+
+    async def test_manual_password_failure_freezes_and_skips_later_browser_runs(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.user_id = 7
+        live.cookies_str = "unb=9988; cookie2=old"
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live.pending_verification_url = ""
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase()
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            cookies=dict(live.cookies),
+        ))
+        FailingOfficialRefreshService.calls.clear()
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FailingOfficialRefreshService,
+            ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            first = await live._try_password_login_refresh("令牌/Session过期")
+            second = await live._try_password_login_refresh("定时 Cookie 刷新（每24小时）")
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(len(FailingOfficialRefreshService.calls), 1)
+        self.assertEqual(database.status["state"], "manual_reauth_required")
+        self.assertEqual(database.status["error_code"], "manual_reauth_required")
+        self.assertEqual(database.expired_calls, 1)
+
+    async def test_transient_official_failure_remains_retryable(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.user_id = 7
+        live.cookies_str = "unb=9988; cookie2=old"
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live.pending_verification_url = ""
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase()
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            cookies=dict(live.cookies),
+        ))
+        FailingOfficialRefreshService.calls.clear()
+        FailingOfficialRefreshService.error_code = "profile_in_use"
+
+        try:
+            with (
+                patch("db_manager.db_manager", database),
+                patch(
+                    "utils.xianyu_official_login.XianyuOfficialLoginService",
+                    FailingOfficialRefreshService,
+                ),
+                patch("XianyuAutoAsync.probe_message_session_async", probe),
+            ):
+                first = await live._try_password_login_refresh("令牌/Session过期")
+                second = await live._try_password_login_refresh("令牌/Session过期")
+        finally:
+            FailingOfficialRefreshService.error_code = "invalid_credentials"
+
+        self.assertFalse(first)
+        self.assertFalse(second)
+        self.assertEqual(len(FailingOfficialRefreshService.calls), 2)
+        self.assertEqual(database.status["state"], "failed")
+        self.assertEqual(database.status["error_code"], "profile_in_use")
+        self.assertEqual(database.expired_calls, 0)
+
+    async def test_message_token_probe_uses_persisted_browser_ua_and_never_starts_browser(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_VERIFICATION_REQUIRED,
+            cookies=dict(live.cookies),
+            verification_url="https://passport.goofish.com/iv/check",
+            error_code="human_verification_required",
+        ))
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FakeOfficialRefreshService,
+            ),
+        ):
+            token = await live.refresh_token()
+
+        self.assertIsNone(token)
+        probe.assert_awaited_once_with(live.cookies_str, live.browser_user_agent)
+        self.assertEqual(database.status["state"], "manual_reauth_required")
+        self.assertFalse(getattr(live, "pending_verification_url", ""))
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
+
+    async def test_successful_probe_sets_token_without_a_second_probe_or_browser(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.current_token = None
+        database = FakeRefreshDatabase()
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_SUCCESS,
+            cookies={"unb": "9988", "cookie2": "renewed", "_m_h5_tk": "token_2"},
+            access_token="message-access-token",
+        ))
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            token = await live.refresh_token()
+
+        self.assertEqual(token, "message-access-token")
+        self.assertEqual(live.current_token, "message-access-token")
+        self.assertEqual(probe.await_count, 1)
+        self.assertEqual(database.cas_calls, 1)
+
+    async def test_validated_cookie_ua_and_token_install_one_listener_generation(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old"
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Old Chrome/149.0.0.0"
+        live.current_token = "old-token"
+        live.last_token_refresh_time = 100.0
+        stored = {
+            "value": live.cookies_str,
+            "browser_user_agent": live.browser_user_agent,
+            "user_id": 7,
+            "cookie_revision": 3,
+            "xianyu_unb": "9988",
+        }
+
+        def update_cookie_account_info(_cookie_id, **kwargs):
+            stored.update({
+                "value": kwargs.get("cookie_value", stored["value"]),
+                "browser_user_agent": kwargs.get(
+                    "browser_user_agent",
+                    stored["browser_user_agent"],
+                ),
+            })
+            return True
+
+        def compare_and_swap_cookie_session(_cookie_id, **kwargs):
+            stored["value"] = kwargs["cookie_value"]
+            stored["browser_user_agent"] = kwargs.get(
+                "browser_user_agent", stored["browser_user_agent"]
+            )
+            stored["cookie_revision"] += 1
+            return {"state": "updated", "cookie_revision": stored["cookie_revision"]}
+
+        database = SimpleNamespace(
+            get_cookie_details=lambda _cookie_id: dict(stored),
+            update_cookie_account_info=unittest.mock.Mock(side_effect=update_cookie_account_info),
+            update_account_session_refresh=unittest.mock.Mock(return_value=True),
+            compare_and_swap_cookie_session=unittest.mock.Mock(
+                side_effect=compare_and_swap_cookie_session
+            ),
+        )
+        manager = SimpleNamespace(
+            replace_cookie=AsyncMock(
+                return_value={"status": "restarted", "cookie_id": "account-1"}
+            )
+        )
+        user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch("cookie_manager.manager", manager),
+            patch("XianyuAutoAsync.time.time", return_value=5000.0),
+        ):
+            updated = await live._update_cookies_and_restart(
+                "unb=9988; cookie2=renewed; _m_h5_tk=token_2",
+                browser_user_agent=user_agent,
+                access_token="message-access-token",
+            )
+
+        self.assertTrue(updated)
+        manager.replace_cookie.assert_awaited_once()
+        handoff = manager.replace_cookie.await_args.kwargs["runtime_state"]
+        self.assertEqual(handoff["current_token"], "message-access-token")
+        self.assertEqual(handoff["browser_user_agent"], user_agent)
+        self.assertEqual(stored["browser_user_agent"], user_agent)
 
     async def test_scheduled_refresh_calls_the_same_official_refresh_path(self):
         live = object.__new__(XianyuLive)

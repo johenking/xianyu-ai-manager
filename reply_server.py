@@ -5,7 +5,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
-from typing import List, Tuple, Optional, Dict, Any, Literal
+from typing import Awaitable, Callable, List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import quote, unquote
 import hashlib
@@ -18,12 +18,12 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
-from datetime import datetime, timedelta
 from collections import defaultdict
+from datetime import datetime, timedelta
 import requests
 
 import cookie_manager
-from db_manager import db_manager
+from db_manager import AccountIdentityMismatchError, db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from ai_provider_service import (
@@ -39,11 +39,22 @@ from settings_service import (
     resolve_user_basic_settings,
     validate_skill_monitor_features,
 )
+from skill_monitor_features import (
+    get_skill_monitor_feature_state,
+    skill_monitor_feature_enabled,
+)
 from account_session_refresh import (
     active_refresh_registry,
     is_runtime_event_active,
     is_valid_account_login_username,
+    login_method_label,
+    normalize_login_method,
+    official_login_error_message,
+    password_refresh_requires_manual_reauth,
+    reauth_action_for,
+    reauth_message_for,
     remove_verification_image,
+    supports_automatic_refresh,
 )
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
@@ -62,7 +73,24 @@ from api_routers import (
     skills_router,
     system_router,
 )
-from session_registry import get_session_registry
+from session_registry import get_session_registry, sanitize_runtime_error
+from official_login_sessions import OfficialLoginSessionCoordinator, OfficialLoginSessionRecord
+from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLoginService
+from browser_extension_pairing import (
+    MAX_COOKIE_COUNT,
+    MAX_USER_AGENT_LENGTH,
+    PairingError,
+    browser_extension_pairings,
+    normalize_structured_cookies,
+)
+from utils.xianyu_session_probe import (
+    PROBE_RETRYABLE_ERROR,
+    cookies_to_string as session_cookies_to_string,
+    detect_default_browser_user_agent,
+    has_core_session_cookies,
+    parse_cookie_string,
+    probe_message_session_async,
+)
 from auth_registration_service import (
     RegistrationError,
     mask_email_for_log,
@@ -101,33 +129,23 @@ TOKEN_EXPIRE_TIME = 30 * 24 * 60 * 60  # token过期时间：30天
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
 
-# 扫码登录检查锁 - 防止并发处理同一个session
-qr_check_locks = defaultdict(lambda: asyncio.Lock())
-qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
-
-# 账号密码登录会话管理。明文密码只存在于后台任务参数中，不写入会话表。
-password_login_sessions = {}
-password_login_locks = defaultdict(lambda: asyncio.Lock())
 ai_reply_lab_sessions = {}  # {session_id: {'cookie_id': str, 'user_id': int, 'history': list, 'timestamp': float}}
+
+# Direct API QR sessions are owner-scoped and persisted at most once.
+qr_check_locks = defaultdict(lambda: asyncio.Lock())
+qr_check_processed: Dict[str, Dict[str, Any]] = {}
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
 
-def cleanup_qr_check_records():
-    """清理过期的扫码检查记录"""
-    current_time = time.time()
-    expired_sessions = []
-
-    for session_id, record in qr_check_processed.items():
-        # 清理超过1小时的记录
-        if current_time - record['timestamp'] > 3600:
-            expired_sessions.append(session_id)
-
-    for session_id in expired_sessions:
-        if session_id in qr_check_processed:
-            del qr_check_processed[session_id]
-        if session_id in qr_check_locks:
-            del qr_check_locks[session_id]
+def cleanup_qr_check_records() -> None:
+    """Drop completed QR bookkeeping after one hour."""
+    cutoff = time.time() - 3600
+    for session_id, record in list(qr_check_processed.items()):
+        if float(record.get("timestamp") or 0) >= cutoff:
+            continue
+        qr_check_processed.pop(session_id, None)
+        qr_check_locks.pop(session_id, None)
 
 
 def load_keywords() -> List[Tuple[str, str]]:
@@ -524,6 +542,7 @@ app.add_middleware(
         "http://127.0.0.1:3001",
         "http://127.0.0.1:3002",
     ],  # 允许的前端开发服务器地址
+    allow_origin_regex=r"^chrome-extension://[a-p]{32}$",
     allow_credentials=True,  # 允许携带凭证
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有请求头
@@ -1611,8 +1630,33 @@ async def xianyu_reply(req: RequestModel):
 
 
 class CookieIn(BaseModel):
-    id: str
-    value: str
+    id: Optional[str] = None
+    value: str = Field(..., min_length=1)
+
+
+class OfficialWindowLoginIn(BaseModel):
+    mode: str = Field('sms', pattern='^sms$')
+    account: Optional[str] = Field(None, max_length=200)
+
+
+class BrowserExtensionCookieIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=256)
+    value: str = Field(..., max_length=8192)
+    domain: str = Field(..., min_length=1, max_length=255)
+    path: str = Field("/", min_length=1, max_length=1024)
+    secure: bool = False
+    httpOnly: bool = False
+    sameSite: Optional[str] = None
+    expirationDate: Optional[float] = None
+    storeId: Optional[str] = Field(None, max_length=128)
+    partitionKey: Optional[Dict[str, Any]] = None
+
+
+class BrowserExtensionImportIn(BaseModel):
+    pairing_id: str = Field(..., min_length=8, max_length=80)
+    pairing_code: str = Field(..., min_length=6, max_length=32)
+    cookies: List[BrowserExtensionCookieIn]
+    user_agent: str = Field(..., min_length=1, max_length=MAX_USER_AGENT_LENGTH)
 
 
 class CookieStatusIn(BaseModel):
@@ -1670,6 +1714,41 @@ class SystemSettingCreateIn(BaseModel):
     description: Optional[str] = None
 
 
+def _manual_cookie_identity(cookie_value: str) -> str:
+    parsed = parse_cookie_string(cookie_value)
+    if not has_core_session_cookies(parsed):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                'code': 'invalid_cookie',
+                'message': 'Cookie 必须包含 unb 和至少一个核心会话字段',
+            },
+        )
+    return str(parsed.get('unb') or '').strip()
+
+
+def _raise_account_identity_mismatch() -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={
+            'code': 'account_identity_mismatch',
+            'message': 'Cookie 中的闲鱼账号身份与当前账号不一致，未保存任何修改',
+        },
+    )
+
+
+def _require_stable_cookie_identity(cookie_id: str, cookie_value: str) -> str:
+    candidate_unb = _manual_cookie_identity(cookie_value)
+    details = db_manager.get_cookie_details(cookie_id) or {}
+    stable_unb = (
+        str(details.get('xianyu_unb') or '').strip()
+        or db_manager._extract_cookie_unb(str(details.get('value') or ''))
+    )
+    if stable_unb and candidate_unb != stable_unb:
+        _raise_account_identity_mismatch()
+    return candidate_unb
+
+
 
 
 
@@ -1687,7 +1766,7 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 @accounts_router.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取所有Cookie的详细信息（包括值和状态）"""
+    """Return account capabilities without exposing Cookie or password material."""
     if cookie_manager.manager is None:
         return []
 
@@ -1703,16 +1782,26 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
+        has_login_password = bool(cookie_details.get('password')) if cookie_details else False
+        login_method = normalize_login_method(
+            cookie_details.get('login_method') if cookie_details else 'unknown'
+        )
+        auto_refresh_supported = supports_automatic_refresh(
+            login_method,
+            cookie_details.get('username') if cookie_details else '',
+            has_login_password,
+        )
+        refresh_status = _current_session_refresh_status(cookie_id)
+        reauth_required = refresh_status.get('state') == 'manual_reauth_required'
 
         result.append({
             'id': cookie_id,
-            'value': cookie_value,
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
             'username': cookie_details.get('username', '') if cookie_details else '',
-            'has_login_password': bool(cookie_details.get('password')) if cookie_details else False,
+            'has_login_password': has_login_password,
             'login_credentials_valid': bool(
                 cookie_details
                 and cookie_details.get('password')
@@ -1723,6 +1812,15 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'cookie_refresh_interval_minutes': (
                 cookie_details.get('cookie_refresh_interval_minutes', 1440) if cookie_details else 1440
             ),
+            'login_method': login_method,
+            'login_method_label': login_method_label(login_method),
+            'auto_refresh_supported': auto_refresh_supported,
+            'reauth_required': reauth_required,
+            'reauth_action': reauth_action_for(login_method),
+            'last_login_at': cookie_details.get('last_login_at') if cookie_details else None,
+            'last_validated_at': cookie_details.get('last_validated_at') if cookie_details else None,
+            'last_expired_at': cookie_details.get('last_expired_at') if cookie_details else None,
+            'reauth_updated_at': refresh_status.get('updated_at') if reauth_required else None,
         })
     return result
 
@@ -1736,36 +1834,182 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
         user_id = current_user['user_id']
         from db_manager import db_manager
 
-        cookie_unb = db_manager._extract_cookie_unb(item.value)
-        canonical_id = db_manager.find_cookie_id_by_unb(user_id, cookie_unb) if cookie_unb else None
-        target_id = canonical_id or item.id
+        cookie_unb = _manual_cookie_identity(item.value)
+        canonical_id = db_manager.find_cookie_id_by_unb(user_id, cookie_unb)
+        target_id = canonical_id or cookie_unb
 
-        log_with_user('info', f"尝试添加Cookie: {target_id}, 当前用户ID: {user_id}, 用户名: {current_user.get('username', 'unknown')}", current_user)
+        log_with_user(
+            'info',
+            f"尝试添加 Cookie: {_masked_identifier(target_id)}, 当前用户ID: {user_id}",
+            current_user,
+        )
 
         # 检查cookie是否已存在且属于其他用户
         existing_cookies = db_manager.get_all_cookies()
-        if target_id in existing_cookies:
-            # 检查是否属于当前用户
-            user_cookies = db_manager.get_all_cookies(user_id)
-            if target_id not in user_cookies:
-                log_with_user('warning', f"Cookie ID冲突: {target_id} 已被其他用户使用", current_user)
-                raise HTTPException(status_code=400, detail="该Cookie ID已被其他用户使用")
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if canonical_id is None and target_id in existing_cookies and target_id not in user_cookies:
+            base_id = target_id
+            suffix = 1
+            while target_id in existing_cookies:
+                target_id = f"{base_id}_{suffix}"
+                suffix += 1
 
         # 保存到数据库时指定用户ID
-        db_manager.save_cookie(target_id, item.value, user_id)
+        if not db_manager.save_cookie(
+            target_id, item.value, user_id, login_method='manual_cookie'
+        ):
+            raise HTTPException(status_code=400, detail="Cookie 保存失败")
 
         # 添加到CookieManager，同时指定用户ID
         if target_id in cookie_manager.manager.cookies:
             cookie_manager.manager.update_cookie(target_id, item.value, save_to_db=False)
         else:
             cookie_manager.manager.add_cookie(target_id, item.value, user_id=user_id)
-        log_with_user('info', f"Cookie添加成功: {target_id}", current_user)
+        log_with_user('info', f"Cookie 添加成功: {_masked_identifier(target_id)}", current_user)
         return {"msg": "success", "account_id": target_id, "matched_existing": bool(canonical_id)}
+    except AccountIdentityMismatchError:
+        _raise_account_identity_mismatch()
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"添加Cookie失败: {item.id} - {str(e)}", current_user)
-        raise HTTPException(status_code=400, detail=str(e))
+        log_with_user(
+            'error',
+            f"添加 Cookie 失败: {type(e).__name__}",
+            current_user,
+        )
+        raise HTTPException(status_code=400, detail="Cookie 保存失败") from e
+
+
+@accounts_router.post("/api/browser-extension/pairings")
+def create_browser_extension_pairing(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Create a five-minute, owner-bound, single-use local pairing."""
+    try:
+        status_info, pairing_code = browser_extension_pairings.create(current_user['user_id'])
+    except PairingError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "data": {
+            **status_info,
+            "pairing_code": pairing_code,
+            "local_import_url": "http://127.0.0.1:8091/api/browser-extension/import",
+        },
+    }
+
+
+@accounts_router.get("/api/browser-extension/pairings/{pairing_id}")
+def get_browser_extension_pairing(
+    pairing_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        return {
+            "success": True,
+            "data": browser_extension_pairings.get(pairing_id, current_user['user_id']),
+        }
+    except PairingError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+
+
+@accounts_router.post("/api/browser-extension/import")
+async def import_browser_extension_cookies(
+    payload: BrowserExtensionImportIn,
+    request: Request,
+):
+    """Validate one loopback-only import without echoing sensitive material."""
+    content_length = request.headers.get("content-length", "")
+    try:
+        parsed_content_length = int(content_length) if content_length else 0
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Content-Length 无效") from exc
+    if parsed_content_length > 262_144:
+        raise HTTPException(status_code=413, detail="导入请求体过大")
+    if len(payload.cookies) > MAX_COOKIE_COUNT:
+        raise HTTPException(status_code=413, detail="Cookie 数量超过限制")
+
+    remote_host = request.client.host if request.client else ""
+    consumed = False
+    try:
+        record = browser_extension_pairings.consume(
+            payload.pairing_id,
+            payload.pairing_code,
+            remote_host=remote_host,
+        )
+        consumed = True
+        raw_records = [
+            cookie.model_dump() if hasattr(cookie, "model_dump") else cookie.dict()
+            for cookie in payload.cookies
+        ]
+        imported_cookies = normalize_structured_cookies(raw_records)
+        browser_extension_pairings.mark_validating(payload.pairing_id)
+        imported_unb = str(imported_cookies.get("unb") or "").strip()
+        probe_result = await probe_message_session_async(
+            session_cookies_to_string(imported_cookies),
+            payload.user_agent,
+        )
+        platform_unb = str((probe_result.cookies or {}).get("unb") or "").strip()
+
+        if not probe_result.succeeded:
+            error_code = (
+                "session_probe_retryable"
+                if probe_result.status == PROBE_RETRYABLE_ERROR
+                else probe_result.error_code or "session_validation_failed"
+            )
+            message = (
+                "平台状态检查出现临时异常，未导入 Cookie"
+                if probe_result.status == PROBE_RETRYABLE_ERROR
+                else probe_result.message or "平台未确认有效登录状态"
+            )
+            raise PairingError(message, error_code=error_code)
+        if not platform_unb or platform_unb != imported_unb:
+            raise PairingError(
+                "平台验证身份与导入 Cookie 不一致",
+                error_code="account_mismatch",
+            )
+
+        now = time.time()
+        account_info = await _persist_validated_account_login(
+            user_id=record.owner_user_id,
+            cookies_str=session_cookies_to_string(probe_result.cookies),
+            validated_unb=platform_unb,
+            login_method='chrome_extension',
+            browser_user_agent=payload.user_agent,
+            runtime_state={
+                "current_token": probe_result.access_token,
+                "last_token_refresh_time": now,
+                "browser_user_agent": payload.user_agent,
+                "cookie_refresh_anchor": now,
+                "item_sync_anchor": now,
+            },
+        )
+        safe_status = browser_extension_pairings.succeed(
+            payload.pairing_id,
+            account_id=account_info['account_id'],
+        )
+        return {
+            "success": True,
+            "status": safe_status['status'],
+            "message": safe_status['message'],
+        }
+    except PairingError as exc:
+        if consumed:
+            browser_extension_pairings.fail(
+                payload.pairing_id,
+                message=str(exc),
+                error_code=exc.error_code,
+            )
+        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+    except Exception as exc:
+        if consumed:
+            browser_extension_pairings.fail(
+                payload.pairing_id,
+                message="导入处理失败",
+                error_code="import_failed",
+            )
+        logger.error(f"Chrome 扩展导入失败: {type(exc).__name__}")
+        raise HTTPException(status_code=400, detail="导入处理失败") from exc
 
 
 # ============ 带子路径的 /cookies/{cid}/xxx 路由必须在 /cookies/{cid} 之前定义 ============
@@ -1870,13 +2114,19 @@ def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depen
 
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        _require_stable_cookie_identity(cid, item.value)
 
         # 获取旧的 cookie 值，用于判断是否需要重启任务
         old_cookie_details = db_manager.get_cookie_details(cid)
         old_cookie_value = old_cookie_details.get('value') if old_cookie_details else None
 
         # 使用 update_cookie_account_info 更新（只更新cookie值，不覆盖其他字段）
-        success = db_manager.update_cookie_account_info(cid, cookie_value=item.value)
+        success = db_manager.update_cookie_account_info(
+            cid,
+            cookie_value=item.value,
+            login_method='manual_cookie',
+            login_validated=False,
+        )
 
         if not success:
             raise HTTPException(status_code=400, detail="更新Cookie失败")
@@ -1889,10 +2139,13 @@ def update_cookie(cid: str, item: CookieIn, current_user: Dict[str, Any] = Depen
             logger.info(f"Cookie值未变化，无需重启任务: {cid}")
 
         return {'msg': 'updated'}
+    except AccountIdentityMismatchError:
+        _raise_account_identity_mismatch()
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"更新 Cookie 失败: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail="更新 Cookie 失败") from e
 
 
 class CookieAccountInfo(BaseModel):
@@ -1916,6 +2169,8 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
 
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if info.value is not None:
+            _require_stable_cookie_identity(cid, info.value)
 
         # 获取旧的 cookie 值，用于判断是否需要重启任务
         old_cookie_details = db_manager.get_cookie_details(cid)
@@ -1927,7 +2182,8 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
             cookie_value=info.value,
             username=info.username,
             password=info.password,
-            show_browser=info.show_browser
+            show_browser=info.show_browser,
+            login_method='manual_cookie' if info.value is not None else None,
         )
 
         if not success:
@@ -1941,11 +2197,13 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
             logger.info(f"Cookie值未变化，无需重启任务: {cid}")
 
         return {'msg': 'updated', 'success': True}
+    except AccountIdentityMismatchError:
+        _raise_account_identity_mismatch()
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新账号信息失败: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"更新账号信息失败: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail="更新账号信息失败") from e
 
 
 @accounts_router.get("/cookie/{cid}/details")
@@ -1969,6 +2227,13 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         safe_details = dict(details)
         safe_details['has_login_password'] = bool(safe_details.pop('password', ''))
         safe_details.pop('password_encrypted', None)
+        safe_details.pop('value', None)
+        safe_details.pop('browser_user_agent', None)
+        safe_details['auto_refresh_supported'] = supports_automatic_refresh(
+            safe_details.get('login_method'),
+            safe_details.get('username'),
+            safe_details['has_login_password'],
+        )
         return safe_details
     except HTTPException:
         raise
@@ -1985,120 +2250,343 @@ async def _update_cookie_manager_after_official_login(
     user_id: int,
     *,
     is_new_account: bool,
+    runtime_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Apply one CookieManager mutation after the database transaction succeeds."""
     manager = cookie_manager.manager
     if manager is None:
-        logger.warning(f"CookieManager 未初始化，账号 {account_id} 将在服务重启后启动监听")
+        logger.warning(
+            f"CookieManager 未初始化，账号 {_masked_identifier(account_id)} "
+            "将在服务重启后启动监听"
+        )
         return
 
     if is_new_account:
-        operation = manager.add_cookie(account_id, cookies_str, user_id=user_id)
+        operation = manager.add_cookie(
+            account_id,
+            cookies_str,
+            user_id=user_id,
+            runtime_state=runtime_state,
+        )
     else:
-        operation = manager.update_cookie(account_id, cookies_str, save_to_db=False)
+        operation = manager.replace_cookie(
+            account_id,
+            cookies_str,
+            save_to_db=False,
+            runtime_state=runtime_state,
+        )
     if asyncio.isfuture(operation) or asyncio.iscoroutine(operation):
         await operation
 
 
-async def _execute_password_login(
-    session_id: str,
+async def _persist_validated_account_login(
+    *,
+    user_id: int,
+    cookies_str: str,
+    validated_unb: str,
+    login_method: str = 'unknown',
+    browser_user_agent: str = "",
+    runtime_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist one platform-validated identity and restart its listener once."""
+    parsed = trans_cookies(cookies_str)
+    cookie_unb = str(parsed.get("unb") or "").strip()
+    expected_unb = str(validated_unb or "").strip()
+    if not expected_unb or cookie_unb != expected_unb:
+        raise ValueError("平台验证身份与 Cookie 身份不一致")
+
+    canonical_account_id = await asyncio.to_thread(
+        db_manager.find_cookie_id_by_unb,
+        user_id,
+        expected_unb,
+    )
+    account_id = canonical_account_id or expected_unb
+    user_cookies = await asyncio.to_thread(db_manager.get_all_cookies, user_id)
+    all_cookies = await asyncio.to_thread(db_manager.get_all_cookies)
+    if canonical_account_id is None and account_id in all_cookies and account_id not in user_cookies:
+        base_id = account_id
+        suffix = 1
+        while account_id in all_cookies:
+            account_id = f"{base_id}_{suffix}"
+            suffix += 1
+    is_new_account = account_id not in user_cookies
+
+    update_success = await asyncio.to_thread(
+        db_manager.update_cookie_account_info,
+        account_id,
+        cookie_value=cookies_str,
+        user_id=user_id,
+        browser_user_agent=browser_user_agent or None,
+        login_method=login_method,
+        login_validated=True,
+    )
+    if not update_success:
+        raise RuntimeError("已验证登录态保存失败")
+    db_manager.update_account_session_refresh(
+        account_id,
+        state='success',
+        trigger=f'{normalize_login_method(login_method)}_login',
+        message='登录状态已验证',
+    )
+
+    await _update_cookie_manager_after_official_login(
+        account_id,
+        cookies_str,
+        user_id,
+        is_new_account=is_new_account,
+        runtime_state=runtime_state,
+    )
+    return {
+        "account_id": account_id,
+        "is_new_account": is_new_account,
+        "cookie_count": len(parsed),
+    }
+
+
+_official_login_completion_locks: Dict[tuple[int, int, str], asyncio.Lock] = {}
+
+
+async def _complete_official_login_session(
+    record: OfficialLoginSessionRecord,
+    result: OfficialLoginResult,
     account: str,
     password: str,
-    show_browser: bool,
-    user_id: int,
-    current_user: Dict[str, Any],
-):
-    """Run the official password login and persist the account by its real unb."""
-    from utils.xianyu_official_login import OfficialLoginWorker, XianyuOfficialLoginService
-
-    session = password_login_sessions.get(session_id)
-    if session is None:
-        return
-
-    worker = OfficialLoginWorker()
-    session['worker'] = worker
-    login_key = f"{user_id}:{account.strip().lower()}"
-    log_with_user('info', f"开始闲鱼官方账号密码登录任务: {session_id}", current_user)
-
-    def on_status(result):
-        active_session = password_login_sessions.get(session_id)
-        if active_session is None or result.status != 'verification_required':
-            return
-        active_session['status'] = 'verification_required'
-        active_session['screenshot_path'] = result.verification_image_path or None
-        active_session['error_code'] = result.error_code
-        get_session_registry().update(
-            session_id,
-            status='verification_required',
-            error_code=result.error_code,
-            error_message=result.message,
+) -> Dict[str, Any]:
+    """Persist a successful official session once, then hand off its listener."""
+    user_id = record.owner_user_id
+    loop = asyncio.get_running_loop()
+    completion_key = (id(loop), user_id, result.unb)
+    completion_lock = _official_login_completion_locks.setdefault(
+        completion_key,
+        asyncio.Lock(),
+    )
+    async with completion_lock:
+        canonical_account_id = await asyncio.to_thread(
+            db_manager.find_cookie_id_by_unb,
+            user_id,
+            result.unb,
         )
-
-    try:
-        async with password_login_locks[login_key]:
-            service = XianyuOfficialLoginService()
-            result = await asyncio.to_thread(
-                service.login_with_password,
-                account=account,
-                password=password,
-                show_browser=show_browser,
-                worker=worker,
-                on_status=on_status,
-            )
-
-        if not result.succeeded:
-            session['status'] = result.status if result.status in {'timeout', 'cancelled'} else 'failed'
-            session['error'] = result.message or '闲鱼官方登录失败'
-            session['error_code'] = result.error_code
-            session['screenshot_path'] = result.verification_image_path or session.get('screenshot_path')
-            return
-
-        canonical_account_id = db_manager.find_cookie_id_by_unb(user_id, result.unb)
         account_id = canonical_account_id or result.unb
-        existing_cookies = db_manager.get_all_cookies(user_id)
+        existing_cookies = await asyncio.to_thread(db_manager.get_all_cookies, user_id)
         is_new_account = account_id not in existing_cookies
-        cookies_str = service.cookies_to_string(result.cookies)
+        cookies_str = XianyuOfficialLoginService.cookies_to_string(result.cookies)
 
-        update_success = db_manager.update_cookie_account_info(
+        update_kwargs: Dict[str, Any] = {
+            "cookie_value": cookies_str,
+            "user_id": user_id,
+            "browser_user_agent": result.browser_user_agent,
+            "login_method": (
+                "password"
+                if record.mode == "password"
+                else "sms_window" if record.mode == "sms" else "qr"
+            ),
+            "login_validated": True,
+        }
+        if record.mode == "password":
+            update_kwargs.update({
+                "username": account,
+                "password": password,
+                "show_browser": record.show_browser,
+            })
+        elif record.mode == "sms":
+            update_kwargs.update({
+                "username": account or None,
+                "show_browser": True,
+            })
+        update_success = await asyncio.to_thread(
+            db_manager.update_cookie_account_info,
             account_id,
-            cookie_value=cookies_str,
-            username=account,
-            password=password,
-            show_browser=show_browser,
-            user_id=user_id,
+            **update_kwargs,
         )
         if not update_success:
-            session['status'] = 'failed'
-            session['error'] = '官方登录成功，但保存账号信息失败'
-            session['error_code'] = 'account_save_failed'
-            return
+            raise RuntimeError("官方登录成功，但保存账号信息失败")
+        db_manager.update_account_session_refresh(
+            account_id,
+            state="success",
+            trigger=f"{normalize_login_method(update_kwargs['login_method'])}_login",
+            message="登录状态已验证",
+        )
 
+        official_login_coordinator.mark_restarting_listener(record)
+        now = time.time()
         await _update_cookie_manager_after_official_login(
             account_id,
             cookies_str,
             user_id,
             is_new_account=is_new_account,
+            runtime_state={
+                "current_token": result.access_token,
+                "last_token_refresh_time": now,
+                "browser_user_agent": result.browser_user_agent,
+                "cookie_refresh_anchor": now,
+                "item_sync_anchor": now,
+            },
         )
-        session.update({
-            'status': 'success',
-            'account_id': account_id,
-            'is_new_account': is_new_account,
-            'cookie_count': len(result.cookies),
-            'error_code': '',
+    logger.info(
+        f"闲鱼官方登录成功，账号已按真实 unb 保存: {_masked_identifier(account_id)}, "
+        f"cookie_fields={len(result.cookies)}"
+    )
+    return {"account_id": account_id, "is_new_account": is_new_account}
+
+
+official_login_coordinator = OfficialLoginSessionCoordinator(
+    completion_handler=_complete_official_login_session,
+)
+
+
+def _expected_owned_unb(user_id: int, account: str) -> str:
+    value = str(account or "").strip()
+    if not value:
+        return ""
+    for cookie_id in db_manager.get_all_cookies(user_id):
+        details = db_manager.get_cookie_details(cookie_id) or {}
+        if value in {
+            str(cookie_id),
+            str(details.get("xianyu_unb") or "").strip(),
+            str(details.get("username") or "").strip(),
+        }:
+            return str(details.get("xianyu_unb") or "").strip()
+    return ""
+
+
+@accounts_router.post("/api/official-login/sessions")
+async def create_official_login_session(
+    request: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    mode = str(request.get("mode") or "qr").strip().lower()
+    account = str(request.get("account") or "").strip()
+    try:
+        session = await official_login_coordinator.start(
+            owner_user_id=current_user["user_id"],
+            mode=mode,
+            account=account,
+            expected_unb=(
+                _expected_owned_unb(current_user["user_id"], account)
+                if mode == "sms"
+                else ""
+            ),
+            password=str(request.get("password") or ""),
+            show_browser=bool(request.get("show_browser", False)),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, **session}
+
+
+@accounts_router.get("/api/official-login/sessions/{session_id}")
+async def get_official_login_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    session = await official_login_coordinator.get_status(session_id, current_user["user_id"])
+    if session is not None:
+        return session
+    persisted = get_session_registry().get(session_id)
+    if persisted and persisted.get("owner_user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="无权限访问该登录会话")
+    if persisted and persisted.get("status") == "interrupted":
+        return {
+            "session_id": session_id,
+            "state": "interrupted",
+            "message": persisted.get("error_message") or "服务已重启，请重新发起登录",
+            "error_code": persisted.get("error_code") or "interrupted",
+        }
+    raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+
+
+@accounts_router.post("/api/official-login/sessions/{session_id}/show-browser")
+async def show_official_login_browser(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    shown = await official_login_coordinator.show_browser(session_id, current_user["user_id"])
+    if not shown:
+        raise HTTPException(status_code=404, detail="登录会话不存在、已结束或不属于当前用户")
+    return {"success": True, "message": "已请求在本机显示闲鱼官方浏览器"}
+
+
+@accounts_router.post("/api/official-login/sessions/{session_id}/cancel")
+async def cancel_official_login_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cancelled = await official_login_coordinator.cancel(session_id, current_user["user_id"])
+    if not cancelled:
+        raise HTTPException(status_code=404, detail="登录会话不存在、已结束或不属于当前用户")
+    return {"success": True, "message": "登录会话已取消"}
+
+
+@accounts_router.post("/official-window-login")
+async def official_window_login(
+    payload: OfficialWindowLoginIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Open installed Chrome and wait for SMS login on the official page."""
+    account = str(payload.account or "").strip()
+    try:
+        session = await official_login_coordinator.start(
+            owner_user_id=current_user['user_id'],
+            mode="sms",
+            account=account,
+            expected_unb=_expected_owned_unb(current_user['user_id'], account),
+            password="",
+            show_browser=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="验证码登录参数无效") from exc
+    return {
+        "success": True,
+        "session_id": session["session_id"],
+        "status": "processing",
+        "message": "已打开闲鱼官方登录窗口，请在窗口内完成验证码登录",
+    }
+
+
+@accounts_router.get("/official-window-login/check/{session_id}")
+async def check_official_window_login(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        session = await get_official_login_session(session_id, current_user)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return {"status": "not_found", "message": "会话不存在或已过期"}
+        raise
+    state = session.get("state", "failed")
+    status_value = {
+        "preparing": "processing",
+        "waiting_user": "processing",
+        "verification_required": "processing",
+        "persisting": "processing",
+        "restarting_listener": "processing",
+        "expired": "timeout",
+    }.get(state, state)
+    response = {
+        "status": status_value,
+        "message": session.get("message") or "请在官方窗口完成验证码登录",
+        "error_code": session.get("error_code") or "",
+    }
+    if status_value == "success":
+        response.update({
+            "account_id": session.get("account_id") or "",
+            "is_new_account": bool(session.get("is_new_account")),
         })
-        log_with_user(
-            'info',
-            f"闲鱼官方登录成功，已按真实 unb 保存并更新监听: {account_id}",
-            current_user,
-        )
-    except Exception as exc:
-        session['status'] = 'failed'
-        session['error'] = str(exc)
-        session['error_code'] = 'login_exception'
-        log_with_user('error', f"闲鱼官方账号密码登录异常: {exc}", current_user)
-        logger.exception("闲鱼官方账号密码登录任务异常")
-    finally:
-        session['worker'] = None
+    return response
+
+
+@accounts_router.post("/official-window-login/cancel/{session_id}")
+async def cancel_official_window_login(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    cancelled = await official_login_coordinator.cancel(
+        session_id, current_user["user_id"]
+    )
+    if not cancelled:
+        return {"success": True, "message": "登录会话已经结束"}
+    return {"success": True, "message": "手机号验证码登录已取消"}
 
 
 @accounts_router.post("/password-login")
@@ -2106,7 +2594,7 @@ async def password_login(
     request: Dict[str, Any],
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """账号密码登录接口（异步，支持人脸认证）"""
+    """兼容旧客户端的账号密码登录入口。"""
     try:
         account = request.get('account')
         password = request.get('password')
@@ -2115,53 +2603,25 @@ async def password_login(
         if not account or not password:
             return {'success': False, 'message': '登录账号和密码不能为空'}
 
-        log_with_user('info', f"开始闲鱼官方账号密码登录: {account}", current_user)
-
-        # 生成会话ID
-        import secrets
-        session_id = secrets.token_urlsafe(16)
-
-        user_id = current_user['user_id']
-
-        # 创建登录会话
-        password_login_sessions[session_id] = {
-            'account': account,
-            'show_browser': show_browser,
-            'status': 'processing',
-            'screenshot_path': None,
-            'worker': None,
-            'task': None,
-            'timestamp': time.time(),
-            'user_id': user_id,
-            'error_code': '',
-        }
-        get_session_registry().register(
-            session_id,
-            "password_login",
-            user_id,
-            status="processing",
-            ttl_seconds=3600,
-            transient=password_login_sessions[session_id],
+        session = await official_login_coordinator.start(
+            owner_user_id=current_user['user_id'],
+            mode="password",
+            account=str(account),
+            password=str(password),
+            show_browser=bool(show_browser),
         )
-
-        # 启动后台登录任务
-        task = asyncio.create_task(_execute_password_login(
-            session_id, account, password, show_browser, user_id, current_user
-        ))
-        password_login_sessions[session_id]['task'] = task
 
         return {
             'success': True,
-            'session_id': session_id,
+            'session_id': session['session_id'],
             'status': 'processing',
-            'message': '登录任务已启动，请等待...'
+            'message': session['message'],
         }
 
     except Exception as e:
-        log_with_user('error', f"账号密码登录异常: {str(e)}", current_user)
-        import traceback
-        logger.error(traceback.format_exc())
-        return {'success': False, 'message': f'登录失败: {str(e)}'}
+        safe_error = sanitize_runtime_error(e)
+        log_with_user('error', f"账号密码登录异常: {safe_error}", current_user)
+        return {'success': False, 'message': f'登录失败: {safe_error}'}
 
 
 @accounts_router.get("/password-login/check/{session_id}")
@@ -2169,95 +2629,33 @@ async def check_password_login_status(
     session_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """检查账号密码登录状态"""
+    """兼容旧客户端的账号密码登录状态。"""
     try:
-        registry = get_session_registry()
-        registry.cleanup()
-        # 清理过期会话（超过1小时）
-        current_time = time.time()
-        expired_sessions = [
-            sid for sid, session in password_login_sessions.items()
-            if current_time - session['timestamp'] > 3600
-        ]
-        for sid in expired_sessions:
-            expired_session = password_login_sessions.pop(sid, None)
-            worker = expired_session.get('worker') if expired_session else None
-            if worker:
-                worker.close_browser()
-
-        if session_id not in password_login_sessions:
-            persisted = registry.get(session_id)
-            if persisted and persisted.get('owner_user_id') != current_user['user_id']:
-                raise HTTPException(status_code=403, detail='无权限访问该会话')
-            if persisted and persisted.get('status') == 'interrupted':
-                return {'status': 'interrupted', 'message': persisted.get('error_message') or '服务已重启，请重新发起登录'}
-            return {'status': 'not_found', 'message': '会话不存在或已过期'}
-
-        session = password_login_sessions[session_id]
-
-        # 检查用户权限
-        if session['user_id'] != current_user['user_id']:
-            raise HTTPException(status_code=403, detail='无权限访问该会话')
-
-        status = session['status']
-        registry.update(
-            session_id,
-            status=status,
-            error_code=session.get('error_code', ''),
-            error_message=session.get('error', '') if status in {'failed', 'timeout', 'cancelled'} else '',
-        )
-
-        if status == 'verification_required':
-            screenshot_path = session.get('screenshot_path')
-            return {
-                'status': 'verification_required',
-                'screenshot_path': screenshot_path,
-                'message': '需要身份验证，请查看验证截图' if screenshot_path else '需要身份验证，请在可见浏览器中完成'
-            }
-        elif status == 'success':
-            screenshot_path = session.get('screenshot_path')
-            if screenshot_path:
-                remove_verification_image(screenshot_path)
-
-            result = {
-                'status': 'success',
-                'message': f'账号 {session["account_id"]} 登录成功',
-                'account_id': session['account_id'],
-                'is_new_account': session.get('is_new_account', False),
-                'cookie_count': session.get('cookie_count', 0)
-            }
-            # 清理会话
-            del password_login_sessions[session_id]
-            return result
-        elif status in {'failed', 'timeout', 'cancelled'}:
-            # 删除截图（如果存在）
-            screenshot_path = session.get('screenshot_path')
-            if screenshot_path:
-                remove_verification_image(screenshot_path)
-
-            error_msg = session.get('error', '登录失败')
-            log_with_user('info', f"返回登录终态: {session_id}, 状态: {status}, 消息: {error_msg}", current_user)
-            result = {
-                'status': status,
-                'message': error_msg,
-                'error': error_msg,
-                'error_code': session.get('error_code', ''),
-            }
-            # 清理会话
-            del password_login_sessions[session_id]
-            return result
-        else:
-            # 处理中
-            return {
-                'status': 'processing',
-                'message': '登录处理中，请稍候...'
-            }
+        session = await get_official_login_session(session_id, current_user)
+        state = session.get("state", "failed")
+        status = {
+            "preparing": "processing",
+            "waiting_user": "processing",
+            "persisting": "processing",
+            "restarting_listener": "processing",
+            "expired": "timeout",
+        }.get(state, state)
+        return {
+            "status": status,
+            "message": session.get("message", ""),
+            "error": session.get("message", "") if status in {"failed", "timeout"} else "",
+            "error_code": session.get("error_code", ""),
+            "account_id": session.get("account_id", ""),
+            "is_new_account": session.get("is_new_account", False),
+            "screenshot_path": session.get("verification_image_url") or session.get("qr_image_url"),
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
-        return {'status': 'error', 'message': str(e)}
+        safe_error = sanitize_runtime_error(e)
+        log_with_user('error', f"检查账号密码登录状态异常: {safe_error}", current_user)
+        return {'status': 'error', 'message': safe_error}
 
 
 # ========================= 人脸验证截图相关接口 =========================
@@ -2390,14 +2788,11 @@ async def delete_account_face_verification_screenshot(
 
 @accounts_router.post("/qr-login/generate")
 async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """生成扫码登录二维码"""
+    """Generate the default login QR without starting a browser."""
     try:
-        log_with_user('info', "请求生成扫码登录二维码", current_user)
-
         result = await qr_login_manager.generate_qr_code()
-
-        if result['success']:
-            session_id = result['session_id']
+        if result.get("success"):
+            session_id = result["session_id"]
             get_session_registry().register(
                 session_id,
                 "qr_login",
@@ -2406,20 +2801,19 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
                 ttl_seconds=900,
                 transient=qr_login_manager.sessions.get(session_id),
             )
-            log_with_user('info', f"扫码登录二维码生成成功: {result['session_id']}", current_user)
-        else:
-            log_with_user('warning', f"扫码登录二维码生成失败: {result.get('message', '未知错误')}", current_user)
-
+            log_with_user('info', f"接口二维码生成成功: {session_id}", current_user)
         return result
-
-    except Exception as e:
-        log_with_user('error', f"生成扫码登录二维码异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+    except Exception as exc:
+        logger.error(f"生成接口二维码失败: {type(exc).__name__}")
+        return {
+            'success': False,
+            'message': '生成二维码失败，请稍后重试',
+        }
 
 
 @accounts_router.get("/qr-login/check/{session_id}")
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """检查扫码登录状态"""
+    """Poll one owner-scoped API QR session and persist it once after validation."""
     try:
         registry = get_session_registry()
         registry.cleanup()
@@ -2427,379 +2821,116 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         if persisted and persisted.get('owner_user_id') != current_user['user_id']:
             raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
         if persisted and persisted.get('status') == 'interrupted':
-            return {'status': 'interrupted', 'message': persisted.get('error_message') or '服务已重启，请重新生成二维码'}
-        # 清理过期记录
+            return {
+                'status': 'interrupted',
+                'message': persisted.get('error_message') or '服务已重启，请重新生成二维码',
+            }
+
         cleanup_qr_check_records()
+        completed = qr_check_processed.get(session_id)
+        if completed and completed.get('processed'):
+            return {
+                'status': 'already_processed',
+                'message': '该会话已处理完成',
+                'account_info': completed.get('account_info'),
+            }
 
-        # 检查是否已经处理过
-        if session_id in qr_check_processed:
-            record = qr_check_processed[session_id]
-            if record['processed']:
-                log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
-                # 返回简单的成功状态，避免重复处理
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
-
-        # 获取该session的锁
         session_lock = qr_check_locks[session_id]
-
-        # 使用非阻塞方式尝试获取锁
         if session_lock.locked():
-            log_with_user('debug', f"扫码登录session {session_id} 正在被其他请求处理，跳过", current_user)
-            return {'status': 'processing', 'message': '正在处理中，请稍候...'}
+            return {'status': 'processing', 'message': '正在处理中，请稍候'}
 
         async with session_lock:
-            # 再次检查是否已处理（双重检查）
-            if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
-                log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+            completed = qr_check_processed.get(session_id)
+            if completed and completed.get('processed'):
+                return {
+                    'status': 'already_processed',
+                    'message': '该会话已处理完成',
+                    'account_info': completed.get('account_info'),
+                }
 
-            # 清理过期会话
             qr_login_manager.cleanup_expired_sessions()
-
-            # 获取会话状态
             status_info = qr_login_manager.get_session_status(session_id)
             registry.update(
                 session_id,
                 status=status_info.get('status') or 'processing',
-                error_code='qr_login_error' if status_info.get('status') in {'failed', 'error'} else '',
-                error_message=status_info.get('message', '') if status_info.get('status') in {'failed', 'error'} else '',
+                error_code=(
+                    'qr_login_error'
+                    if status_info.get('status') in {'failed', 'error'}
+                    else ''
+                ),
+                error_message=(
+                    status_info.get('message', '')
+                    if status_info.get('status') in {'failed', 'error'}
+                    else ''
+                ),
             )
-            safe_status_info = {
-                'status': status_info.get('status'),
-                'session_id': status_info.get('session_id'),
-                'has_verification_screenshot': bool(status_info.get('verification_screenshot_path')),
-                'verification_browser_status': status_info.get('verification_browser_status'),
-                'has_cookies': bool(status_info.get('cookies')),
-            }
-            log_with_user('info', f"获取扫码登录会话状态: {safe_status_info}", current_user)
-            if status_info['status'] == 'success':
-                log_with_user('info', f"扫码登录会话成功，准备处理Cookie: {session_id}", current_user)
-                # 登录成功，处理Cookie（现在包含获取真实cookie的逻辑）
+
+            if status_info.get('status') == 'success':
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
-                log_with_user(
-                    'info',
-                    f"获取扫码登录Cookie摘要: session={session_id}, "
-                    f"has_cookies={bool(cookies_info and cookies_info.get('cookies'))}, "
-                    f"has_unb={bool(cookies_info and cookies_info.get('unb'))}",
-                    current_user
-                )
-                if cookies_info:
-                    account_info = await process_qr_login_cookies(
-                        cookies_info['cookies'],
-                        cookies_info['unb'],
-                        current_user
-                    )
-                    status_info['account_info'] = account_info
-
-                    log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
-
-                    # 标记该session已处理
-                    qr_check_processed[session_id] = {
-                        'processed': True,
-                        'timestamp': time.time()
+                if not cookies_info:
+                    return {
+                        'status': 'error',
+                        'message': '平台登录态尚未完成验证，请重新扫码',
                     }
+                now = time.time()
+                account_info = await process_qr_login_cookies(
+                    cookies_info['cookies'],
+                    cookies_info['unb'],
+                    current_user,
+                    runtime_state={
+                        'browser_user_agent': detect_default_browser_user_agent(),
+                        'cookie_refresh_anchor': now,
+                        'item_sync_anchor': now,
+                    },
+                )
+                status_info['account_info'] = account_info
+                qr_check_processed[session_id] = {
+                    'processed': True,
+                    'timestamp': now,
+                    'account_info': account_info,
+                }
+                qr_login_manager.remove_session(session_id)
 
             status_info.pop('cookies', None)
             status_info.pop('unb', None)
             return status_info
-
     except HTTPException:
         raise
-    except Exception as e:
-        log_with_user('error', f"检查扫码登录状态异常: {str(e)}", current_user)
-        return {'status': 'error', 'message': str(e)}
+    except Exception as exc:
+        log_with_user(
+            'error',
+            f"检查扫码登录状态异常: {type(exc).__name__}",
+            current_user,
+        )
+        return {'status': 'error', 'message': '扫码登录状态检查失败，请重新扫码'}
 
 
 @accounts_router.post("/qr-login/continue/{session_id}")
 async def continue_qr_code_after_verification(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """用户完成安全验证后，恢复扫码登录状态检查"""
-    try:
-        log_with_user('info', f"请求继续检查扫码安全验证结果: {session_id}", current_user)
-        qr_login_manager.continue_after_verification(session_id)
-        return await check_qr_code_status(session_id, current_user)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"继续检查扫码安全验证结果异常: {str(e)}", current_user)
-        return {'status': 'error', 'message': str(e)}
+    """Start the dedicated Chrome window only after an explicit user action."""
+    persisted = get_session_registry().get(session_id)
+    if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+    qr_login_manager.continue_after_verification(session_id)
+    return await check_qr_code_status(session_id, current_user)
 
 
-async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
-    """处理扫码登录获取的Cookie - 先获取真实cookie再保存到数据库"""
-    try:
-        user_id = current_user['user_id']
-
-        # 检查是否已存在相同unb的账号
-        existing_cookies = db_manager.get_all_cookies(user_id)
-        existing_account_id = db_manager.find_cookie_id_by_unb(user_id, unb)
-
-        # 确定账号ID
-        if existing_account_id:
-            account_id = existing_account_id
-            is_new_account = False
-            log_with_user('info', f"扫码登录找到现有账号: {account_id}, UNB: {unb}", current_user)
-        else:
-            # 创建新账号，使用unb作为账号ID
-            account_id = unb
-
-            # 确保账号ID唯一
-            counter = 1
-            original_account_id = account_id
-            while account_id in existing_cookies:
-                account_id = f"{original_account_id}_{counter}"
-                counter += 1
-
-            is_new_account = True
-            log_with_user('info', f"扫码登录准备创建新账号: {account_id}, UNB: {unb}", current_user)
-
-        # 第一步：使用扫码cookie获取真实cookie
-        log_with_user('info', f"开始使用扫码cookie获取真实cookie: {account_id}", current_user)
-
-        try:
-            # 创建一个临时的XianyuLive实例来执行cookie刷新
-            from XianyuAutoAsync import XianyuLive
-
-            # 使用扫码登录的cookie创建临时实例
-            temp_instance = XianyuLive(
-                cookies_str=cookies,
-                cookie_id=account_id,
-                user_id=user_id
-            )
-
-            # 执行cookie刷新获取真实cookie
-            refresh_success = await temp_instance.refresh_cookies_from_qr_login(
-                qr_cookies_str=cookies,
-                cookie_id=account_id,
-                user_id=user_id
-            )
-
-            if refresh_success:
-                log_with_user('info', f"扫码登录真实cookie获取成功: {account_id}", current_user)
-
-                # 从数据库获取刚刚保存的真实cookie
-                updated_cookie_info = db_manager.get_cookie_by_id(account_id)
-                if updated_cookie_info:
-                    real_cookies = updated_cookie_info['cookies_str']
-                    log_with_user('info', f"已获取真实cookie，长度: {len(real_cookies)}", current_user)
-
-                    # 第二步：将真实cookie添加到cookie_manager（如果是新账号）或更新现有账号
-                    if cookie_manager.manager:
-                        if is_new_account:
-                            cookie_manager.manager.add_cookie(account_id, real_cookies)
-                            log_with_user('info', f"已将真实cookie添加到cookie_manager: {account_id}", current_user)
-                        else:
-                            # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                            cookie_manager.manager.update_cookie(account_id, real_cookies, save_to_db=False)
-                            log_with_user('info', f"已更新cookie_manager中的真实cookie: {account_id}", current_user)
-
-                    return {
-                        'account_id': account_id,
-                        'is_new_account': is_new_account,
-                        'real_cookie_refreshed': True,
-                        'cookie_length': len(real_cookies)
-                    }
-                else:
-                    log_with_user('error', f"无法从数据库获取真实cookie: {account_id}", current_user)
-                    # 降级处理：使用原始扫码cookie
-                    return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "无法从数据库获取真实cookie")
-            else:
-                log_with_user('warning', f"扫码登录真实cookie获取失败: {account_id}", current_user)
-                # 降级处理：使用原始扫码cookie
-                return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, "真实cookie获取失败")
-
-        except Exception as refresh_e:
-            log_with_user('error', f"扫码登录真实cookie获取异常: {str(refresh_e)}", current_user)
-            # 降级处理：使用原始扫码cookie
-            return await _fallback_save_qr_cookie(account_id, cookies, user_id, is_new_account, current_user, f"获取真实cookie异常: {str(refresh_e)}")
-
-    except Exception as e:
-        log_with_user('error', f"处理扫码登录Cookie失败: {str(e)}", current_user)
-        raise e
-
-
-async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, is_new_account: bool, current_user: Dict[str, Any], error_reason: str) -> Dict[str, Any]:
-    """降级处理：当无法获取真实cookie时，保存原始扫码cookie"""
-    try:
-        log_with_user('warning', f"降级处理 - 保存原始扫码cookie: {account_id}, 原因: {error_reason}", current_user)
-
-        # 保存原始扫码cookie到数据库
-        if is_new_account:
-            db_manager.save_cookie(account_id, cookies, user_id)
-            log_with_user('info', f"降级处理 - 新账号原始cookie已保存: {account_id}", current_user)
-        else:
-            # 现有账号使用 update_cookie_account_info 避免覆盖其他字段
-            db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
-            log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
-
-        # 添加到或更新cookie_manager
-        if cookie_manager.manager:
-            if is_new_account:
-                cookie_manager.manager.add_cookie(account_id, cookies)
-                log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
-            else:
-                # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, cookies, save_to_db=False)
-                log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
-
-        return {
-            'account_id': account_id,
-            'is_new_account': is_new_account,
-            'real_cookie_refreshed': False,
-            'fallback_reason': error_reason,
-            'cookie_length': len(cookies)
-        }
-
-    except Exception as fallback_e:
-        log_with_user('error', f"降级处理失败: {str(fallback_e)}", current_user)
-        raise fallback_e
-
-
-@accounts_router.post("/qr-login/refresh-cookies")
-async def refresh_cookies_from_qr_login(
-    request: Dict[str, Any],
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库"""
-    try:
-        qr_cookies = request.get('qr_cookies')
-        cookie_id = request.get('cookie_id')
-
-        if not qr_cookies:
-            return {'success': False, 'message': '缺少扫码登录cookie'}
-
-        if not cookie_id:
-            return {'success': False, 'message': '缺少cookie_id'}
-
-        log_with_user('info', f"开始使用扫码cookie刷新真实cookie: {cookie_id}", current_user)
-
-        # 创建一个临时的XianyuLive实例来执行cookie刷新
-        from XianyuAutoAsync import XianyuLive
-
-        # 使用扫码登录的cookie创建临时实例
-        temp_instance = XianyuLive(
-            cookies_str=qr_cookies,
-            cookie_id=cookie_id,
-            user_id=current_user['user_id']
-        )
-
-        # 执行cookie刷新
-        success = await temp_instance.refresh_cookies_from_qr_login(
-            qr_cookies_str=qr_cookies,
-            cookie_id=cookie_id,
-            user_id=current_user['user_id']
-        )
-
-        if success:
-            log_with_user('info', f"扫码cookie刷新成功: {cookie_id}", current_user)
-
-            # 如果cookie_manager存在，更新其中的cookie
-            if cookie_manager.manager:
-                # 从数据库获取更新后的cookie
-                updated_cookie_info = db_manager.get_cookie_by_id(cookie_id)
-                if updated_cookie_info:
-                    # refresh_cookies_from_qr_login 已经保存到数据库了，这里不需要再保存
-                    cookie_manager.manager.update_cookie(cookie_id, updated_cookie_info['cookies_str'], save_to_db=False)
-                    log_with_user('info', f"已更新cookie_manager中的cookie: {cookie_id}", current_user)
-
-            return {
-                'success': True,
-                'message': '真实cookie获取并保存成功',
-                'cookie_id': cookie_id
-            }
-        else:
-            log_with_user('error', f"扫码cookie刷新失败: {cookie_id}", current_user)
-            return {'success': False, 'message': '获取真实cookie失败'}
-
-    except Exception as e:
-        log_with_user('error', f"扫码cookie刷新异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'刷新cookie失败: {str(e)}'}
-
-
-@accounts_router.post("/qr-login/reset-cooldown/{cookie_id}")
-async def reset_qr_cookie_refresh_cooldown(
-    cookie_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """重置指定账号的扫码登录Cookie刷新冷却时间"""
-    try:
-        log_with_user('info', f"重置扫码登录Cookie刷新冷却时间: {cookie_id}", current_user)
-
-        # 检查cookie是否存在
-        cookie_info = db_manager.get_cookie_by_id(cookie_id)
-        if not cookie_info:
-            return {'success': False, 'message': '账号不存在'}
-
-        # 如果cookie_manager中有对应的实例，直接重置
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
-            remaining_time_before = instance.get_qr_cookie_refresh_remaining_time()
-            instance.reset_qr_cookie_refresh_flag()
-
-            log_with_user('info', f"已重置账号 {cookie_id} 的扫码登录冷却时间，原剩余时间: {remaining_time_before}秒", current_user)
-
-            return {
-                'success': True,
-                'message': '扫码登录Cookie刷新冷却时间已重置',
-                'cookie_id': cookie_id,
-                'previous_remaining_time': remaining_time_before
-            }
-        else:
-            # 如果没有活跃实例，返回成功（因为没有冷却时间需要重置）
-            log_with_user('info', f"账号 {cookie_id} 没有活跃实例，无需重置冷却时间", current_user)
-            return {
-                'success': True,
-                'message': '账号没有活跃实例，无需重置冷却时间',
-                'cookie_id': cookie_id
-            }
-
-    except Exception as e:
-        log_with_user('error', f"重置扫码登录冷却时间异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'重置冷却时间失败: {str(e)}'}
-
-
-@accounts_router.get("/qr-login/cooldown-status/{cookie_id}")
-async def get_qr_cookie_refresh_cooldown_status(
-    cookie_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """获取指定账号的扫码登录Cookie刷新冷却状态"""
-    try:
-        # 检查cookie是否存在
-        cookie_info = db_manager.get_cookie_by_id(cookie_id)
-        if not cookie_info:
-            return {'success': False, 'message': '账号不存在'}
-
-        # 如果cookie_manager中有对应的实例，获取冷却状态
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
-            remaining_time = instance.get_qr_cookie_refresh_remaining_time()
-            cooldown_duration = instance.qr_cookie_refresh_cooldown
-            last_refresh_time = instance.last_qr_cookie_refresh_time
-
-            return {
-                'success': True,
-                'cookie_id': cookie_id,
-                'remaining_time': remaining_time,
-                'cooldown_duration': cooldown_duration,
-                'last_refresh_time': last_refresh_time,
-                'is_in_cooldown': remaining_time > 0,
-                'remaining_minutes': remaining_time // 60,
-                'remaining_seconds': remaining_time % 60
-            }
-        else:
-            return {
-                'success': True,
-                'cookie_id': cookie_id,
-                'remaining_time': 0,
-                'cooldown_duration': 600,  # 默认10分钟
-                'last_refresh_time': 0,
-                'is_in_cooldown': False,
-                'message': '账号没有活跃实例'
-            }
-
-    except Exception as e:
-        log_with_user('error', f"获取扫码登录冷却状态异常: {str(e)}", current_user)
-        return {'success': False, 'message': f'获取冷却状态失败: {str(e)}'}
+async def process_qr_login_cookies(
+    cookies: str,
+    unb: str,
+    current_user: Dict[str, Any],
+    *,
+    runtime_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist only a Cookie already validated by the API QR manager."""
+    return await _persist_validated_account_login(
+        user_id=current_user['user_id'],
+        cookies_str=cookies,
+        validated_unb=unb,
+        login_method='qr',
+        browser_user_agent=detect_default_browser_user_agent(),
+        runtime_state=runtime_state,
+    )
 
 
 @accounts_router.put('/cookies/{cid}/status')
@@ -4901,7 +5032,7 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
         all_items = []
         for cookie_id in user_cookies.keys():
-            items = db_manager.get_items_by_cookie(cookie_id)
+            items = db_manager.get_items_by_cookie(cookie_id, include_inactive=False)
             all_items.extend(items)
 
         return {"items": all_items}
@@ -4913,17 +5044,19 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 class ItemSearchRequest(BaseModel):
     keyword: str
+    account_id: str
     page: int = 1
     page_size: int = 20
 
 class ItemSearchMultipleRequest(BaseModel):
     keyword: str
+    account_id: str
     total_pages: int = 1
 
 @content_router.post("/items/search")
 async def search_items(
     search_request: ItemSearchRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -4936,6 +5069,8 @@ async def search_items(
         # 执行搜索
         result = await search_xianyu_items(
             keyword=search_request.keyword,
+            user_id=current_user['user_id'],
+            account_id=search_request.account_id,
             page=search_request.page,
             page_size=search_request.page_size
         )
@@ -5022,7 +5157,7 @@ async def check_valid_cookies(
 @content_router.post("/items/search_multiple")
 async def search_multiple_pages(
     search_request: ItemSearchMultipleRequest,
-    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索多页闲鱼商品"""
     user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
@@ -5035,6 +5170,8 @@ async def search_multiple_pages(
         # 执行多页搜索
         result = await search_multiple_pages_xianyu(
             keyword=search_request.keyword,
+            user_id=current_user['user_id'],
+            account_id=search_request.account_id,
             total_pages=search_request.total_pages
         )
 
@@ -5081,7 +5218,7 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
-        items = db_manager.get_items_by_cookie(cookie_id)
+        items = db_manager.get_items_by_cookie(cookie_id, include_inactive=False)
         return {"items": items}
     except HTTPException:
         raise
@@ -6104,11 +6241,27 @@ def _require_owned_cookie(cookie_id: str, user_id: int) -> None:
 
 def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
     refresh_status = db_manager.get_account_session_refresh(cookie_id)
+    state = refresh_status.get('state')
+    registry_active = active_refresh_registry.is_active(cookie_id)
+    if state in {'refreshing', 'verification_required'} and not registry_active:
+        image_path = (refresh_status.get('verification_image_url') or '').lstrip('/')
+        remove_verification_image(image_path)
+        db_manager.update_account_session_refresh(
+            cookie_id,
+            state='action_required',
+            trigger=refresh_status.get('trigger') or 'automatic',
+            message='需要手动开始一次验证，当前没有正在运行的官方浏览器',
+            error_code='browser_session_missing',
+        )
+        refresh_status = db_manager.get_account_session_refresh(cookie_id)
+        state = refresh_status.get('state')
     if (
-        refresh_status.get('state') in {'refreshing', 'verification_required'}
+        state in {'refreshing', 'verification_required'}
+        and registry_active
         and refresh_status.get('expires_at')
         and time.time() > float(refresh_status['expires_at'])
     ):
+        active_refresh_registry.cancel(cookie_id)
         image_path = (refresh_status.get('verification_image_url') or '').lstrip('/')
         remove_verification_image(image_path)
         db_manager.update_account_session_refresh(
@@ -6119,6 +6272,7 @@ def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
             error_code='verification_timeout',
         )
         refresh_status = db_manager.get_account_session_refresh(cookie_id)
+    refresh_status['browser_active'] = active_refresh_registry.browser_active(cookie_id)
     return refresh_status
 
 
@@ -6141,7 +6295,38 @@ def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = De
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh")
 async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
+    account_info = db_manager.get_cookie_details(cookie_id) or {}
+    if not supports_automatic_refresh(
+        account_info.get('login_method'),
+        account_info.get('username'),
+        bool(account_info.get('password')),
+    ):
+        login_method = normalize_login_method(account_info.get('login_method'))
+        message = reauth_message_for(login_method)
+        db_manager.mark_cookie_expired(cookie_id)
+        db_manager.update_account_session_refresh(
+            cookie_id,
+            state='manual_reauth_required',
+            trigger='manual',
+            message=message,
+            error_code='manual_reauth_required',
+        )
+        return {
+            'success': False,
+            'status': 'manual_reauth_required',
+            'message': message,
+            'reauth_action': reauth_action_for(login_method),
+            'data': db_manager.get_account_session_refresh(cookie_id),
+        }
     current_status = _current_session_refresh_status(cookie_id)
+    if current_status.get('state') == 'manual_reauth_required':
+        return {
+            'success': False,
+            'status': 'manual_reauth_required',
+            'message': reauth_message_for('password'),
+            'reauth_action': 'password_login',
+            'data': current_status,
+        }
     if active_refresh_registry.is_active(cookie_id):
         return {'success': True, 'message': 'Cookie 刷新已经在进行中', 'data': current_status}
 
@@ -6195,8 +6380,8 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
     await asyncio.sleep(0)
     return {
         'success': True,
-        'message': '已开始刷新 Cookie',
-        'data': db_manager.get_account_session_refresh(cookie_id),
+        'message': '已开始一次验证',
+        'data': _current_session_refresh_status(cookie_id),
     }
 
 
@@ -6206,6 +6391,8 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
     status_info = _current_session_refresh_status(cookie_id)
     image_path = (status_info.get('verification_image_url') or '').lstrip('/')
     cancelled = active_refresh_registry.cancel(cookie_id)
+    if not cancelled:
+        raise HTTPException(status_code=409, detail="当前没有正在运行的刷新任务")
     remove_verification_image(image_path)
     db_manager.update_account_session_refresh(
         cookie_id, state='cancelled', trigger=status_info.get('trigger') or 'manual',
@@ -6217,7 +6404,18 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
         error_code='cancelled',
         error_message='Cookie 刷新已取消',
     )
-    return {'success': True, 'message': '刷新已取消' if cancelled else '没有正在运行的刷新任务'}
+    return {'success': True, 'message': '刷新已取消'}
+
+
+@accounts_router.post("/api/accounts/{cookie_id}/session-refresh/show-browser")
+def show_account_session_refresh_browser(
+    cookie_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_owned_cookie(cookie_id, current_user['user_id'])
+    if not active_refresh_registry.show_browser(cookie_id):
+        raise HTTPException(status_code=404, detail="没有正在等待人工操作的官方浏览器会话")
+    return {'success': True, 'message': '已请求在本机显示同一官方会话'}
 
 
 @accounts_router.get("/api/diagnostics/auto-reply/{cookie_id}")
@@ -6318,7 +6516,9 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
             issues.append("关键词、AI、默认回复都未配置，无法自动回复")
 
         refresh_state = refresh_status.get('state')
-        if refresh_state == 'verification_required':
+        if refresh_state == 'action_required':
+            issues.append(refresh_status.get('message') or "需要手动开始一次验证")
+        elif refresh_state == 'verification_required':
             issues.append("Cookie 刷新正在等待身份验证，请在账号卡片中完成验证")
         elif refresh_state == 'refreshing':
             issues.append("Cookie 正在自动刷新，请稍候")
@@ -6330,24 +6530,13 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                 max_age_seconds=600,
             ):
                 issues.append(refresh_status.get('message') or "最近一次 Cookie 刷新失败")
-        if not cookie_info.get('username') or not cookie_info.get('password'):
-            issues.append("未保存闲鱼账号密码，Cookie 过期后无法自动刷新")
-            if recent_runtime_error and 'Token获取失败' in recent_runtime_error:
-                issues.append("当前 Cookie 已无法换取消息 Token，请重新扫码添加账号或保存闲鱼账号密码后再自动刷新")
-        elif not is_valid_account_login_username(cookie_info.get('username')):
-            issues.append("已保存的闲鱼登录账号格式异常，请重新填写")
-
         issues = list(dict.fromkeys(issues))
-        blocking_issues = [
-            issue for issue in issues
-            if issue != "未保存闲鱼账号密码，Cookie 过期后无法自动刷新"
-        ]
 
         return {
             "success": True,
             "data": {
                 "cookie_id": cookie_id,
-                "ready": len(blocking_issues) == 0,
+                "ready": len(issues) == 0,
                 "issues": issues,
                 "diagnosed_at": time.time(),
                 "account": {
@@ -6405,6 +6594,81 @@ SKILL_NOTIFICATION_CHANNEL_TYPES = {
     'telegram',
 }
 
+
+class SkillMonitorActionRequired(HTTPException):
+    """A run outcome that must pause scheduling until an operator intervenes."""
+
+    def __init__(
+        self,
+        *,
+        reason_code: str,
+        detail: str,
+        status_code: int = 409,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        normalized_reason = re.sub(
+            r'[^a-z0-9_]+',
+            '_',
+            str(reason_code or 'account_action_required').strip().lower(),
+        ).strip('_')
+        self.reason_code = normalized_reason[:80] or 'account_action_required'
+
+
+def _require_skill_monitor_feature(feature_key: str, detail: str) -> None:
+    if not skill_monitor_feature_enabled(feature_key):
+        raise HTTPException(status_code=503, detail=detail)
+
+
+def _require_skill_monitor_account_ready(
+    user_id: int,
+    account_id: str,
+) -> Dict[str, Any]:
+    normalized_account_id = str(account_id or '').strip()
+    if not normalized_account_id:
+        raise HTTPException(status_code=409, detail="请先绑定所属闲鱼账号")
+    context = db_manager.get_owned_cookie_search_context(
+        int(user_id),
+        normalized_account_id,
+    )
+    state = str(context.get('state') or 'error')
+    if state == 'ownership_mismatch':
+        raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+    if state == 'not_found':
+        raise HTTPException(status_code=409, detail="绑定的闲鱼账号不存在")
+    if state != 'ready':
+        raise HTTPException(
+            status_code=409,
+            detail="闲鱼账号身份不完整，请先完成账号登录恢复",
+        )
+    return context
+
+
+def _require_skill_monitor_schedule_ready(
+    user_id: int,
+    account_id: str,
+) -> Dict[str, Any]:
+    _require_skill_monitor_feature(
+        'skill_monitor_enabled',
+        '监控全局开关关闭，暂不能开启定时监控',
+    )
+    _require_skill_monitor_feature(
+        'skill_monitor_scheduler_enabled',
+        '监控调度开关关闭，暂不能开启定时监控',
+    )
+    return _require_skill_monitor_account_ready(user_id, account_id)
+
+
+def _require_skill_monitor_delivery_ready() -> None:
+    _require_skill_monitor_feature(
+        'skill_monitor_enabled',
+        '监控全局开关关闭，暂不能开启监控通知',
+    )
+    _require_skill_monitor_feature(
+        'skill_monitor_delivery_enabled',
+        '监控通知开关关闭，暂不能开启监控通知',
+    )
+
+
 def _skill_interval_minutes(value: Any) -> int:
     try:
         return max(15, int(value or 60))
@@ -6455,28 +6719,12 @@ def _user_has_ai_configuration(user_id: int) -> bool:
     return _user_ai_cookie_settings(user_id)[0] is not None
 
 
-def _json_from_model_text(text: str) -> Dict[str, Any]:
-    cleaned = (text or '').strip()
-    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(0)
-    try:
-        value = json.loads(cleaned)
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        lowered = cleaned.lower()
-        return {
-            'recommended': any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')),
-            'score': 80 if any(word in lowered for word in ('yes', 'true', '推荐', '值得', '合适')) else 20,
-            'reason': cleaned[:200] or 'AI未返回可解析理由',
-        }
-
-
-def _run_skill_ai_filter(item: Dict[str, Any], task: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+def _prepare_skill_ai_filter_request(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+) -> Tuple[Any, Dict[str, Any], List[Dict[str, str]]]:
     ai_filter = str(task.get('ai_filter') or '').strip()
-    if not ai_filter:
-        return {'recommended': True, 'score': 0, 'reason': ''}
-
     cookie_id, settings = _user_ai_cookie_settings(user_id, task.get('account_id') or '')
     if not cookie_id or not settings:
         raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
@@ -6507,16 +6755,106 @@ def _run_skill_ai_filter(item: Dict[str, Any], task: Dict[str, Any], user_id: in
             'content': f"筛选要求：{ai_filter}\n商品信息：{json.dumps(item_summary, ensure_ascii=False)}",
         },
     ]
+    return client, settings, messages
+
+
+def _run_skill_ai_filter(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    run_id: int = 0,
+    claim_token: str = '',
+) -> Dict[str, Any]:
+    from skill_monitor_ai_contract import (
+        SkillMonitorAIError,
+        parse_skill_monitor_ai_decision,
+    )
+
+    if not str(task.get('ai_filter') or '').strip():
+        return {'recommended': True, 'score': 0, 'reason': ''}
+    client, settings, messages = _prepare_skill_ai_filter_request(
+        item,
+        task,
+        user_id,
+    )
+    if run_id and not db_manager.skill_monitor_run_claim_is_current(
+        run_id,
+        claim_token,
+    ):
+        raise HTTPException(status_code=409, detail="监控运行租约已失效")
     raw = ai_reply_engine._call_openai_api(client, settings, messages, max_tokens=220, temperature=0.1)
-    parsed = _json_from_model_text(raw)
-    score = parsed.get('score', 0)
+    if run_id and not db_manager.skill_monitor_run_claim_is_current(
+        run_id,
+        claim_token,
+    ):
+        raise HTTPException(status_code=409, detail="监控运行租约已失效")
     try:
-        score = max(0, min(100, int(float(score))))
-    except (TypeError, ValueError):
-        score = 0
-    recommended = bool(parsed.get('recommended')) and score >= 50
-    reason = str(parsed.get('reason') or raw or '').strip()[:300]
-    return {'recommended': recommended, 'score': score, 'reason': reason or 'AI筛选完成'}
+        parsed = parse_skill_monitor_ai_decision(raw)
+    except SkillMonitorAIError as exc:
+        raise HTTPException(status_code=502, detail=exc.safe_message) from exc
+    return {
+        'recommended': parsed.recommended and parsed.score >= 50,
+        'score': parsed.score,
+        'reason': parsed.reason,
+    }
+
+
+async def _run_skill_ai_filter_bounded(
+    item: Dict[str, Any],
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    run_id: int,
+    claim_token: str,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    from skill_monitor_ai_contract import (
+        SkillMonitorAIError,
+        evaluate_skill_monitor_ai_decision,
+    )
+
+    if not str(task.get('ai_filter') or '').strip():
+        return {'recommended': True, 'score': 0, 'reason': ''}
+    client, settings, messages = _prepare_skill_ai_filter_request(
+        item,
+        task,
+        user_id,
+    )
+
+    async def provider_call() -> str:
+        return await asyncio.to_thread(
+            ai_reply_engine._call_openai_api,
+            client,
+            settings,
+            messages,
+            max_tokens=220,
+            temperature=0.1,
+        )
+
+    def lease_is_current() -> bool:
+        return db_manager.skill_monitor_run_claim_is_current(
+            run_id,
+            claim_token,
+        )
+
+    try:
+        decision = await evaluate_skill_monitor_ai_decision(
+            provider_call,
+            lease_is_current,
+            timeout_seconds=timeout_seconds,
+        )
+    except SkillMonitorAIError as exc:
+        if exc.code == 'ai_lease_lost':
+            raise HTTPException(status_code=409, detail="监控运行租约已失效") from exc
+        if exc.code == 'ai_timeout':
+            raise HTTPException(status_code=504, detail=exc.safe_message) from exc
+        raise HTTPException(status_code=502, detail=exc.safe_message) from exc
+    return {
+        'recommended': decision.recommended and decision.score >= 50,
+        'score': decision.score,
+        'reason': decision.reason,
+    }
 
 
 def _raise_skill_notification_api_error(response: Any, channel_type: str) -> None:
@@ -6568,6 +6906,17 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
     if result_payload.get('item_url'):
         lines.append(f"链接：{result_payload['item_url']}")
     message = "\n".join(lines)
+    idempotency_key = str(
+        result_payload.get('_delivery_idempotency_key') or ''
+    ).strip()
+    idempotency_headers = (
+        {
+            'Idempotency-Key': idempotency_key,
+            'X-Idempotency-Key': idempotency_key,
+        }
+        if idempotency_key
+        else {}
+    )
 
     timeout = 10
     if channel_type in {'webhook', 'wechat', 'dingtalk', 'ding_talk', 'feishu', 'lark'}:
@@ -6576,6 +6925,8 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             raise ValueError("Webhook通知缺少url")
 
         request_kwargs: Dict[str, Any] = {}
+        if idempotency_headers:
+            request_kwargs['headers'] = idempotency_headers
         if channel_type == 'wechat':
             payload = {'msgtype': 'text', 'text': {'content': message}}
         elif channel_type in {'dingtalk', 'ding_talk'}:
@@ -6613,6 +6964,8 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             payload = config.get('payload_template')
         if not isinstance(payload, dict):
             payload = {'title': title, 'text': message, 'message': message, 'item_url': result_payload.get('item_url')}
+        if channel_type == 'webhook' and idempotency_key:
+            payload.setdefault('idempotency_key', idempotency_key)
         response = requests.post(url, json=payload, timeout=timeout, **request_kwargs)
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
@@ -6626,7 +6979,11 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             if not key:
                 raise ValueError("Bark通知缺少url或device_key")
             url = f"{server}/{key}/{quote(title)}/{quote(message)}"
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers=idempotency_headers or None,
+        )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
         return
@@ -6641,6 +6998,7 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             f"{api_base}/bot{token}/sendMessage",
             json={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': False},
             timeout=timeout,
+            headers=idempotency_headers or None,
         )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
@@ -6649,71 +7007,248 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
     raise ValueError(f"暂不支持的通知渠道类型: {channel_type}")
 
 
-def _notify_skill_monitor_result(task: Dict[str, Any], user_id: int, result_id: int, result_payload: Dict[str, Any]) -> Tuple[str, str]:
-    if not task.get('notify_enabled'):
-        return 'disabled', ''
-
-    channels = _enabled_notification_channels(user_id)
-    if not channels:
-        db_manager.update_skill_monitor_result_notification(result_id, user_id, 'skipped_no_channel', '没有启用的通知渠道')
-        return 'skipped_no_channel', '没有启用的通知渠道'
-
-    errors = []
-    sent_count = 0
-    for channel in channels:
-        try:
-            _send_skill_notification_to_channel(channel, task, result_payload)
-            sent_count += 1
-        except Exception as exc:
-            errors.append(
-                f"{channel.get('name') or channel.get('type')}: {_safe_skill_notification_error(exc)}"
-            )
-
-    error = "；".join(errors)[:500]
-    if sent_count == len(channels):
-        status = 'sent'
-    elif sent_count > 0:
-        status = 'partial'
-    else:
-        status = 'failed'
-        error = error or '通知发送失败'
-    db_manager.update_skill_monitor_result_notification(result_id, user_id, status, error)
-    return status, error
-
-
 @skills_router.get('/api/skills/capabilities')
 def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_user)):
-    account_count = len(db_manager.get_all_cookies(current_user['user_id']))
-    user_id = current_user['user_id']
-    has_ai = _user_has_ai_configuration(user_id)
-    channels = _enabled_notification_channels(user_id)
+    from skill_monitor_mtop_adapter import get_mtop_offline_contract_status
+
+    user_id = int(current_user['user_id'])
+    feature_state = get_skill_monitor_feature_state(db_manager)
+    effective_flags = feature_state['effective']
+    account_ids = list(db_manager.get_all_cookies(user_id).keys())
+    ready_account_ids = {
+        account_id
+        for account_id in account_ids
+        if db_manager.get_owned_cookie_search_context(
+            user_id,
+            account_id,
+        ).get('state') == 'ready'
+    }
+    tasks = db_manager.list_skill_monitor_tasks(user_id)
+    runnable_tasks = [
+        task
+        for task in tasks
+        if task.get('enabled')
+        and str(task.get('account_id') or '') in ready_account_ids
+    ]
+    manual_ready = bool(
+        effective_flags.get('skill_monitor_enabled')
+        and runnable_tasks
+    )
+    blockers = []
+    if not effective_flags.get('skill_monitor_enabled'):
+        blockers.append('全局监控开关关闭')
+    if not ready_account_ids:
+        blockers.append('没有身份完整的所属账号')
+    if not runnable_tasks:
+        blockers.append('没有绑定可用账号的启用任务')
+
+    evidence = db_manager.get_skill_capability_evidence(user_id)
+    last_search = evidence.get('last_real_search')
+    last_scheduled = evidence.get('last_scheduled_run')
+    last_ai = evidence.get('last_ai_decision')
+    last_delivery = evidence.get('last_real_delivery')
+    last_delivery_attempt = evidence.get('last_delivery_attempt')
+    scheduled_status_labels = {
+        'success': '成功',
+        'failed': '失败',
+        'interrupted': '已中断',
+        'action_required': '需要处理',
+        'running': '运行中',
+        'claimed': '已领取',
+        'pending': '等待中',
+    }
+    scheduled_status = str((last_scheduled or {}).get('status') or '')
+    if last_delivery:
+        delivery_detail = (
+            f"最近一次已确认送达渠道：{last_delivery['channel_type']}"
+        )
+    elif last_delivery_attempt:
+        delivery_detail = (
+            "尚无确认送达；最近投递状态为 "
+            f"{last_delivery_attempt['status']}"
+        )
+    else:
+        delivery_detail = '尚无真实通知投递记录'
+    mtop_offline_contract = get_mtop_offline_contract_status(db_manager)
+
     return {
         'success': True,
         'data': {
-            'manual_monitor': {
+            'code_present': {
                 'available': True,
-                'label': '可用',
-                'detail': '使用Playwright执行单次真实搜索',
+                'state': 'present',
+                'badge_state': 'ready',
+                'label': '代码已加载',
+                'detail': '执行租约、结果事务、通知 outbox 与离线 MTop 契约代码已加载；不代表配置或真实运行通过',
+                'evidence': {
+                    'offline_mtop_adapter': mtop_offline_contract,
+                },
             },
-            'scheduled_monitor': {
-                'available': True,
-                'label': '可用',
-                'detail': '单worker内置调度器按任务间隔运行',
+            'config_ready': {
+                'available': manual_ready,
+                'state': 'ready' if manual_ready else 'blocked',
+                'badge_state': 'ready' if manual_ready else 'missing',
+                'label': '配置就绪' if manual_ready else '尚未就绪',
+                'detail': (
+                    f"{len(runnable_tasks)} 个任务可手动执行"
+                    if manual_ready
+                    else '；'.join(blockers)
+                ),
+                'evidence': {
+                    'ready_accounts': len(ready_account_ids),
+                    'runnable_tasks': len(runnable_tasks),
+                    'ready_account_ids': sorted(ready_account_ids),
+                    'runnable_task_ids': sorted(
+                        int(task['id']) for task in runnable_tasks
+                    ),
+                    'global_enabled': bool(
+                        effective_flags.get('skill_monitor_enabled')
+                    ),
+                    'scheduler_enabled': bool(
+                        effective_flags.get('skill_monitor_scheduler_enabled')
+                    ),
+                    'delivery_enabled': bool(
+                        effective_flags.get('skill_monitor_delivery_enabled')
+                    ),
+                    'mtop_enabled': bool(
+                        effective_flags.get('skill_monitor_mtop_enabled')
+                    ),
+                    'operation_gates': {
+                        'manual_run': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                            ),
+                            'reason_code': (
+                                ''
+                                if effective_flags.get('skill_monitor_enabled')
+                                else 'monitor_disabled'
+                            ),
+                        },
+                        'schedule_activation': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                                and effective_flags.get(
+                                    'skill_monitor_scheduler_enabled'
+                                )
+                            ),
+                            'reason_code': (
+                                ''
+                                if (
+                                    effective_flags.get('skill_monitor_enabled')
+                                    and effective_flags.get(
+                                        'skill_monitor_scheduler_enabled'
+                                    )
+                                )
+                                else (
+                                    'monitor_disabled'
+                                    if not effective_flags.get(
+                                        'skill_monitor_enabled'
+                                    )
+                                    else 'scheduler_disabled'
+                                )
+                            ),
+                        },
+                        'delivery_activation': {
+                            'enabled': bool(
+                                effective_flags.get('skill_monitor_enabled')
+                                and effective_flags.get(
+                                    'skill_monitor_delivery_enabled'
+                                )
+                            ),
+                            'reason_code': (
+                                ''
+                                if (
+                                    effective_flags.get('skill_monitor_enabled')
+                                    and effective_flags.get(
+                                        'skill_monitor_delivery_enabled'
+                                    )
+                                )
+                                else (
+                                    'monitor_disabled'
+                                    if not effective_flags.get(
+                                        'skill_monitor_enabled'
+                                    )
+                                    else 'delivery_disabled'
+                                )
+                            ),
+                        },
+                    },
+                },
             },
-            'ai_filter': {
-                'available': has_ai,
-                'label': '可用' if has_ai else '需配置AI',
-                'detail': '命中规则后调用AI判断是否推荐' if has_ai else '请先为至少一个账号配置并启用AI',
+            'last_real_search': {
+                'available': bool(last_search),
+                'state': 'success' if last_search else 'never',
+                'badge_state': 'ready' if last_search else 'missing',
+                'label': '已有真实记录' if last_search else '从未验证',
+                'detail': (
+                    f"{last_search['source_adapter']} 成功抓取 "
+                    f"{last_search['raw_result_count']} 条，命中 "
+                    f"{last_search['accepted_result_count']} 条"
+                    if last_search
+                    else '没有成功完成的 Playwright/MTop 真实搜索记录'
+                ),
+                'observed_at': (
+                    last_search.get('observed_at') if last_search else None
+                ),
+                'evidence': last_search,
             },
-            'notifications': {
-                'available': len(channels) > 0,
-                'label': '可用' if channels else '缺少渠道',
-                'detail': f'将发送到 {len(channels)} 个启用通知渠道' if channels else '请先创建并启用通知渠道',
+            'last_scheduled_run': {
+                'available': scheduled_status == 'success',
+                'state': scheduled_status or 'never',
+                'badge_state': (
+                    'ready'
+                    if scheduled_status == 'success'
+                    else ('warning' if last_scheduled else 'missing')
+                ),
+                'label': (
+                    scheduled_status_labels.get(scheduled_status, scheduled_status)
+                    if last_scheduled
+                    else '从未运行'
+                ),
+                'detail': (
+                    f"最近一次定时运行状态："
+                    f"{scheduled_status_labels.get(scheduled_status, scheduled_status)}"
+                    if last_scheduled
+                    else '没有定时任务运行记录'
+                ),
+                'observed_at': (
+                    last_scheduled.get('observed_at')
+                    if last_scheduled
+                    else None
+                ),
+                'evidence': last_scheduled,
             },
-            'expert_live_reply': {
-                'available': account_count > 0,
-                'label': '可用' if account_count > 0 else '缺少账号',
-                'detail': '价格、技术和默认专家策略同时作用于测试与正式AI回复',
+            'last_ai_decision': {
+                'available': bool(last_ai),
+                'state': 'observed' if last_ai else 'never',
+                'badge_state': 'ready' if last_ai else 'missing',
+                'label': (
+                    ('推荐' if last_ai.get('recommended') else '不推荐')
+                    if last_ai
+                    else '从未判断'
+                ),
+                'detail': (
+                    f"最近一次 AI 过滤得分：{last_ai['score']:g}"
+                    if last_ai
+                    else '没有持久化的真实 AI 过滤决策'
+                ),
+                'observed_at': (
+                    last_ai.get('observed_at') if last_ai else None
+                ),
+                'evidence': last_ai,
+            },
+            'last_real_delivery': {
+                'available': bool(last_delivery),
+                'state': 'sent' if last_delivery else 'never',
+                'badge_state': 'ready' if last_delivery else 'missing',
+                'label': '已确认送达' if last_delivery else '从未确认',
+                'detail': delivery_detail,
+                'observed_at': (
+                    last_delivery.get('observed_at')
+                    if last_delivery
+                    else None
+                ),
+                'evidence': last_delivery,
             },
         },
     }
@@ -6884,24 +7419,91 @@ def _skill_item_matches_task(item: Dict[str, Any], task: Dict[str, Any]) -> Tupl
     return True, f'命中关键词、价格、地区过滤{publish_reason}', price
 
 
-async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Tuple[List[int], int, Dict[str, Any]]:
-    from utils.item_search import search_xianyu_items
+async def _run_real_skill_monitor(
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    scheduled_run: bool = False,
+    run_id: Optional[int] = None,
+    claim_token: str = '',
+    search_provider: Optional[
+        Callable[..., Awaitable[Dict[str, Any]]]
+    ] = None,
+) -> Tuple[List[int], int, Dict[str, Any]]:
+    provider_is_mocked = search_provider is not None
+    if search_provider is None:
+        from utils.item_search import search_xianyu_items
+
+        search_provider = search_xianyu_items
 
     keyword = (task.get('keyword') or '').strip()
+    account_id = str(task.get('account_id') or '').strip()
+    if not account_id:
+        raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
+    if provider_is_mocked and str(task.get('ai_filter') or '').strip():
+        raise HTTPException(
+            status_code=409,
+            detail="离线模拟搜索不允许调用真实 AI Provider",
+        )
     if str(task.get('ai_filter') or '').strip():
-        _user_ai_cookie_settings(user_id, task.get('account_id') or '')
+        _user_ai_cookie_settings(user_id, account_id)
         if not _user_has_ai_configuration(user_id):
             raise HTTPException(status_code=400, detail="AI筛选需要先为当前用户的账号配置并启用AI")
 
     page_size = 20
-    search_result = await search_xianyu_items(keyword=keyword, page=1, page_size=page_size)
+    search_result = await search_provider(
+        keyword=keyword,
+        user_id=user_id,
+        account_id=account_id,
+        page=1,
+        page_size=page_size,
+    )
 
+    if not isinstance(search_result, dict):
+        raise HTTPException(status_code=502, detail="闲鱼搜索返回结构无效")
     if not search_result or search_result.get('error'):
         error_message = (search_result or {}).get('error') or '真实搜索没有返回结果'
+        error_code = str((search_result or {}).get('error_code') or '')
+        if error_code in {'action_required', 'revision_conflict'}:
+            raise SkillMonitorActionRequired(
+                reason_code=(
+                    error_message
+                    if error_code == 'action_required'
+                    else error_code
+                ),
+                detail=f"闲鱼账号需要处理: {error_message}",
+            )
+        if error_code in {'ownership_mismatch', 'not_found'}:
+            raise SkillMonitorActionRequired(
+                reason_code=error_code,
+                detail="监控任务绑定的闲鱼账号不可用",
+                status_code=403,
+            )
         raise HTTPException(status_code=502, detail=f"闲鱼真实搜索失败: {error_message}")
 
-    if not search_result.get('is_real_data'):
+    search_result = dict(search_result)
+    if provider_is_mocked:
+        # This path is an internal test seam only.  Never allow a fixture to
+        # promote itself into real-provider evidence.
+        search_result.update(
+            {
+                'source': 'mocked',
+                'is_real_data': False,
+                'provider_mode': 'mocked',
+                'evidence_scope': 'mocked_provider',
+            }
+        )
+    elif not search_result.get('is_real_data'):
         raise HTTPException(status_code=502, detail="闲鱼搜索没有返回真实数据，已阻止写入样例结果")
+    else:
+        # Keep evidence labels controlled by the adapter boundary rather than
+        # trusting arbitrary provider response fields.
+        search_result.update(
+            {
+                'provider_mode': 'real',
+                'evidence_scope': 'real_provider',
+            }
+        )
 
     raw_items = search_result.get('items') or []
     created_ids: List[int] = []
@@ -6922,8 +7524,28 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, schedul
             continue
 
         ai_filter_result = {'recommended': True, 'score': 0, 'reason': reason}
-        if str(task.get('ai_filter') or '').strip():
-            ai_filter_result = _run_skill_ai_filter(item, task, user_id)
+        ai_evaluated = bool(str(task.get('ai_filter') or '').strip())
+        if ai_evaluated:
+            ai_filter_result = await _run_skill_ai_filter_bounded(
+                item,
+                task,
+                user_id,
+                run_id=int(run_id or 0),
+                claim_token=claim_token,
+            )
+            decision = db_manager.record_skill_monitor_ai_decision(
+                run_id=int(run_id or 0),
+                claim_token=claim_token,
+                task_id=int(task['id']),
+                user_id=int(user_id),
+                item_identity=str(item_id or item_url or item.get('title') or ''),
+                recommended=bool(ai_filter_result.get('recommended')),
+                score=float(ai_filter_result.get('score') or 0),
+            )
+            if decision.get('state') == 'lease_lost':
+                raise HTTPException(status_code=409, detail="监控运行租约已失效")
+            if decision.get('state') not in {'recorded', 'duplicate'}:
+                raise HTTPException(status_code=500, detail="AI 判断审计记录失败")
             if not ai_filter_result.get('recommended'):
                 continue
 
@@ -6934,17 +7556,28 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, schedul
             'price': price,
             'region': item.get('area') or item.get('region') or '',
             'item_url': item_url,
+            'item_id': item_id,
             'item_image': item.get('main_image') or item.get('item_image') or '',
             'seller_name': item.get('seller_name') or '',
             'ai_score': ai_filter_result.get('score') or 0,
             'ai_reason': ai_filter_result.get('reason') or reason,
             'notify_status': 'pending' if task.get('notify_enabled') else 'disabled',
+            'source_adapter': 'mocked' if provider_is_mocked else 'playwright',
             'raw_data': {
-                'source': search_result.get('source') or 'playwright',
-                'is_real_data': True,
-                'keyword': keyword,
+                'source': search_result.get('source') or (
+                    'mocked' if provider_is_mocked else 'playwright'
+                ),
+                'is_real_data': not provider_is_mocked,
+                'provider_mode': search_result.get(
+                    'provider_mode',
+                    'mocked' if provider_is_mocked else 'real',
+                ),
+                'evidence_scope': search_result.get(
+                    'evidence_scope',
+                    'mocked_provider' if provider_is_mocked else 'real_provider',
+                ),
                 'filter_reason': reason,
-                'ai_filter': task.get('ai_filter') or '',
+                'ai_evaluated': ai_evaluated,
                 'ai_recommended': bool(ai_filter_result.get('recommended')),
                 'scheduled_run': scheduled_run,
                 'published_within_hours': task.get('published_within_hours'),
@@ -6953,37 +7586,152 @@ async def _run_real_skill_monitor(task: Dict[str, Any], user_id: int, *, schedul
                 'want_count': item.get('want_count'),
             }
         }
-        result_id = db_manager.create_skill_monitor_result(result_payload)
-        if result_id:
-            notify_status, notify_error = _notify_skill_monitor_result(task, user_id, result_id, result_payload)
-            if notify_error:
-                result_payload.setdefault('raw_data', {})['notify_error'] = notify_error
-            result_payload['notify_status'] = notify_status
-            created_ids.append(result_id)
+        persistence = db_manager.persist_skill_monitor_match(
+            result_payload,
+            run_id=int(run_id or 0),
+            claim_token=claim_token,
+        )
+        if persistence.get('state') == 'lease_lost':
+            raise HTTPException(status_code=409, detail="监控运行租约已失效")
+        if persistence.get('state') == 'error':
+            raise HTTPException(status_code=500, detail="监控结果事务提交失败")
+        if persistence.get('created'):
+            result_payload['notify_status'] = persistence.get('notify_status')
+            created_ids.append(int(persistence['result_id']))
 
     return created_ids, len(raw_items), search_result
 
 
-async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, scheduled_run: bool = False) -> Dict[str, Any]:
-    if not db_manager.mark_skill_monitor_task_running(task['id'], user_id):
+SKILL_MONITOR_RUN_HEARTBEAT_SECONDS = 30
+
+
+async def _heartbeat_skill_monitor_run(
+    run_id: int,
+    claim_token: str,
+    stop_event: asyncio.Event,
+    lease_lost: asyncio.Event,
+    kill_switch_disabled: asyncio.Event,
+    owner_task: Optional[asyncio.Task],
+) -> None:
+    while not stop_event.is_set():
+        if not skill_monitor_feature_enabled("skill_monitor_enabled"):
+            kill_switch_disabled.set()
+            logger.warning(f"技能监控运行因全局开关关闭而中断 run_id={run_id}")
+            if owner_task is not None and not owner_task.done():
+                owner_task.cancel()
+            return
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=SKILL_MONITOR_RUN_HEARTBEAT_SECONDS,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        if db_manager.heartbeat_skill_monitor_run(run_id, claim_token):
+            continue
+        lease_lost.set()
+        logger.error(f"技能监控运行租约丢失 run_id={run_id}")
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
+        return
+
+
+def _safe_skill_run_error(exc: BaseException) -> Tuple[str, str]:
+    if isinstance(exc, HTTPException):
+        code = f"http_{exc.status_code}"
+        message = str(exc.detail or '')
+    else:
+        code = type(exc).__name__.lower()[:80]
+        message = str(exc or type(exc).__name__)
+    message = _safe_skill_notification_error(Exception(message))
+    message = re.sub(
+        r'(?i)(cookie|token|password|authorization)\s*[:=]\s*[^\s,;]+',
+        r'\1=[redacted]',
+        message,
+    )
+    return code, message[:500]
+
+
+async def execute_skill_monitor_task(
+    task: Dict[str, Any],
+    user_id: int,
+    *,
+    scheduled_run: bool = False,
+    search_provider: Optional[
+        Callable[..., Awaitable[Dict[str, Any]]]
+    ] = None,
+) -> Dict[str, Any]:
+    if not skill_monitor_feature_enabled("skill_monitor_enabled"):
+        raise HTTPException(status_code=503, detail="监控全局开关关闭")
+    if scheduled_run and not skill_monitor_feature_enabled("skill_monitor_scheduler_enabled"):
+        raise HTTPException(status_code=503, detail="监控调度开关关闭")
+
+    provider_is_mocked = search_provider is not None
+    claim = db_manager.claim_skill_monitor_run(
+        task['id'],
+        user_id,
+        trigger_type='scheduled' if scheduled_run else 'manual',
+        source_adapter='mocked' if provider_is_mocked else 'playwright',
+    )
+    if claim.get('state') == 'action_required':
+        raise HTTPException(status_code=409, detail="监控任务需要先绑定所属闲鱼账号")
+    if claim.get('state') == 'disabled':
+        raise HTTPException(status_code=409, detail="监控任务或定时设置已关闭")
+    if claim.get('state') == 'not_found':
+        raise HTTPException(status_code=404, detail="监控任务不存在")
+    if claim.get('state') == 'conflict':
         raise HTTPException(status_code=409, detail="监控任务正在运行，请稍后再试")
+    if not claim.get('claimed'):
+        raise HTTPException(status_code=500, detail="无法领取监控任务运行权")
+
+    run_id = int(claim['run_id'])
+    claim_token = str(claim['claim_token'])
+    run_task = dict(task)
+    run_task['account_id'] = str(claim.get('account_id') or '')
+    stop_heartbeat = asyncio.Event()
+    lease_lost = asyncio.Event()
+    kill_switch_disabled = asyncio.Event()
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_skill_monitor_run(
+            run_id,
+            claim_token,
+            stop_heartbeat,
+            lease_lost,
+            kill_switch_disabled,
+            asyncio.current_task(),
+        ),
+        name=f'skill-monitor-run-heartbeat:{run_id}',
+    )
 
     try:
-        result_ids, raw_count, search_result = await _run_real_skill_monitor(task, user_id, scheduled_run=scheduled_run)
-        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
-        db_manager.update_skill_monitor_task_run(
-            task['id'],
+        result_ids, raw_count, search_result = await _run_real_skill_monitor(
+            run_task,
             user_id,
-            status='success',
-            error='',
-            next_run_at=next_run_at,
+            scheduled_run=scheduled_run,
+            run_id=run_id,
+            claim_token=claim_token,
+            search_provider=search_provider,
         )
+        stop_heartbeat.set()
+        await heartbeat_task
+        next_run_at = _skill_next_run_at(run_task.get('schedule_interval_minutes')) if run_task.get('schedule_enabled') else None
+        if not db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='success',
+            raw_result_count=raw_count,
+            accepted_result_count=len(result_ids),
+            next_run_at=next_run_at,
+        ):
+            raise HTTPException(status_code=409, detail="监控运行租约已失效，结果未确认为成功")
         db_manager.log_skill_event(
             user_id,
             'monitor',
-            f"{'定时' if scheduled_run else '手动'}运行监控任务: {task['keyword']}",
+            f"{'定时' if scheduled_run else '手动'}运行监控任务",
             payload={
                 'task_id': task['id'],
+                'run_id': run_id,
                 'result_ids': result_ids,
                 'raw_count': raw_count,
                 'source': search_result.get('source'),
@@ -6992,28 +7740,92 @@ async def execute_skill_monitor_task(task: Dict[str, Any], user_id: int, *, sche
         )
         return {
             "success": True,
-            "message": f"真实监控完成，抓取 {raw_count} 条，命中 {len(result_ids)} 条",
+            "message": (
+                f"{'离线模拟' if provider_is_mocked else '真实'}监控完成，"
+                f"抓取 {raw_count} 条，命中 {len(result_ids)} 条"
+            ),
             "result_ids": result_ids,
             "created_count": len(result_ids),
             "raw_count": raw_count,
             "source": search_result.get('source'),
-            "is_real_data": True,
+            "is_real_data": not provider_is_mocked,
+            "provider_mode": search_result.get(
+                'provider_mode',
+                'mocked' if provider_is_mocked else 'real',
+            ),
+            "evidence_scope": search_result.get(
+                'evidence_scope',
+                'mocked_provider' if provider_is_mocked else 'real_provider',
+            ),
             "scheduled_run": scheduled_run,
             "next_run_at": next_run_at,
+            "run_id": run_id,
         }
+    except asyncio.CancelledError:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if kill_switch_disabled.is_set():
+            reason_code = 'kill_switch_disabled'
+            reason_message = '监控全局开关关闭，运行已中断'
+        elif lease_lost.is_set():
+            reason_code = 'lease_lost'
+            reason_message = '运行租约丢失，已中断'
+        else:
+            reason_code = 'shutdown_interrupted'
+            reason_message = '服务停止时运行被中断'
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='interrupted',
+            error_code=reason_code,
+            error_message=reason_message,
+            next_run_at=(
+                _skill_next_run_at(run_task.get('schedule_interval_minutes'))
+                if run_task.get('schedule_enabled')
+                else None
+            ),
+        )
+        raise
+    except SkillMonitorActionRequired as exc:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        _, message = _safe_skill_run_error(exc)
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
+            status='action_required',
+            error_code=exc.reason_code,
+            error_message=message,
+            next_run_at=None,
+        )
+        raise
     except Exception as exc:
-        next_run_at = _skill_next_run_at(task.get('schedule_interval_minutes')) if task.get('schedule_enabled') else None
-        message = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        db_manager.update_skill_monitor_task_run(
-            task['id'],
-            user_id,
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        next_run_at = _skill_next_run_at(run_task.get('schedule_interval_minutes')) if run_task.get('schedule_enabled') else None
+        error_code, message = _safe_skill_run_error(exc)
+        db_manager.finish_skill_monitor_run(
+            run_id,
+            claim_token,
             status='failed',
-            error=str(message)[:500],
+            error_code=error_code,
+            error_message=message,
             next_run_at=next_run_at,
         )
         if isinstance(exc, HTTPException):
             raise
         raise
+    finally:
+        stop_heartbeat.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
 @skills_router.get("/api/skills/monitor/tasks")
@@ -7033,8 +7845,10 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
             raise HTTPException(status_code=400, detail="关键词不能为空")
         if task.schedule_interval_minutes < 15:
             raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
-        if task.notify_enabled and not _enabled_notification_channels(current_user['user_id']):
-            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
+        if task.notify_enabled:
+            _require_skill_monitor_delivery_ready()
+            if not _enabled_notification_channels(current_user['user_id']):
+                raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
         try:
             validate_skill_monitor_features(
                 notify_enabled=task.notify_enabled,
@@ -7043,10 +7857,16 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        if task.account_id:
-            user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-            if task.account_id not in user_cookies:
-                raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+        if task.schedule_enabled:
+            _require_skill_monitor_schedule_ready(
+                current_user['user_id'],
+                task.account_id,
+            )
+        elif task.account_id:
+            _require_skill_monitor_account_ready(
+                current_user['user_id'],
+                task.account_id,
+            )
 
         task_payload = task.dict()
         task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task.schedule_interval_minutes)
@@ -7086,16 +7906,38 @@ def update_skill_monitor_task(task_id: int, task: SkillMonitorTaskUpdate, curren
             if task_payload['schedule_interval_minutes'] is not None and task_payload['schedule_interval_minutes'] < 15:
                 raise HTTPException(status_code=400, detail="定时监控间隔不能少于15分钟")
             task_payload['schedule_interval_minutes'] = _skill_interval_minutes(task_payload['schedule_interval_minutes'])
-        if task_payload.get('notify_enabled') and not _enabled_notification_channels(current_user['user_id']):
-            raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
-        account_id = task_payload.get('account_id')
-        if account_id:
-            user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-            if account_id not in user_cookies:
-                raise HTTPException(status_code=403, detail="无权限绑定该闲鱼账号")
+        enabling_notification = bool(
+            task_payload.get('notify_enabled') is True
+            and not existing.get('notify_enabled')
+        )
+        if enabling_notification:
+            _require_skill_monitor_delivery_ready()
+            if not _enabled_notification_channels(current_user['user_id']):
+                raise HTTPException(status_code=400, detail="请先创建并启用通知渠道，再开启监控通知")
+
+        effective_account_id = str(
+            task_payload.get('account_id', existing.get('account_id')) or ''
+        ).strip()
+        if 'account_id' in task_payload and not effective_account_id:
+            task_payload['schedule_enabled'] = False
+            task_payload['next_run_at'] = None
 
         schedule_enabled = task_payload.get('schedule_enabled', existing.get('schedule_enabled'))
         interval = task_payload.get('schedule_interval_minutes', existing.get('schedule_interval_minutes') or 60)
+        enabling_schedule = bool(
+            task_payload.get('schedule_enabled') is True
+            and not existing.get('schedule_enabled')
+        )
+        if enabling_schedule:
+            _require_skill_monitor_schedule_ready(
+                current_user['user_id'],
+                effective_account_id,
+            )
+        elif 'account_id' in task_payload and effective_account_id:
+            _require_skill_monitor_account_ready(
+                current_user['user_id'],
+                effective_account_id,
+            )
         if schedule_enabled and ('next_run_at' not in task_payload or not task_payload.get('next_run_at')):
             task_payload['next_run_at'] = _skill_next_run_at(interval)
         if not schedule_enabled and task_payload.get('schedule_enabled') is False:
@@ -7493,7 +8335,10 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
         xianyu_instance = XianyuLive(cookies_str, cookie_id)
 
         # 调用获取所有商品信息的方法（自动分页）
-        logger.info(f"开始获取账号 {cookie_id} 的所有商品信息")
+        logger.info(
+            "开始同步账号 {} 的在售商品",
+            _masked_identifier(cookie_id),
+        )
         result = await xianyu_instance.get_all_items()
 
         # 关闭session
@@ -7506,13 +8351,29 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
             total_count = result.get('total_count', 0)
             total_pages = result.get('total_pages', 1)
             saved_count = result.get('total_saved', 0)
-            logger.info(f"成功获取账号 {cookie_id} 的 {total_count} 个商品（共{total_pages}页），保存 {saved_count} 个")
+            active_count = result.get('active_count', total_count)
+            hidden_count = result.get('hidden_count', 0)
+            images_updated = result.get('images_updated', 0)
+            failed_count = result.get('failed_count', 0)
+            logger.info(
+                "账号商品同步完成: account={}, pages={}, active={}, hidden={}, images_updated={}, failed={}",
+                _masked_identifier(cookie_id),
+                total_pages,
+                active_count,
+                hidden_count,
+                images_updated,
+                failed_count,
+            )
             return {
                 "success": True,
-                "message": f"成功获取商品，共 {total_count} 件，保存 {saved_count} 件",
+                "message": f"同步完成：在售 {active_count} 件，隐藏历史 {hidden_count} 件，更新图片 {images_updated} 件",
                 "total_count": total_count,
                 "total_pages": total_pages,
-                "saved_count": saved_count
+                "saved_count": saved_count,
+                "active_count": active_count,
+                "hidden_count": hidden_count,
+                "images_updated": images_updated,
+                "failed_count": failed_count,
             }
 
     except Exception as e:
@@ -8713,6 +9574,21 @@ async def _fetch_order_details_for_sync(**kwargs):
     )
 
 
+async def _persist_order_sync_cookie(cookie_id: str, cookie_string: str) -> bool:
+    """Persist one verified account-scoped Cookie update and refresh its listener."""
+    if not db_manager.update_cookie_account_info(cookie_id, cookie_value=cookie_string):
+        return False
+    if cookie_manager.manager:
+        runtime_update = cookie_manager.manager.update_cookie(
+            cookie_id,
+            cookie_string,
+            save_to_db=False,
+        )
+        if hasattr(runtime_update, '__await__'):
+            await runtime_update
+    return True
+
+
 async def _sync_recent_orders(
     current_user: Dict[str, Any],
     cookie_id: Optional[str] = None,
@@ -8731,6 +9607,7 @@ async def _sync_recent_orders(
         db_manager,
         discoverer=client.discover,
         detail_fetcher=_fetch_order_details_for_sync,
+        cookie_updater=_persist_order_sync_cookie,
     )
     account_results = []
     total_summary = {
@@ -8742,10 +9619,12 @@ async def _sync_recent_orders(
         "failed": 0,
     }
     for account_id, cookie_string in user_cookies.items():
+        account_details = db_manager.get_cookie_by_id(account_id) or {}
         result = await coordinator.sync_account(
             cookie_id=account_id,
             cookie_string=cookie_string,
             days=days,
+            user_agent=str(account_details.get('browser_user_agent') or ''),
         )
         account_results.append({"cookie_id": account_id, **result})
         for key in total_summary:
@@ -8807,22 +9686,18 @@ def get_user_orders(
         if cookie_id and cookie_id in user_cookies:
             user_cookies = {cookie_id: user_cookies[cookie_id]}
 
-        # 获取所有订单数据
+        # 获取所有订单数据，并按账号+商品ID关联商品，避免多账号串数据。
         all_orders = []
-        # 先获取所有商品的 item_id 到 item_title 的映射
-        item_titles = {}
-        with db_manager.lock:
-            cursor = db_manager.conn.cursor()
-            cursor.execute('SELECT item_id, item_title FROM item_info')
-            for row in cursor.fetchall():
-                item_titles[row[0]] = row[1]
+        item_lookup = db_manager.get_item_catalog_lookup(list(user_cookies.keys()))
 
         for cid in user_cookies.keys():
             orders = db_manager.get_orders_by_cookie(cid, limit=1000)
             for order in orders:
                 order['cookie_id'] = cid
-                # 添加 item_title 字段
-                order['item_title'] = item_titles.get(order.get('item_id'), '')
+                catalog_item = item_lookup.get((cid, str(order.get('item_id') or '')), {})
+                order['item_title'] = catalog_item.get('item_title', '')
+                order['item_price'] = catalog_item.get('item_price', '')
+                order['item_image'] = catalog_item.get('item_image', '')
                 # 状态筛选
                 if status and order.get('status') != status:
                     continue
