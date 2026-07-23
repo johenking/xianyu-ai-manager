@@ -106,12 +106,14 @@ export interface AutoReplyDiagnostics {
 
 export type AccountSessionRefreshState =
   | 'idle'
+  | 'action_required'
   | 'refreshing'
   | 'verification_required'
   | 'success'
   | 'failed'
   | 'timeout'
-  | 'cancelled';
+  | 'cancelled'
+  | 'manual_reauth_required';
 
 export interface AccountSessionRefreshStatus {
   state: AccountSessionRefreshState;
@@ -119,11 +121,13 @@ export interface AccountSessionRefreshStatus {
   message: string;
   error_code: string;
   verification_image_url: string;
+  browser_active?: boolean;
   started_at?: number | null;
   last_attempt_at?: number | null;
   last_success_at?: number | null;
   expires_at?: number | null;
   updated_at?: number | null;
+  last_expired_at?: number | null;
 }
 
 export interface SkillAgentPrompt {

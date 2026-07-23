@@ -8,11 +8,13 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "verify:build": "node scripts/verifyBuildOutput.mjs",
+    "verify:extension": "node ../browser_extension/scripts/verify-package.mjs",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:extension": "node --test ../browser_extension/tests/*.test.mjs"
   },
   "dependencies": {
-    "axios": "^1.13.2",
+    "axios": "^1.18.1",
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",

@@ -52,6 +52,7 @@ const accountOneItems = [
     item_id: 'item-1',
     item_title: '账号一商品',
     item_price: '145',
+    item_image: 'https://img.alicdn.com/account-one.jpg',
   },
 ] as any;
 
@@ -87,6 +88,11 @@ describe('ItemList account filtering', () => {
     render(<ItemList />);
 
     await screen.findByText('账号一商品');
+    const image = screen.getByRole('img', { name: '账号一商品' });
+    expect(image).toHaveAttribute('src', 'https://img.alicdn.com/account-one.jpg');
+    expect(image).toHaveAttribute('referrerpolicy', 'no-referrer');
+    fireEvent.error(image);
+    expect(screen.queryByRole('img', { name: '账号一商品' })).not.toBeInTheDocument();
     expect(screen.queryByText('账号二商品')).not.toBeInTheDocument();
     expect(getItemsByCookie).toHaveBeenCalledWith('account-1');
     expect(getItems).not.toHaveBeenCalled();
@@ -101,5 +107,34 @@ describe('ItemList account filtering', () => {
     expect(screen.getByText('账号一商品')).toBeInTheDocument();
     expect(screen.getByText('账号二商品')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /同步商品/ })).toBeDisabled();
+  });
+
+  it('shows reconciliation statistics and retries the image when sync returns a new URL', async () => {
+    vi.mocked(getItemsByCookie)
+      .mockResolvedValueOnce(accountOneItems)
+      .mockResolvedValueOnce([{
+        ...accountOneItems[0],
+        item_image: 'https://img.alicdn.com/account-one-new.jpg',
+      }] as any);
+    vi.mocked(syncItemsFromAccount).mockResolvedValue({
+      success: true,
+      message: '同步完成：在售 1 件，隐藏历史 2 件，更新图片 1 件',
+      active_count: 1,
+      hidden_count: 2,
+      images_updated: 1,
+      failed_count: 0,
+    });
+
+    render(<ItemList />);
+
+    const initialImage = await screen.findByRole('img', { name: '账号一商品' });
+    fireEvent.error(initialImage);
+    fireEvent.click(screen.getByRole('button', { name: /同步商品/ }));
+
+    expect(await screen.findByText('同步完成：在售 1 件，隐藏历史 2 件，更新图片 1 件')).toBeInTheDocument();
+    expect(await screen.findByRole('img', { name: '账号一商品' })).toHaveAttribute(
+      'src',
+      'https://img.alicdn.com/account-one-new.jpg',
+    );
   });
 });
