@@ -9,7 +9,7 @@
 
 ## 功能
 
-- 多账号管理：官方账号密码登录、扫码和手动 Cookie 绑定，按真实 `unb` 保留账号数据；持久浏览器档案可续期 Cookie，账号级定时刷新默认关闭，活动刷新不会排队或重复启动浏览器。
+- 多账号管理：API 扫码、官方手机号验证码、账号密码、本机 Chrome 扩展和手动 Cookie 五种入口，按真实 `unb` 保留账号数据；只有账号密码来源支持自动续期，账号级定时刷新默认关闭。
 - 商品管理：按账号筛选和同步真实商品，只有选择“全部账号”时才展示全量商品；每件商品可维护独立知识档案和训练规则，相同商品可复刻知识草稿。
 - AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复；不同账号可选择不同平台和模型。
 - AI 训练：在独立对话框中模拟买家咨询，显示实际加载、排除和停用的规则；修正确认后才写入线上配置。
@@ -60,11 +60,13 @@
 
 同一后台用户重新扫码、密码登录或更新 Cookie 时，系统会优先按 Cookie 中的闲鱼 `unb` 找回原账号记录，因此原账号 ID、AI 配置、训练规则和商品知识可以继续复用。不要通过“删除账号”来解决过期登录：删除操作会清理该账号关联数据。
 
-首次账号密码登录会打开闲鱼官方登录页，从默认短信模式切换到密码模式，并在成功后读取真实 `unb`，把临时浏览器档案归档为 `browser_data/user_<unb>`。前端不再要求账号 ID；旧客户端传入的 `account_id` 仅为兼容字段，不参与身份判定。登录密码使用独立密钥加密保存，接口不会返回明文或密文。
+新增账号默认调用官方二维码接口取得 `codeContent` 并在本地渲染二维码，不使用浏览器截图。手机号验证码由用户在可见官方 Chrome 窗口中完成，应用不接收验证码；密码登录成功后系统使用独立密钥加密保存凭据。系统按真实 `unb` 保存账号，并把浏览器会话归档为 `browser_data/user_<unb>`。前端不要求账号 ID；旧客户端传入的 `account_id` 或 `id` 仅为兼容字段，不参与身份判定。
 
-Token 失效、手动刷新和账号级定时刷新都复用同一官方浏览器档案。档案仍有效时可直接续期，不需要反复扫码；档案彻底退出时，系统才使用已保存凭据重新登录。定时刷新默认关闭，可设置 1 小时到 7 天的间隔；关闭时 Token 异常只记录状态，不会自动启动 Chrome，手动“立即刷新”仍可使用。
+只有 `password + 有效账号 + 加密密码` 具备自动续期能力。续期先复用官方浏览器档案，档案完全退出后才使用保存凭据重新登录。扫码、验证码、扩展、手填 Cookie 和历史来源过期后进入 `manual_reauth_required`，系统显示对应重登入口且不重复启动 Chrome。人工验证期间同一窗口最多保留 15 分钟；Cookie、实际浏览器 User-Agent 和监听任务交接完成后才结束会话。
 
-闲鱼要求短信、扫码、人脸或其他安全验证时，系统会保留可见浏览器并最多等待 15 分钟，同时在账号页显示验证截图。验证不能绕过，完成后系统才会继续保存 Cookie 并恢复监听。官方页面结构或风控策略变化时，密码登录仍可能需要维护；不要通过删除账号来重试登录。
+官方登录使用本机系统 Chrome 的真实版本和有头窗口；后台运行只把窗口移到屏幕外。闲鱼要求短信、扫码、人脸或其他安全验证时，系统停止自动重试，保留同一会话最多 15 分钟，同时在账号页显示安全截图；用户可明确点击“本机打开”让窗口回到屏幕内。完成后系统只有在真实 `unb`、关键会话 Cookie 和页面状态同时通过时才保存 Cookie 并恢复监听。不要通过删除账号来重试登录。
+
+默认扫码客户端使用 `/qr-login/generate` 和 `/qr-login/check/{session_id}`；手机号验证码与账号密码通过 `POST /api/official-login/sessions` 创建 `sms` 或 `password` 会话。旧的 QR 浏览器刷新和冷却接口已移除。完整能力边界见 [登录策略](docs/login-strategy.md)，请求示例见 [接入指南](docs/integration-guide.md#account-binding-and-refresh)。
 
 ## 直接注册与找回
 
@@ -150,7 +152,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 

@@ -17,12 +17,22 @@ import qrcode.constants
 from loguru import logger
 import hashlib
 from utils.qr_verification_browser import QRVerificationBrowser, remove_public_screenshot
+from utils.xianyu_session_probe import (
+    PROBE_EXPIRED,
+    PROBE_RETRYABLE_ERROR,
+    PROBE_SUCCESS,
+    PROBE_VERIFICATION_REQUIRED,
+    cookies_to_string,
+    detect_default_browser_user_agent,
+    has_core_session_cookies,
+    probe_message_session_async,
+)
 
 
 def generate_headers():
     """生成请求头"""
     return {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': detect_default_browser_user_agent(),
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
         'Accept-Encoding': 'gzip, deflate, br',
@@ -66,6 +76,10 @@ class QRLoginSession:
         self.verification_browser_status = None  # starting, waiting, success, failed, timeout
         self.verification_error = None
         self.verification_task = None
+        self.error_code = None
+        self.message = None
+        self.validated = False
+        self.terminal_at = None
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -89,7 +103,13 @@ class QRLoginSession:
 class QRLoginManager:
     """二维码登录管理器"""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        verification_browser=None,
+        session_validator=None,
+        terminal_retention_seconds: float = 300.0,
+    ):
         self.sessions: Dict[str, QRLoginSession] = {}
         self.headers = generate_headers()
         self.host = "https://passport.goofish.com"
@@ -104,7 +124,23 @@ class QRLoginManager:
 
         # 配置超时时间
         self.timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
-        self.verification_browser = QRVerificationBrowser(headless=True)
+        self.verification_browser = verification_browser or QRVerificationBrowser()
+        self.session_validator = session_validator or probe_message_session_async
+        self.terminal_retention_seconds = max(300.0, float(terminal_retention_seconds))
+
+    @staticmethod
+    def _mark_terminal(
+        session: QRLoginSession,
+        status: str,
+        message: Optional[str] = None,
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        session.status = status
+        if message is not None:
+            session.message = message
+        if session.terminal_at is None:
+            session.terminal_at = time.time() if now is None else now
 
     def _cookie_marshal(self, cookies: dict) -> str:
         """将Cookie字典转换为字符串"""
@@ -250,24 +286,37 @@ class QRLoginManager:
                     params=login_params,
                     headers=self.headers
                 )
-                logger.debug(f"[调试] 获取二维码接口原始响应: {resp.text}")
 
                 try:
                     results = resp.json()
-                    logger.debug(f"[调试] 获取二维码接口解析后: {json.dumps(results, ensure_ascii=False)}")
-                except Exception as e:
-                    logger.exception("二维码接口返回不是JSON")
-                    raise GetLoginQRCodeError(f"二维码接口返回异常: {resp.text}")
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "二维码接口返回格式异常: status_code={}, content_type={}",
+                        resp.status_code,
+                        resp.headers.get("content-type", "unknown").split(";", 1)[0],
+                    )
+                    raise GetLoginQRCodeError("二维码接口返回格式异常") from None
 
-                if results.get("content", {}).get("success") == True:
+                content = results.get("content", {}) if isinstance(results, dict) else {}
+                data = content.get("data", {}) if isinstance(content, dict) else {}
+                success = content.get("success") is True
+                has_code_content = isinstance(data, dict) and bool(data.get("codeContent"))
+                logger.debug(
+                    "二维码接口响应摘要: status_code={}, success={}, has_code_content={}",
+                    resp.status_code,
+                    success,
+                    has_code_content,
+                )
+
+                if success and has_code_content:
                     # 更新会话参数
                     session.params.update({
-                        "t": results["content"]["data"]["t"],
-                        "ck": results["content"]["data"]["ck"],
+                        "t": data.get("t", ""),
+                        "ck": data.get("ck", ""),
                     })
 
                     # 获取二维码内容
-                    qr_content = results["content"]["data"]["codeContent"]
+                    qr_content = data["codeContent"]
                     session.qr_content = qr_content
 
                     # 生成二维码图片（base64格式）
@@ -291,18 +340,21 @@ class QRLoginManager:
                 else:
                     raise GetLoginQRCodeError("获取登录二维码失败")
 
-        except httpx.ConnectTimeout as e:
-            logger.error(f"连接超时: {e}")
+        except GetLoginQRCodeError as exc:
+            logger.warning("二维码生成失败: {}", exc)
+            return {'success': False, 'message': str(exc)}
+        except httpx.ConnectTimeout:
+            logger.error("二维码接口连接超时")
             return {'success': False, 'message': f'连接超时，请检查网络或尝试使用代理'}
-        except httpx.ReadTimeout as e:
-            logger.error(f"读取超时: {e}")
+        except httpx.ReadTimeout:
+            logger.error("二维码接口读取超时")
             return {'success': False, 'message': f'读取超时，服务器响应过慢'}
-        except httpx.ConnectError as e:
-            logger.error(f"连接错误: {e}")
+        except httpx.ConnectError:
+            logger.error("二维码接口连接错误")
             return {'success': False, 'message': f'连接错误，请检查网络或代理设置'}
-        except Exception as e:
-            logger.exception("二维码生成过程中发生异常")
-            return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+        except Exception as exc:
+            logger.error("二维码生成过程中发生异常: {}", type(exc).__name__)
+            return {'success': False, 'message': '生成二维码失败，请稍后重试'}
 
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
@@ -314,6 +366,60 @@ class QRLoginManager:
                 headers=self.headers,
             )
             return resp
+
+    async def _validate_candidate_session(self, session: QRLoginSession) -> bool:
+        """Validate a candidate Cookie through the real message-token API."""
+        claimed_unb = str(session.unb or session.cookies.get("unb") or "").strip()
+        if not claimed_unb or not has_core_session_cookies(session.cookies):
+            session.status = "error"
+            session.error_code = "core_cookies_missing"
+            session.message = "扫码结果缺少账号身份或核心会话字段，请重新扫码"
+            session.validated = False
+            return False
+
+        result = await self.session_validator(
+            cookies_to_string(session.cookies),
+            detect_default_browser_user_agent(),
+        )
+        result_unb = str((result.cookies or {}).get("unb") or "").strip()
+        if result_unb and result_unb != claimed_unb:
+            session.status = "error"
+            session.error_code = "account_mismatch"
+            session.message = "平台返回的账号身份与扫码会话不一致，已停止保存"
+            session.validated = False
+            return False
+
+        if result.status == PROBE_SUCCESS:
+            session.cookies.update(result.cookies or {})
+            session.unb = claimed_unb
+            session.status = "success"
+            session.error_code = None
+            session.message = "扫码登录成功"
+            session.validated = True
+            return True
+
+        if result.status == PROBE_VERIFICATION_REQUIRED:
+            session.cookies.update(result.cookies or {})
+            session.verification_url = result.verification_url or session.verification_url
+            session.status = "verification_required"
+            session.verification_browser_status = None
+            session.verification_error = None
+            session.error_code = result.error_code
+            session.message = "闲鱼要求完成安全验证，请点击“本机打开官方窗口”"
+            session.validated = False
+            return False
+
+        session.status = "error"
+        session.error_code = result.error_code or (
+            "session_expired" if result.status == PROBE_EXPIRED else "session_probe_retryable"
+        )
+        session.message = (
+            "平台暂时未能确认登录状态，请重新生成二维码后再试"
+            if result.status == PROBE_RETRYABLE_ERROR
+            else result.message or "扫码登录态已失效，请重新扫码"
+        )
+        session.validated = False
+        return False
 
     async def _monitor_qr_status(self, session_id: str, max_wait_time: int = 300, preserve_verification: bool = False):
         """监控二维码状态"""
@@ -360,22 +466,25 @@ class QRLoginManager:
                                 .get("iframeRedirectUrl")
                             )
                             session.verification_url = iframe_url
-                            session.verification_browser_status = 'starting' if iframe_url else 'failed'
+                            session.verification_browser_status = None if iframe_url else 'failed'
                             session.verification_error = None if iframe_url else '未获取到安全验证链接'
-                            self._ensure_verification_browser(session_id)
+                            session.message = (
+                                '闲鱼要求完成安全验证，请点击“本机打开官方窗口”'
+                                if iframe_url else '未获取到安全验证链接，请重新扫码'
+                            )
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, 已保存验证链接")
                             break
                         else:
-                            # 登录成功
-                            session.status = 'success'
-
-                            # 保存Cookie
+                            # 先收集扫码 Cookie，再通过真实消息会话接口校验。
                             for k, v in resp.cookies.items():
                                 session.cookies[k] = v
                                 if k == 'unb':
                                     session.unb = v
-
-                            logger.info(f"扫码登录成功: {session_id}, UNB: {session.unb}")
+                            await self._validate_candidate_session(session)
+                            logger.info(
+                                f"扫码登录校验完成: {session_id}, "
+                                f"status={session.status}, has_unb={bool(session.unb)}"
+                            )
                             break
 
                     elif qrcode_status == "NEW":
@@ -388,7 +497,11 @@ class QRLoginManager:
                             logger.info(f"二维码查询显示过期，保留安全验证状态: {session_id}")
                             break
                         # 二维码已过期
-                        session.status = 'expired'
+                        self._mark_terminal(
+                            session,
+                            'expired',
+                            '二维码已过期，请重新扫码',
+                        )
                         logger.info(f"二维码已过期: {session_id}")
                         break
 
@@ -399,32 +512,40 @@ class QRLoginManager:
                             logger.info(f"二维码已扫描，等待确认: {session_id}")
                     else:
                         # 用户取消确认
-                        session.status = 'cancelled'
+                        self._mark_terminal(session, 'cancelled', '扫码登录已取消')
                         logger.info(f"用户取消登录: {session_id}")
                         break
 
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 
-                except Exception as e:
-                    logger.error(f"监控二维码状态异常: {e}")
+                except Exception as exc:
+                    logger.error(f"监控二维码状态异常: {type(exc).__name__}")
                     await asyncio.sleep(2)
 
             # 超时处理
-            if session.status not in ['success', 'expired', 'cancelled', 'verification_required']:
+            if session.status not in ['success', 'expired', 'cancelled', 'verification_required', 'error']:
                 if preserve_verification and session.verification_url:
                     session.status = 'verification_required'
                     logger.info(f"未检测到安全验证通过，保留安全验证状态: {session_id}")
                 else:
-                    session.status = 'expired'
+                    self._mark_terminal(
+                        session,
+                        'expired',
+                        '二维码已过期，请重新扫码',
+                    )
                     logger.info(f"二维码监控超时，标记为过期: {session_id}")
 
-        except Exception as e:
-            logger.error(f"监控二维码状态失败: {e}")
+        except Exception as exc:
+            logger.error(f"监控二维码状态失败: {type(exc).__name__}")
             if session_id in self.sessions:
                 if preserve_verification and self.sessions[session_id].verification_url:
                     self.sessions[session_id].status = 'verification_required'
                 else:
-                    self.sessions[session_id].status = 'expired'
+                    self._mark_terminal(
+                        self.sessions[session_id],
+                        'expired',
+                        '二维码已过期，请重新扫码',
+                    )
 
     def _ensure_verification_browser(self, session_id: str):
         """确保二次验证浏览器会话已启动。"""
@@ -445,7 +566,10 @@ class QRLoginManager:
         except RuntimeError as exc:
             session.verification_browser_status = 'failed'
             session.verification_error = '无法启动安全验证浏览器任务'
-            logger.error(f"启动扫码二次验证浏览器任务失败: {session_id}, 错误: {exc}")
+            logger.error(
+                f"启动扫码二次验证浏览器任务失败: {session_id}, "
+                f"错误类型: {type(exc).__name__}"
+            )
 
     def _apply_verification_browser_update(self, session_id: str, update: Dict[str, str]):
         """接收浏览器线程回传的安全验证页面状态。"""
@@ -498,24 +622,46 @@ class QRLoginManager:
             if cookies and unb:
                 session.cookies.update(cookies)
                 session.unb = unb
-                session.status = 'success'
-                session.verification_browser_status = 'success'
-                session.verification_error = None
-                remove_public_screenshot(session.verification_screenshot_path)
-                session.verification_screenshot_path = None
-                logger.info(
-                    f"扫码二次验证登录成功: {session_id}, "
-                    f"cookie_count={len(cookies)}, has_unb={bool(unb)}"
-                )
+                validated = await self._validate_candidate_session(session)
+                if validated:
+                    try:
+                        self.verification_browser.promote_profile(session_id, str(unb))
+                    except Exception as exc:
+                        session.status = 'verification_required'
+                        session.validated = False
+                        session.verification_browser_status = 'failed'
+                        session.verification_error = '官方登录完成，但专用浏览器档案保存失败'
+                        logger.error(
+                            f"扫码二次验证档案归档失败: {session_id}, "
+                            f"error={type(exc).__name__}"
+                        )
+                        return
+                    session.verification_browser_status = 'success'
+                    session.verification_error = None
+                    remove_public_screenshot(session.verification_screenshot_path)
+                    session.verification_screenshot_path = None
+                    logger.info(
+                        f"扫码二次验证登录成功: {session_id}, "
+                        f"cookie_count={len(cookies)}, has_unb={bool(unb)}"
+                    )
+                elif session.status == 'verification_required':
+                    session.verification_browser_status = 'failed'
+                    session.verification_error = '官方窗口完成后，平台仍要求继续验证'
+                else:
+                    self.verification_browser.discard_profile(session_id)
             else:
                 session.status = 'verification_required'
                 session.verification_browser_status = 'failed'
                 session.verification_error = '安全验证完成后未获取到可用登录 Cookie'
                 logger.warning(f"扫码二次验证未获取到可用登录 Cookie: {session_id}")
         elif status == 'timeout':
-            session.status = 'expired'
+            self._mark_terminal(
+                session,
+                'expired',
+                '二维码已过期，请重新扫码',
+            )
             session.verification_browser_status = 'timeout'
-            session.verification_error = result.get('message') or '等待安全验证超时'
+            session.verification_error = '等待安全验证超时'
             remove_public_screenshot(session.verification_screenshot_path)
             session.verification_screenshot_path = None
         elif status == 'cancelled':
@@ -523,18 +669,19 @@ class QRLoginManager:
         else:
             session.status = 'verification_required'
             session.verification_browser_status = 'failed'
-            session.verification_error = result.get('message') or '安全验证浏览器处理失败'
+            session.verification_error = '安全验证浏览器处理失败'
             logger.warning(f"扫码二次验证浏览器处理失败: {session_id}, 状态: {status}")
 
     def _cleanup_verification_artifacts(self, session: QRLoginSession):
         remove_public_screenshot(session.verification_screenshot_path)
         session.verification_screenshot_path = None
+        self.verification_browser.discard_profile(session.session_id)
         task = session.verification_task
         if task and not task.done():
             task.cancel()
 
     def continue_after_verification(self, session_id: str) -> Dict[str, Any]:
-        """用户完成安全验证后，检查浏览器托管验证结果。"""
+        """用户明确请求后启动本机官方验证窗口。"""
         session = self.sessions.get(session_id)
         if not session:
             return {'status': 'not_found', 'message': '二维码会话不存在或已过期'}
@@ -543,8 +690,13 @@ class QRLoginManager:
             return self.get_session_status(session_id)
 
         if session.is_verification_expired():
-            session.status = 'expired'
-            return {'status': 'expired', 'message': '安全验证会话已过期，请重新生成二维码'}
+            self._mark_terminal(
+                session,
+                'expired',
+                '二维码已过期，请重新扫码',
+            )
+            self._cleanup_verification_artifacts(session)
+            return {'status': 'expired', 'message': '二维码已过期，请重新扫码'}
 
         self._ensure_verification_browser(session_id)
         return self.get_session_status(session_id)
@@ -557,9 +709,20 @@ class QRLoginManager:
 
         if session.status in ['verification_required', 'verification_checking']:
             if session.is_verification_expired():
-                session.status = 'expired'
+                self._mark_terminal(
+                    session,
+                    'expired',
+                    '二维码已过期，请重新扫码',
+                )
         elif session.is_expired() and session.status != 'success':
-            session.status = 'expired'
+            self._mark_terminal(
+                session,
+                'expired',
+                '二维码已过期，请重新扫码',
+            )
+
+        if session.status == 'expired':
+            self._cleanup_verification_artifacts(session)
 
         public_status = 'processing' if session.status == 'verification_checking' else session.status
         result = {
@@ -574,43 +737,68 @@ class QRLoginManager:
             if session.verification_browser_status == 'failed':
                 result['message'] = session.verification_error or '安全验证浏览器处理失败，请重新生成二维码'
             elif session.verification_browser_status == 'starting':
-                result['message'] = '正在打开闲鱼安全验证页面，请稍候'
+                result['message'] = '正在打开本机闲鱼官方窗口，请稍候'
             elif session.verification_screenshot_path:
                 result['message'] = '请用手机版闲鱼扫描图中的身份验证二维码，完成后系统会自动检测'
             else:
-                result['message'] = '闲鱼要求完成安全验证，正在获取验证页面'
+                result['message'] = session.message or '闲鱼要求完成安全验证，请点击“本机打开官方窗口”'
+
+        if session.status in {'error', 'expired', 'cancelled'} and session.message:
+            result['message'] = session.message
+            if session.error_code:
+                result['error_code'] = session.error_code
 
         # 如果登录成功，返回Cookie信息
-        if session.status == 'success' and session.cookies and session.unb:
+        if session.status == 'success' and session.validated and session.cookies and session.unb:
             result['cookies'] = self._cookie_marshal(session.cookies)
             result['unb'] = session.unb
 
         return result
 
-    def cleanup_expired_sessions(self):
-        """清理过期会话"""
-        expired_sessions = []
-        for session_id, session in self.sessions.items():
+    def cleanup_expired_sessions(self, *, now: Optional[float] = None):
+        """Retain an explicit expired result before deleting terminal state."""
+        current_time = time.time() if now is None else now
+        sessions_to_delete = []
+        for session_id, session in list(self.sessions.items()):
             if session.status in ['verification_required', 'verification_checking']:
-                if session.is_verification_expired():
-                    expired_sessions.append(session_id)
-            elif session.is_expired():
-                expired_sessions.append(session_id)
+                expired = current_time - session.created_time > session.verification_expire_time
+            else:
+                expired = current_time - session.created_time > session.expire_time
 
-        for session_id in expired_sessions:
-            self._cleanup_verification_artifacts(self.sessions[session_id])
+            if expired and session.status not in {'success', 'cancelled', 'error', 'expired'}:
+                self._mark_terminal(
+                    session,
+                    'expired',
+                    '二维码已过期，请重新扫码',
+                    now=current_time,
+                )
+                self._cleanup_verification_artifacts(session)
+
+            if session.status in {'expired', 'cancelled', 'error'}:
+                if session.terminal_at is None:
+                    session.terminal_at = current_time
+                self._cleanup_verification_artifacts(session)
+                if current_time - session.terminal_at > self.terminal_retention_seconds:
+                    sessions_to_delete.append(session_id)
+
+        for session_id in sessions_to_delete:
             del self.sessions[session_id]
-            logger.info(f"清理过期会话: {session_id}")
+            logger.info(f"清理二维码终态会话: {session_id}")
 
     def get_session_cookies(self, session_id: str) -> Optional[Dict[str, str]]:
         """获取会话Cookie"""
         session = self.sessions.get(session_id)
-        if session and session.status == 'success':
+        if session and session.status == 'success' and session.validated:
             return {
                 'cookies': self._cookie_marshal(session.cookies),
                 'unb': session.unb
             }
         return None
+
+    def remove_session(self, session_id: str) -> None:
+        session = self.sessions.pop(session_id, None)
+        if session is not None:
+            self._cleanup_verification_artifacts(session)
 
 # 全局二维码登录管理器实例
 qr_login_manager = QRLoginManager()

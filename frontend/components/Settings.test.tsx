@@ -139,7 +139,7 @@ describe('Settings configuration sections', () => {
     expect(screen.queryByText('允许用户注册')).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /SMTP 配置/ }));
     expect(screen.getByLabelText('支持邮箱')).toBeInTheDocument();
-    expect(screen.getByRole('switch', { name: '开放注册' })).toBeDisabled();
+    expect(await screen.findByRole('switch', { name: '开放注册' })).toBeDisabled();
   });
 
   it('applies the QQ Mail preset without filling an authorization code', async () => {
@@ -414,7 +414,7 @@ describe('ordinary user settings', () => {
     expect(screen.queryByText('登录滑动验证码')).not.toBeInTheDocument();
     expect(screen.queryByText('账号管理器')).not.toBeInTheDocument();
     expect(screen.queryByText('监听任务')).not.toBeInTheDocument();
-    expect(getAIProviders).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(getAIProviders).toHaveBeenCalledTimes(1));
   });
 
   it('validates and saves editable personal sync settings in seconds', async () => {

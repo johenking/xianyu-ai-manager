@@ -37,7 +37,11 @@ export interface Item {
   item_title?: string;
   item_description?: string;
   item_price?: string;
-  item_image?: string; // Inferred from common usage, though not explicitly in list model sometimes
+  item_image?: string;
+  platform_item_status?: number | null;
+  catalog_active?: boolean;
+  catalog_last_seen_at?: string | null;
+  catalog_metadata?: string;
   item_category?: string;
   item_detail?: string;
   is_multi_spec?: number | boolean;

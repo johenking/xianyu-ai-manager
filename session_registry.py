@@ -11,15 +11,29 @@ from repositories.runtime_session_repository import RuntimeSessionRepository
 
 
 _URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+_SECRET_CONTAINER_PATTERN = re.compile(
+    r"(?is)(?P<key>\b(?:cookies?|headers)\b)\s*[:=]\s*[\{\[][^\}\]]*[\}\]]"
+)
 _SECRET_PATTERN = re.compile(
-    r"(?i)(cookie|token|password|authorization|api[_ -]?key)\s*[:=]\s*\S+"
+    r"(?ix)"
+    r"(?P<key>[\"']?(?:"
+    r"cookie(?:2|s)?|unb|sgcookie|x5sec|_tb_token_|_m_h5_tk(?:_enc)?|"
+    r"access[_ -]?token|token|password|authorization|api[_ -]?key"
+    r")[\"']?)\s*[:=]\s*(?:[\"']?bearer\s+)?[\"']?[^\"'\s,;}\]]+[\"']?"
 )
 
 
 def sanitize_runtime_error(value: Any) -> str:
     text = str(value or "")
+    text = _SECRET_CONTAINER_PATTERN.sub(
+        lambda match: f"{match.group('key')}=REDACTED",
+        text,
+    )
     text = _URL_PATTERN.sub("[REDACTED_URL]", text)
-    text = _SECRET_PATTERN.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
+    text = _SECRET_PATTERN.sub(
+        lambda match: f"{match.group('key').strip(chr(34) + chr(39))}=[REDACTED]",
+        text,
+    )
     return text[:500]
 
 

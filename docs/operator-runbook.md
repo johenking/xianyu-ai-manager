@@ -28,7 +28,7 @@ curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 
 Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
 
-The v1.7.3 source change has no database migration and must leave the latest migration at `2026071104`, but that does not prove the service or public bundle was upgraded. Before calling v1.7.3 deployed, verify the listening process path, health response, HTML entry bundle and referenced asset, public page version, staged password-reset flow, account listeners, disabled Cookie schedules, and Skill scheduler.
+The official-login stability change adds migration `2026071701` for `cookies.browser_user_agent`. The migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, official-login status endpoints, account listeners, Cookie schedules, and Skill scheduler. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
 
 ## Backup Before Risky Changes
 
@@ -49,11 +49,12 @@ Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.syst
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
 python -m unittest discover -s tests -v
 ruff check .
 
 cd frontend
+npm audit --audit-level=high
 npm run typecheck
 npm test
 npm run build
@@ -145,7 +146,7 @@ app_port: 8080
 
 Persist and protect the database, logs, uploads, all three local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
 
-Official password login and renewal launch headed Chromium because Goofish rejects headless mode. The current container entrypoint does not create a virtual display, so do not claim Docker or cloud credential renewal works until a display/Xvfb setup and human-verification workflow have been tested on that deployment.
+API QR generation and ordinary scanning do not launch a browser. SMS login, explicit password login, QR secondary verification, and password renewal use the installed system Chrome in headed mode because Goofish rejects headless Chromium. Automatic renewal is available only to password accounts with valid stored credentials. The current container entrypoint does not provide system Chrome or a virtual display, so do not claim Docker or cloud login renewal works until the browser, display/Xvfb, and human-verification workflow have been tested on that deployment.
 
 ## AI And Knowledge Diagnostics
 
@@ -162,24 +163,26 @@ For provider issues, refresh the profile model list and test the exact selected 
 
 ## Xianyu Session Troubleshooting
 
-Symptoms include missing message Tokens, expired Cookies, or a `verification_required` refresh state.
+Symptoms include missing message Tokens, expired Cookies, passive `action_required`, active `verification_required`, or stable `manual_reauth_required`.
 
 Recommended order:
 
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
-2. Confirm `cookies.xianyu_unb` is present and `browser_data/user_<unb>` exists; the refresh service always tries that profile first.
-3. Keep the account listener running, then trigger `/session-refresh` once.
-4. If the status reports `no_credentials`, perform one official account-password login so encrypted fallback credentials are saved.
-5. Complete the account-page verification when required; the visible browser waits for up to 15 minutes and platform verification cannot be bypassed.
-6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off and should use conservative intervals such as 24 hours or longer.
-7. Use QR or update the existing Cookie only when the official profile and password fallback cannot recover the session.
+2. Confirm `cookies.xianyu_unb` and `cookies.login_method` are present. Only `password` plus a valid username and encrypted password supports automatic renewal; that path tries `browser_data/user_<unb>` first.
+3. Keep the account listener running. In `action_required`, trigger `/session-refresh` exactly once; repeated Token or connection failures must not create a browser. In `manual_reauth_required`, use the returned `reauth_action` and do not keep calling refresh.
+4. Wait for `verification_required` with `browser_active=true`, then use the account-page “open on this Mac” action and complete login in that same official browser session; background polling continues without a completion button.
+5. Complete any platform verification when required; the headed browser session waits for up to 15 minutes.
+6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off, is disabled for non-password sources, and should use conservative intervals such as 24 hours or longer.
+7. Use API QR, a visible SMS official window, explicit password login, the local Chrome extension, or a matching manual Cookie when the saved profile cannot recover the session. Never update an existing record with a different Cookie `unb`; the API must return HTTP 409 `account_identity_mismatch`.
 
-For a v1.7.3 manual-refresh acceptance check, keep the account's scheduled refresh disabled, click immediate refresh once, and observe logs and processes for at least two minutes. There must be one official session and one listener restart, with no later scheduled refresh and no immediate item-detail Playwright session. Active duplicate requests should return the current refresh status instead of creating queued browser work. A Cookie-driven listener restart sets a fresh item-sync anchor; normal item synchronization resumes only after its configured interval.
+For a password-account manual-refresh acceptance check, keep the account's scheduled refresh disabled, click start once, and observe the same window through the full human step. It must remain open until the real message Token succeeds, the Cookie and actual browser User-Agent are saved, and one listener replacement finishes. Then observe processes and status for at least 15 minutes: there must be no later browser, validation popup, scheduled refresh, or immediate item-detail Playwright session. Active duplicate requests return the current status instead of queuing work.
 8. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
-Do not switch the renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Background renewal intentionally launches a headed browser off-screen and reopens it visibly only for human verification. Password login still depends on the current official page structure; when that flow breaks after a platform change, use QR or Cookie recovery without deleting the account.
+Do not switch the renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Background renewal launches the installed system Chrome in headed mode, positions it off-screen, and moves the same session back on-screen only after an explicit user action. Do not override its User-Agent or add web-security/anti-detection flags. Invalid/missing credentials, identity mismatch, verification/login timeout, or official-page structure mismatch must persist `manual_reauth_required`; `profile_in_use`, temporary browser/probe failures, and cancellation remain retryable. Password login still depends on the current official page structure; when that flow breaks, use QR, SMS, extension, or matching Cookie recovery without deleting the account.
+
+API QR expiry is an explicit terminal result. After the first `expired` response, repeated polling must return `status='expired'` and “二维码已过期，请重新扫码” for at least five minutes before the session becomes `not_found`; associated verification screenshots must be removed on schedule. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes are intentionally removed.
 
 ## Skill Monitor Troubleshooting
 
@@ -228,4 +231,4 @@ Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard
 
 For an ordinary-user dashboard that does not finish loading, verify `/verify` returns `is_admin: false` and call `/api/dashboard/summary` with that user's Token. The page must not request `/admin/stats`; a 403 or 500 from the summary should end in a visible retry state. Migration `2026071104` adds `idx_orders_cookie_created_at` and `idx_orders_status_created_at`; verify them with `PRAGMA index_list(orders)` when summary latency regresses.
 
-When account-level `cookie_refresh_enabled` is false, Token or Session failure must not launch Chrome for Testing. The refresh status should record `automatic_refresh_disabled`; only the account page's manual immediate-refresh action may launch the official browser in that state.
+When account-level `cookie_refresh_enabled` is false, Token, Session, and connection failures must not launch Chrome. The refresh status should be passive `action_required` with `browser_active=false`; only the account page's explicit start action may launch the official browser.

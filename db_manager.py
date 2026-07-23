@@ -10,6 +10,7 @@ import asyncio
 import io
 import base64
 import binascii
+import secrets
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
@@ -45,10 +46,26 @@ from auth_email_service import (
     canonical_smtp_setting_value,
     smtp_configuration_status,
 )
+from account_session_refresh import (
+    normalize_login_method,
+    supports_automatic_refresh,
+)
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
 COOKIE_REFRESH_MAX_INTERVAL_MINUTES = 10080
+SKILL_MONITOR_RUN_LEASE_SECONDS = 180
+SKILL_MONITOR_DELIVERY_LEASE_SECONDS = 60
+SKILL_MONITOR_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+
+class AccountIdentityMismatchError(ValueError):
+    code = "account_identity_mismatch"
+
+    def __init__(self) -> None:
+        super().__init__("Cookie 中的闲鱼账号身份与当前账号不一致")
+SKILL_MONITOR_BUDGET_RETENTION_SECONDS = 24 * 60 * 60
+SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 class DBManager:
@@ -175,6 +192,12 @@ class DBManager:
                 show_browser INTEGER DEFAULT 0,
                 cookie_refresh_enabled INTEGER DEFAULT 0,
                 cookie_refresh_interval_minutes INTEGER DEFAULT 1440,
+                browser_user_agent TEXT NOT NULL DEFAULT '',
+                cookie_revision INTEGER NOT NULL DEFAULT 0,
+                login_method TEXT NOT NULL DEFAULT 'unknown',
+                last_login_at REAL,
+                last_validated_at REAL,
+                last_expired_at REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -576,6 +599,11 @@ class DBManager:
                 item_category TEXT,
                 item_price TEXT,
                 item_detail TEXT,
+                item_image TEXT NOT NULL DEFAULT '',
+                platform_item_status INTEGER,
+                catalog_active BOOLEAN NOT NULL DEFAULT FALSE,
+                catalog_last_seen_at TIMESTAMP,
+                catalog_metadata TEXT NOT NULL DEFAULT '{}',
                 is_multi_spec BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1613,6 +1641,7 @@ class DBManager:
             'auth_challenges',
             'registration_invites',
             'auth_rate_events',
+            'account_session_refresh_status',
             'cookies',
             'password',
             'token',
@@ -1799,7 +1828,14 @@ class DBManager:
                     return cookie_id
         return None
 
-    def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
+    def save_cookie(
+        self,
+        cookie_id: str,
+        cookie_value: str,
+        user_id: int = None,
+        *,
+        login_method: str = None,
+    ) -> bool:
         """保存Cookie到数据库，如存在则更新"""
         with self.lock:
             try:
@@ -1818,13 +1854,59 @@ class DBManager:
                         user_id = admin_user[0] if admin_user else 1
 
                 xianyu_unb = self._extract_cookie_unb(cookie_value)
+                self._execute_sql(
+                    cursor,
+                    "SELECT xianyu_unb, value FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                identity_row = cursor.fetchone()
+                stable_unb = (identity_row[0] or "").strip() if identity_row else ""
+                if identity_row and not stable_unb:
+                    stable_unb = self._extract_cookie_unb(identity_row[1])
+                if stable_unb and xianyu_unb != stable_unb:
+                    raise AccountIdentityMismatchError()
                 self._execute_sql(cursor, '''
                     INSERT INTO cookies (id, value, user_id, xianyu_unb)
                     VALUES (?, ?, ?, NULLIF(?, ''))
                     ON CONFLICT(id) DO UPDATE SET
+                        cookie_revision = CASE
+                            WHEN cookies.value <> excluded.value
+                            THEN cookies.cookie_revision + 1
+                            ELSE cookies.cookie_revision
+                        END,
                         value = excluded.value,
                         xianyu_unb = COALESCE(NULLIF(excluded.xianyu_unb, ''), cookies.xianyu_unb)
+                    WHERE cookies.user_id = excluded.user_id
+                      AND (
+                          cookies.xianyu_unb IS NULL
+                          OR cookies.xianyu_unb = ''
+                          OR excluded.xianyu_unb IS NULL
+                          OR excluded.xianyu_unb = ''
+                          OR cookies.xianyu_unb = excluded.xianyu_unb
+                      )
                 ''', (cookie_id, cookie_value, user_id, xianyu_unb))
+
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    logger.warning("Cookie保存被账号归属或身份校验阻止")
+                    return False
+
+                if login_method is not None:
+                    normalized_method = normalize_login_method(login_method)
+                    now = time.time()
+                    self._execute_sql(
+                        cursor,
+                        "UPDATE cookies SET login_method = ?, last_login_at = ?, "
+                        "last_validated_at = NULL, last_expired_at = NULL, "
+                        "cookie_refresh_enabled = CASE WHEN ? = 'password' "
+                        "THEN cookie_refresh_enabled ELSE 0 END WHERE id = ?",
+                        (normalized_method, now, normalized_method, cookie_id),
+                    )
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM account_session_refresh_status WHERE cookie_id = ?",
+                        (cookie_id,),
+                    )
 
                 self.conn.commit()
                 logger.info(f"Cookie保存成功: {cookie_id} (用户ID: {user_id})")
@@ -1837,8 +1919,11 @@ class DBManager:
                 else:
                     logger.error(f"Cookie保存验证失败: {cookie_id} 未找到记录")
                 return True
+            except AccountIdentityMismatchError:
+                self.conn.rollback()
+                raise
             except Exception as e:
-                logger.error(f"Cookie保存失败: {e}")
+                logger.error(f"Cookie保存失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 
@@ -1923,7 +2008,9 @@ class DBManager:
                     cursor,
                     "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, "
                     "show_browser, created_at, xianyu_unb, password_encrypted, "
-                    "cookie_refresh_enabled, cookie_refresh_interval_minutes "
+                    "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent, "
+                    "cookie_revision, login_method, last_login_at, last_validated_at, "
+                    "last_expired_at "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -1950,11 +2037,214 @@ class DBManager:
                             if result[13] is not None
                             else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
                         ),
+                        'browser_user_agent': result[14] or '',
+                        'cookie_revision': int(result[15] or 0),
+                        'login_method': normalize_login_method(result[16]),
+                        'last_login_at': result[17],
+                        'last_validated_at': result[18],
+                        'last_expired_at': result[19],
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    def get_owned_cookie_search_context(self, user_id: int, cookie_id: str) -> Dict[str, any]:
+        """Return the minimum owner-scoped account context needed by item search."""
+        normalized_cookie_id = str(cookie_id or '').strip()
+        try:
+            normalized_user_id = int(user_id)
+        except (TypeError, ValueError):
+            normalized_user_id = 0
+        if normalized_user_id <= 0 or not normalized_cookie_id:
+            return {
+                'state': 'action_required',
+                'reason': 'missing_account_binding',
+            }
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT id, value, user_id, xianyu_unb, cookie_revision, browser_user_agent "
+                    "FROM cookies WHERE id = ? AND user_id = ?",
+                    (normalized_cookie_id, normalized_user_id),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    self._execute_sql(
+                        cursor,
+                        "SELECT 1 FROM cookies WHERE id = ?",
+                        (normalized_cookie_id,),
+                    )
+                    return {
+                        'state': (
+                            'ownership_mismatch'
+                            if cursor.fetchone()
+                            else 'not_found'
+                        ),
+                        'reason': 'account_not_owned',
+                    }
+
+                cookie_value = str(row[1] or '')
+                stored_unb = str(row[3] or '').strip()
+                cookie_unb = self._extract_cookie_unb(cookie_value)
+                if not stored_unb or not cookie_unb or cookie_unb != stored_unb:
+                    return {
+                        'state': 'action_required',
+                        'reason': 'account_identity_incomplete',
+                    }
+
+                return {
+                    'state': 'ready',
+                    'account_id': str(row[0]),
+                    'value': cookie_value,
+                    'user_id': int(row[2]),
+                    'xianyu_unb': stored_unb,
+                    'cookie_revision': int(row[4] or 0),
+                    'browser_user_agent': str(row[5] or '').strip(),
+                }
+            except Exception as exc:
+                logger.error(
+                    f"读取账号搜索上下文失败: {type(exc).__name__}"
+                )
+                return {
+                    'state': 'error',
+                    'reason': 'account_context_read_failed',
+                }
+
+    def compare_and_swap_cookie_session(
+        self,
+        cookie_id: str,
+        *,
+        user_id: int,
+        expected_xianyu_unb: str,
+        expected_revision: int,
+        cookie_value: str,
+        browser_user_agent: str = None,
+    ) -> Dict[str, any]:
+        """Persist a refreshed Cookie only while owner, identity, and revision match."""
+        normalized_cookie_id = str(cookie_id or '').strip()
+        normalized_expected_unb = str(expected_xianyu_unb or '').strip()
+        normalized_cookie_value = str(cookie_value or '').strip()
+        incoming_unb = self._extract_cookie_unb(normalized_cookie_value)
+        try:
+            normalized_user_id = int(user_id)
+            normalized_revision = int(expected_revision)
+        except (TypeError, ValueError):
+            return {
+                'state': 'action_required',
+                'reason': 'invalid_cookie_cas_identity',
+                'updated': False,
+            }
+
+        if (
+            not normalized_cookie_id
+            or normalized_user_id <= 0
+            or normalized_revision < 0
+            or not normalized_expected_unb
+            or not incoming_unb
+        ):
+            return {
+                'state': 'action_required',
+                'reason': 'account_identity_incomplete',
+                'updated': False,
+            }
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                self._execute_sql(
+                    cursor,
+                    "SELECT value, user_id, xianyu_unb, cookie_revision, browser_user_agent "
+                    "FROM cookies WHERE id = ?",
+                    (normalized_cookie_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return {
+                        'state': 'not_found',
+                        'reason': 'account_missing',
+                        'updated': False,
+                    }
+
+                stored_value = str(row[0] or '')
+                stored_user_id = int(row[1] or 0)
+                stored_unb = str(row[2] or '').strip()
+                stored_revision = int(row[3] or 0)
+                stored_cookie_unb = self._extract_cookie_unb(stored_value)
+                if stored_user_id != normalized_user_id:
+                    return {
+                        'state': 'ownership_mismatch',
+                        'reason': 'account_not_owned',
+                        'updated': False,
+                    }
+                if (
+                    not stored_unb
+                    or not stored_cookie_unb
+                    or stored_cookie_unb != stored_unb
+                    or normalized_expected_unb != stored_unb
+                    or incoming_unb != stored_unb
+                ):
+                    return {
+                        'state': 'action_required',
+                        'reason': 'account_identity_changed',
+                        'updated': False,
+                    }
+                if stored_revision != normalized_revision:
+                    return {
+                        'state': 'revision_conflict',
+                        'reason': 'cookie_revision_conflict',
+                        'updated': False,
+                        'cookie_revision': stored_revision,
+                    }
+
+                cookie_changed = stored_value != normalized_cookie_value
+                next_revision = stored_revision + (1 if cookie_changed else 0)
+                next_user_agent = (
+                    str(browser_user_agent).strip()
+                    if browser_user_agent is not None
+                    else str(row[4] or '').strip()
+                )
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET value = ?, xianyu_unb = ?, cookie_revision = ?, "
+                    "browser_user_agent = ? "
+                    "WHERE id = ? AND user_id = ? AND xianyu_unb = ? AND cookie_revision = ?",
+                    (
+                        normalized_cookie_value,
+                        stored_unb,
+                        next_revision,
+                        next_user_agent,
+                        normalized_cookie_id,
+                        normalized_user_id,
+                        stored_unb,
+                        stored_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return {
+                        'state': 'revision_conflict',
+                        'reason': 'cookie_revision_conflict',
+                        'updated': False,
+                    }
+                self.conn.commit()
+                return {
+                    'state': 'updated' if cookie_changed else 'unchanged',
+                    'reason': '',
+                    'updated': cookie_changed,
+                    'cookie_revision': next_revision,
+                }
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"Cookie CAS 保存失败: {type(exc).__name__}")
+                return {
+                    'state': 'error',
+                    'reason': 'cookie_cas_failed',
+                    'updated': False,
+                }
 
     def _validate_cookie_refresh_interval(self, interval_minutes: int) -> int:
         try:
@@ -1985,7 +2275,24 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(
                     cursor,
-                    "UPDATE cookies SET cookie_refresh_enabled = ?, cookie_refresh_interval_minutes = ? WHERE id = ?",
+                    "SELECT login_method, username, password, password_encrypted "
+                    "FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                capability = cursor.fetchone()
+                if not capability:
+                    return False
+                auto_refresh_supported = supports_automatic_refresh(
+                    capability[0], capability[1], bool(capability[2] or capability[3])
+                )
+                if enabled and not auto_refresh_supported:
+                    raise ValueError(
+                        "当前登录方式不支持自动续期，请先使用账号密码重新登录"
+                    )
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET cookie_refresh_enabled = ?, "
+                    "cookie_refresh_interval_minutes = ? WHERE id = ?",
                     (1 if enabled else 0, normalized_interval, cookie_id),
                 )
                 self.conn.commit()
@@ -2008,7 +2315,9 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(
                     cursor,
-                    "SELECT cookie_refresh_enabled, cookie_refresh_interval_minutes FROM cookies WHERE id = ?",
+                    "SELECT cookie_refresh_enabled, cookie_refresh_interval_minutes, "
+                    "login_method, username, password, password_encrypted "
+                    "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
                 row = cursor.fetchone()
@@ -2016,21 +2325,27 @@ class DBManager:
                     return {
                         'enabled': False,
                         'interval_minutes': COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES,
+                        'auto_refresh_supported': False,
                     }
                 interval = row[1] if row[1] is not None else COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
                 try:
                     interval = self._validate_cookie_refresh_interval(interval)
                 except ValueError:
                     interval = COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
+                auto_refresh_supported = supports_automatic_refresh(
+                    row[2], row[3], bool(row[4] or row[5])
+                )
                 return {
-                    'enabled': bool(row[0]) if row[0] is not None else False,
+                    'enabled': bool(row[0]) if row[0] is not None and auto_refresh_supported else False,
                     'interval_minutes': interval,
+                    'auto_refresh_supported': auto_refresh_supported,
                 }
             except Exception as e:
                 logger.error(f"获取账号Cookie定时刷新设置失败: {e}")
                 return {
                     'enabled': False,
                     'interval_minutes': COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES,
+                    'auto_refresh_supported': False,
                 }
 
     def update_account_session_refresh(
@@ -2044,17 +2359,27 @@ class DBManager:
         verification_image_path: str = '',
         expires_at: float = None,
     ) -> bool:
-        allowed_states = {'idle', 'refreshing', 'verification_required', 'success', 'failed', 'timeout', 'cancelled'}
+        allowed_states = {
+            'idle', 'action_required', 'refreshing', 'verification_required',
+            'success', 'failed', 'timeout', 'cancelled', 'manual_reauth_required',
+        }
         if state not in allowed_states:
             raise ValueError(f"不支持的刷新状态: {state}")
         now = time.time()
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "SELECT last_success_at, started_at FROM account_session_refresh_status WHERE cookie_id = ?", (cookie_id,))
+                self._execute_sql(
+                    cursor,
+                    "SELECT state, last_success_at, started_at "
+                    "FROM account_session_refresh_status WHERE cookie_id = ?",
+                    (cookie_id,),
+                )
                 existing = cursor.fetchone()
-                last_success_at = now if state == 'success' else (existing[0] if existing else None)
-                started_at = now if state == 'refreshing' else (existing[1] if existing else now)
+                if state == 'manual_reauth_required' and existing and existing[0] == state:
+                    return True
+                last_success_at = now if state == 'success' else (existing[1] if existing else None)
+                started_at = now if state == 'refreshing' else (existing[2] if existing else now)
                 image_path = verification_image_path if state == 'verification_required' else ''
                 self._execute_sql(cursor, '''
                     INSERT INTO account_session_refresh_status (
@@ -2092,11 +2417,19 @@ class DBManager:
                 FROM account_session_refresh_status WHERE cookie_id = ?
             ''', (cookie_id,))
             row = cursor.fetchone()
+            self._execute_sql(
+                cursor,
+                "SELECT last_expired_at FROM cookies WHERE id = ?",
+                (cookie_id,),
+            )
+            expiry_row = cursor.fetchone()
+        last_expired_at = expiry_row[0] if expiry_row else None
         if not row:
             return {
                 'state': 'idle', 'trigger': '', 'message': '', 'error_code': '',
                 'verification_image_url': '', 'started_at': None, 'last_attempt_at': None,
                 'last_success_at': None, 'expires_at': None, 'updated_at': None,
+                'last_expired_at': last_expired_at,
             }
         image_path = (row[4] or '').replace('\\', '/')
         image_url = f"/{image_path}" if image_path.startswith('static/uploads/images/') else ''
@@ -2111,6 +2444,7 @@ class DBManager:
             'last_success_at': row[7],
             'expires_at': row[8],
             'updated_at': row[9],
+            'last_expired_at': last_expired_at,
         }
 
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
@@ -2174,7 +2508,19 @@ class DBManager:
                 logger.error(f"获取账号自动回复暂停时间失败: {e}")
                 return 10
 
-    def update_cookie_account_info(self, cookie_id: str, cookie_value: str = None, username: str = None, password: str = None, show_browser: bool = None, user_id: int = None) -> bool:
+    def update_cookie_account_info(
+        self,
+        cookie_id: str,
+        cookie_value: str = None,
+        username: str = None,
+        password: str = None,
+        show_browser: bool = None,
+        user_id: int = None,
+        browser_user_agent: str = None,
+        *,
+        login_method: str = None,
+        login_validated: bool = False,
+    ) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
         """
@@ -2183,8 +2529,14 @@ class DBManager:
                 cursor = self.conn.cursor()
 
                 # 检查记录是否存在
-                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                exists = cursor.fetchone() is not None
+                self._execute_sql(
+                    cursor,
+                    "SELECT user_id, xianyu_unb, value FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                existing_row = cursor.fetchone()
+                exists = existing_row is not None
+                candidate_unb = self._extract_cookie_unb(cookie_value) if cookie_value is not None else ""
 
                 if not exists:
                     # 记录不存在，需要创建新记录
@@ -2204,7 +2556,7 @@ class DBManager:
                     insert_values = [cookie_id, cookie_value, user_id]
                     insert_placeholders = ['?', '?', '?']
 
-                    xianyu_unb = self._extract_cookie_unb(cookie_value)
+                    xianyu_unb = candidate_unb
                     if xianyu_unb:
                         insert_fields.append('xianyu_unb')
                         insert_values.append(xianyu_unb)
@@ -2226,24 +2578,53 @@ class DBManager:
                         insert_values.append(1 if show_browser else 0)
                         insert_placeholders.append('?')
 
+                    if browser_user_agent is not None:
+                        insert_fields.append('browser_user_agent')
+                        insert_values.append(str(browser_user_agent or '')[:1000])
+                        insert_placeholders.append('?')
+
+                    if login_method is not None:
+                        normalized_method = normalize_login_method(login_method)
+                        now = time.time()
+                        insert_fields.extend(['login_method', 'last_login_at'])
+                        insert_values.extend([normalized_method, now])
+                        insert_placeholders.extend(['?', '?'])
+                        if login_validated:
+                            insert_fields.append('last_validated_at')
+                            insert_values.append(now)
+                            insert_placeholders.append('?')
+
                     sql = f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(insert_placeholders)})"
                     self._execute_sql(cursor, sql, tuple(insert_values))
                     self.conn.commit()
                     logger.info(f"创建新账号 {cookie_id} 并保存信息成功: {insert_fields}")
                     return True
                 else:
+                    if user_id is not None and int(existing_row[0]) != int(user_id):
+                        logger.warning("账号信息更新被所有权校验阻止")
+                        return False
+                    if cookie_value is not None:
+                        stored_unb = str(existing_row[1] or '').strip()
+                        if not stored_unb:
+                            stored_unb = self._extract_cookie_unb(existing_row[2])
+                        if stored_unb and candidate_unb != stored_unb:
+                            raise AccountIdentityMismatchError()
+
                     # 记录存在，执行更新
                     # 构建动态SQL更新语句
                     update_fields = []
                     params = []
 
                     if cookie_value is not None:
+                        update_fields.append(
+                            "cookie_revision = cookie_revision + CASE WHEN value <> ? THEN 1 ELSE 0 END"
+                        )
+                        params.append(cookie_value)
                         update_fields.append("value = ?")
                         params.append(cookie_value)
-                        xianyu_unb = self._extract_cookie_unb(cookie_value)
-                        if xianyu_unb:
+                        if candidate_unb and not stored_unb:
                             update_fields.append("xianyu_unb = ?")
-                            params.append(xianyu_unb)
+                            params.append(candidate_unb)
 
                     if username is not None:
                         update_fields.append("username = ?")
@@ -2264,6 +2645,27 @@ class DBManager:
                         update_fields.append("show_browser = ?")
                         params.append(1 if show_browser else 0)
 
+                    if browser_user_agent is not None:
+                        update_fields.append("browser_user_agent = ?")
+                        params.append(str(browser_user_agent or '')[:1000])
+
+                    if login_method is not None:
+                        normalized_method = normalize_login_method(login_method)
+                        now = time.time()
+                        update_fields.extend([
+                            "login_method = ?",
+                            "last_login_at = ?",
+                            "last_expired_at = NULL",
+                        ])
+                        params.extend([normalized_method, now])
+                        if login_validated:
+                            update_fields.append("last_validated_at = ?")
+                            params.append(now)
+                        else:
+                            update_fields.append("last_validated_at = NULL")
+                        if normalized_method != 'password':
+                            update_fields.append("cookie_refresh_enabled = 0")
+
                     if not update_fields:
                         logger.warning(f"更新账号 {cookie_id} 信息时没有提供任何更新字段")
                         return False
@@ -2272,13 +2674,55 @@ class DBManager:
                     sql = f"UPDATE cookies SET {', '.join(update_fields)} WHERE id = ?"
 
                     self._execute_sql(cursor, sql, tuple(params))
+                    if login_method is not None:
+                        self._execute_sql(
+                            cursor,
+                            "DELETE FROM account_session_refresh_status WHERE cookie_id = ?",
+                            (cookie_id,),
+                        )
                     self.conn.commit()
                     logger.info(f"更新账号 {cookie_id} 信息成功: {update_fields}")
                     return True
+            except AccountIdentityMismatchError:
+                self.conn.rollback()
+                raise
             except Exception as e:
-                logger.error(f"更新账号信息失败: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"更新账号信息失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def mark_cookie_expired(self, cookie_id: str) -> bool:
+        """Record the first expiry for the current login without churning reminder keys."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET last_expired_at = COALESCE(last_expired_at, ?) "
+                    "WHERE id = ?",
+                    (time.time(), cookie_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as exc:
+                logger.error(f"记录账号登录态过期失败: {type(exc).__name__}")
+                self.conn.rollback()
+                return False
+
+    def mark_cookie_validated(self, cookie_id: str) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET last_validated_at = ?, last_expired_at = NULL "
+                    "WHERE id = ?",
+                    (time.time(), cookie_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as exc:
+                logger.error(f"记录账号登录态验证成功失败: {type(exc).__name__}")
                 self.conn.rollback()
                 return False
 
@@ -5227,6 +5671,24 @@ class DBManager:
 
     # ==================== 商品信息管理 ====================
 
+    @staticmethod
+    def _decode_item_row(columns: List[str], row: tuple) -> Dict[str, Any]:
+        item_info = dict(zip(columns, row))
+        item_info['catalog_active'] = bool(item_info.get('catalog_active'))
+        for source_key, target_key in (
+            ('item_detail', 'item_detail_parsed'),
+            ('catalog_metadata', 'catalog_metadata_parsed'),
+        ):
+            raw_value = item_info.get(source_key)
+            if raw_value:
+                try:
+                    item_info[target_key] = json.loads(raw_value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item_info[target_key] = {}
+            else:
+                item_info[target_key] = {}
+        return item_info
+
     def save_item_basic_info(self, cookie_id: str, item_id: str, item_title: str = None,
                             item_description: str = None, item_category: str = None,
                             item_price: str = None, item_detail: str = None) -> bool:
@@ -5432,15 +5894,13 @@ class DBManager:
                 row = cursor.fetchone()
                 if row:
                     columns = [description[0] for description in cursor.description]
-                    item_info = dict(zip(columns, row))
-
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-                    logger.info(f"item_info: {item_info}")
+                    item_info = self._decode_item_row(columns, row)
+                    logger.debug(
+                        "已读取商品信息摘要: item_id={}, has_detail={}, parsed_detail={}",
+                        item_id,
+                        bool(item_info.get('item_detail')),
+                        bool(item_info.get('item_detail_parsed')),
+                    )
                     return item_info
                 return None
 
@@ -5534,7 +5994,7 @@ class DBManager:
             logger.error(f"获取商品多数量发货状态失败: {e}")
             return False
 
-    def get_items_by_cookie(self, cookie_id: str) -> List[Dict]:
+    def get_items_by_cookie(self, cookie_id: str, include_inactive: bool = True) -> List[Dict]:
         """获取指定Cookie的所有商品信息
 
         Args:
@@ -5546,9 +6006,10 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
+                active_clause = '' if include_inactive else ' AND catalog_active = TRUE'
+                cursor.execute(f'''
                 SELECT * FROM item_info
-                WHERE cookie_id = ?
+                WHERE cookie_id = ?{active_clause}
                 ORDER BY updated_at DESC
                 ''', (cookie_id,))
 
@@ -5556,16 +6017,7 @@ class DBManager:
                 items = []
 
                 for row in cursor.fetchall():
-                    item_info = dict(zip(columns, row))
-
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-
-                    items.append(item_info)
+                    items.append(self._decode_item_row(columns, row))
 
                 return items
 
@@ -5573,7 +6025,7 @@ class DBManager:
             logger.error(f"获取Cookie商品信息失败: {e}")
             return []
 
-    def get_all_items(self) -> List[Dict]:
+    def get_all_items(self, include_inactive: bool = True) -> List[Dict]:
         """获取所有商品信息
 
         Returns:
@@ -5582,8 +6034,9 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT * FROM item_info
+                active_clause = '' if include_inactive else ' WHERE catalog_active = TRUE'
+                cursor.execute(f'''
+                SELECT * FROM item_info{active_clause}
                 ORDER BY updated_at DESC
                 ''')
 
@@ -5591,16 +6044,7 @@ class DBManager:
                 items = []
 
                 for row in cursor.fetchall():
-                    item_info = dict(zip(columns, row))
-
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-
-                    items.append(item_info)
+                    items.append(self._decode_item_row(columns, row))
 
                 return items
 
@@ -5767,6 +6211,168 @@ class DBManager:
             except:
                 pass
             return success_count
+
+    def reconcile_catalog_items(
+        self,
+        cookie_id: str,
+        items_data: List[Dict[str, Any]],
+        reconcile: bool = True,
+    ) -> Dict[str, int]:
+        """Upsert a seller's published catalog and optionally hide unseen rows.
+
+        Product detail text, knowledge profiles and delivery flags are preserved.
+        The caller must only request reconciliation after a complete successful
+        traversal of the platform's published-item pages.
+        """
+        deduplicated: Dict[str, Dict[str, Any]] = {}
+        failed_count = 0
+        for raw_item in items_data or []:
+            item_id = str(raw_item.get('item_id') or '').strip()
+            item_title = str(raw_item.get('item_title') or '').strip()
+            try:
+                platform_status = int(raw_item.get('platform_item_status'))
+            except (TypeError, ValueError):
+                failed_count += 1
+                continue
+            if not item_id or not item_title or platform_status != 0:
+                failed_count += 1
+                continue
+            deduplicated[item_id] = {
+                **raw_item,
+                'item_id': item_id,
+                'item_title': item_title,
+                'platform_item_status': platform_status,
+            }
+
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT item_id, catalog_active, item_image FROM item_info WHERE cookie_id = ?",
+                    (cookie_id,),
+                )
+                existing = {
+                    str(row[0]): {
+                        'catalog_active': bool(row[1]),
+                        'item_image': str(row[2] or ''),
+                    }
+                    for row in cursor.fetchall()
+                }
+                active_ids = set(deduplicated)
+                hidden_count = (
+                    sum(
+                        1
+                        for item_id, value in existing.items()
+                        if value['catalog_active'] and item_id not in active_ids
+                    )
+                    if reconcile
+                    else 0
+                )
+                images_updated = sum(
+                    1
+                    for item_id, item in deduplicated.items()
+                    if str(item.get('item_image') or '')
+                    and existing.get(item_id, {}).get('item_image') != str(item.get('item_image') or '')
+                )
+
+                cursor.execute('BEGIN IMMEDIATE')
+                if reconcile:
+                    cursor.execute(
+                        "UPDATE item_info SET catalog_active = FALSE "
+                        "WHERE cookie_id = ? AND catalog_active = TRUE",
+                        (cookie_id,),
+                    )
+
+                saved_count = 0
+                for item in deduplicated.values():
+                    metadata = item.get('catalog_metadata') or {}
+                    metadata_json = (
+                        metadata
+                        if isinstance(metadata, str)
+                        else json.dumps(metadata, ensure_ascii=False, separators=(',', ':'))
+                    )
+                    cursor.execute(
+                        '''
+                        INSERT INTO item_info (
+                            cookie_id, item_id, item_title, item_description,
+                            item_category, item_price, item_detail, item_image,
+                            platform_item_status, catalog_active,
+                            catalog_last_seen_at, catalog_metadata,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, '', ?, ?, '', ?, ?, TRUE,
+                                  CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                            item_title = excluded.item_title,
+                            item_category = excluded.item_category,
+                            item_price = excluded.item_price,
+                            item_image = CASE
+                                WHEN excluded.item_image <> '' THEN excluded.item_image
+                                ELSE item_info.item_image
+                            END,
+                            platform_item_status = excluded.platform_item_status,
+                            catalog_active = TRUE,
+                            catalog_last_seen_at = CURRENT_TIMESTAMP,
+                            catalog_metadata = excluded.catalog_metadata,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (
+                            cookie_id,
+                            item['item_id'],
+                            item['item_title'],
+                            str(item.get('item_category') or ''),
+                            str(item.get('item_price') or ''),
+                            str(item.get('item_image') or ''),
+                            item['platform_item_status'],
+                            metadata_json,
+                        ),
+                    )
+                    saved_count += 1
+
+                cursor.execute('COMMIT')
+                return {
+                    'saved_count': saved_count,
+                    'active_count': len(deduplicated),
+                    'hidden_count': hidden_count,
+                    'images_updated': images_updated,
+                    'failed_count': failed_count,
+                }
+        except Exception as exc:
+            logger.error(f"同步在售商品目录失败: {exc}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return {
+                'saved_count': 0,
+                'active_count': 0,
+                'hidden_count': 0,
+                'images_updated': 0,
+                'failed_count': failed_count + len(deduplicated),
+            }
+
+    def get_item_catalog_lookup(
+        self,
+        cookie_ids: List[str],
+    ) -> Dict[Tuple[str, str], Dict[str, str]]:
+        normalized_ids = [str(value) for value in cookie_ids if str(value)]
+        if not normalized_ids:
+            return {}
+        placeholders = ','.join('?' for _ in normalized_ids)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                f'''SELECT cookie_id, item_id, item_title, item_price, item_image
+                    FROM item_info WHERE cookie_id IN ({placeholders})''',
+                normalized_ids,
+            )
+            return {
+                (str(row[0]), str(row[1])): {
+                    'item_title': str(row[2] or ''),
+                    'item_price': str(row[3] or ''),
+                    'item_image': str(row[4] or ''),
+                }
+                for row in cursor.fetchall()
+            }
 
     def delete_item_info(self, cookie_id: str, item_id: str) -> bool:
         """删除商品信息
@@ -7465,6 +8071,1933 @@ class DBManager:
 
     # ==================== 技能中心方法 ====================
 
+    @staticmethod
+    def _new_skill_monitor_token() -> str:
+        return secrets.token_urlsafe(24)
+
+    def claim_skill_monitor_request_budget(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        global_limit: int,
+        account_limit: int,
+        window_seconds: int,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Atomically consume one global and one owner/account request slot.
+
+        Only a digest of the owner/account binding is persisted. A denied claim
+        consumes neither budget, and failures stay fail-closed.
+        """
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_global_limit = max(1, min(int(global_limit), 10000))
+            normalized_account_limit = max(1, min(int(account_limit), 10000))
+            normalized_window = max(1, min(int(window_seconds), 86400))
+        except (TypeError, ValueError):
+            return {
+                'allowed': False,
+                'reason': 'invalid_budget_identity',
+                'retry_after': 0.0,
+            }
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {
+                'allowed': False,
+                'reason': 'invalid_budget_identity',
+                'retry_after': 0.0,
+            }
+
+        timestamp = float(now if now is not None else time.time())
+        scopes = (
+            (
+                'global',
+                hashlib.sha256(b'skill-monitor-mtop-global-v1').hexdigest(),
+                normalized_global_limit,
+            ),
+            (
+                'account',
+                hashlib.sha256(
+                    f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+                ).hexdigest(),
+                normalized_account_limit,
+            ),
+        )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    'DELETE FROM skill_monitor_request_budgets '
+                    'WHERE retention_until <= ?',
+                    (timestamp,),
+                )
+                states: List[Dict[str, Any]] = []
+                for scope_type, scope_digest, limit in scopes:
+                    row = cursor.execute('''
+                        SELECT window_started_at, window_seconds, request_count
+                        FROM skill_monitor_request_budgets
+                        WHERE scope_type = ? AND scope_digest = ?
+                    ''', (scope_type, scope_digest)).fetchone()
+                    if (
+                        not row
+                        or int(row[1] or 0) != normalized_window
+                        or float(row[0]) + normalized_window <= timestamp
+                    ):
+                        window_started_at = timestamp
+                        request_count = 0
+                    else:
+                        window_started_at = float(row[0])
+                        request_count = int(row[2] or 0)
+                    states.append({
+                        'scope_type': scope_type,
+                        'scope_digest': scope_digest,
+                        'limit': limit,
+                        'window_started_at': window_started_at,
+                        'request_count': request_count,
+                    })
+
+                blocked = [state for state in states if state['request_count'] >= state['limit']]
+                if blocked:
+                    retry_after = max(
+                        0.0,
+                        max(
+                            state['window_started_at'] + normalized_window - timestamp
+                            for state in blocked
+                        ),
+                    )
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'reason': 'request_budget_exhausted',
+                        'retry_after': retry_after,
+                        'global_count': states[0]['request_count'],
+                        'global_limit': normalized_global_limit,
+                        'account_count': states[1]['request_count'],
+                        'account_limit': normalized_account_limit,
+                        'window_seconds': normalized_window,
+                    }
+
+                for state in states:
+                    next_count = state['request_count'] + 1
+                    retention_until = (
+                        state['window_started_at']
+                        + normalized_window
+                        + SKILL_MONITOR_BUDGET_RETENTION_SECONDS
+                    )
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_request_budgets (
+                            scope_type, scope_digest, window_started_at,
+                            window_seconds, request_count, retention_until,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(scope_type, scope_digest) DO UPDATE SET
+                            window_started_at = excluded.window_started_at,
+                            window_seconds = excluded.window_seconds,
+                            request_count = excluded.request_count,
+                            retention_until = excluded.retention_until,
+                            updated_at = excluded.updated_at
+                    ''', (
+                        state['scope_type'],
+                        state['scope_digest'],
+                        state['window_started_at'],
+                        normalized_window,
+                        next_count,
+                        retention_until,
+                        timestamp,
+                    ))
+                    state['request_count'] = next_count
+                self.conn.commit()
+                return {
+                    'allowed': True,
+                    'reason': '',
+                    'retry_after': 0.0,
+                    'global_count': states[0]['request_count'],
+                    'global_limit': normalized_global_limit,
+                    'account_count': states[1]['request_count'],
+                    'account_limit': normalized_account_limit,
+                    'window_seconds': normalized_window,
+                }
+            except Exception as exc:
+                logger.error(
+                    f"领取技能监控请求预算失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {
+                    'allowed': False,
+                    'reason': 'request_budget_unavailable',
+                    'retry_after': 0.0,
+                }
+
+    def claim_skill_monitor_mtop_circuit_probe(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        probe_lease_seconds: int,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fail closed while open and single-flight the half-open probe."""
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_lease = max(15, min(int(probe_lease_seconds), 600))
+        except (TypeError, ValueError):
+            return {'allowed': False, 'state': 'invalid_identity', 'retry_after': 0.0}
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {'allowed': False, 'state': 'invalid_identity', 'retry_after': 0.0}
+        timestamp = float(now if now is not None else time.time())
+        scope_digest = hashlib.sha256(
+            f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+        ).hexdigest()
+        retention_until = timestamp + SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    'DELETE FROM skill_monitor_mtop_breakers WHERE retention_until <= ?',
+                    (timestamp,),
+                )
+                row = cursor.execute('''
+                    SELECT state, consecutive_failures, opened_until,
+                           probe_token, probe_lease_expires_at
+                    FROM skill_monitor_mtop_breakers
+                    WHERE scope_digest = ?
+                ''', (scope_digest,)).fetchone()
+                if not row:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_mtop_breakers (
+                            scope_digest, state, consecutive_failures,
+                            retention_until, updated_at
+                        ) VALUES (?, 'closed', 0, ?, ?)
+                    ''', (scope_digest, retention_until, timestamp))
+                    self.conn.commit()
+                    return {
+                        'allowed': True,
+                        'state': 'closed',
+                        'probe_token': '',
+                        'retry_after': 0.0,
+                    }
+
+                state = str(row[0] or 'closed')
+                opened_until = float(row[2] or 0.0)
+                probe_lease_expires_at = float(row[4] or 0.0)
+                if state == 'closed':
+                    cursor.execute('''
+                        UPDATE skill_monitor_mtop_breakers
+                        SET retention_until = ?, updated_at = ?
+                        WHERE scope_digest = ?
+                    ''', (retention_until, timestamp, scope_digest))
+                    self.conn.commit()
+                    return {
+                        'allowed': True,
+                        'state': 'closed',
+                        'probe_token': '',
+                        'retry_after': 0.0,
+                    }
+                if state == 'open' and opened_until > timestamp:
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'state': 'open',
+                        'probe_token': '',
+                        'retry_after': opened_until - timestamp,
+                        'consecutive_failures': int(row[1] or 0),
+                    }
+                if state == 'half_open' and probe_lease_expires_at > timestamp:
+                    self.conn.commit()
+                    return {
+                        'allowed': False,
+                        'state': 'half_open',
+                        'probe_token': '',
+                        'retry_after': probe_lease_expires_at - timestamp,
+                        'consecutive_failures': int(row[1] or 0),
+                    }
+
+                probe_token = self._new_skill_monitor_token()
+                probe_lease_expires_at = timestamp + normalized_lease
+                cursor.execute('''
+                    UPDATE skill_monitor_mtop_breakers
+                    SET state = 'half_open', probe_token = ?,
+                        probe_lease_expires_at = ?, retention_until = ?,
+                        updated_at = ?
+                    WHERE scope_digest = ?
+                ''', (
+                    probe_token,
+                    probe_lease_expires_at,
+                    retention_until,
+                    timestamp,
+                    scope_digest,
+                ))
+                self.conn.commit()
+                return {
+                    'allowed': True,
+                    'state': 'half_open',
+                    'probe_token': probe_token,
+                    'retry_after': 0.0,
+                    'consecutive_failures': int(row[1] or 0),
+                }
+            except Exception as exc:
+                logger.error(
+                    f"领取 MTop 熔断探针失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {
+                    'allowed': False,
+                    'state': 'breaker_unavailable',
+                    'probe_token': '',
+                    'retry_after': 0.0,
+                }
+
+    def record_skill_monitor_mtop_circuit_outcome(
+        self,
+        user_id: int,
+        account_id: str,
+        *,
+        success: bool,
+        error_code: str = '',
+        failure_threshold: int,
+        cooldown_seconds: int,
+        probe_token: str = '',
+        force_open: bool = False,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        try:
+            normalized_user_id = int(user_id)
+            normalized_account_id = str(account_id or '').strip()
+            normalized_threshold = max(1, min(int(failure_threshold), 20))
+            normalized_cooldown = max(60, min(int(cooldown_seconds), 86400))
+        except (TypeError, ValueError):
+            return {'recorded': False, 'state': 'invalid_identity'}
+        if normalized_user_id <= 0 or not normalized_account_id:
+            return {'recorded': False, 'state': 'invalid_identity'}
+        normalized_error_code = ''.join(
+            character
+            for character in str(error_code or '').lower()
+            if character.isalnum() or character == '_'
+        )[:80]
+        timestamp = float(now if now is not None else time.time())
+        scope_digest = hashlib.sha256(
+            f'{normalized_user_id}:{normalized_account_id}'.encode('utf-8')
+        ).hexdigest()
+        retention_until = timestamp + SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT state, consecutive_failures, probe_token
+                    FROM skill_monitor_mtop_breakers
+                    WHERE scope_digest = ?
+                ''', (scope_digest,)).fetchone()
+                if not row:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_mtop_breakers (
+                            scope_digest, state, consecutive_failures,
+                            retention_until, updated_at
+                        ) VALUES (?, 'closed', 0, ?, ?)
+                    ''', (scope_digest, retention_until, timestamp))
+                    row = ('closed', 0, '')
+                state = str(row[0] or 'closed')
+                if state == 'half_open' and str(row[2] or '') != str(probe_token or ''):
+                    self.conn.rollback()
+                    return {'recorded': False, 'state': 'probe_lost'}
+
+                if success:
+                    cursor.execute('''
+                        UPDATE skill_monitor_mtop_breakers
+                        SET state = 'closed', consecutive_failures = 0,
+                            opened_until = NULL, probe_token = '',
+                            probe_lease_expires_at = NULL,
+                            last_error_code = '', last_success_at = ?,
+                            retention_until = ?, updated_at = ?
+                        WHERE scope_digest = ?
+                    ''', (timestamp, retention_until, timestamp, scope_digest))
+                    self.conn.commit()
+                    return {
+                        'recorded': True,
+                        'state': 'closed',
+                        'consecutive_failures': 0,
+                    }
+
+                failures = int(row[1] or 0) + 1
+                should_open = bool(
+                    force_open
+                    or state == 'half_open'
+                    or failures >= normalized_threshold
+                )
+                next_state = 'open' if should_open else 'closed'
+                opened_until = (
+                    timestamp + normalized_cooldown if should_open else None
+                )
+                cursor.execute('''
+                    UPDATE skill_monitor_mtop_breakers
+                    SET state = ?, consecutive_failures = ?,
+                        opened_until = ?, probe_token = '',
+                        probe_lease_expires_at = NULL,
+                        last_error_code = ?, last_failure_at = ?,
+                        retention_until = ?, updated_at = ?
+                    WHERE scope_digest = ?
+                ''', (
+                    next_state,
+                    failures,
+                    opened_until,
+                    normalized_error_code or 'unknown_error',
+                    timestamp,
+                    retention_until,
+                    timestamp,
+                    scope_digest,
+                ))
+                self.conn.commit()
+                return {
+                    'recorded': True,
+                    'state': next_state,
+                    'consecutive_failures': failures,
+                    'opened_until': opened_until,
+                }
+            except Exception as exc:
+                logger.error(
+                    f"记录 MTop 熔断结果失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {'recorded': False, 'state': 'breaker_unavailable'}
+
+    def skill_monitor_run_claim_is_current(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            try:
+                row = self.conn.execute('''
+                    SELECT 1 FROM skill_monitor_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(run_id), str(claim_token), timestamp)).fetchone()
+                return bool(row)
+            except Exception as exc:
+                logger.error(
+                    f"核对技能监控运行租约失败: {type(exc).__name__}"
+                )
+                return False
+
+    def _insert_skill_monitor_event(
+        self,
+        cursor,
+        *,
+        idempotency_key: str,
+        event_type: str,
+        task_id: int,
+        user_id: int,
+        account_id: str = '',
+        run_id: Optional[int] = None,
+        result_id: Optional[int] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        retention_until: Optional[float] = None,
+    ) -> Optional[int]:
+        cursor.execute('''
+            INSERT OR IGNORE INTO skill_monitor_events (
+                event_token, idempotency_key, event_type, run_id, result_id,
+                task_id, user_id, account_id, payload_json, retention_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            self._new_skill_monitor_token(),
+            str(idempotency_key),
+            str(event_type),
+            run_id,
+            result_id,
+            int(task_id),
+            int(user_id),
+            str(account_id or ''),
+            json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+            retention_until,
+        ))
+        return int(cursor.lastrowid) if cursor.rowcount > 0 else None
+
+    def _recover_stale_skill_monitor_runs(
+        self,
+        cursor,
+        *,
+        now: float,
+        task_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        conditions = [
+            "status IN ('claimed', 'running')",
+            "(lease_expires_at IS NULL OR lease_expires_at <= ?)",
+        ]
+        params: List[Any] = [float(now)]
+        if task_id is not None:
+            conditions.append('task_id = ?')
+            params.append(int(task_id))
+        rows = cursor.execute(f'''
+            SELECT id, run_token, task_id, user_id, account_id, attempt
+            FROM skill_monitor_runs
+            WHERE {' AND '.join(conditions)}
+            ORDER BY id ASC
+        ''', params).fetchall()
+        recovered: List[Dict[str, Any]] = []
+        for row in rows:
+            run_id = int(row[0])
+            cursor.execute('''
+                UPDATE skill_monitor_runs
+                SET status = 'interrupted',
+                    claim_token = '',
+                    lease_expires_at = NULL,
+                    heartbeat_at = ?,
+                    interrupted_at = ?,
+                    finished_at = ?,
+                    error_code = 'lease_expired',
+                    error_message = '运行租约过期，已中断',
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('claimed', 'running')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ''', (now, now, now, now, run_id, now))
+            if cursor.rowcount <= 0:
+                continue
+            run = {
+                'id': run_id,
+                'run_token': str(row[1]),
+                'task_id': int(row[2]),
+                'user_id': int(row[3]),
+                'account_id': str(row[4] or ''),
+                'attempt': int(row[5] or 0),
+            }
+            recovered.append(run)
+            self._insert_skill_monitor_event(
+                cursor,
+                idempotency_key=f"run:{run['run_token']}:lease-expired:{run['attempt']}",
+                event_type='run_interrupted',
+                run_id=run_id,
+                task_id=run['task_id'],
+                user_id=run['user_id'],
+                account_id=run['account_id'],
+                payload={
+                    'reason_code': 'lease_expired',
+                    'attempt': run['attempt'],
+                },
+                retention_until=now + SKILL_MONITOR_RETENTION_SECONDS,
+            )
+            active = cursor.execute('''
+                SELECT 1 FROM skill_monitor_runs
+                WHERE task_id = ?
+                  AND status IN ('claimed', 'running')
+                  AND lease_expires_at > ?
+                LIMIT 1
+            ''', (run['task_id'], now)).fetchone()
+            if not active:
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'interrupted',
+                        last_error = '上次运行租约过期，已中断',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (run['task_id'], run['user_id']))
+        return recovered
+
+    def recover_stale_skill_monitor_runs(self, now: Optional[float] = None) -> int:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                recovered = self._recover_stale_skill_monitor_runs(
+                    cursor,
+                    now=timestamp,
+                )
+                self.conn.commit()
+                return len(recovered)
+            except Exception as e:
+                logger.error(f"恢复过期技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return 0
+
+    def claim_skill_monitor_run(
+        self,
+        task_id: int,
+        user_id: int,
+        *,
+        trigger_type: str,
+        source_adapter: str = 'playwright',
+        lease_seconds: int = SKILL_MONITOR_RUN_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Atomically create and claim one run for manual and scheduled entrypoints."""
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 3600))
+        trigger_type = 'scheduled' if trigger_type == 'scheduled' else 'manual'
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                task = cursor.execute('''
+                    SELECT id, user_id, account_id, enabled, schedule_enabled
+                    FROM skill_monitor_tasks
+                    WHERE id = ? AND user_id = ?
+                ''', (int(task_id), int(user_id))).fetchone()
+                if not task:
+                    self.conn.rollback()
+                    return {'state': 'not_found', 'claimed': False}
+                if not bool(task[3]) or (trigger_type == 'scheduled' and not bool(task[4])):
+                    self.conn.rollback()
+                    return {'state': 'disabled', 'claimed': False}
+
+                recovered = self._recover_stale_skill_monitor_runs(
+                    cursor,
+                    now=timestamp,
+                    task_id=int(task_id),
+                )
+                active = cursor.execute('''
+                    SELECT id FROM skill_monitor_runs
+                    WHERE task_id = ? AND user_id = ?
+                      AND status IN ('claimed', 'running')
+                      AND lease_expires_at > ?
+                    ORDER BY id DESC LIMIT 1
+                ''', (int(task_id), int(user_id), timestamp)).fetchone()
+                if active:
+                    self.conn.commit()
+                    return {
+                        'state': 'conflict',
+                        'claimed': False,
+                        'active_run_id': int(active[0]),
+                    }
+
+                account_id = str(task[2] or '').strip()
+                run_token = self._new_skill_monitor_token()
+                retention_until = timestamp + SKILL_MONITOR_RETENTION_SECONDS
+                recovered_from = recovered[-1] if recovered else None
+                if recovered_from is None:
+                    prior = cursor.execute('''
+                        SELECT prior.id, prior.run_token, prior.task_id,
+                               prior.user_id, prior.account_id, prior.attempt
+                        FROM skill_monitor_runs AS prior
+                        WHERE prior.task_id = ? AND prior.user_id = ?
+                          AND prior.status = 'interrupted'
+                          AND prior.error_code = 'lease_expired'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM skill_monitor_runs AS successor
+                              WHERE successor.recovered_from_run_id = prior.id
+                          )
+                        ORDER BY prior.id DESC
+                        LIMIT 1
+                    ''', (int(task_id), int(user_id))).fetchone()
+                    if prior:
+                        recovered_from = {
+                            'id': int(prior[0]),
+                            'run_token': str(prior[1]),
+                            'task_id': int(prior[2]),
+                            'user_id': int(prior[3]),
+                            'account_id': str(prior[4] or ''),
+                            'attempt': int(prior[5] or 0),
+                        }
+                attempt = int((recovered_from or {}).get('attempt') or 0) + 1
+                if not account_id:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_runs (
+                            run_token, task_id, user_id, account_id, trigger_type,
+                            source_adapter, status, attempt, finished_at,
+                            error_code, error_message, retention_until,
+                            recovered_from_run_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, '', ?, ?, 'action_required', ?, ?,
+                                  'account_required', '任务尚未绑定闲鱼账号', ?, ?, ?, ?)
+                    ''', (
+                        run_token,
+                        int(task_id),
+                        int(user_id),
+                        trigger_type,
+                        str(source_adapter or 'playwright'),
+                        attempt,
+                        timestamp,
+                        retention_until,
+                        (recovered_from or {}).get('id'),
+                        timestamp,
+                        timestamp,
+                    ))
+                    run_id = int(cursor.lastrowid)
+                    cursor.execute('''
+                        UPDATE skill_monitor_tasks
+                        SET last_status = 'action_required',
+                            last_error = '任务尚未绑定闲鱼账号',
+                            schedule_enabled = 0,
+                            next_run_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND user_id = ?
+                    ''', (int(task_id), int(user_id)))
+                    self._insert_skill_monitor_event(
+                        cursor,
+                        idempotency_key=f'run:{run_token}:account-required',
+                        event_type='run_action_required',
+                        run_id=run_id,
+                        task_id=int(task_id),
+                        user_id=int(user_id),
+                        payload={'reason_code': 'account_required'},
+                        retention_until=retention_until,
+                    )
+                    self.conn.commit()
+                    return {
+                        'state': 'action_required',
+                        'claimed': False,
+                        'run_id': run_id,
+                        'run_token': run_token,
+                        'error_code': 'account_required',
+                    }
+
+                claim_token = self._new_skill_monitor_token()
+                lease_expires_at = timestamp + lease_seconds
+                cursor.execute('''
+                    INSERT INTO skill_monitor_runs (
+                        run_token, task_id, user_id, account_id, trigger_type,
+                        source_adapter, status, claim_token, lease_expires_at,
+                        heartbeat_at, attempt, started_at, retention_until,
+                        recovered_from_run_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    run_token,
+                    int(task_id),
+                    int(user_id),
+                    account_id,
+                    trigger_type,
+                    str(source_adapter or 'playwright'),
+                    claim_token,
+                    lease_expires_at,
+                    timestamp,
+                    attempt,
+                    timestamp,
+                    retention_until,
+                    (recovered_from or {}).get('id'),
+                    timestamp,
+                    timestamp,
+                ))
+                run_id = int(cursor.lastrowid)
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_status = 'running', last_error = '',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (int(task_id), int(user_id)))
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=f'run:{run_token}:claimed:{attempt}',
+                    event_type='run_claimed',
+                    run_id=run_id,
+                    task_id=int(task_id),
+                    user_id=int(user_id),
+                    account_id=account_id,
+                    payload={
+                        'trigger_type': trigger_type,
+                        'source_adapter': str(source_adapter or 'playwright'),
+                        'attempt': attempt,
+                    },
+                    retention_until=retention_until,
+                )
+                self.conn.commit()
+                return {
+                    'state': 'claimed',
+                    'claimed': True,
+                    'run_id': run_id,
+                    'run_token': run_token,
+                    'claim_token': claim_token,
+                    'lease_expires_at': lease_expires_at,
+                    'attempt': attempt,
+                    'account_id': account_id,
+                }
+            except Exception as e:
+                logger.error(f"领取技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'claimed': False}
+
+    def heartbeat_skill_monitor_run(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        lease_seconds: int = SKILL_MONITOR_RUN_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 3600))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_runs
+                    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    timestamp,
+                    timestamp + lease_seconds,
+                    timestamp,
+                    int(run_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"更新技能监控运行心跳失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def finish_skill_monitor_run(
+        self,
+        run_id: int,
+        claim_token: str,
+        *,
+        status: str,
+        raw_result_count: int = 0,
+        accepted_result_count: int = 0,
+        error_code: str = '',
+        error_message: str = '',
+        next_run_at: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        allowed_statuses = {'success', 'failed', 'interrupted', 'action_required'}
+        if status not in allowed_statuses:
+            return False
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT run_token, task_id, user_id, account_id, attempt
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(run_id), str(claim_token), timestamp)).fetchone()
+                if not row:
+                    self.conn.rollback()
+                    return False
+                cursor.execute('''
+                    UPDATE skill_monitor_runs
+                    SET status = ?, claim_token = '', lease_expires_at = NULL,
+                        heartbeat_at = ?, finished_at = ?,
+                        interrupted_at = CASE WHEN ? = 'interrupted' THEN ? ELSE interrupted_at END,
+                        raw_result_count = ?, accepted_result_count = ?,
+                        error_code = ?, error_message = ?, updated_at = ?
+                    WHERE id = ? AND claim_token = ? AND status = 'running'
+                ''', (
+                    status,
+                    timestamp,
+                    timestamp,
+                    status,
+                    timestamp,
+                    max(0, int(raw_result_count)),
+                    max(0, int(accepted_result_count)),
+                    str(error_code or '')[:80],
+                    str(error_message or '')[:500],
+                    timestamp,
+                    int(run_id),
+                    str(claim_token),
+                ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                cursor.execute('''
+                    UPDATE skill_monitor_tasks
+                    SET last_run_at = CURRENT_TIMESTAMP,
+                        last_status = ?, last_error = ?,
+                        schedule_enabled = CASE
+                            WHEN ? = 'action_required' THEN 0
+                            ELSE schedule_enabled
+                        END,
+                        next_run_at = CASE
+                            WHEN ? = 'action_required' THEN NULL
+                            ELSE ?
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                ''', (
+                    status,
+                    str(error_message or '')[:500],
+                    status,
+                    status,
+                    next_run_at,
+                    int(row[1]),
+                    int(row[2]),
+                ))
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=f'run:{row[0]}:finished:{status}:{row[4]}',
+                    event_type=f'run_{status}',
+                    run_id=int(run_id),
+                    task_id=int(row[1]),
+                    user_id=int(row[2]),
+                    account_id=str(row[3] or ''),
+                    payload={
+                        'status': status,
+                        'attempt': int(row[4] or 0),
+                        'raw_result_count': max(0, int(raw_result_count)),
+                        'accepted_result_count': max(0, int(accepted_result_count)),
+                        'error_code': str(error_code or '')[:80],
+                    },
+                    retention_until=timestamp + SKILL_MONITOR_RETENTION_SECONDS,
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"完成技能监控运行失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def get_skill_monitor_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT id, run_token, task_id, user_id, account_id, trigger_type,
+                       source_adapter, status, claim_token, lease_expires_at,
+                       heartbeat_at, attempt, started_at, finished_at,
+                       interrupted_at, recovered_from_run_id, raw_result_count,
+                       accepted_result_count, error_code, error_message,
+                       retention_until, created_at, updated_at
+                FROM skill_monitor_runs WHERE id = ?
+            ''', (int(run_id),)).fetchone()
+            if not row:
+                return None
+            keys = (
+                'id', 'run_token', 'task_id', 'user_id', 'account_id',
+                'trigger_type', 'source_adapter', 'status', 'claim_token',
+                'lease_expires_at', 'heartbeat_at', 'attempt', 'started_at',
+                'finished_at', 'interrupted_at', 'recovered_from_run_id',
+                'raw_result_count', 'accepted_result_count', 'error_code',
+                'error_message', 'retention_until', 'created_at', 'updated_at',
+            )
+            return dict(zip(keys, row))
+
+    def record_skill_monitor_ai_decision(
+        self,
+        *,
+        run_id: int,
+        claim_token: str,
+        task_id: int,
+        user_id: int,
+        item_identity: str,
+        recommended: bool,
+        score: float,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Persist one whitelisted AI decision while the run lease is valid."""
+        timestamp = float(now if now is not None else time.time())
+        identity_digest = hashlib.sha256(
+            str(item_identity or '').encode('utf-8')
+        ).hexdigest()
+        if not item_identity:
+            return {'state': 'invalid_identity', 'recorded': False}
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                run = cursor.execute('''
+                    SELECT run_token, account_id
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND task_id = ? AND user_id = ?
+                      AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    int(run_id),
+                    int(task_id),
+                    int(user_id),
+                    str(claim_token),
+                    timestamp,
+                )).fetchone()
+                if not run:
+                    self.conn.rollback()
+                    return {'state': 'lease_lost', 'recorded': False}
+                event_id = self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=(
+                        f'run:{run[0]}:ai-decision:{identity_digest}'
+                    ),
+                    event_type='ai_decision',
+                    run_id=int(run_id),
+                    task_id=int(task_id),
+                    user_id=int(user_id),
+                    account_id=str(run[1] or ''),
+                    payload={
+                        'recommended': bool(recommended),
+                        'score': max(0.0, min(float(score or 0), 100.0)),
+                        'item_identity_digest': identity_digest,
+                    },
+                    retention_until=(
+                        timestamp + SKILL_MONITOR_RETENTION_SECONDS
+                    ),
+                )
+                self.conn.commit()
+                return {
+                    'state': 'recorded' if event_id else 'duplicate',
+                    'recorded': bool(event_id),
+                    'event_id': event_id,
+                }
+            except Exception as e:
+                logger.error(f"记录技能 AI 决策失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'recorded': False}
+
+    def get_skill_capability_evidence(self, user_id: int) -> Dict[str, Any]:
+        """Return user-scoped, non-secret evidence for the capability matrix."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                last_real_search = cursor.execute('''
+                    SELECT id, task_id, source_adapter, raw_result_count,
+                           accepted_result_count, finished_at
+                    FROM skill_monitor_runs
+                    WHERE user_id = ? AND status = 'success'
+                      AND source_adapter IN ('playwright', 'mtop')
+                      AND finished_at IS NOT NULL
+                    ORDER BY finished_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_scheduled_run = cursor.execute('''
+                    SELECT id, task_id, status, source_adapter,
+                           raw_result_count, accepted_result_count,
+                           COALESCE(finished_at, started_at, created_at)
+                    FROM skill_monitor_runs
+                    WHERE user_id = ? AND trigger_type = 'scheduled'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_ai_decision = cursor.execute('''
+                    SELECT id, run_id, task_id, payload_json, created_at
+                    FROM skill_monitor_events
+                    WHERE user_id = ? AND event_type = 'ai_decision'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_real_delivery = cursor.execute('''
+                    SELECT d.id, d.task_id, d.channel_type, d.confirmed_at
+                    FROM skill_monitor_deliveries
+                    AS d
+                    JOIN skill_monitor_results AS r
+                      ON r.id = d.result_id AND r.user_id = d.user_id
+                    WHERE d.user_id = ? AND d.status = 'sent'
+                      AND d.confirmed_at IS NOT NULL
+                      AND r.source_adapter IN ('playwright', 'mtop')
+                      AND COALESCE(json_extract(r.raw_data, '$.is_real_data'), 0) = 1
+                      AND COALESCE(json_extract(r.raw_data, '$.provider_mode'), 'real') <> 'mocked'
+                    ORDER BY d.confirmed_at DESC, d.id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+                last_delivery_attempt = cursor.execute('''
+                    SELECT id, status, channel_type,
+                           COALESCE(confirmed_at, sent_at, updated_at, created_at)
+                    FROM skill_monitor_deliveries
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                ''', (int(user_id),)).fetchone()
+
+                ai_payload: Dict[str, Any] = {}
+                if last_ai_decision:
+                    try:
+                        parsed_payload = json.loads(last_ai_decision[3] or '{}')
+                        if isinstance(parsed_payload, dict):
+                            ai_payload = {
+                                'recommended': bool(
+                                    parsed_payload.get('recommended')
+                                ),
+                                'score': float(parsed_payload.get('score') or 0),
+                            }
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        ai_payload = {}
+
+                return {
+                    'last_real_search': (
+                        {
+                            'run_id': int(last_real_search[0]),
+                            'task_id': int(last_real_search[1]),
+                            'source_adapter': str(last_real_search[2] or ''),
+                            'raw_result_count': int(last_real_search[3] or 0),
+                            'accepted_result_count': int(last_real_search[4] or 0),
+                            'observed_at': float(last_real_search[5]),
+                        }
+                        if last_real_search
+                        else None
+                    ),
+                    'last_scheduled_run': (
+                        {
+                            'run_id': int(last_scheduled_run[0]),
+                            'task_id': int(last_scheduled_run[1]),
+                            'status': str(last_scheduled_run[2] or ''),
+                            'source_adapter': str(last_scheduled_run[3] or ''),
+                            'raw_result_count': int(last_scheduled_run[4] or 0),
+                            'accepted_result_count': int(last_scheduled_run[5] or 0),
+                            'observed_at': float(last_scheduled_run[6]),
+                        }
+                        if last_scheduled_run
+                        else None
+                    ),
+                    'last_ai_decision': (
+                        {
+                            'event_id': int(last_ai_decision[0]),
+                            'run_id': int(last_ai_decision[1]),
+                            'task_id': int(last_ai_decision[2]),
+                            'recommended': ai_payload.get('recommended'),
+                            'score': ai_payload.get('score'),
+                            'observed_at': float(last_ai_decision[4]),
+                        }
+                        if last_ai_decision
+                        else None
+                    ),
+                    'last_real_delivery': (
+                        {
+                            'delivery_id': int(last_real_delivery[0]),
+                            'task_id': int(last_real_delivery[1]),
+                            'channel_type': str(last_real_delivery[2] or ''),
+                            'observed_at': float(last_real_delivery[3]),
+                        }
+                        if last_real_delivery
+                        else None
+                    ),
+                    'last_delivery_attempt': (
+                        {
+                            'delivery_id': int(last_delivery_attempt[0]),
+                            'status': str(last_delivery_attempt[1] or ''),
+                            'channel_type': str(last_delivery_attempt[2] or ''),
+                            'observed_at': float(last_delivery_attempt[3]),
+                        }
+                        if last_delivery_attempt
+                        else None
+                    ),
+                }
+            except Exception as e:
+                logger.error(f"读取技能能力证据失败: {type(e).__name__}")
+                return {
+                    'last_real_search': None,
+                    'last_scheduled_run': None,
+                    'last_ai_decision': None,
+                    'last_real_delivery': None,
+                    'last_delivery_attempt': None,
+                }
+
+    def _recover_stale_skill_monitor_deliveries(
+        self,
+        cursor,
+        *,
+        now: float,
+    ) -> int:
+        rows = cursor.execute('''
+            SELECT id, event_id, result_id, task_id, user_id, attempt
+            FROM skill_monitor_deliveries
+            WHERE status = 'sending'
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ORDER BY id ASC
+        ''', (float(now),)).fetchall()
+        recovered = 0
+        for row in rows:
+            cursor.execute('''
+                UPDATE skill_monitor_deliveries
+                SET status = 'unknown', claim_token = '',
+                    lease_expires_at = NULL, heartbeat_at = ?,
+                    error_code = 'send_outcome_unknown',
+                    error_message = '发送租约过期，结果未知，未自动重试',
+                    updated_at = ?
+                WHERE id = ? AND status = 'sending'
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            ''', (now, now, int(row[0]), now))
+            if cursor.rowcount <= 0:
+                continue
+            recovered += 1
+            self._insert_skill_monitor_event(
+                cursor,
+                idempotency_key=f'delivery:{row[0]}:unknown:{row[5]}',
+                event_type='delivery_unknown',
+                run_id=None,
+                result_id=int(row[2]),
+                task_id=int(row[3]),
+                user_id=int(row[4]),
+                payload={
+                    'delivery_id': int(row[0]),
+                    'reason_code': 'send_outcome_unknown',
+                    'attempt': int(row[5] or 0),
+                },
+                retention_until=now + SKILL_MONITOR_RETENTION_SECONDS,
+            )
+            self._refresh_skill_monitor_result_notify_status(
+                cursor,
+                int(row[2]),
+            )
+        return recovered
+
+    @staticmethod
+    def _refresh_skill_monitor_result_notify_status(cursor, result_id: int) -> str:
+        statuses = [
+            str(row[0])
+            for row in cursor.execute('''
+                SELECT status FROM skill_monitor_deliveries
+                WHERE result_id = ?
+                ORDER BY id ASC
+            ''', (int(result_id),)).fetchall()
+        ]
+        if not statuses:
+            status = 'skipped_no_channel'
+        elif all(value == 'sent' for value in statuses):
+            status = 'sent'
+        elif any(value in {'pending', 'retry', 'sending'} for value in statuses):
+            status = 'queued'
+        elif any(value == 'sent' for value in statuses):
+            status = 'partial_unknown' if any(
+                value in {'unknown', 'sent_unconfirmed'} for value in statuses
+            ) else 'partial'
+        elif any(value in {'unknown', 'sent_unconfirmed'} for value in statuses):
+            status = 'unknown'
+        else:
+            status = 'failed'
+        cursor.execute('''
+            UPDATE skill_monitor_results
+            SET notify_status = ?
+            WHERE id = ?
+        ''', (status, int(result_id)))
+        return status
+
+    def recover_stale_skill_monitor_deliveries(self, now: Optional[float] = None) -> int:
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                recovered = self._recover_stale_skill_monitor_deliveries(
+                    cursor,
+                    now=timestamp,
+                )
+                self.conn.commit()
+                return recovered
+            except Exception as e:
+                logger.error(f"恢复过期技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return 0
+
+    def cleanup_expired_skill_monitor_records(
+        self,
+        *,
+        now: Optional[float] = None,
+        batch_size: int = 500,
+        max_batches: int = 20,
+    ) -> Dict[str, int]:
+        """Delete expired monitor audit data without touching active leases.
+
+        Rows without a retention deadline are legacy/operator evidence and stay
+        untouched. Children are removed before parents, and stale run/delivery
+        leases are recovered in the same transaction before retention checks.
+        """
+        timestamp = float(now if now is not None else time.time())
+        normalized_batch_size = max(1, min(int(batch_size), 5000))
+        normalized_max_batches = max(1, min(int(max_batches), 100))
+        deleted = {
+            'deliveries': 0,
+            'events': 0,
+            'result_identities': 0,
+            'results': 0,
+            'runs': 0,
+            'request_budgets': 0,
+            'mtop_breakers': 0,
+            'recovered_runs': 0,
+            'recovered_deliveries': 0,
+        }
+
+        def _delete_ids(cursor, table: str, ids: List[int]) -> int:
+            if not ids:
+                return 0
+            placeholders = ','.join('?' for _ in ids)
+            cursor.execute(
+                f'DELETE FROM {table} WHERE id IN ({placeholders})',
+                tuple(ids),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                deleted['recovered_runs'] = len(
+                    self._recover_stale_skill_monitor_runs(
+                        cursor,
+                        now=timestamp,
+                    )
+                )
+                deleted['recovered_deliveries'] = (
+                    self._recover_stale_skill_monitor_deliveries(
+                        cursor,
+                        now=timestamp,
+                    )
+                )
+
+                for _ in range(normalized_max_batches):
+                    batch_changes = 0
+
+                    delivery_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT id
+                            FROM skill_monitor_deliveries
+                            WHERE retention_until IS NOT NULL
+                              AND retention_until <= ?
+                              AND NOT (
+                                  status = 'sending'
+                                  AND lease_expires_at > ?
+                              )
+                            ORDER BY id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_deliveries',
+                        delivery_ids,
+                    )
+                    deleted['deliveries'] += count
+                    batch_changes += count
+
+                    event_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT event.id
+                            FROM skill_monitor_events AS event
+                            WHERE event.retention_until IS NOT NULL
+                              AND event.retention_until <= ?
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_deliveries AS delivery
+                                  WHERE delivery.event_id = event.id
+                              )
+                            ORDER BY event.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_events',
+                        event_ids,
+                    )
+                    deleted['events'] += count
+                    batch_changes += count
+
+                    result_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT result.id
+                            FROM skill_monitor_results AS result
+                            WHERE result.retention_until IS NOT NULL
+                              AND result.retention_until <= ?
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_events AS event
+                                  WHERE event.result_id = result.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_deliveries AS delivery
+                                  WHERE delivery.result_id = result.id
+                              )
+                            ORDER BY result.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    if result_ids:
+                        placeholders = ','.join('?' for _ in result_ids)
+                        cursor.execute(
+                            'DELETE FROM skill_monitor_result_identities '
+                            f'WHERE result_id IN ({placeholders})',
+                            tuple(result_ids),
+                        )
+                        identity_count = max(0, int(cursor.rowcount or 0))
+                        deleted['result_identities'] += identity_count
+                        batch_changes += identity_count
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_results',
+                        result_ids,
+                    )
+                    deleted['results'] += count
+                    batch_changes += count
+
+                    run_ids = [
+                        int(row[0])
+                        for row in cursor.execute('''
+                            SELECT run.id
+                            FROM skill_monitor_runs AS run
+                            WHERE run.retention_until IS NOT NULL
+                              AND run.retention_until <= ?
+                              AND NOT (
+                                  run.status IN ('claimed', 'running')
+                                  AND run.lease_expires_at > ?
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_events AS event
+                                  WHERE event.run_id = run.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_results AS result
+                                  WHERE result.run_id = run.id
+                              )
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM skill_monitor_runs AS successor
+                                  WHERE successor.recovered_from_run_id = run.id
+                              )
+                            ORDER BY run.id ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    count = _delete_ids(
+                        cursor,
+                        'skill_monitor_runs',
+                        run_ids,
+                    )
+                    deleted['runs'] += count
+                    batch_changes += count
+
+                    cursor.execute('''
+                        DELETE FROM skill_monitor_request_budgets
+                        WHERE retention_until <= ?
+                    ''', (timestamp,))
+                    count = max(0, int(cursor.rowcount or 0))
+                    deleted['request_budgets'] += count
+                    batch_changes += count
+
+                    breaker_digests = [
+                        str(row[0])
+                        for row in cursor.execute('''
+                            SELECT scope_digest
+                            FROM skill_monitor_mtop_breakers
+                            WHERE retention_until <= ?
+                              AND NOT (
+                                  state = 'half_open'
+                                  AND probe_lease_expires_at > ?
+                              )
+                            ORDER BY scope_digest ASC
+                            LIMIT ?
+                        ''', (
+                            timestamp,
+                            timestamp,
+                            normalized_batch_size,
+                        )).fetchall()
+                    ]
+                    if breaker_digests:
+                        placeholders = ','.join('?' for _ in breaker_digests)
+                        cursor.execute(
+                            'DELETE FROM skill_monitor_mtop_breakers '
+                            f'WHERE scope_digest IN ({placeholders})',
+                            tuple(breaker_digests),
+                        )
+                        count = max(0, int(cursor.rowcount or 0))
+                        deleted['mtop_breakers'] += count
+                        batch_changes += count
+
+                    if batch_changes == 0:
+                        break
+
+                self.conn.commit()
+                return deleted
+            except Exception as exc:
+                logger.error(
+                    f"清理技能监控留存记录失败: {type(exc).__name__}"
+                )
+                self.conn.rollback()
+                return {key: 0 for key in deleted}
+
+    def claim_skill_monitor_delivery(
+        self,
+        *,
+        delivery_id: Optional[int] = None,
+        lease_seconds: int = SKILL_MONITOR_DELIVERY_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 600))
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                self._recover_stale_skill_monitor_deliveries(cursor, now=timestamp)
+                conditions = [
+                    "status IN ('pending', 'retry')",
+                    '(next_attempt_at IS NULL OR next_attempt_at <= ?)',
+                ]
+                params: List[Any] = [timestamp]
+                if delivery_id is not None:
+                    conditions.append('id = ?')
+                    params.append(int(delivery_id))
+                row = cursor.execute(f'''
+                    SELECT id, idempotency_key, event_id, result_id, task_id,
+                           user_id, channel_id, channel_type, destination_digest,
+                           attempt
+                    FROM skill_monitor_deliveries
+                    WHERE {' AND '.join(conditions)}
+                    ORDER BY id ASC LIMIT 1
+                ''', params).fetchone()
+                if not row:
+                    self.conn.commit()
+                    return None
+                claim_token = self._new_skill_monitor_token()
+                lease_expires_at = timestamp + lease_seconds
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET status = 'sending', claim_token = ?,
+                        lease_expires_at = ?, heartbeat_at = ?,
+                        attempt = attempt + 1, send_started_at = ?,
+                        error_code = '', error_message = '', updated_at = ?
+                    WHERE id = ? AND status IN ('pending', 'retry')
+                ''', (
+                    claim_token,
+                    lease_expires_at,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    int(row[0]),
+                ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return None
+                self.conn.commit()
+                return {
+                    'id': int(row[0]),
+                    'idempotency_key': str(row[1]),
+                    'event_id': int(row[2]),
+                    'result_id': int(row[3]),
+                    'task_id': int(row[4]),
+                    'user_id': int(row[5]),
+                    'channel_id': row[6],
+                    'channel_type': str(row[7] or ''),
+                    'destination_digest': str(row[8] or ''),
+                    'attempt': int(row[9] or 0) + 1,
+                    'claim_token': claim_token,
+                    'lease_expires_at': lease_expires_at,
+                }
+            except Exception as e:
+                logger.error(f"领取技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return None
+
+    def heartbeat_skill_monitor_delivery(
+        self,
+        delivery_id: int,
+        claim_token: str,
+        *,
+        lease_seconds: int = SKILL_MONITOR_DELIVERY_LEASE_SECONDS,
+        now: Optional[float] = None,
+    ) -> bool:
+        timestamp = float(now if now is not None else time.time())
+        lease_seconds = max(30, min(int(lease_seconds), 600))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    timestamp,
+                    timestamp + lease_seconds,
+                    timestamp,
+                    int(delivery_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                logger.error(f"更新技能通知投递心跳失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def finish_skill_monitor_delivery(
+        self,
+        delivery_id: int,
+        claim_token: str,
+        *,
+        status: str,
+        error_code: str = '',
+        error_message: str = '',
+        next_attempt_at: Optional[float] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        if status not in {'sent', 'sent_unconfirmed', 'failed', 'unknown', 'retry'}:
+            return False
+        timestamp = float(now if now is not None else time.time())
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT idempotency_key, result_id, task_id, user_id, attempt
+                    FROM skill_monitor_deliveries
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (int(delivery_id), str(claim_token), timestamp)).fetchone()
+                if not row:
+                    self.conn.rollback()
+                    return False
+                cursor.execute('''
+                    UPDATE skill_monitor_deliveries
+                    SET status = ?, claim_token = '', lease_expires_at = NULL,
+                        heartbeat_at = ?,
+                        sent_at = CASE WHEN ? IN ('sent', 'sent_unconfirmed') THEN ? ELSE sent_at END,
+                        confirmed_at = CASE WHEN ? = 'sent' THEN ? ELSE confirmed_at END,
+                        error_code = ?, error_message = ?, next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'sending' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    status,
+                    timestamp,
+                    status,
+                    timestamp,
+                    status,
+                    timestamp,
+                    str(error_code or '')[:80],
+                    str(error_message or '')[:500],
+                    next_attempt_at,
+                    timestamp,
+                    int(delivery_id),
+                    str(claim_token),
+                    timestamp,
+                ))
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=(
+                        f'delivery:{delivery_id}:finished:{int(row[4] or 0)}:{status}'
+                    ),
+                    event_type=f'delivery_{status}',
+                    result_id=int(row[1]),
+                    task_id=int(row[2]),
+                    user_id=int(row[3]),
+                    payload={
+                        'delivery_id': int(delivery_id),
+                        'status': status,
+                        'attempt': int(row[4] or 0),
+                        'error_code': str(error_code or '')[:80],
+                    },
+                    retention_until=timestamp + SKILL_MONITOR_RETENTION_SECONDS,
+                )
+                self._refresh_skill_monitor_result_notify_status(
+                    cursor,
+                    int(row[1]),
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"完成技能通知投递失败: {type(e).__name__}")
+                self.conn.rollback()
+                return False
+
+    def persist_skill_monitor_match(
+        self,
+        result_data: Dict[str, Any],
+        *,
+        run_id: int,
+        claim_token: str,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Commit result, first-seen event, and delivery outbox atomically."""
+        timestamp = float(now if now is not None else time.time())
+        task_id = int(result_data.get('task_id') or 0)
+        user_id = int(result_data.get('user_id') or 0)
+        item_id = str(result_data.get('item_id') or '').strip()[:256]
+        item_url = str(result_data.get('item_url') or '').strip()[:2000]
+        if not task_id or not user_id or not (item_id or item_url):
+            return {'state': 'invalid_identity', 'created': False}
+
+        safe_metadata_keys = {
+            'source',
+            'is_real_data',
+            'filter_reason',
+            'ai_recommended',
+            'ai_evaluated',
+            'scheduled_run',
+            'published_within_hours',
+            'item_id',
+            'publish_time',
+            'want_count',
+            'provider_mode',
+            'evidence_scope',
+        }
+        raw_data = result_data.get('raw_data')
+        if not isinstance(raw_data, dict):
+            raw_data = {}
+        safe_raw_data = {
+            key: raw_data[key]
+            for key in safe_metadata_keys
+            if key in raw_data
+        }
+        safe_raw_data['item_id'] = item_id
+        source_adapter = str(
+            result_data.get('source_adapter')
+            or safe_raw_data.get('source')
+            or 'playwright'
+        )[:40]
+        identity_parts = []
+        if item_id:
+            identity_parts.append(('item_id', item_id))
+        if item_url:
+            identity_parts.append(('item_url', item_url))
+        primary_identity = identity_parts[0]
+        identity_digest = hashlib.sha256(
+            f'{task_id}:{user_id}:{primary_identity[0]}:{primary_identity[1]}'.encode('utf-8')
+        ).hexdigest()
+        event_key = f'result-first-seen:v1:{identity_digest}'
+        retention_until = timestamp + SKILL_MONITOR_RETENTION_SECONDS
+
+        supported_channel_types = (
+            'webhook',
+            'wechat',
+            'dingtalk',
+            'ding_talk',
+            'feishu',
+            'lark',
+            'bark',
+            'telegram',
+        )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                run = cursor.execute('''
+                    SELECT run_token, account_id, source_adapter
+                    FROM skill_monitor_runs
+                    WHERE id = ? AND task_id = ? AND user_id = ?
+                      AND status = 'running' AND claim_token = ?
+                      AND lease_expires_at > ?
+                ''', (
+                    int(run_id),
+                    task_id,
+                    user_id,
+                    str(claim_token),
+                    timestamp,
+                )).fetchone()
+                if not run:
+                    self.conn.rollback()
+                    return {'state': 'lease_lost', 'created': False}
+
+                for identity_type, identity_value in identity_parts:
+                    existing = cursor.execute('''
+                        SELECT result_id FROM skill_monitor_result_identities
+                        WHERE task_id = ? AND user_id = ?
+                          AND identity_type = ? AND identity_value = ?
+                    ''', (
+                        task_id,
+                        user_id,
+                        identity_type,
+                        identity_value,
+                    )).fetchone()
+                    if existing:
+                        self.conn.rollback()
+                        return {
+                            'state': 'duplicate',
+                            'created': False,
+                            'result_id': int(existing[0]),
+                        }
+
+                task = cursor.execute('''
+                    SELECT notify_enabled FROM skill_monitor_tasks
+                    WHERE id = ? AND user_id = ?
+                ''', (task_id, user_id)).fetchone()
+                if not task:
+                    self.conn.rollback()
+                    return {'state': 'not_found', 'created': False}
+                notify_enabled = bool(task[0])
+                channels = []
+                if notify_enabled:
+                    placeholders = ','.join('?' for _ in supported_channel_types)
+                    channels = cursor.execute(f'''
+                        SELECT id, type FROM notification_channels
+                        WHERE user_id = ? AND enabled = 1
+                          AND LOWER(type) IN ({placeholders})
+                        ORDER BY id ASC
+                    ''', (user_id, *supported_channel_types)).fetchall()
+                notify_status = (
+                    'queued'
+                    if channels
+                    else ('skipped_no_channel' if notify_enabled else 'disabled')
+                )
+                cursor.execute('''
+                    INSERT INTO skill_monitor_results (
+                        task_id, user_id, title, price, region, item_url,
+                        item_image, seller_name, ai_score, ai_reason,
+                        notify_status, raw_data, item_id, run_id,
+                        source_adapter, first_seen_at, retention_until
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    task_id,
+                    user_id,
+                    str(result_data.get('title') or '')[:500],
+                    result_data.get('price'),
+                    str(result_data.get('region') or '')[:200],
+                    item_url,
+                    str(result_data.get('item_image') or '')[:2000],
+                    str(result_data.get('seller_name') or '')[:300],
+                    max(0, min(100, int(result_data.get('ai_score') or 0))),
+                    str(result_data.get('ai_reason') or '')[:500],
+                    notify_status,
+                    json.dumps(safe_raw_data, ensure_ascii=False, sort_keys=True),
+                    item_id,
+                    int(run_id),
+                    str(run[2] or source_adapter)[:40],
+                    timestamp,
+                    retention_until,
+                ))
+                result_id = int(cursor.lastrowid)
+                for identity_type, identity_value in identity_parts:
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_result_identities (
+                            task_id, user_id, identity_type,
+                            identity_value, result_id
+                        ) VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        task_id,
+                        user_id,
+                        identity_type,
+                        identity_value,
+                        result_id,
+                    ))
+                event_id = self._insert_skill_monitor_event(
+                    cursor,
+                    idempotency_key=event_key,
+                    event_type='result_first_seen',
+                    run_id=int(run_id),
+                    result_id=result_id,
+                    task_id=task_id,
+                    user_id=user_id,
+                    account_id=str(run[1] or ''),
+                    payload={
+                        'identity_type': primary_identity[0],
+                        'identity_digest': identity_digest,
+                        'source_adapter': str(run[2] or source_adapter)[:40],
+                    },
+                    retention_until=retention_until,
+                )
+                if event_id is None:
+                    raise sqlite3.IntegrityError('first-seen event collision')
+
+                delivery_ids: List[int] = []
+                for channel_id, channel_type in channels:
+                    delivery_digest = hashlib.sha256(
+                        f'{event_key}:channel:{int(channel_id)}'.encode('utf-8')
+                    ).hexdigest()
+                    destination_digest = hashlib.sha256(
+                        f'{user_id}:{int(channel_id)}:{str(channel_type).lower()}'.encode('utf-8')
+                    ).hexdigest()
+                    cursor.execute('''
+                        INSERT INTO skill_monitor_deliveries (
+                            idempotency_key, event_id, result_id, task_id,
+                            user_id, channel_id, channel_type,
+                            destination_digest, status, retention_until
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    ''', (
+                        f'delivery:v1:{delivery_digest}',
+                        int(event_id),
+                        result_id,
+                        task_id,
+                        user_id,
+                        int(channel_id),
+                        str(channel_type).lower()[:40],
+                        destination_digest,
+                        retention_until,
+                    ))
+                    delivery_ids.append(int(cursor.lastrowid))
+                self.conn.commit()
+                return {
+                    'state': 'created',
+                    'created': True,
+                    'result_id': result_id,
+                    'event_id': int(event_id),
+                    'delivery_ids': delivery_ids,
+                    'notify_status': notify_status,
+                }
+            except Exception as e:
+                logger.error(f"事务化保存技能监控结果失败: {type(e).__name__}")
+                self.conn.rollback()
+                return {'state': 'error', 'created': False}
+
+    def get_skill_monitor_delivery_context(
+        self,
+        delivery_id: int,
+        claim_token: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT d.id, d.idempotency_key, d.user_id, d.channel_id,
+                       d.channel_type, d.attempt,
+                       r.id, r.title, r.price, r.region, r.item_url,
+                       r.item_image, r.seller_name, r.ai_score, r.ai_reason,
+                       t.id, t.name, t.keyword, t.notify_enabled,
+                       c.id, c.name, c.type, c.config, c.enabled, c.user_id
+                FROM skill_monitor_deliveries AS d
+                JOIN skill_monitor_results AS r
+                  ON r.id = d.result_id AND r.user_id = d.user_id
+                JOIN skill_monitor_tasks AS t
+                  ON t.id = d.task_id AND t.user_id = d.user_id
+                LEFT JOIN notification_channels AS c
+                  ON c.id = d.channel_id AND c.user_id = d.user_id
+                WHERE d.id = ? AND d.status = 'sending'
+                  AND d.claim_token = ?
+            ''', (int(delivery_id), str(claim_token))).fetchone()
+            if not row:
+                return None
+            channel = None
+            if row[19] is not None:
+                channel = {
+                    'id': int(row[19]),
+                    'name': str(row[20] or ''),
+                    'type': str(row[21] or ''),
+                    'config': row[22],
+                    'enabled': bool(row[23]),
+                    'user_id': int(row[24]),
+                }
+            return {
+                'delivery': {
+                    'id': int(row[0]),
+                    'idempotency_key': str(row[1]),
+                    'user_id': int(row[2]),
+                    'channel_id': row[3],
+                    'channel_type': str(row[4] or ''),
+                    'attempt': int(row[5] or 0),
+                },
+                'result': {
+                    'id': int(row[6]),
+                    'title': str(row[7] or ''),
+                    'price': row[8],
+                    'region': str(row[9] or ''),
+                    'item_url': str(row[10] or ''),
+                    'item_image': str(row[11] or ''),
+                    'seller_name': str(row[12] or ''),
+                    'ai_score': int(row[13] or 0),
+                    'ai_reason': str(row[14] or ''),
+                },
+                'task': {
+                    'id': int(row[15]),
+                    'name': str(row[16] or ''),
+                    'keyword': str(row[17] or ''),
+                    'notify_enabled': bool(row[18]),
+                },
+                'channel': channel,
+            }
+
     def _skill_monitor_task_from_row(self, row) -> Dict[str, Any]:
         return {
             'id': row[0],
@@ -7643,6 +10176,7 @@ class DBManager:
                     FROM skill_monitor_tasks
                     WHERE enabled = 1
                       AND schedule_enabled = 1
+                      AND TRIM(COALESCE(account_id, '')) <> ''
                       AND (next_run_at IS NULL OR next_run_at <= CURRENT_TIMESTAMP)
                       AND COALESCE(last_status, 'idle') != 'running'
                     ORDER BY COALESCE(next_run_at, created_at) ASC, id ASC

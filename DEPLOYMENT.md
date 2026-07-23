@@ -14,7 +14,7 @@ This project is a long-running FastAPI application with SQLite data, WebSocket/b
 
 The account listeners and Skill Center scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
 
-The last verified runtime baseline is v1.7.1. v1.7.2 adds no database migration, so an upgrade must leave `2026071104` as the latest schema migration. Before calling v1.7.2 deployed, verify the listening process path, health response, public HTML entry bundle and referenced asset, shared branding and package-derived version on `/login`, `/register`, `/forgot-password`, `/terms`, and `/privacy`, the staged password-reset endpoints, and the CAPTCHA resend behavior. Also retain the v1.7.1 checks for role-aware `/api/dashboard/summary`, ordinary-user `/api/settings/user-summary`, administrator-only global settings, and disabled automatic Cookie refresh. Source or build completion alone is not deployment or CI evidence.
+The official-login stability change adds migration `2026071701`, which persists the official browser User-Agent on each account. Before calling any build deployed, verify the listening process path, local and public health, the migration version, HTML entry bundle and every referenced asset, account listeners, disabled-by-default Cookie and Skill schedules, and the official-login status endpoints. Source or build completion alone is not deployment or CI evidence; dated Mac deployment evidence and external-account release gates live in `docs/handoff.md`.
 
 ## Recommended Platforms
 
@@ -90,7 +90,7 @@ When deploying with `huggingface_hub`, upload source and built assets only. Excl
 
 ## Local Docker
 
-The Docker image is prepared, but the current machine needs more free disk space before building. Use this after disk space is available:
+Build and run the Docker image locally with:
 
 ```bash
 docker build -t xianyu-ai-manager .
@@ -106,7 +106,7 @@ docker run --rm -p 8091:8080 \
 
 Then open `http://localhost:8091`.
 
-The official Goofish login flow requires headed Chromium; the current container command does not start a virtual display. Treat password login and automatic credential fallback as unsupported in Docker or cloud environments until a display/Xvfb setup and the human-verification path have been tested there. Persisting `browser_data/` is still required once that support exists.
+The official Goofish login flow requires the installed system Chrome in headed mode; the current container command does not start a virtual display. Automatic renewal is profile-only and never submits a stored password. Treat QR login, explicit password login, and profile renewal as unsupported in Docker or cloud environments until system Chrome, a display/Xvfb setup, and the human-verification path have been tested there. Persisting `browser_data/` is required once that support exists.
 
 ## Direct Registration
 

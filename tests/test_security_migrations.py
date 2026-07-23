@@ -8,7 +8,7 @@ import unittest
 from loguru import logger
 
 from db_manager import DBManager
-from schema_migrations import Migration, MigrationRunner
+from schema_migrations import MIGRATIONS, Migration, MigrationRunner
 from security_utils import (
     SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
@@ -107,14 +107,7 @@ class SchemaMigrationTests(unittest.TestCase):
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            [
-                "2026070501",
-                "2026070502",
-                "2026071101",
-                "2026071102",
-                "2026071103",
-                "2026071104",
-            ],
+            [migration.version for migration in MIGRATIONS],
         )
         self.assertIsNotNone(runner.last_backup_dir)
         self.assertTrue((runner.last_backup_dir / self.db_path.name).exists())
@@ -122,7 +115,7 @@ class SchemaMigrationTests(unittest.TestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            6,
+            len(MIGRATIONS),
         )
 
         password, encrypted, version = connection.execute(

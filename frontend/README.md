@@ -19,6 +19,8 @@ npm run verify:build
 
 Unauthenticated navigation uses the History API for `/login`, `/register`, `/forgot-password`, `/terms`, and `/privacy`. These views and the authenticated sidebar share `components/BrandLockup.tsx`; Vite injects the displayed version from `package.json`. Registration stays visibly disabled when the public readiness endpoint is closed. Password recovery verifies the six-digit email code before rendering new-password fields and keeps the resulting one-time reset grant only in component memory. The Settings page contains the administrator-only SMTP receipt confirmation, registration switch, ordinary-user capacity, and user enablement controls.
 
+The account dialog creates one official-login session. QR is the default method; password and manual Cookie are secondary paths. The fixed-size image/status area keeps refresh, cancel, and “open on this Mac” actions stable while polling. Closing the dialog, changing methods, or unmounting stops polling and cancels an unused session. Account renewal reuses the official browser profile and never reads saved login credentials.
+
 ## Notes
 
 - Keep `base: '/static/'` in `vite.config.ts`, because the FastAPI app serves bundled assets under `/static/`.

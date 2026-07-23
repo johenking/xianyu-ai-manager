@@ -12,9 +12,13 @@ import {
   generateQRLogin,
   checkQRLoginStatus,
   continueQRLoginAfterVerification,
+  createBrowserExtensionPairing,
+  getBrowserExtensionPairing,
+  createOfficialLoginSession,
+  getOfficialLoginSession,
+  showOfficialLoginBrowser,
+  cancelOfficialLoginSession,
   addAccountCookie,
-  passwordLogin,
-  checkPasswordLoginStatus,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -28,6 +32,7 @@ import {
   getAccountSessionStatus,
   refreshAccountSession,
   cancelAccountSessionRefresh,
+  showAccountSessionRefreshBrowser,
   getAIProviders,
   refreshAIProviderModels,
   testAIProvider
@@ -35,11 +40,12 @@ import {
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Upload, Key, Eye, EyeOff, Bot, Settings
+  Upload, Key, Eye, EyeOff, Bot, Settings, ExternalLink, Chrome, Copy,
+  Smartphone, ChevronDown, AlertTriangle, ShieldCheck
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
-type AddLoginMethod = 'qr' | 'password' | 'cookie';
+type AddLoginMethod = 'qr' | 'sms' | 'extension' | 'password' | 'cookie';
 type AddLoginStatus = 'idle' | 'processing' | 'success' | 'failed' | 'verification_required';
 
 const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
@@ -60,6 +66,15 @@ const formatCookieRefreshInterval = (minutes?: number) => {
   return `${value} 分钟`;
 };
 
+const reauthActionLabel = (account: AccountDetail) => {
+  if (account.reauth_action === 'qr_login') return '重新扫码';
+  if (account.reauth_action === 'sms_login') return '验证码登录';
+  if (account.reauth_action === 'password_login') return '账号密码登录';
+  if (account.reauth_action === 'chrome_extension_import') return '重新导入';
+  if (account.reauth_action === 'manual_cookie') return '重新填写';
+  return '重新登录';
+};
+
 const AccountList: React.FC = () => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [loading, setLoading] = useState(true);
@@ -73,6 +88,14 @@ const AccountList: React.FC = () => {
   const qrPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const qrHadVerificationRef = useRef(false);
   const passwordPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const smsPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const extensionPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [extensionPairing, setExtensionPairing] = useState<Awaited<ReturnType<typeof createBrowserExtensionPairing>> | null>(null);
+  const [extensionMessage, setExtensionMessage] = useState('');
+  const [extensionBusy, setExtensionBusy] = useState(false);
+  const [extensionCopied, setExtensionCopied] = useState(false);
+  const [showAdvancedLogin, setShowAdvancedLogin] = useState(false);
+  const activeOfficialSessionRef = useRef<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [trainingAccount, setTrainingAccount] = useState<AccountDetail | null>(null);
@@ -80,19 +103,23 @@ const AccountList: React.FC = () => {
   const [diagnosingId, setDiagnosingId] = useState<string>('');
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, AccountSessionRefreshStatus>>({});
   const [refreshingSessionId, setRefreshingSessionId] = useState<string>('');
+  const [reauthReminderAccounts, setReauthReminderAccounts] = useState<AccountDetail[]>([]);
   const manualRefreshFlightsRef = useRef<Set<string>>(new Set());
-  const [checkingSessionId, setCheckingSessionId] = useState<string>('');
   const [passwordForm, setPasswordForm] = useState({
     account: '',
     password: '',
-    show_browser: true,
+    show_browser: false,
     showPassword: false,
   });
   const [passwordStatus, setPasswordStatus] = useState<AddLoginStatus>('idle');
   const [passwordMessage, setPasswordMessage] = useState('');
   const [passwordVerificationImage, setPasswordVerificationImage] = useState('');
   const [passwordSubmitting, setPasswordSubmitting] = useState(false);
-  const [manualCookieForm, setManualCookieForm] = useState({ id: '', value: '' });
+  const [officialWindowAccount, setOfficialWindowAccount] = useState('');
+  const [officialWindowStatus, setOfficialWindowStatus] = useState<AddLoginStatus>('idle');
+  const [officialWindowMessage, setOfficialWindowMessage] = useState('');
+  const [officialWindowSubmitting, setOfficialWindowSubmitting] = useState(false);
+  const [manualCookieForm, setManualCookieForm] = useState({ value: '' });
   const [manualCookieStatus, setManualCookieStatus] = useState<AddLoginStatus>('idle');
   const [manualCookieMessage, setManualCookieMessage] = useState('');
   const [manualCookieSubmitting, setManualCookieSubmitting] = useState(false);
@@ -163,9 +190,37 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const clearSmsPolling = () => {
+    if (smsPollingRef.current) {
+      clearInterval(smsPollingRef.current);
+      smsPollingRef.current = null;
+    }
+  };
+
+  const clearExtensionPolling = () => {
+    if (extensionPollingRef.current) {
+      clearInterval(extensionPollingRef.current);
+      extensionPollingRef.current = null;
+    }
+  };
+
+  const cancelActiveOfficialSession = async () => {
+    const sessionId = activeOfficialSessionRef.current;
+    activeOfficialSessionRef.current = '';
+    if (!sessionId) return;
+    try {
+      await cancelOfficialLoginSession(sessionId);
+    } catch {
+      // The session may already be terminal or expired.
+    }
+  };
+
   const closeAddModal = () => {
     clearQRPolling();
     clearPasswordPolling();
+    clearSmsPolling();
+    clearExtensionPolling();
+    void cancelActiveOfficialSession();
     setShowAddModal(false);
     setPasswordStatus('idle');
     setPasswordMessage('');
@@ -173,12 +228,19 @@ const AccountList: React.FC = () => {
     setPasswordForm({
       account: '',
       password: '',
-      show_browser: true,
+      show_browser: false,
       showPassword: false,
     });
     setManualCookieStatus('idle');
     setManualCookieMessage('');
-    setManualCookieForm({ id: '', value: '' });
+    setManualCookieForm({ value: '' });
+    setOfficialWindowAccount('');
+    setOfficialWindowStatus('idle');
+    setOfficialWindowMessage('');
+    setShowAdvancedLogin(false);
+    setExtensionPairing(null);
+    setExtensionMessage('');
+    setExtensionCopied(false);
   };
 
   const resetPasswordStatus = () => {
@@ -196,7 +258,7 @@ const AccountList: React.FC = () => {
   const getReachableVerificationImage = (imageUrl?: string | null, screenshotPath?: string | null) => {
     if (imageUrl) return imageUrl;
     if (!screenshotPath) return '';
-    if (screenshotPath.startsWith('http') || screenshotPath.startsWith('/static/')) {
+    if (screenshotPath.startsWith('/static/')) {
       return screenshotPath;
     }
     if (screenshotPath.startsWith('static/')) {
@@ -241,6 +303,9 @@ const AccountList: React.FC = () => {
     return () => {
       clearQRPolling();
       clearPasswordPolling();
+      clearSmsPolling();
+      clearExtensionPolling();
+      void cancelActiveOfficialSession();
     };
   }, []);
 
@@ -251,6 +316,24 @@ const AccountList: React.FC = () => {
     const timer = window.setInterval(() => void loadSessionStatuses(accounts), 3000);
     return () => window.clearInterval(timer);
   }, [accountIds]);
+
+  useEffect(() => {
+    const expiredAccounts = accounts.filter((account) => (
+      account.reauth_required
+      || sessionStatuses[account.id]?.state === 'manual_reauth_required'
+    ));
+    if (!expiredAccounts.length) return;
+    const unseen = expiredAccounts.filter((account) => {
+      const key = `xianyu-reauth:${account.id}:${account.last_expired_at ?? sessionStatuses[account.id]?.last_expired_at ?? account.reauth_updated_at ?? 0}`;
+      return window.localStorage.getItem(key) !== 'shown';
+    });
+    if (!unseen.length) return;
+    unseen.forEach((account) => {
+      const key = `xianyu-reauth:${account.id}:${account.last_expired_at ?? sessionStatuses[account.id]?.last_expired_at ?? account.reauth_updated_at ?? 0}`;
+      window.localStorage.setItem(key, 'shown');
+    });
+    setReauthReminderAccounts(unseen);
+  }, [accounts, sessionStatuses]);
 
   const handleToggle = async (id: string, currentStatus: boolean) => {
     try {
@@ -336,6 +419,10 @@ const AccountList: React.FC = () => {
   };
 
   const handleRefreshSession = async (account: AccountDetail) => {
+    if (!account.auto_refresh_supported || account.reauth_required || sessionStatuses[account.id]?.state === 'manual_reauth_required') {
+      openReauthMethod(account);
+      return;
+    }
     if (manualRefreshFlightsRef.current.has(account.id)) return;
 
     manualRefreshFlightsRef.current.add(account.id);
@@ -355,6 +442,28 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const openReauthMethod = (account: AccountDetail) => {
+    setReauthReminderAccounts([]);
+    setActiveModal(null);
+    setShowAddModal(true);
+    if (account.reauth_action === 'sms_login') {
+      setActiveAddMethod('sms');
+      setOfficialWindowAccount(account.username || '');
+    } else if (account.reauth_action === 'password_login') {
+      setActiveAddMethod('password');
+      setPasswordForm((current) => ({ ...current, account: account.username || '' }));
+    } else if (account.reauth_action === 'chrome_extension_import') {
+      setActiveAddMethod('extension');
+      setShowAdvancedLogin(true);
+    } else if (account.reauth_action === 'manual_cookie') {
+      setActiveAddMethod('cookie');
+      setShowAdvancedLogin(true);
+    } else {
+      setActiveAddMethod('qr');
+      void startQRLogin();
+    }
+  };
+
   const handleCancelSessionRefresh = async (account: AccountDetail) => {
     try {
       const result = await cancelAccountSessionRefresh(account.id);
@@ -365,22 +474,12 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const handleCheckSessionRefreshStatus = async (account: AccountDetail) => {
-    setCheckingSessionId(account.id);
+  const handleShowAccountSessionBrowser = async (account: AccountDetail) => {
     try {
-      const status = await getAccountSessionStatus(account.id);
-      setSessionStatuses((current) => ({ ...current, [account.id]: status }));
-      if (status.state === 'success') {
-        setPageNotice({ tone: 'success', text: '已检测到验证完成，账号监听状态已更新' });
-      } else if (status.state === 'verification_required' || status.state === 'refreshing') {
-        setPageNotice({ tone: 'info', text: '后台还未检测到登录成功，请确认手机端验证已完成并稍后再检查' });
-      } else {
-        setPageNotice({ tone: status.state === 'failed' || status.state === 'timeout' ? 'error' : 'info', text: status.message || '账号刷新状态已更新' });
-      }
+      const result = await showAccountSessionRefreshBrowser(account.id);
+      setPageNotice({ tone: 'info', text: result.message || '已在本机显示闲鱼官方窗口' });
     } catch (error) {
-      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '检查验证状态失败' });
-    } finally {
-      setCheckingSessionId('');
+      setPageNotice({ tone: 'error', text: error instanceof Error ? error.message : '打开官方窗口失败' });
     }
   };
 
@@ -508,7 +607,7 @@ const AccountList: React.FC = () => {
 
   const handleQRStatusResult = (
     statusRes: Awaited<ReturnType<typeof checkQRLoginStatus>>,
-    verificationMessage?: string
+    verificationMessage?: string,
   ) => {
     if (statusRes.status === 'success' || statusRes.status === 'already_processed') {
       clearQRPolling();
@@ -526,7 +625,7 @@ const AccountList: React.FC = () => {
       setQrStatus('verification_required');
       const verificationImage = getReachableVerificationImage(
         statusRes.verification_qr_code_url,
-        statusRes.verification_screenshot_path
+        statusRes.verification_screenshot_path,
       );
       if (verificationImage) {
         setQrVerificationImage(verificationImage);
@@ -538,8 +637,8 @@ const AccountList: React.FC = () => {
         verificationMessage ||
         statusRes.message ||
         (verificationImage
-          ? '请用手机版闲鱼扫描图中的身份验证二维码，完成后系统会自动检测。'
-          : '正在打开闲鱼安全验证页面，请稍候。')
+          ? '请在本机官方窗口完成身份验证，系统会自动检测。'
+          : '闲鱼要求安全验证，请点击“本机打开官方窗口”。')
       );
     } else if (statusRes.status === 'not_found') {
       clearQRPolling();
@@ -552,7 +651,13 @@ const AccountList: React.FC = () => {
     } else if (statusRes.status === 'expired' || statusRes.status === 'error') {
       clearQRPolling();
       setQrStatus('error');
-      setQrMessage(statusRes.message || (qrHadVerificationRef.current ? '安全验证会话已过期，请重新生成二维码' : '二维码已过期，请重新扫码'));
+      setQrMessage(
+        statusRes.message || (
+          qrHadVerificationRef.current
+            ? '安全验证会话已过期，请重新生成二维码'
+            : '二维码已过期，请重新扫码'
+        ),
+      );
     }
   };
 
@@ -572,6 +677,9 @@ const AccountList: React.FC = () => {
 
   const startQRLogin = async () => {
     clearQRPolling();
+    clearPasswordPolling();
+    clearExtensionPolling();
+    await cancelActiveOfficialSession();
     setShowAddModal(true);
     setActiveAddMethod('qr');
     setQrStatus('loading');
@@ -604,27 +712,150 @@ const AccountList: React.FC = () => {
       setQrMessage('二维码会话不存在，请重新生成二维码');
       return;
     }
-
     clearQRPolling();
     setQrStatus('verification_required');
-    setQrMessage('正在从后台浏览器会话检查安全验证结果');
+    setQrMessage('正在启动本机闲鱼官方窗口，请在窗口内完成验证');
     try {
       const result = await continueQRLoginAfterVerification(qrSessionId);
       handleQRStatusResult(result);
-      if (result.status === 'processing' || result.status === 'scanned') {
+      if (result.status === 'processing' || result.status === 'scanned' || result.status === 'verification_required') {
         startQRStatusPolling(qrSessionId);
       }
     } catch (error) {
-      clearQRPolling();
       setQrStatus('verification_required');
-      setQrMessage(error instanceof Error ? error.message : '继续检查安全验证结果失败，请重试');
+      setQrMessage(error instanceof Error ? error.message : '打开安全验证窗口失败，请重试');
     }
   };
 
-  const handleAddMethodChange = (method: AddLoginMethod) => {
+  const startExtensionPairingPolling = (pairingId: string) => {
+    clearExtensionPolling();
+    extensionPollingRef.current = setInterval(async () => {
+      try {
+        const pairing = await getBrowserExtensionPairing(pairingId);
+        setExtensionPairing((current) => current ? { ...current, ...pairing } : pairing);
+        setExtensionMessage(pairing.message || '等待扩展导入');
+        if (pairing.status === 'success') {
+          clearExtensionPolling();
+          setTimeout(() => {
+            closeAddModal();
+            loadAccounts();
+          }, 800);
+        } else if (pairing.status === 'failed' || pairing.status === 'expired') {
+          clearExtensionPolling();
+        }
+      } catch (error) {
+        clearExtensionPolling();
+        setExtensionMessage(error instanceof Error ? error.message : '配对状态检查失败');
+      }
+    }, 1500);
+  };
+
+  const handleCreateExtensionPairing = async () => {
+    clearExtensionPolling();
+    setExtensionBusy(true);
+    setExtensionPairing(null);
+    setExtensionCopied(false);
+    setExtensionMessage('正在创建本机一次性配对');
+    try {
+      const pairing = await createBrowserExtensionPairing();
+      setExtensionPairing(pairing);
+      setExtensionMessage('配对已创建，请复制到 Chrome 扩展；五分钟内有效且只能使用一次。');
+      startExtensionPairingPolling(pairing.pairing_id);
+    } catch (error) {
+      setExtensionMessage(error instanceof Error ? error.message : '创建配对失败');
+    } finally {
+      setExtensionBusy(false);
+    }
+  };
+
+  const handleCopyExtensionPairing = async () => {
+    if (!extensionPairing?.pairing_code) return;
+    const pairingBundle = JSON.stringify({
+      pairing_id: extensionPairing.pairing_id,
+      pairing_code: extensionPairing.pairing_code,
+    });
+    try {
+      await navigator.clipboard.writeText(pairingBundle);
+      setExtensionCopied(true);
+      setExtensionMessage('配对信息已复制，请打开扩展并粘贴。');
+    } catch {
+      setExtensionCopied(false);
+      setExtensionMessage('浏览器未允许自动复制，请手动选择下方配对信息。');
+    }
+  };
+
+  const handleAddMethodChange = async (method: AddLoginMethod) => {
+    if (method === activeAddMethod) return;
+    clearQRPolling();
+    clearPasswordPolling();
+    clearSmsPolling();
+    clearExtensionPolling();
+    await cancelActiveOfficialSession();
     setActiveAddMethod(method);
     if (method === 'qr' && !qrSessionId && qrStatus !== 'loading') {
-      startQRLogin();
+      await startQRLogin();
+    }
+  };
+
+  const startOfficialWindowStatusPolling = (sessionId: string) => {
+    clearSmsPolling();
+    smsPollingRef.current = setInterval(async () => {
+      try {
+        const status = await getOfficialLoginSession(sessionId);
+        if (['preparing', 'waiting_user', 'persisting', 'restarting_listener'].includes(status.state)) {
+          setOfficialWindowStatus('processing');
+          setOfficialWindowMessage(status.message || '请在官方窗口完成验证码登录');
+        } else if (status.state === 'verification_required') {
+          setOfficialWindowStatus('verification_required');
+          setOfficialWindowMessage(status.message || '请在官方窗口完成身份验证');
+        } else if (status.state === 'success') {
+          clearSmsPolling();
+          activeOfficialSessionRef.current = '';
+          setOfficialWindowStatus('success');
+          setOfficialWindowMessage(status.message || '手机号验证码登录成功');
+          setTimeout(() => {
+            closeAddModal();
+            loadAccounts();
+          }, 1000);
+        } else if (['failed', 'expired', 'cancelled', 'interrupted'].includes(status.state)) {
+          clearSmsPolling();
+          activeOfficialSessionRef.current = '';
+          setOfficialWindowStatus('failed');
+          setOfficialWindowMessage(status.message || '手机号验证码登录未完成，请重新发起');
+        }
+      } catch (error) {
+        clearSmsPolling();
+        activeOfficialSessionRef.current = '';
+        setOfficialWindowStatus('failed');
+        setOfficialWindowMessage(error instanceof Error ? error.message : '验证码登录状态检查失败');
+      }
+    }, 2500);
+  };
+
+  const handleOfficialWindowLogin = async () => {
+    setOfficialWindowSubmitting(true);
+    setOfficialWindowStatus('processing');
+    setOfficialWindowMessage('正在打开本机 Chrome');
+    try {
+      await cancelActiveOfficialSession();
+      const result = await createOfficialLoginSession({
+        mode: 'sms',
+        account: officialWindowAccount.trim(),
+        show_browser: true,
+      });
+      if (!result.success || !result.session_id) {
+        setOfficialWindowStatus('failed');
+        setOfficialWindowMessage(result.message || '手机号验证码登录任务启动失败');
+        return;
+      }
+      activeOfficialSessionRef.current = result.session_id;
+      setOfficialWindowMessage(result.message || '请在官方窗口完成验证码登录');
+      startOfficialWindowStatusPolling(result.session_id);
+    } catch (error) {
+      setOfficialWindowStatus('failed');
+      setOfficialWindowMessage(error instanceof Error ? error.message : '手机号验证码登录请求失败');
+    } finally {
+      setOfficialWindowSubmitting(false);
     }
   };
 
@@ -632,16 +863,22 @@ const AccountList: React.FC = () => {
     clearPasswordPolling();
     passwordPollingRef.current = setInterval(async () => {
       try {
-        const statusRes = await checkPasswordLoginStatus(sessionId);
-        if (statusRes.status === 'processing') {
+        const statusRes = await getOfficialLoginSession(sessionId);
+        if (
+          statusRes.state === 'preparing'
+          || statusRes.state === 'waiting_user'
+          || statusRes.state === 'persisting'
+          || statusRes.state === 'restarting_listener'
+        ) {
           setPasswordStatus('processing');
           setPasswordMessage(statusRes.message || '登录处理中，请稍候');
-        } else if (statusRes.status === 'verification_required') {
+        } else if (statusRes.state === 'verification_required') {
           setPasswordStatus('verification_required');
           setPasswordMessage(statusRes.message || '需要完成闲鱼安全验证');
-          setPasswordVerificationImage(getReachableVerificationImage(statusRes.qr_code_url, statusRes.screenshot_path));
-        } else if (statusRes.status === 'success') {
+          setPasswordVerificationImage(statusRes.verification_image_url || '');
+        } else if (statusRes.state === 'success') {
           clearPasswordPolling();
+          activeOfficialSessionRef.current = '';
           setPasswordStatus('success');
           setPasswordMessage(statusRes.message || '账号密码登录成功，正在刷新账号列表');
           setPasswordForm((current) => ({ ...current, password: '', showPassword: false }));
@@ -650,17 +887,15 @@ const AccountList: React.FC = () => {
             loadAccounts();
           }, 1000);
         } else if (
-          statusRes.status === 'failed' ||
-          statusRes.status === 'timeout' ||
-          statusRes.status === 'cancelled' ||
-          statusRes.status === 'interrupted' ||
-          statusRes.status === 'error' ||
-          statusRes.status === 'not_found' ||
-          statusRes.status === 'forbidden'
+          statusRes.state === 'failed' ||
+          statusRes.state === 'expired' ||
+          statusRes.state === 'cancelled' ||
+          statusRes.state === 'interrupted'
         ) {
           clearPasswordPolling();
+          activeOfficialSessionRef.current = '';
           setPasswordStatus('failed');
-          setPasswordMessage(statusRes.message || statusRes.error || '账号密码登录失败');
+          setPasswordMessage(statusRes.message || '账号密码登录失败');
         }
       } catch (error) {
         clearPasswordPolling();
@@ -684,7 +919,9 @@ const AccountList: React.FC = () => {
     setPasswordStatus('processing');
     setPasswordMessage('正在启动账号密码登录');
     try {
-      const result = await passwordLogin({
+      await cancelActiveOfficialSession();
+      const result = await createOfficialLoginSession({
+        mode: 'password',
         account,
         password: passwordForm.password,
         show_browser: passwordForm.show_browser,
@@ -694,6 +931,7 @@ const AccountList: React.FC = () => {
         setPasswordMessage(result.message || '账号密码登录任务启动失败');
         return;
       }
+      activeOfficialSessionRef.current = result.session_id;
       setPasswordMessage(result.message || '登录任务已启动，请等待');
       startPasswordStatusPolling(result.session_id);
     } catch (error) {
@@ -704,14 +942,47 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const handleShowOfficialBrowser = async () => {
+    const sessionId = activeOfficialSessionRef.current;
+    if (!sessionId) return;
+    try {
+      const result = await showOfficialLoginBrowser(sessionId);
+      const message = result.message || '已在本机显示闲鱼官方窗口';
+      if (activeAddMethod === 'qr') setQrMessage(message);
+      else if (activeAddMethod === 'sms') setOfficialWindowMessage(message);
+      else setPasswordMessage(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '打开官方窗口失败';
+      if (activeAddMethod === 'qr') setQrMessage(message);
+      else if (activeAddMethod === 'sms') setOfficialWindowMessage(message);
+      else setPasswordMessage(message);
+    }
+  };
+
+  const handleCancelOfficialLogin = async () => {
+    clearQRPolling();
+    clearPasswordPolling();
+    clearSmsPolling();
+    await cancelActiveOfficialSession();
+    if (activeAddMethod === 'qr') {
+      setQrStatus('error');
+      setQrMessage('登录会话已取消');
+    } else if (activeAddMethod === 'sms') {
+      setOfficialWindowStatus('failed');
+      setOfficialWindowMessage('手机号验证码登录已取消');
+    } else {
+      setPasswordStatus('failed');
+      setPasswordMessage('登录会话已取消');
+    }
+  };
+
   const handleManualCookieSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     resetManualCookieStatus();
-    const id = manualCookieForm.id.trim();
     const value = manualCookieForm.value.trim();
-    if (!id || !value) {
+    if (!value) {
       setManualCookieStatus('failed');
-      setManualCookieMessage('请填写账号ID和 Cookie');
+      setManualCookieMessage('请填写 Cookie');
       return;
     }
 
@@ -719,10 +990,10 @@ const AccountList: React.FC = () => {
     setManualCookieStatus('processing');
     setManualCookieMessage('正在保存 Cookie');
     try {
-      await addAccountCookie({ id, value });
+      await addAccountCookie({ value });
       setManualCookieStatus('success');
       setManualCookieMessage('Cookie 已保存，正在刷新账号列表');
-      setManualCookieForm({ id: '', value: '' });
+      setManualCookieForm({ value: '' });
       setTimeout(() => {
         closeAddModal();
         loadAccounts();
@@ -789,12 +1060,15 @@ const AccountList: React.FC = () => {
                 <p className="text-sm text-gray-500 font-medium mb-3">{account.remark || account.note || '暂无备注'}</p>
                 <div className="flex flex-wrap gap-2">
                    <StatusBadge state={account.auto_confirm ? 'ready' : 'idle'} label={account.auto_confirm ? '自动确认开启' : '自动确认关闭'} />
+                   <StatusBadge state="idle" label={`登录：${account.login_method_label || '历史登录'}`} />
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
                    <StatusBadge
-                    state={account.cookie_refresh_enabled ? 'warning' : 'idle'}
-                    label={account.cookie_refresh_enabled
-                      ? `每 ${formatCookieRefreshInterval(account.cookie_refresh_interval_minutes)}刷新 Cookie`
-                      : '定时刷新关闭'}
+                    state={account.auto_refresh_supported ? (account.cookie_refresh_enabled ? 'ready' : 'idle') : 'warning'}
+                    label={account.auto_refresh_supported
+                      ? account.cookie_refresh_enabled
+                        ? `每 ${formatCookieRefreshInterval(account.cookie_refresh_interval_minutes)}自动续期`
+                        : '可自动续期 · 定时关闭'
+                      : '到期需人工登录'}
                    />
                    {diagnosis && (
                     <span className={`text-xs px-3 py-1.5 rounded-lg font-bold ${diagnosis.ready ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
@@ -802,9 +1076,11 @@ const AccountList: React.FC = () => {
                     </span>
                    )}
                    {sessionStatus?.state === 'refreshing' && <StatusBadge state="checking" label="Cookie 刷新中" />}
+                   {sessionStatus?.state === 'action_required' && <StatusBadge state="warning" label="需要手动验证" />}
                    {sessionStatus?.state === 'verification_required' && <StatusBadge state="warning" label="等待身份验证" />}
                    {sessionStatus?.state === 'success' && <StatusBadge state="ready" label="Cookie 已刷新" />}
                    {(sessionStatus?.state === 'failed' || sessionStatus?.state === 'timeout') && <StatusBadge state="error" label="Cookie 刷新失败" />}
+                   {(account.reauth_required || sessionStatus?.state === 'manual_reauth_required') && <StatusBadge state="error" label="登录已过期" />}
                    {account.has_login_password && account.login_credentials_valid === false && <StatusBadge state="error" label="登录信息异常" />}
                 </div>
               </div>
@@ -820,10 +1096,12 @@ const AccountList: React.FC = () => {
                 <button
                     onClick={() => void handleRefreshSession(account)}
                     disabled={refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' || sessionStatus?.state === 'verification_required'}
-                    className="p-3 rounded-xl hover:bg-cyan-100 transition-colors text-cyan-700 disabled:cursor-not-allowed disabled:opacity-40"
-                    title="立即刷新 Cookie"
+                    className={`p-3 rounded-xl transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${account.auto_refresh_supported ? 'text-cyan-700 hover:bg-cyan-100' : 'text-amber-700 hover:bg-amber-100'}`}
+                    title={account.auto_refresh_supported ? '立即刷新 Cookie' : reauthActionLabel(account)}
                 >
-                    <RefreshCw className={`w-5 h-5 ${refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' ? 'animate-spin' : ''}`} />
+                    {account.auto_refresh_supported
+                      ? <RefreshCw className={`w-5 h-5 ${refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' ? 'animate-spin' : ''}`} />
+                      : <Key className="h-5 w-5" />}
                 </button>
                 <button
                     onClick={() => openEditModal(account)}
@@ -878,35 +1156,52 @@ const AccountList: React.FC = () => {
               {diagnosis.diagnosed_at && <div className="mt-3 text-[11px] font-medium text-gray-400">诊断更新于 {new Date(diagnosis.diagnosed_at * 1000).toLocaleTimeString()}</div>}
             </div>
           )}
-          {sessionStatus && ['refreshing', 'verification_required', 'failed', 'timeout'].includes(sessionStatus.state) && (
-            <div className={`mt-5 rounded-2xl border p-4 ${sessionStatus.state === 'verification_required' ? 'border-amber-200 bg-amber-50' : sessionStatus.state === 'refreshing' ? 'border-blue-200 bg-blue-50' : 'border-red-200 bg-red-50'}`}>
+          {sessionStatus && ['action_required', 'refreshing', 'verification_required', 'failed', 'timeout', 'manual_reauth_required'].includes(sessionStatus.state) && (
+            <div className={`mt-5 rounded-2xl border p-4 ${sessionStatus.state === 'action_required' || sessionStatus.state === 'verification_required' || sessionStatus.state === 'manual_reauth_required' ? 'border-amber-200 bg-amber-50' : sessionStatus.state === 'refreshing' ? 'border-blue-200 bg-blue-50' : 'border-red-200 bg-red-50'}`}>
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                   <div className="font-bold text-gray-900">
-                    {sessionStatus.state === 'verification_required' ? '需要完成闲鱼身份验证' : sessionStatus.state === 'refreshing' ? '正在刷新 Cookie' : 'Cookie 刷新未完成'}
+                    {sessionStatus.state === 'action_required'
+                      ? '需要开始一次验证'
+                      : sessionStatus.state === 'verification_required'
+                        ? '需要完成闲鱼身份验证'
+                        : sessionStatus.state === 'manual_reauth_required'
+                          ? '登录状态已过期'
+                          : sessionStatus.state === 'refreshing'
+                            ? '正在刷新 Cookie'
+                            : 'Cookie 刷新未完成'}
                   </div>
                   <div className="mt-1 text-sm text-gray-700">{sessionStatus.message}</div>
                   {sessionStatus.updated_at && <div className="mt-1 text-xs text-gray-500">更新于 {new Date(sessionStatus.updated_at * 1000).toLocaleTimeString()}</div>}
                 </div>
                 <div className="flex shrink-0 gap-2">
-                  {(sessionStatus.state === 'refreshing' || sessionStatus.state === 'verification_required') && (
+                  {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
                     <button type="button" onClick={() => void handleCancelSessionRefresh(account)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700">取消</button>
                   )}
-                  {sessionStatus.state === 'verification_required' && (
+                  {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
                     <button
                       type="button"
-                      onClick={() => void handleCheckSessionRefreshStatus(account)}
-                      disabled={checkingSessionId === account.id}
-                      className="rounded-lg bg-[#FFE815] px-3 py-2 text-xs font-bold text-gray-900 disabled:cursor-not-allowed disabled:opacity-60"
+                      onClick={() => void handleShowAccountSessionBrowser(account)}
+                      className="inline-flex items-center gap-2 rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700"
                     >
-                      {checkingSessionId === account.id ? '正在检查...' : '我已完成验证，立即检查'}
+                      <ExternalLink className="h-4 w-4" />
+                      本机打开
                     </button>
+                  )}
+                  {sessionStatus.state === 'action_required' && (
+                    <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-[#FFE815] px-3 py-2 text-xs font-bold text-gray-900">开始一次验证</button>
                   )}
                   {(sessionStatus.state === 'failed' || sessionStatus.state === 'timeout') && (
                     <button type="button" onClick={() => void handleRefreshSession(account)} className="rounded-lg bg-black px-3 py-2 text-xs font-bold text-white">重新刷新</button>
                   )}
+                  {sessionStatus.state === 'manual_reauth_required' && (
+                    <button type="button" onClick={() => openReauthMethod(account)} className="rounded-lg bg-black px-3 py-2 text-xs font-bold text-white">{reauthActionLabel(account)}</button>
+                  )}
                 </div>
               </div>
+              {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
+                <div className="mt-3 text-xs font-bold text-amber-800">后台正在自动检测，完成验证后会自动保存并恢复监听。</div>
+              )}
               {sessionStatus.state === 'verification_required' && sessionStatus.verification_image_url && (
                 <div className="mt-4 overflow-hidden rounded-xl border border-amber-200 bg-white p-2">
                   <img src={`${sessionStatus.verification_image_url}?t=${sessionStatus.updated_at || Date.now()}`} alt="闲鱼身份验证" className="mx-auto max-h-[520px] w-auto max-w-full object-contain" />
@@ -928,29 +1223,73 @@ const AccountList: React.FC = () => {
         )}
       </div>
 
+      {reauthReminderAccounts.length > 0 && createPortal(
+        <div className="modal-overlay-centered" role="dialog" aria-modal="true" aria-labelledby="reauth-reminder-title">
+          <div className="modal-container" style={{ maxWidth: '520px' }}>
+            <div className="modal-header">
+              <div className="min-w-0">
+                <h3 id="reauth-reminder-title" className="text-xl font-extrabold text-gray-900 sm:text-2xl">账号登录已过期</h3>
+                <p className="mt-1 text-sm text-gray-500">完成对应登录后，账号监听会更新到新的登录状态。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReauthReminderAccounts([])}
+                className="flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg hover:bg-gray-100"
+                aria-label="关闭过期提醒"
+              >
+                <X className="h-5 w-5 text-gray-500" />
+              </button>
+            </div>
+            <div className="modal-body space-y-3">
+              {reauthReminderAccounts.map((account) => (
+                <div key={account.id} className="flex flex-col gap-3 border-b border-gray-100 py-3 last:border-0 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+                      <p className="break-words font-bold text-gray-900">{account.nickname || account.remark || account.id}</p>
+                    </div>
+                    <p className="mt-1 text-sm text-gray-500">{account.login_method_label || '历史登录'} · 到期后需人工重新登录</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openReauthMethod(account)}
+                    className="min-h-11 shrink-0 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white"
+                  >
+                    {reauthActionLabel(account)}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+
       {/* 添加账号弹窗 */}
       {showAddModal && createPortal(
-          <div className="modal-overlay-centered">
+          <div className="modal-overlay-centered" role="dialog" aria-modal="true" aria-labelledby="add-account-title">
               <div className="modal-container" style={{maxWidth: '720px'}}>
                   <div className="modal-header">
                     <div>
-                      <h3 className="text-2xl font-extrabold text-gray-900">添加账号</h3>
-                      <p className="text-sm text-gray-500 mt-1">扫码优先，账号密码和 Cookie 可作为备用方式。</p>
+                      <h3 id="add-account-title" className="text-2xl font-extrabold text-gray-900">添加账号</h3>
+                      <p className="text-sm text-gray-500 mt-1">扫码最简单；账号密码支持自动续期。</p>
                     </div>
                     <button
+                      type="button"
                       onClick={closeAddModal}
-                      className="p-2 rounded-xl hover:bg-gray-100 transition-colors flex-shrink-0"
+                      className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-lg hover:bg-gray-100 transition-colors"
+                      aria-label="关闭添加账号"
                     >
                       <X className="w-5 h-5 text-gray-500" />
                     </button>
                   </div>
 
                   <div className="modal-body space-y-6">
-                    <div className="grid grid-cols-3 gap-2 rounded-2xl bg-gray-100 p-1">
+                    <div className="grid grid-cols-1 gap-2 rounded-2xl bg-gray-100 p-1 sm:grid-cols-3">
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('qr')}
-                        className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
+                        onClick={() => void handleAddMethodChange('qr')}
+                        className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
                           activeAddMethod === 'qr' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
                         }`}
                       >
@@ -959,35 +1298,61 @@ const AccountList: React.FC = () => {
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('password')}
-                        className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
+                        onClick={() => void handleAddMethodChange('sms')}
+                        className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
+                          activeAddMethod === 'sms' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
+                        }`}
+                      >
+                        <Smartphone className="w-4 h-4" />
+                        手机号验证码
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleAddMethodChange('password')}
+                        className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
                           activeAddMethod === 'password' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
                         }`}
                       >
                         <Key className="w-4 h-4" />
                         账号密码
                       </button>
+                    </div>
+
+                    <div className="border-t border-gray-200 pt-4">
                       <button
                         type="button"
-                        onClick={() => handleAddMethodChange('cookie')}
-                        className={`flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
-                          activeAddMethod === 'cookie' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
-                        }`}
+                        onClick={() => setShowAdvancedLogin((current) => !current)}
+                        className="flex min-h-11 w-full items-center justify-between rounded-lg px-2 text-sm font-bold text-gray-600 hover:bg-gray-50"
+                        aria-expanded={showAdvancedLogin}
                       >
-                        <Upload className="w-4 h-4" />
-                        Cookie
+                        <span>高级方式</span>
+                        <ChevronDown className={`h-4 w-4 transition-transform ${showAdvancedLogin ? 'rotate-180' : ''}`} />
                       </button>
+                      {showAdvancedLogin && (
+                        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleAddMethodChange('extension')}
+                            className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-bold ${activeAddMethod === 'extension' ? 'border-gray-900 bg-gray-900 text-white' : 'border-gray-200 text-gray-600'}`}
+                          >
+                            <Chrome className="h-4 w-4" /> 本机 Chrome
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleAddMethodChange('cookie')}
+                            className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-bold ${activeAddMethod === 'cookie' ? 'border-gray-900 bg-gray-900 text-white' : 'border-gray-200 text-gray-600'}`}
+                          >
+                            <Upload className="h-4 w-4" /> 手填 Cookie
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     {activeAddMethod === 'qr' && (
                       <div className="text-center">
-                        <div className={`${
-                          qrStatus === 'verification_required' && qrVerificationImage
-                            ? 'w-full max-w-xl h-[360px] rounded-2xl'
-                            : 'w-64 h-64 rounded-[2rem]'
-                        } bg-[#F7F8FA] mx-auto flex items-center justify-center overflow-hidden border-4 border-white shadow-inner mb-6 relative`}>
+                        <div className="relative mx-auto mb-4 flex h-[260px] w-full max-w-[420px] items-center justify-center overflow-hidden rounded-xl border border-gray-200 bg-[#F7F8FA] shadow-inner sm:mb-6 sm:h-[360px]">
                           {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
-                          {qrStatus === 'waiting' && <img src={qrCodeUrl} alt="闲鱼登录二维码" className="w-full h-full p-2" />}
+                          {qrStatus === 'waiting' && qrCodeUrl && <img src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full object-contain p-3" />}
                           {qrStatus === 'scanned' && (
                             <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-blue-600 animate-fade-in">
                               <Loader2 className="w-10 h-10 mb-4 animate-spin" />
@@ -1006,20 +1371,20 @@ const AccountList: React.FC = () => {
                             qrVerificationImage ? (
                               <div className="absolute inset-0 bg-white flex flex-col items-center justify-center animate-fade-in p-3">
                                 <img src={qrVerificationImage} alt="闲鱼安全验证页面" className="w-full h-full object-contain p-2" />
-                                <span className="absolute bottom-3 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-orange-600 shadow-sm">用手机版闲鱼扫描图中的二维码</span>
+                                <span className="absolute bottom-3 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-orange-600 shadow-sm">请按官方页面提示完成验证</span>
                               </div>
                             ) : (
                               <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-orange-600 animate-fade-in p-6">
                                 <Key className="w-10 h-10 mb-4" />
                                 <span className="font-bold text-lg">需要安全验证</span>
-                                <span className="text-xs text-gray-500 mt-2 text-center">完成验证后回到这里继续检查。</span>
+                                <span className="text-xs text-gray-500 mt-2 text-center">点击下方按钮，在官方窗口完成验证。</span>
                               </div>
                             )
                           )}
                           {qrStatus === 'error' && (
                             <div className="flex flex-col items-center">
                               <span className="text-red-500 font-bold mb-2">获取失败</span>
-                              <button onClick={startQRLogin} className="text-xs bg-gray-200 px-3 py-1 rounded-full flex items-center gap-1 hover:bg-gray-300">
+                              <button onClick={() => void startQRLogin()} className="flex items-center gap-1 rounded-lg bg-gray-200 px-3 py-1 text-xs hover:bg-gray-300">
                                 <RefreshCw className="w-3 h-3"/>
                                 重试
                               </button>
@@ -1036,28 +1401,169 @@ const AccountList: React.FC = () => {
                           {qrStatus === 'verification_required' && (
                             <button
                               type="button"
-                              onClick={handleContinueQRVerification}
-                              className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-[#FFE815] text-gray-900 px-4 py-2 rounded-full hover:bg-yellow-300 transition-colors"
+                              onClick={() => void handleContinueQRVerification()}
+                              className="inline-flex items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-4 py-2 text-sm font-bold text-gray-900 hover:bg-yellow-300"
                             >
-                              <RefreshCw className="w-4 h-4" />
-                              我已完成验证，立即检查
+                              <Chrome className="h-4 w-4" />
+                              本机打开官方窗口
                             </button>
                           )}
                           <button
                             type="button"
-                            onClick={startQRLogin}
-                            className="inline-flex items-center justify-center gap-2 text-sm font-bold bg-gray-100 text-gray-700 px-4 py-2 rounded-full hover:bg-gray-200 transition-colors"
+                            onClick={() => void startQRLogin()}
+                            className="inline-flex items-center justify-center gap-2 rounded-lg bg-gray-100 px-4 py-2 text-sm font-bold text-gray-700 transition-colors hover:bg-gray-200"
                           >
                             <RefreshCw className="w-4 h-4" />
                             重新生成二维码
                           </button>
                         </div>
-                        <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl mt-4">二维码有效期为5分钟；二次验证由后台浏览器最多等待15分钟。</p>
+                        <p className="mt-4 rounded-xl bg-gray-50 py-2 text-xs font-medium text-gray-400">
+                          二维码生成和扫码阶段不启动浏览器；只有二次验证时由你主动打开专用 Chrome。
+                        </p>
+                      </div>
+                    )}
+
+                    {activeAddMethod === 'sms' && (
+                      <div className="space-y-4">
+                        <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
+                          <div className="flex items-start gap-3">
+                            <Smartphone className="mt-0.5 h-5 w-5 shrink-0 text-blue-700" />
+                            <div>
+                              <h4 className="font-bold text-gray-900">在闲鱼官方窗口完成验证码登录</h4>
+                              <p className="mt-1 text-sm leading-6 text-gray-600">系统只等待官方页面返回登录状态，不接收或保存短信验证码。此方式到期后需要再次登录。</p>
+                            </div>
+                          </div>
+                        </div>
+                        <div>
+                          <label className="mb-2 block text-sm font-bold text-gray-700">手机号（可选）</label>
+                          <input
+                            type="tel"
+                            value={officialWindowAccount}
+                            onChange={(event) => setOfficialWindowAccount(event.target.value)}
+                            placeholder="用于在官方页面预填"
+                            disabled={['processing', 'verification_required'].includes(officialWindowStatus)}
+                            className="ios-input w-full rounded-xl px-4 py-3"
+                          />
+                        </div>
+                        {officialWindowMessage && (
+                          <div className={`rounded-lg px-4 py-3 text-sm font-bold ${officialWindowStatus === 'success' ? 'bg-emerald-50 text-emerald-700' : officialWindowStatus === 'failed' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+                            {officialWindowMessage}
+                          </div>
+                        )}
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <button
+                            type="button"
+                            onClick={() => void handleOfficialWindowLogin()}
+                            disabled={officialWindowSubmitting || ['processing', 'verification_required'].includes(officialWindowStatus)}
+                            className="ios-btn-primary inline-flex min-h-11 flex-1 items-center justify-center gap-2 rounded-xl px-5 font-bold disabled:opacity-60"
+                          >
+                            {officialWindowSubmitting || ['processing', 'verification_required'].includes(officialWindowStatus)
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Chrome className="h-4 w-4" />}
+                            {['processing', 'verification_required'].includes(officialWindowStatus) ? '等待官方窗口' : '打开官方登录窗口'}
+                          </button>
+                          {['processing', 'verification_required'].includes(officialWindowStatus) && (
+                            <button
+                              type="button"
+                              onClick={() => void handleCancelOfficialLogin()}
+                              className="min-h-11 rounded-xl border border-gray-300 px-5 font-bold text-gray-700"
+                            >
+                              取消
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAddMethod === 'extension' && (
+                      <div className="space-y-4">
+                        <div className="rounded-2xl border border-yellow-200 bg-yellow-50 p-4">
+                          <div className="flex items-start gap-3">
+                            <Chrome className="mt-0.5 h-5 w-5 text-yellow-700" />
+                            <div>
+                              <h4 className="font-bold text-gray-900">从日常 Chrome 主动导入</h4>
+                              <p className="mt-1 text-sm leading-6 text-gray-600">
+                                扩展只在你点击时读取当前 Cookie Store，并只发送到本机 127.0.0.1；不参与后台自动续期。
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-3">
+                          <a
+                            href="/static/downloads/xianyu-cookie-importer.zip"
+                            download
+                            className="inline-flex items-center gap-2 rounded-full bg-gray-100 px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-200"
+                          >
+                            <Upload className="h-4 w-4" />
+                            下载扩展 ZIP
+                          </a>
+                          <button
+                            type="button"
+                            onClick={handleCreateExtensionPairing}
+                            disabled={extensionBusy}
+                            className="inline-flex items-center gap-2 rounded-full bg-[#FFE815] px-4 py-2 text-sm font-bold text-gray-900 hover:bg-yellow-300 disabled:opacity-60"
+                          >
+                            {extensionBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Key className="h-4 w-4" />}
+                            创建一次性配对
+                          </button>
+                        </div>
+
+                        {extensionPairing?.pairing_code && (
+                          <div className="space-y-2">
+                            <label className="block text-sm font-bold text-gray-700">复制到扩展的配对信息</label>
+                            <div className="flex gap-2">
+                              <textarea
+                                readOnly
+                                rows={3}
+                                value={JSON.stringify({
+                                  pairing_id: extensionPairing.pairing_id,
+                                  pairing_code: extensionPairing.pairing_code,
+                                })}
+                                className="min-w-0 flex-1 resize-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-xs"
+                                aria-label="扩展配对信息"
+                              />
+                              <button
+                                type="button"
+                                onClick={handleCopyExtensionPairing}
+                                className="inline-flex h-11 items-center gap-2 rounded-xl bg-gray-900 px-3 text-sm font-bold text-white"
+                              >
+                                <Copy className="h-4 w-4" />
+                                {extensionCopied ? '已复制' : '复制'}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {extensionMessage && (
+                          <p className={`rounded-2xl px-4 py-3 text-sm font-medium ${
+                            extensionPairing?.status === 'success'
+                              ? 'bg-green-50 text-green-700'
+                              : extensionPairing?.status === 'failed' || extensionPairing?.status === 'expired'
+                                ? 'bg-red-50 text-red-700'
+                                : 'bg-gray-50 text-gray-600'
+                          }`}>
+                            {extensionMessage}
+                          </p>
+                        )}
+
+                        <ol className="list-decimal space-y-1 pl-5 text-xs leading-5 text-gray-500">
+                          <li>解压 ZIP，在 chrome://extensions 开启开发者模式并加载已解压扩展。</li>
+                          <li>在本机 Chrome 登录闲鱼官网，并保持官方页面为当前标签页。</li>
+                          <li>创建配对、复制到扩展，然后点击“导入到咸鱼监控台”。</li>
+                        </ol>
                       </div>
                     )}
 
                     {activeAddMethod === 'password' && (
                       <form onSubmit={handlePasswordLoginSubmit} className="space-y-4">
+                        <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+                          <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
+                          <div>
+                            <h4 className="font-bold text-gray-900">支持自动续期</h4>
+                            <p className="mt-1 text-sm text-gray-600">使用每账号独立 Chrome 档案；密码加密保存，仅在官方登录态完全失效后使用。</p>
+                          </div>
+                        </div>
                         <div>
                           <label className="block text-sm font-bold text-gray-700 mb-2">闲鱼账号/手机号</label>
                           <input
@@ -1122,6 +1628,26 @@ const AccountList: React.FC = () => {
                             )}
                           </div>
                         )}
+                        {(passwordStatus === 'processing' || passwordStatus === 'verification_required') && (
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void handleShowOfficialBrowser()}
+                              className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-700"
+                            >
+                              <ExternalLink className="h-4 w-4" />
+                              本机打开官方窗口
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleCancelOfficialLogin()}
+                              className="inline-flex items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-600"
+                            >
+                              <X className="h-4 w-4" />
+                              取消
+                            </button>
+                          </div>
+                        )}
                         <button
                           type="submit"
                           disabled={passwordSubmitting || passwordStatus === 'processing'}
@@ -1136,16 +1662,6 @@ const AccountList: React.FC = () => {
                     {activeAddMethod === 'cookie' && (
                       <form onSubmit={handleManualCookieSubmit} className="space-y-4">
                         <div>
-                          <label className="block text-sm font-bold text-gray-700 mb-2">账号ID</label>
-                          <input
-                            type="text"
-                            value={manualCookieForm.id}
-                            onChange={(e) => setManualCookieForm({ ...manualCookieForm, id: e.target.value })}
-                            placeholder="例如闲鱼 userId / unb"
-                            className="w-full ios-input px-4 py-3 rounded-xl"
-                          />
-                        </div>
-                        <div>
                           <label className="block text-sm font-bold text-gray-700 mb-2">Cookie</label>
                           <textarea
                             value={manualCookieForm.value}
@@ -1153,6 +1669,7 @@ const AccountList: React.FC = () => {
                             placeholder="粘贴从浏览器复制的 Cookie"
                             className="w-full ios-input px-4 py-3 rounded-xl h-36 resize-none font-mono text-xs"
                           />
+                          <p className="mt-2 text-xs text-gray-500">账号身份从 Cookie 内的 unb 读取，需同时包含至少一个核心会话字段。</p>
                         </div>
                         {manualCookieMessage && (
                           <div className={`text-sm font-bold rounded-2xl px-4 py-3 ${
@@ -1300,10 +1817,10 @@ const AccountList: React.FC = () => {
                     </div>
                     <p className={`mt-1 text-xs font-medium ${editingAccount.login_credentials_valid ? 'text-emerald-600' : 'text-amber-600'}`}>
                       {editingAccount.login_credentials_valid
-                        ? '登录信息已保存，系统不会把密码回传到页面。'
+                        ? '登录信息已加密保存；官方档案完全退出后可使用这些凭据自动续期。'
                         : editingAccount.has_login_password
                           ? '已保存的信息格式异常，请重新填写正确的闲鱼登录账号和密码。'
-                          : '尚未保存登录密码，Cookie 失效后无法自动登录刷新。'}
+                          : '尚未保存登录密码，Cookie 失效后需要人工重新登录。'}
                     </p>
                   </div>
                   <div className="flex items-center justify-between">
@@ -1327,18 +1844,32 @@ const AccountList: React.FC = () => {
                   Cookie 刷新
                 </h3>
                 <div className="space-y-4">
+                  {!editingAccount.auto_refresh_supported && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                      <p className="font-bold text-gray-900">当前方式到期后需要人工重新登录</p>
+                      <p className="mt-1 text-sm text-gray-600">只有通过账号密码官方登录并保存有效凭据后，才可开启自动定时续期。</p>
+                      <button
+                        type="button"
+                        onClick={() => openReauthMethod({ ...editingAccount, reauth_action: 'password_login' })}
+                        className="mt-3 min-h-11 rounded-lg bg-gray-900 px-4 text-sm font-bold text-white"
+                      >
+                        使用账号密码重新登录
+                      </button>
+                    </div>
+                  )}
                   <div className="flex items-center justify-between p-4 bg-cyan-50 rounded-xl">
                     <div>
                       <div className="font-bold text-gray-900">自动定时 Cookie 刷新</div>
-                      <div className="text-xs text-gray-500">关闭后仍可手动刷新，可降低频繁触发验证的概率。</div>
+                      <div className="text-xs text-gray-500">{editingAccount.auto_refresh_supported ? '关闭后仍可手动刷新，可降低频繁触发验证的概率。' : '当前登录方式不提供后台自动续期。'}</div>
                     </div>
                     <ToggleControl
                       checked={editForm.cookie_refresh_enabled}
                       onChange={(checked) => setEditForm({ ...editForm, cookie_refresh_enabled: checked })}
                       label="自动定时 Cookie 刷新"
+                      disabled={!editingAccount.auto_refresh_supported}
                     />
                   </div>
-                  {editForm.cookie_refresh_enabled && (
+                  {editForm.cookie_refresh_enabled && editingAccount.auto_refresh_supported && (
                     <div>
                       <label htmlFor="cookie-refresh-interval" className="block text-sm font-bold text-gray-700 mb-2">
                         刷新间隔

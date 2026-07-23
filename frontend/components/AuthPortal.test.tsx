@@ -490,8 +490,8 @@ describe('AuthPortal', () => {
 
     const desktopNavigation = screen.getByRole('navigation', { name: '认证导航' });
     expect(screen.getByRole('navigation', { name: '移动认证导航' })).toBeInTheDocument();
-    expect(screen.getByText('闲鱼智控 v1.7.3')).toBeInTheDocument();
-    expect(screen.getByText('Xianyu AI Manager v1.7.3')).toBeInTheDocument();
+    expect(screen.getByText('闲鱼智控 v1.8.0')).toBeInTheDocument();
+    expect(screen.getByText('Xianyu AI Manager v1.8.0')).toBeInTheDocument();
 
     fireEvent.click(within(desktopNavigation).getByRole('button', { name: '注册账号' }));
     expect(window.location.pathname).toBe('/register');

@@ -1,11 +1,19 @@
 """Shared order discovery, status normalization and sync coordination."""
 
 import json
+import inspect
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+
+
+DEFAULT_ORDER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/138.0.0.0 Safari/537.36"
+)
 
 
 ORDER_STATUSES = {
@@ -90,7 +98,24 @@ def classify_platform_error(ret_values: Iterable[Any] | Any) -> Dict[str, Any]:
         values = list(ret_values or [])
     message = " | ".join(str(value) for value in values)
     lowered = message.lower()
-    if "session_expired" in lowered or "session过期" in lowered or "token过期" in lowered:
+    session_markers = (
+        "session_expired",
+        "session过期",
+        "session expired",
+        "token_expired",
+        "token_expoired",
+        "token_exoired",
+        "token expired",
+        "token过期",
+        "令牌过期",
+        "fail_sys_user_validate",
+        "fail_sys_session_expired",
+        "fail_sys_token_expired",
+        "fail_sys_token_expoired",
+        "passport.goofish.com",
+        "mini_login",
+    )
+    if any(marker in lowered for marker in session_markers):
         return {
             "code": "session_expired",
             "message": "闲鱼登录状态已过期，请先更新登录状态",
@@ -148,17 +173,19 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
     buyer_info = raw.get("buyerInfoVO") if isinstance(raw.get("buyerInfoVO"), dict) else {}
     price_info = raw.get("priceVO") if isinstance(raw.get("priceVO"), dict) else {}
     order_id = common_data.get("orderId") or raw.get("order_id") or raw.get("orderId") or raw.get("bizOrderId") or raw.get("mainOrderId") or raw.get("id")
-    raw_status = raw.get("status") or raw.get("orderStatus") or raw.get("statusCode") or common_data.get("orderStatusCode") or ""
-    status_text = raw.get("status_text") or raw.get("statusText") or raw.get("status_desc") or raw.get("statusDesc") or common_data.get("orderStatus") or ""
+    raw_status = common_data.get("orderStatusCode") or raw.get("status") or raw.get("orderStatus") or raw.get("statusCode") or common_data.get("orderStatus") or ""
+    status_text = common_data.get("orderStatus") or raw.get("status_text") or raw.get("statusText") or raw.get("status_desc") or raw.get("statusDesc") or ""
+    if str(common_data.get("inRefund") or raw.get("inRefund") or "").lower() == "true":
+        status_text = status_text if "退款" in str(status_text) else f"退款中 {status_text}".strip()
     raw_amount = raw.get("amount") or raw.get("payAmount") or raw.get("actualFee") or raw.get("price") or price_info.get("totalPrice") or price_info.get("confirmFee") or price_info.get("auctionPrice") or ""
     amount = str(raw_amount).replace("¥", "").replace("￥", "").replace(",", "").strip()
     return {
         "order_id": str(order_id or ""),
         "item_id": str(common_data.get("itemId") or raw.get("item_id") or raw.get("itemId") or raw.get("auctionId") or ""),
         "buyer_id": str(buyer_info.get("buyerId") or raw.get("buyer_id") or raw.get("buyerId") or raw.get("buyerUserId") or ""),
-        "item_title": str(raw.get("title") or raw.get("itemTitle") or raw.get("subject") or ""),
+        "item_title": str(common_data.get("itemTitle") or raw.get("title") or raw.get("itemTitle") or raw.get("subject") or ""),
         "amount": amount,
-        "quantity": str(raw.get("quantity") or raw.get("itemNum") or "1"),
+        "quantity": str(price_info.get("buyNum") or raw.get("quantity") or raw.get("itemNum") or "1"),
         "order_status": normalize_order_status(raw_status, status_text),
         "platform_status_code": str(raw_status or ""),
         "platform_status_text": str(status_text or ""),
@@ -195,6 +222,7 @@ async def fetch_xianyu_order_list_page(
     page_number: int,
     page_size: int,
     user_id: str,
+    user_agent: str = "",
 ) -> Dict[str, Any]:
     """Fetch one seller-order page without persisting or logging credentials."""
     del cookie_id, user_id
@@ -237,19 +265,38 @@ async def fetch_xianyu_order_list_page(
         "idle_user_group_member_id": "",
         "Origin": "https://seller.goofish.com",
         "Referer": "https://seller.goofish.com/?site=COMMONPRO#/seller-trade/order-manage",
+        "User-Agent": str(user_agent or DEFAULT_ORDER_USER_AGENT),
     }
     timeout = aiohttp.ClientTimeout(total=20)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
             async with session.post(
                 "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/",
                 params=params,
                 data={"data": data_value},
                 headers=headers,
             ) as response:
+                cookie_updates = {}
+                try:
+                    set_cookie_values = response.headers.getall("Set-Cookie", [])
+                except Exception:
+                    set_cookie_values = []
+                for raw_cookie in set_cookie_values:
+                    first_segment = str(raw_cookie).split(";", 1)[0]
+                    if "=" not in first_segment:
+                        continue
+                    name, value = first_segment.split("=", 1)
+                    if name.strip():
+                        cookie_updates[name.strip()] = value.strip()
                 if response.status >= 400:
                     return {"ret": [f"HTTP_{response.status}::订单接口请求失败"]}
-                return await response.json(content_type=None)
+                payload = await response.json(content_type=None)
+                if isinstance(payload, dict) and cookie_updates:
+                    payload["_cookie_updates"] = cookie_updates
+                return payload
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
         return {"ret": [f"NETWORK_ERROR::{type(exc).__name__}"]}
 
@@ -269,7 +316,30 @@ class XianyuOrderListClient:
         self.page_size = max(1, min(int(page_size), 100))
         self.max_pages = max(1, min(int(max_pages), 100))
 
-    async def discover(self, *, cookie_id: str, cookie_string: str, days: int = 90) -> Dict[str, Any]:
+    @staticmethod
+    def _merge_cookie_updates(cookie_string: str, updates: Dict[str, Any]) -> str:
+        from utils.xianyu_utils import trans_cookies
+
+        merged = dict(trans_cookies(cookie_string))
+        for name, value in (updates or {}).items():
+            normalized_name = str(name or '').strip()
+            if not normalized_name:
+                continue
+            normalized_value = str(value or '')
+            if normalized_value:
+                merged[normalized_name] = normalized_value
+            else:
+                merged.pop(normalized_name, None)
+        return '; '.join(f"{name}={value}" for name, value in merged.items())
+
+    async def discover(
+        self,
+        *,
+        cookie_id: str,
+        cookie_string: str,
+        days: int = 90,
+        user_agent: str = "",
+    ) -> Dict[str, Any]:
         try:
             from utils.xianyu_utils import trans_cookies
 
@@ -288,17 +358,50 @@ class XianyuOrderListClient:
         orders: List[Dict[str, Any]] = []
         seen_order_ids = set()
         pages_scanned = 0
+        current_cookie_string = cookie_string
+        cookie_changed = False
 
         for page_number in range(1, self.max_pages + 1):
-            payload = await self.page_loader(
-                cookie_id=cookie_id,
-                cookie_string=cookie_string,
-                page_number=page_number,
-                page_size=self.page_size,
-                user_id=user_id,
-            )
-            parsed = parse_order_api_payload(payload)
-            if not parsed.get("success"):
+            retry_count = 0
+            while True:
+                payload = await self.page_loader(
+                    cookie_id=cookie_id,
+                    cookie_string=current_cookie_string,
+                    page_number=page_number,
+                    page_size=self.page_size,
+                    user_id=user_id,
+                    user_agent=user_agent,
+                )
+                cookie_updates = (
+                    payload.get("_cookie_updates")
+                    if isinstance(payload, dict) and isinstance(payload.get("_cookie_updates"), dict)
+                    else {}
+                )
+                if cookie_updates:
+                    merged_cookie_string = self._merge_cookie_updates(
+                        current_cookie_string,
+                        cookie_updates,
+                    )
+                    merged_user_id = str(trans_cookies(merged_cookie_string).get("unb") or "")
+                    if merged_user_id != user_id:
+                        return {
+                            "success": False,
+                            "error_code": "account_identity_mismatch",
+                            "error": "订单接口返回的登录身份与当前账号不一致",
+                            "requires_login": True,
+                            "orders": orders,
+                            "pages_scanned": pages_scanned,
+                        }
+                    if merged_cookie_string != current_cookie_string:
+                        current_cookie_string = merged_cookie_string
+                        cookie_changed = True
+
+                parsed = parse_order_api_payload(payload)
+                if parsed.get("success"):
+                    break
+                if parsed.get("requires_login") and cookie_updates and retry_count == 0:
+                    retry_count += 1
+                    continue
                 return {
                     "success": False,
                     "error_code": parsed.get("error_code") or "platform_error",
@@ -334,12 +437,15 @@ class XianyuOrderListClient:
             if reached_cutoff or not has_next_page or not raw_orders:
                 break
 
-        return {
+        result = {
             "success": True,
             "requires_login": False,
             "orders": orders,
             "pages_scanned": pages_scanned,
         }
+        if cookie_changed:
+            result["updated_cookie_string"] = current_cookie_string
+        return result
 
 
 class OrderSyncCoordinator:
@@ -347,13 +453,21 @@ class OrderSyncCoordinator:
 
     def __init__(self, db, discoverer: Callable[..., Awaitable[Dict[str, Any]]],
                  detail_fetcher: Optional[Callable[..., Awaitable[List[Dict[str, Any]]]]] = None,
+                 cookie_updater: Optional[Callable[[str, str], Any]] = None,
                  now_fn: Callable[[], float] = time.time):
         self.db = db
         self.discoverer = discoverer
         self.detail_fetcher = detail_fetcher
+        self.cookie_updater = cookie_updater
         self.now_fn = now_fn
 
-    async def sync_account(self, cookie_id: str, cookie_string: str, days: int = 90) -> Dict[str, Any]:
+    async def sync_account(
+        self,
+        cookie_id: str,
+        cookie_string: str,
+        days: int = 90,
+        user_agent: str = "",
+    ) -> Dict[str, Any]:
         summary = {
             "total_seen": 0,
             "discovered": 0,
@@ -366,6 +480,7 @@ class OrderSyncCoordinator:
             cookie_id=cookie_id,
             cookie_string=cookie_string,
             days=max(1, min(int(days or 90), 365)),
+            user_agent=user_agent,
         )
         if not discovery.get("success"):
             return {
@@ -377,6 +492,27 @@ class OrderSyncCoordinator:
                 "summary": summary,
                 "errors": [discovery.get("error") or "订单发现失败"],
             }
+
+        updated_cookie_string = str(discovery.pop("updated_cookie_string", "") or "")
+        if updated_cookie_string and updated_cookie_string != cookie_string:
+            if self.cookie_updater:
+                try:
+                    update_result = self.cookie_updater(cookie_id, updated_cookie_string)
+                    if inspect.isawaitable(update_result):
+                        update_result = await update_result
+                    if update_result is False:
+                        raise RuntimeError("Cookie 持久化返回失败")
+                except Exception:
+                    return {
+                        "success": False,
+                        "partial": False,
+                        "requires_login": False,
+                        "error_code": "cookie_update_failed",
+                        "message": "订单接口刷新了登录状态，但本地保存失败",
+                        "summary": summary,
+                        "errors": ["订单同步 Cookie 保存失败"],
+                    }
+            cookie_string = updated_cookie_string
 
         errors = []
         for discovered_order in discovery.get("orders") or []:

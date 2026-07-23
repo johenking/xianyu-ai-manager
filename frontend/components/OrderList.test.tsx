@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import React from 'react';
+import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getItems, getOrders, syncOrders } from '../services/api';
@@ -22,7 +23,7 @@ describe('OrderList status sync', () => {
     vi.mocked(getOrders).mockResolvedValue({
       success: true,
       data: [
-        { id: 'refund-1', order_id: 'refund-1', cookie_id: 'account-1', item_id: '', buyer_id: '', quantity: 1, amount: '20', status: 'refunded' },
+        { id: 'refund-1', order_id: 'refund-1', cookie_id: 'account-1', item_id: '', item_title: '退款商品', item_image: 'https://img.alicdn.com/refund.jpg', buyer_id: '', quantity: 1, amount: '20', status: 'refunded' },
         { id: 'unknown-1', order_id: 'unknown-1', cookie_id: 'account-1', item_id: '', buyer_id: '', quantity: 1, amount: '30', status: 'unknown' },
       ] as any,
       total: 2,
@@ -39,6 +40,7 @@ describe('OrderList status sync', () => {
 
     expect(await screen.findByText('已退款')).toBeTruthy();
     expect((await screen.findAllByText('待核对')).length).toBeGreaterThan(1);
+    expect(screen.getByRole('img', { name: '退款商品' })).toHaveAttribute('src', 'https://img.alicdn.com/refund.jpg');
   });
 
   it('shows login recovery guidance when recent sync requires login', async () => {

@@ -42,10 +42,11 @@ const preloadAppPages = () => {
     });
   };
   if ('requestIdleCallback' in window) {
-    window.requestIdleCallback(run, { timeout: 2000 });
-  } else {
-    globalThis.setTimeout(run, 500);
+    const handle = window.requestIdleCallback(run, { timeout: 2000 });
+    return () => window.cancelIdleCallback(handle);
   }
+  const handle = globalThis.setTimeout(run, 500);
+  return () => globalThis.clearTimeout(handle);
 };
 
 const PageLoading: React.FC = () => (
@@ -136,9 +137,8 @@ const App: React.FC = () => {
   }, [clearIdentity, hydrateIdentity]);
 
   useEffect(() => {
-      if (isLoggedIn) {
-          preloadAppPages();
-      }
+      if (!isLoggedIn) return undefined;
+      return preloadAppPages();
   }, [isLoggedIn]);
 
   const publicDocument = window.location.pathname === '/terms'
