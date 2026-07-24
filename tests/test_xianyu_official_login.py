@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -556,6 +557,43 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertEqual((target / "old.txt").read_text(encoding="utf-8"), "old")
         self.assertTrue((temporary / "new.txt").is_file())
         self.assertEqual(list(self.profile_root.glob("user_9988.backup-*")), [])
+
+    def test_initialization_cleans_only_aged_temporary_and_backup_profiles(self):
+        self.profile_root.mkdir(parents=True, exist_ok=True)
+        stale_login = self.profile_root / ".login_stale"
+        stale_window = self.profile_root / ".window_stale"
+        stale_backup = self.profile_root / "user_9988.backup-stale"
+        canonical = self.profile_root / "user_9988"
+        unknown = self.profile_root / "legacy_profile"
+        fresh_login = self.profile_root / ".login_active"
+        fresh_window = self.profile_root / ".window_active"
+        for path in (
+            stale_login,
+            stale_window,
+            stale_backup,
+            canonical,
+            unknown,
+            fresh_login,
+            fresh_window,
+        ):
+            path.mkdir()
+        ignored_file = self.profile_root / "user_9988.backup-file"
+        ignored_file.write_text("keep", encoding="utf-8")
+
+        old_mtime = time.time() - (7 * 3600)
+        for path in (stale_login, stale_window, stale_backup, ignored_file):
+            os.utime(path, (old_mtime, old_mtime))
+
+        self.make_service(SequencePlaywrightFactory([]))
+
+        self.assertFalse(stale_login.exists())
+        self.assertFalse(stale_window.exists())
+        self.assertFalse(stale_backup.exists())
+        self.assertTrue(canonical.is_dir())
+        self.assertTrue(unknown.is_dir())
+        self.assertTrue(fresh_login.is_dir())
+        self.assertTrue(fresh_window.is_dir())
+        self.assertTrue(ignored_file.is_file())
 
     def test_browser_failures_do_not_log_or_return_sensitive_material(self):
         class SensitiveFailureFactory:

@@ -414,7 +414,12 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
         probe = AsyncMock(return_value=SessionProbeResult(
             status=PROBE_SUCCESS,
-            cookies={"unb": "9988", "cookie2": "renewed", "_m_h5_tk": "token_2"},
+            cookies={
+                "unb": "9988",
+                "cookie2": "renewed",
+                "_m_h5_tk": "token_2",
+                "x5sec": "verification-cookie",
+            },
             access_token="message-access-token",
         ))
 
@@ -428,6 +433,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(live.current_token, "message-access-token")
         self.assertEqual(probe.await_count, 1)
         self.assertEqual(database.cas_calls, 1)
+        self.assertIn("x5sec=verification-cookie", database.details["value"])
 
     async def test_validated_cookie_ua_and_token_install_one_listener_generation(self):
         live = object.__new__(XianyuLive)

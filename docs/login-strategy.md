@@ -2,7 +2,7 @@
 
 ## 最终结论
 
-添加账号默认使用 API 扫码。二维码不是浏览器截图：`utils/qr_login.py` 从闲鱼官方接口取得 `codeContent`，后端在本地渲染为 PNG Data URL。只有平台要求二次安全验证、且用户主动继续时，系统才打开本机安装版 Chrome；安全验证页面可以提供脱敏截图。
+添加账号的“扫码”面板先显示两个入口，打开面板本身不创建会话：“本机 Chrome 扫码（推荐）”通过统一官方会话在运行服务的 Mac 上打开可见 Chrome；“网页二维码”继续由 `utils/qr_login.py` 从闲鱼官方接口取得 `codeContent`，并在后端本地渲染为 PNG Data URL，适合远程访问。网页二维码只有在平台要求二次安全验证、且用户主动继续时才打开本机 Chrome；安全验证页面可以提供脱敏截图。
 
 只有通过账号密码官方登录，并保存了格式有效的登录账号和加密密码时，账号才具备自动续期能力。扫码、手机号验证码、本机 Chrome 扩展和手填 Cookie 到期后进入 `manual_reauth_required`，账号页显示对应的人工重登入口，不重复启动隐藏浏览器。
 
@@ -12,7 +12,7 @@
 
 | 登录来源 | 实现 | 自动续期 | 到期后的操作 | 主要限制 |
 |---|---|---:|---|---|
-| `qr` | 官方二维码 API 返回 `codeContent`，后端本地渲染图片 | 否 | 重新扫码 | 风控时仍需人工验证；没有可复用的密码凭据 |
+| `qr` | 可选统一官方 Chrome QR，或官方二维码 API 返回 `codeContent` 并由后端本地渲染 | 否 | 重新扫码 | Chrome 窗口位于运行服务的 Mac；网页 QR 适合远程访问；两者的风控仍需人工验证 |
 | `password` | 安装版 Chrome 打开官方登录页，凭据使用独立密钥加密保存 | 是 | 自动续期失败后重新账号密码登录 | 密码错误、短信、人脸和页面变化仍需人工处理 |
 | `sms_window` | 可见官方 Chrome 窗口，用户在官方页面收码并输入 | 否 | 重新验证码登录 | 应用不接收验证码；窗口最多等待 15 分钟 |
 | `chrome_extension` | 用户主动从日常 Chrome Cookie Store 导入本机回环接口 | 否 | 重新导入 | 五分钟、单次使用、只能从本机发起 |
@@ -44,11 +44,13 @@
 
 ## 官方窗口登录
 
-`POST /api/official-login/sessions` 支持 `mode='qr'`、`mode='password'` 和 `mode='sms'`。当前前端扫码入口使用 API 二维码；手机号验证码和账号密码复用此统一会话协议。短信模式固定打开可见 Chrome，系统只等待官方页面产生经过验证的 Cookie，不接收或保存短信验证码。
+`POST /api/official-login/sessions` 支持 `mode='qr'`、`mode='password'` 和 `mode='sms'`。前端本机扫码提交 `{mode:'qr', show_browser:true}`，手机号验证码和账号密码也复用此统一会话协议；网页二维码保持 `/qr-login/*` 契约。短信模式固定打开可见 Chrome，系统只等待官方页面产生经过验证的 Cookie，不接收或保存短信验证码。
 
-客户端轮询 `GET /api/official-login/sessions/{session_id}`。终态包括 `success`、`expired`、`failed`、`cancelled` 和 `interrupted`；需要时可调用 `POST .../{session_id}/show-browser`，关闭弹窗时调用 `POST .../{session_id}/cancel`。兼容端点 `/official-window-login*` 仍映射到同一个会话协调器。
+客户端轮询 `GET /api/official-login/sessions/{session_id}`。QR 和 SMS 统一处理 `preparing`、`waiting_user`、`verification_required`、`persisting`、`restarting_listener` 以及 `success`、`expired`、`failed`、`cancelled`、`interrupted` 终态。需要时可调用 `POST .../{session_id}/show-browser`；切换方式或关闭弹窗时停止轮询并调用 `POST .../{session_id}/cancel`。网页二维码停止前端轮询后由既有 TTL 清理。兼容端点 `/official-window-login*` 仍映射到同一个会话协调器。
 
-登录成功后按真实 `unb` 保存账号，并把档案归档到 `browser_data/user_<unb>`。短信重登已有账号时会绑定预期 `unb`；登录到其他账号不会覆盖原记录。
+登录成功后按真实 `unb` 保存或归并账号，并把档案归档到 `browser_data/user_<unb>`；不另存 `storage_state.json`。新增 QR 会话不提供预期身份，短信重登已有账号时会绑定预期 `unb`；登录到其他账号不会覆盖原记录。服务初始化时只会最佳努力删除超过六小时的 `.login_*`、`.window_*` 和 `user_*.backup-*` 目录，正式 `user_*`、未知目录和新鲜临时目录保持不动。
+
+统一 Session Probe 在首次响应明确表示 H5 Token 过期、且响应 Cookie 提供了不同的 `_m_h5_tk` 时，会先合并全部 `Set-Cookie`（包括 `x5sec`、`cookie2` 等），再用新时间戳和新签名在同一 HTTP 客户端中重试一次。没有新 Token、人工验证、身份过期或普通临时错误不重试，也不因此启动浏览器。成功合并的 Cookie 仍由调用方通过现有 compare-and-swap 保存。
 
 ## 自动续期与人工重登
 

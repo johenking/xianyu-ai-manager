@@ -54,6 +54,11 @@ _EXPIRED_MARKERS = (
     "SESSION_EXPIRED",
     "TOKEN_EXPIRED",
 )
+_TOKEN_EXPIRED_MARKERS = (
+    "FAIL_SYS_TOKEN_EXOIRED",
+    "令牌过期",
+    "TOKEN_EXPIRED",
+)
 _ALLOWED_VERIFICATION_HOSTS = ("goofish.com", "taobao.com")
 _H5_API_HOST_OK_CACHE: dict[str, bool] = {}
 
@@ -311,6 +316,123 @@ def _preflight_cookies(cookie_string: str) -> Optional[SessionProbeResult]:
     return None
 
 
+def _payload_ret_text(payload: Mapping[str, Any]) -> str:
+    ret = payload.get("ret")
+    values = ret if isinstance(ret, list) else []
+    return " ".join(str(value) for value in values)
+
+
+def _should_retry_with_fresh_h5_token(
+    payload: Mapping[str, Any],
+    previous_cookies: Mapping[str, str],
+    merged_cookies: Mapping[str, str],
+) -> bool:
+    ret_text = _payload_ret_text(payload)
+    if (
+        not any(marker in ret_text for marker in _TOKEN_EXPIRED_MARKERS)
+        or _safe_verification_url(payload)
+        or any(marker in ret_text for marker in _VERIFICATION_MARKERS)
+    ):
+        return False
+    previous_token = str(previous_cookies.get("_m_h5_tk") or "").strip()
+    fresh_token = str(merged_cookies.get("_m_h5_tk") or "").strip()
+    return bool(fresh_token and fresh_token != previous_token)
+
+
+def _classify_probe_http_response(
+    response: httpx.Response,
+    cookies: Mapping[str, str],
+) -> tuple[Mapping[str, Any], SessionProbeResult]:
+    payload = response.json()
+    if not isinstance(payload, Mapping):
+        raise ValueError("unexpected token response")
+    return payload, classify_probe_response(
+        payload,
+        cookies,
+        set_cookie_headers=_response_set_cookie_headers(response),
+    )
+
+
+def _next_probe_timestamp_ms(previous_params: Mapping[str, str]) -> int:
+    try:
+        previous_timestamp = int(previous_params.get("t") or 0)
+    except (TypeError, ValueError):
+        previous_timestamp = 0
+    return max(int(time.time() * 1000), previous_timestamp + 1)
+
+
+def _probe_message_session_with_sync_client(
+    client: Any,
+    cookie_string: str,
+    browser_user_agent: str,
+) -> SessionProbeResult:
+    cookies = parse_cookie_string(cookie_string)
+    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
+    response = client.post(url, params=params, data=data, headers=headers)
+    payload, result = _classify_probe_http_response(response, cookies)
+    if not _should_retry_with_fresh_h5_token(payload, cookies, result.cookies):
+        return result
+
+    refreshed_cookie_string = cookies_to_string(result.cookies)
+    retry_url, retry_params, retry_data, retry_headers = build_probe_request(
+        refreshed_cookie_string,
+        browser_user_agent,
+        timestamp_ms=_next_probe_timestamp_ms(params),
+    )
+    try:
+        retry_response = client.post(
+            retry_url,
+            params=retry_params,
+            data=retry_data,
+            headers=retry_headers,
+        )
+        _, retry_result = _classify_probe_http_response(retry_response, result.cookies)
+        return retry_result
+    except Exception:
+        return SessionProbeResult(
+            status=PROBE_RETRYABLE_ERROR,
+            cookies=dict(result.cookies),
+            error_code="token_probe_retry_exception",
+            message="消息 Token 重签探测出现临时异常",
+        )
+
+
+async def _probe_message_session_with_async_client(
+    client: Any,
+    cookie_string: str,
+    browser_user_agent: str,
+) -> SessionProbeResult:
+    cookies = parse_cookie_string(cookie_string)
+    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
+    response = await client.post(url, params=params, data=data, headers=headers)
+    payload, result = _classify_probe_http_response(response, cookies)
+    if not _should_retry_with_fresh_h5_token(payload, cookies, result.cookies):
+        return result
+
+    refreshed_cookie_string = cookies_to_string(result.cookies)
+    retry_url, retry_params, retry_data, retry_headers = build_probe_request(
+        refreshed_cookie_string,
+        browser_user_agent,
+        timestamp_ms=_next_probe_timestamp_ms(params),
+    )
+    try:
+        retry_response = await client.post(
+            retry_url,
+            params=retry_params,
+            data=retry_data,
+            headers=retry_headers,
+        )
+        _, retry_result = _classify_probe_http_response(retry_response, result.cookies)
+        return retry_result
+    except Exception:
+        return SessionProbeResult(
+            status=PROBE_RETRYABLE_ERROR,
+            cookies=dict(result.cookies),
+            error_code="token_probe_retry_exception",
+            message="消息 Token 重签探测出现临时异常",
+        )
+
+
 def probe_message_session_sync(
     cookie_string: str,
     browser_user_agent: str,
@@ -322,20 +444,18 @@ def probe_message_session_sync(
     if preflight:
         return preflight
     cookies = parse_cookie_string(cookie_string)
-    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
     try:
         if client_factory is None:
             with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-                response = client.post(url, params=params, data=data, headers=headers)
-        else:
-            response = client_factory().post(url, params=params, data=data, headers=headers)
-        payload = response.json()
-        if not isinstance(payload, Mapping):
-            raise ValueError("unexpected token response")
-        return classify_probe_response(
-            payload,
-            cookies,
-            set_cookie_headers=_response_set_cookie_headers(response),
+                return _probe_message_session_with_sync_client(
+                    client,
+                    cookie_string,
+                    browser_user_agent,
+                )
+        return _probe_message_session_with_sync_client(
+            client_factory(),
+            cookie_string,
+            browser_user_agent,
         )
     except Exception:
         return SessionProbeResult(
@@ -357,20 +477,18 @@ async def probe_message_session_async(
     if preflight:
         return preflight
     cookies = parse_cookie_string(cookie_string)
-    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
     try:
         if client_factory is None:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                response = await client.post(url, params=params, data=data, headers=headers)
-        else:
-            response = await client_factory().post(url, params=params, data=data, headers=headers)
-        payload = response.json()
-        if not isinstance(payload, Mapping):
-            raise ValueError("unexpected token response")
-        return classify_probe_response(
-            payload,
-            cookies,
-            set_cookie_headers=_response_set_cookie_headers(response),
+                return await _probe_message_session_with_async_client(
+                    client,
+                    cookie_string,
+                    browser_user_agent,
+                )
+        return await _probe_message_session_with_async_client(
+            client_factory(),
+            cookie_string,
+            browser_user_agent,
         )
     except Exception:
         return SessionProbeResult(

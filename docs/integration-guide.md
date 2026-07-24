@@ -32,7 +32,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
-| Official account login | API QR through `/qr-login/*`; visible SMS/password Chrome through `POST /api/official-login/sessions`, `GET .../{session_id}`, `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
+| Official account login | Web QR through `/qr-login/*`; local headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Dashboard and orders | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
@@ -290,12 +290,24 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- Default API QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The QR image is rendered locally from the official `codeContent`; it is not a browser screenshot.
+- Local Chrome QR (recommended when operating the service Mac): create `{"mode":"qr","show_browser":true}` through `/api/official-login/sessions`. The window opens on the Mac running the service.
+- Web QR (recommended for remote access): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The QR image is rendered locally from the official `codeContent`; it is not a browser screenshot.
 - Visible official window: create explicit `sms` or `password` sessions through `/api/official-login/sessions`. SMS codes are entered only on the official page.
 - Local Chrome extension: create a five-minute, owner-bound, single-use pairing through `/api/browser-extension/pairings`, then import from the local extension.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
-Start the default API QR session:
+Start a local headed Chrome QR session:
+
+```bash
+curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"qr","show_browser":true}'
+```
+
+Poll `GET /api/official-login/sessions/{session_id}`. QR and SMS clients share the same state contract: `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, and terminal `success`, `expired`, `failed`, `cancelled`, or `interrupted`. Show the same window through `POST .../show-browser` and cancel it through `POST .../cancel`. Starting a new account leaves `expected_unb` empty; the validated platform `unb` selects the created or existing account row.
+
+Start the web QR session:
 
 ```bash
 curl -sS -X POST "$BASE_URL/qr-login/generate" \
@@ -331,7 +343,9 @@ curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
 
 Legacy clients may still send `account_id`, but the backend ignores it and resolves the account from the authenticated Cookie's real `unb`. Re-login updates the existing account within the same backend user, preserving its settings and related data.
 
-Every successful browser binding stores the session as `browser_data/user_<unb>`. After an explicit password-mode login succeeds, the submitted password is encrypted with the independent account-credential key; QR and SMS sessions do not create a saved password. Status and account-detail responses never return the password or ciphertext. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+Every successful browser binding stores the complete persistent Chrome profile as `browser_data/user_<unb>`; there is no parallel `storage_state.json`. On startup the login service best-effort removes only six-hour-old `.login_*`, `.window_*`, and `user_*.backup-*` directories. Canonical `user_*` profiles, unknown legacy directories, and fresh temporary directories are never cleanup targets. After an explicit password-mode login succeeds, the submitted password is encrypted with the independent account-credential key; QR and SMS sessions do not create a saved password. Status and account-detail responses never return the password or ciphertext. Do not delete the account merely to refresh authentication; deletion removes account-linked data.
+
+The shared message-session probe retries at most once only when the first payload explicitly reports an H5 Token expiry and the same response rotates `_m_h5_tk`. It merges all response Cookies before rebuilding the timestamp and signature in the same HTTP client. Missing fresh Token, human verification, identity expiry, and ordinary transient errors do not retry. Successful response Cookies continue through the existing compare-and-swap persistence path.
 
 `POST /cookies` accepts a compatibility `id` field but ignores it for identity. The Cookie must contain `unb` and at least one core session field; the response returns the actual `account_id` selected from the real `unb`. `PUT /cookies/{cid}` rejects a different Cookie `unb` with HTTP 409 and `account_identity_mismatch` without changing the record or its related data.
 
