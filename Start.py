@@ -33,6 +33,7 @@ def main() -> None:
         port=port,
         workers=1,
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        access_log=False,
     )
 
 

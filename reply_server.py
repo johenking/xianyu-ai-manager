@@ -563,6 +563,12 @@ from loguru import logger
 logger.info("Web服务器启动，文件日志收集器已初始化")
 
 # 添加请求日志中间件
+def _request_log_path(request: Request) -> str:
+    route = request.scope.get("route")
+    route_path = getattr(route, "path_format", None) or getattr(route, "path", None)
+    return str(route_path or "<unmatched>")
+
+
 @app.middleware("http")
 async def log_requests(request, call_next):
     start_time = time.time()
@@ -570,13 +576,16 @@ async def log_requests(request, call_next):
     request_id = supplied_request_id if re.fullmatch(r"[A-Za-z0-9._-]{8,80}", supplied_request_id) else secrets.token_hex(8)
     request.state.request_id = request_id
 
-    logger.info(f"🌐 API请求: {request.method} {request.url.path} request_id={request_id}")
+    logger.info(f"🌐 API请求: {request.method} request_id={request_id}")
 
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
 
     process_time = time.time() - start_time
-    logger.info(f"✅ API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
+    logger.info(
+        f"✅ API响应: {request.method} {_request_log_path(request)} - "
+        f"{response.status_code} ({process_time:.3f}s)"
+    )
 
     return response
 

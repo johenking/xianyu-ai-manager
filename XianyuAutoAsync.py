@@ -332,12 +332,40 @@ class XianyuLive:
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
         try:
-            return str(e)
-        except:
-            try:
-                return repr(e)
-            except:
-                return "未知错误"
+            return sanitize_runtime_error(e)
+        except Exception:
+            return type(e).__name__
+
+    @staticmethod
+    def _log_websocket_connection_failure(
+        cookie_id: str,
+        *,
+        error_type: str,
+        error_message: str,
+        failure_count: int,
+        max_failures: int,
+    ) -> bool:
+        safe_message = sanitize_runtime_error(error_message)
+        is_expected_disconnect = (
+            "ConnectionClosed" in error_type
+            or "IncompleteReadError" in error_type
+            or "no close frame received or sent" in safe_message
+        )
+        if is_expected_disconnect:
+            logger.warning(
+                f"【{cookie_id}】WebSocket连接已关闭 "
+                f"({failure_count}/{max_failures})"
+            )
+            logger.warning(f"【{cookie_id}】关闭原因: {safe_message}")
+            return True
+
+        logger.error(
+            f"【{cookie_id}】WebSocket连接异常 "
+            f"({failure_count}/{max_failures})"
+        )
+        logger.error(f"【{cookie_id}】异常类型: {error_type}")
+        logger.error(f"【{cookie_id}】异常信息: {safe_message}")
+        return False
 
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
@@ -7159,29 +7187,17 @@ class XianyuLive:
 
                 except Exception as e:
                     error_msg = self._safe_str(e)
-                    import traceback
                     error_type = type(e).__name__
-
-                    # 检查是否是 ConnectionClosedError（正常的连接关闭）
-                    is_connection_closed = (
-                        'ConnectionClosedError' in error_type or
-                        'ConnectionClosed' in error_type or
-                        'no close frame received or sent' in error_msg or
-                        'IncompleteReadError' in error_type
+                    self.connection_failures += 1
+                    is_connection_closed = self._log_websocket_connection_failure(
+                        self.cookie_id,
+                        error_type=error_type,
+                        error_message=error_msg,
+                        failure_count=self.connection_failures,
+                        max_failures=self.max_connection_failures,
                     )
-
-                    # 对于连接关闭错误，使用警告级别而不是错误级别
-                    if is_connection_closed:
-                        logger.warning(f"【{self.cookie_id}】WebSocket连接已关闭 ({self.connection_failures + 1}/{self.max_connection_failures})")
-                        logger.warning(f"【{self.cookie_id}】关闭原因: {error_msg}")
-                    else:
-                        self.connection_failures += 1
                     # 更新连接状态为重连中
                     self._set_connection_state(ConnectionState.RECONNECTING, f"第{self.connection_failures}次失败")
-                    logger.error(f"【{self.cookie_id}】WebSocket连接异常 ({self.connection_failures}/{self.max_connection_failures})")
-                    logger.error(f"【{self.cookie_id}】异常类型: {error_type}")
-                    logger.error(f"【{self.cookie_id}】异常信息: {error_msg}")
-                    logger.warning(f"【{self.cookie_id}】异常堆栈:\n{traceback.format_exc()}")
 
                     # 确保清理 WebSocket 引用
                     if self.ws:
@@ -7199,10 +7215,8 @@ class XianyuLive:
                             self.ws = None
                             logger.info(f"【{self.cookie_id}】WebSocket引用已清理")
 
-                    # 对于连接关闭错误，也增加失败计数
+                    # 对于连接关闭错误，补充更明确的重连状态。
                     if is_connection_closed:
-                        self.connection_failures += 1
-                        # 更新连接状态为重连中
                         self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
                     # 检查是否超过最大失败次数
@@ -7270,7 +7284,6 @@ class XianyuLive:
                                 raise
                             except Exception as sleep_error:
                                 logger.error(f"【{self.cookie_id}】等待期间发生异常: {self._safe_str(sleep_error)}")
-                                logger.warning(f"【{self.cookie_id}】等待异常堆栈:\n{traceback.format_exc()}")
                                 # 即使出错也继续等待剩余时间
                                 if remaining > 0:
                                     await asyncio.sleep(remaining)
@@ -7285,7 +7298,6 @@ class XianyuLive:
 
                     except Exception as cleanup_error:
                         logger.error(f"【{self.cookie_id}】清理过程出错: {self._safe_str(cleanup_error)}")
-                        logger.warning(f"【{self.cookie_id}】清理异常堆栈:\n{traceback.format_exc()}")
                         # 即使清理失败，也要重置任务引用并等待后重试
                         self.heartbeat_task = None
                         self.token_refresh_task = None

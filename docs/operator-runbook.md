@@ -214,7 +214,9 @@ tmux capture-pane -t xianyu-butler -p -S -500
 rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
 ```
 
-Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, provider keys, verification URLs, the default administrator password, email OTPs, password-reset grant IDs or tokens, full email addresses, or any password. Use masked email values, digests, request IDs, and exception classes for correlation instead.
+Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, provider keys, verification URLs, stable account identities, the default administrator password, email OTPs, password-reset grant IDs or tokens, full email addresses, or any password. API request records use request IDs and matched route templates such as `/api/accounts/{cookie_id}/session-status`; raw Uvicorn access logging stays disabled so dynamic path values are not emitted a second time. Expected WebSocket disconnects are warning-level retry events without tracebacks, while unexpected failures retain only the exception class and sanitized summary.
+
+After a deployment that changes logging, record the current log byte offsets, request one protected dynamic account route with a synthetic or already-authorized session, and scan only the newly appended bytes. Require zero matches for the stable account identity, Cookie and Token values, passwords, QR content, verification URLs, and `Traceback`. Do not print the searched values or matching lines into release notes or chat.
 
 Backend login tokens live in `auth_sessions` for up to 30 days. If the dashboard logs out unexpectedly, check browser `localStorage.auth_token`, call `/verify`, confirm the same `DB_PATH` is in use, and verify that the session row still exists.
 

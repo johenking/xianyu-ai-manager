@@ -1,7 +1,10 @@
 import asyncio
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from loguru import logger
 
 from account_session_refresh import active_refresh_registry
 from cookie_manager import CookieManager
@@ -108,6 +111,57 @@ class FailingOfficialRefreshService(FakeOfficialRefreshService):
 
 
 class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_expected_websocket_disconnect_avoids_error_and_traceback_logs(self):
+        output = io.StringIO()
+        sink_id = logger.add(output, level="DEBUG", format="{level}|{message}")
+        try:
+            expected = XianyuLive._log_websocket_connection_failure(
+                "2219255254384",
+                error_type="ConnectionClosedError",
+                error_message=(
+                    "no close frame received or sent "
+                    "cookie2=COOKIE_SECRET "
+                    "https://passport.goofish.com/verify/VERIFY_SECRET"
+                ),
+                failure_count=1,
+                max_failures=5,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        logged = output.getvalue()
+        self.assertTrue(expected)
+        self.assertIn("WARNING|", logged)
+        self.assertNotIn("ERROR|", logged)
+        self.assertNotIn("Traceback", logged)
+        self.assertNotIn("COOKIE_SECRET", logged)
+        self.assertNotIn("VERIFY_SECRET", logged)
+
+    def test_unexpected_websocket_failure_keeps_redacted_error_summary(self):
+        output = io.StringIO()
+        sink_id = logger.add(output, level="DEBUG", format="{level}|{message}")
+        try:
+            expected = XianyuLive._log_websocket_connection_failure(
+                "2219255254384",
+                error_type="RuntimeError",
+                error_message=(
+                    "provider failed cookie2=COOKIE_SECRET "
+                    "https://passport.goofish.com/verify/VERIFY_SECRET"
+                ),
+                failure_count=1,
+                max_failures=5,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        logged = output.getvalue()
+        self.assertFalse(expected)
+        self.assertIn("ERROR|", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("COOKIE_SECRET", logged)
+        self.assertNotIn("VERIFY_SECRET", logged)
+        self.assertNotIn("Traceback", logged)
+
     async def asyncSetUp(self):
         active_refresh_registry.unregister("account-1")
         FakeOfficialRefreshService.calls.clear()

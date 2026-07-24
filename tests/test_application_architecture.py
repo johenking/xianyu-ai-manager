@@ -3,6 +3,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+import Start
 from app_factory import create_app
 
 
@@ -87,6 +88,14 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("new_event_loop", source)
         self.assertNotIn("run_until_complete", source)
         self.assertIn('"app_factory:create_app"', source)
+
+    def test_start_disables_raw_uvicorn_access_logs(self):
+        with patch.object(Start, "_server_address", return_value=("127.0.0.1", 8091)), patch.object(
+            Start.uvicorn, "run"
+        ) as run_mock:
+            Start.main()
+
+        self.assertFalse(run_mock.call_args.kwargs["access_log"])
 
     def test_auth_logs_do_not_reference_the_default_password_constant(self):
         source = Path("reply_server.py").read_text(encoding="utf-8")
