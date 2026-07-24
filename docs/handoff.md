@@ -1,5 +1,94 @@
 # Handoff
 
+## v1.8.2 Production Release On 2026-07-24
+
+The dual-QR login release was merged through PR `#35` at
+`a860834a8d73694b7f6c383b7e6b27f96e3c9abb`. Live QR acceptance then exposed
+one raw stable account identifier in an early database persistence log; PR
+`#36` moved that redaction to the log source. The final application commit is
+`29f523659c091526bd393bc3b797dce7fb4570ea`. This document update is docs-only;
+after it merges, production can fast-forward without another restart. Release
+closure will place the annotated `v1.8.2` tag on this final evidence
+merge after production fast-forwards to it; the loaded application payload
+remains byte-equivalent to `29f5236`.
+
+GitHub and clean-worktree gates:
+
+- PR `#35` CI run `30096458035` and its `main` push run `30096628378` passed
+  both `secrets` and `test`. PR `#36` CI run `30099092672` and final `main`
+  push run `30099265493` passed the same jobs. Both PRs used ordinary merge
+  commits. No historical `v1.8.1` tag was created.
+- The feature candidate passed Ruff, the explicit Python compilation list, 317
+  backend tests with isolated SQLite and keys, TypeScript, 18 frontend files
+  with 92 tests, 27 targeted account-panel tests, 6 extension tests, and
+  `npm audit --audit-level=high` with zero vulnerabilities. The final log-source
+  correction used a verified red-to-green regression and passed the same Ruff
+  and compilation gates plus 318 backend tests in 25.021 seconds.
+- Two builds from exact feature merge `a860834` were reproducible. The entry
+  assets are `index-izG0227c.js` (245,344 bytes, SHA-256
+  `1553754b77ba837f69e3dce3bd2263ee92d76d05fc89dbef8adbbb18ef1664dc`)
+  and `index-Do2LTy2E.css` (76,129 bytes, SHA-256
+  `3c2966b0f0b8dfa6d494834194cc053727f905bef621a8b8d6d98227edc0a85c`).
+  Build verification retained two 32-asset generations with zero orphans and
+  a 71.7% entry reduction. Extension verification passed; its ZIP SHA-256 is
+  `373a1b9ebb424ce3276b71a3818def994d04c367066e93947c2e161ebf32f106`.
+
+Production deployment and runtime evidence:
+
+- Production is `/Users/mac/Library/Application Support/XianyuManager`, served
+  by `com.cxywjx.xianyu-manager` with `WEB_CONCURRENCY=1`. It was advanced only
+  with `git merge --ff-only`. Final process `14740` became ready in four seconds
+  from commit `29f5236`; the migration remained `2026072301`.
+- The mode-`0700` pre-deploy snapshot is outside the repository at
+  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/` under
+  `v1.8.2-pre-deploy-20260724-212959`. Its 2,328-file SHA-256 manifest verifies
+  an integrity-checked SQLite backup, all three local keys, the prior static
+  site, 49 uploads, four stopped-service browser-profile directories, the
+  LaunchAgent, source archive, verified Git bundle, and the prior atomic static
+  directory. A second stopped-service post-QR/pre-final snapshot named
+  `v1.8.2-post-qr-pre-final-20260724-220658` verifies 1,841 files and preserves
+  the newly accepted login state before the final log-only restart.
+- Local and public live/ready responses passed with identical migration and
+  runtime state. Local and public `/` and `/login` HTML were byte-identical and
+  referenced the new entry assets. Every current-generation asset (32/32) and
+  the extension ZIP matched disk, local HTTP, and public HTTP byte-for-byte.
+  OpenAPI contained 186 paths and 224 methods; all 12 QR, official-session,
+  password, and compatibility login routes matched their expected methods. No
+  public route or schema migration was added.
+- SQLite integrity remained `ok`. Before the user-operated local-Chrome QR
+  acceptance, account/user/item/order counts and all three local keys plus 49
+  uploads matched the pre-deploy snapshot. The live QR created one new account
+  row, produced no duplicate stable identity, promoted one canonical persistent
+  profile, left no temporary or backup profile directory, installed one
+  listener, reached a connected WebSocket, and closed its Chrome process.
+- Browser acceptance covered 1440x900 and 390x844 production viewports plus
+  isolated 360/390/430-pixel mobile checks. The account modal opened without a
+  request, both QR entries remained visible with at least 44-pixel controls,
+  the modal's full scroll range was reachable, and document width never exceeded
+  viewport width. Web QR completed a real generation and repeated polling
+  without Chrome; closing the modal stopped polling and left TTL cleanup to the
+  service. Local Chrome QR completed with user scanning, real platform identity
+  resolution, one persistence/listener handoff, and automatic window cleanup.
+- A pre-final 31-sample observation over 15 minutes had zero failures: local and
+  public readiness stayed healthy, PID and one-listener count were stable,
+  migration stayed `2026072301`, and no application Chrome process reappeared.
+  The final log-redacted process completed the same 31-sample/15-minute gate
+  with zero health-sample failures. Its fresh log contained two error-level
+  heartbeat-send timeouts during one WebSocket keepalive interruption. The
+  listener then exited the stale socket, entered its normal reconnect path,
+  re-established the connection in about 12 seconds, completed Token probing
+  and registration, and resumed successful heartbeat responses. The same log
+  had no traceback, raw account create/update identity, long numeric identity
+  candidate, Cookie, Token, password, bearer value, QR content, or verification
+  URL.
+
+Acceptance boundary: unit/UI tests, isolated SQLite, CI, and candidate builds
+are automated or mocked evidence. Web QR generation/polling, the local Chrome
+QR scan, real identity/Profile persistence, WebSocket listener handoff, public
+asset equality, and both production observation windows are live evidence. No
+real password, Cookie, Token, account identifier, key, verification URL, database
+content, or browser profile is recorded in this document.
+
 ## v1.8.0 Production Release On 2026-07-23
 
 The audited application payload was merged through PRs `#30` and `#31` and
