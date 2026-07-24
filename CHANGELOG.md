@@ -10,6 +10,7 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 - Log matched FastAPI route templates after request dispatch and disable the raw Uvicorn access log, so stable account identities in dynamic API paths are not written to runtime logs.
 - Treat expected WebSocket connection closures as retryable warnings without tracebacks while retaining a redacted error summary for unexpected connection failures.
+- Keep listeners in passive wait while an account is in `manual_reauth_required`, preventing expired non-password sessions from spinning on WebSocket and message-Token initialization.
 
 ### Security
 

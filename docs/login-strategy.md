@@ -61,7 +61,7 @@
 - 人工验证或官方登录超时。
 - 官方登录页面结构失配。
 
-已进入 `manual_reauth_required` 后，定时刷新、运行时过期处理和手动刷新均不会再次启动浏览器。`profile_in_use`、临时浏览器错误、平台探测临时失败和用户取消仍保持可重试。成功完成对应登录后清除过期状态。
+已进入 `manual_reauth_required` 后，账号监听进入被动等待，不再建立 WebSocket、探测消息 Token 或启动浏览器；定时刷新、运行时过期处理和手动刷新也不会重复执行。`profile_in_use`、临时浏览器错误、平台探测临时失败和用户取消仍保持可重试。成功完成对应登录后清除过期状态并恢复监听。
 
 `reauth_action` 可能为 `qr_login`、`sms_login`、`password_login`、`chrome_extension_import`、`manual_cookie` 或 `choose_login`。账号页按 `account_id + last_expired_at` 记录一次性提醒，同一次过期不重复弹窗；账号卡持续显示对应入口。
 

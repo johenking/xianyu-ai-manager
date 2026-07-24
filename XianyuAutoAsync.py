@@ -7070,6 +7070,7 @@ class XianyuLive:
                         "action_required",
                         "refreshing",
                         "verification_required",
+                        "manual_reauth_required",
                     }:
                         self._set_connection_state(
                             ConnectionState.DISCONNECTED,
