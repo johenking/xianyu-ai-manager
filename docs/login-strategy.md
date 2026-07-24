@@ -25,9 +25,9 @@
 
 迁移 `2026072301` 为 `cookies` 增加：
 
-- `login_method`: 最近一次成功登录的来源。
-- `last_login_at`: 最近一次该来源成功写入的时间。
-- `last_validated_at`: 最近一次平台会话验证成功的时间。
+- `login_method`: 最后一次成功登录所用的来源。
+- `last_login_at`: 该来源成功写入的最新时间戳。
+- `last_validated_at`: 平台会话验证成功的最新时间戳。
 - `last_expired_at`: 当前登录态首次确认过期的时间；同一次过期不会反复改写。
 
 手填新 Cookie 必须包含 `unb` 和至少一个核心会话字段。`POST /cookies` 的账号身份和返回的 `account_id` 均来自 Cookie 中的真实 `unb`；旧客户端仍可发送 `id`，但服务端忽略其身份含义。同一后台用户再次提交相同 `unb` 时归并到原账号。

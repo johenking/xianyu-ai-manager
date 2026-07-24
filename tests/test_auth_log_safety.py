@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
 from loguru import logger
 
 import reply_server
@@ -12,6 +13,23 @@ from utils.qr_verification_browser import QRVerificationBrowser
 
 
 class AuthLogSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_request_logs_use_route_template_instead_of_account_identity(self):
+        stable_identity = "2219255254384"
+        output = io.StringIO()
+        sink_id = logger.add(output, level="INFO", format="{message}")
+        try:
+            with TestClient(reply_server.app) as client:
+                response = client.get(
+                    f"/api/accounts/{stable_identity}/session-status"
+                )
+        finally:
+            logger.remove(sink_id)
+
+        self.assertEqual(response.status_code, 401)
+        logged = output.getvalue()
+        self.assertNotIn(stable_identity, logged)
+        self.assertIn("/api/accounts/{cookie_id}/session-status", logged)
+
     def test_session_refresh_sql_logs_redact_stable_account_identity(self):
         stable_identity = "2219255254384"
         output = io.StringIO()

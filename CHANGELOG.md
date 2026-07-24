@@ -4,6 +4,17 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-07-24
+
+### Fixed
+
+- Log matched FastAPI route templates after request dispatch and disable the raw Uvicorn access log, so stable account identities in dynamic API paths are not written to runtime logs.
+- Treat expected WebSocket connection closures as retryable warnings without tracebacks while retaining a redacted error summary for unexpected connection failures.
+
+### Security
+
+- Sanitize WebSocket exception text before logging and add regression coverage for dynamic account routes, injected Cookie and verification-URL material, and raw access-log configuration.
+
 ## [1.8.0] - 2026-07-23
 
 ### Added
