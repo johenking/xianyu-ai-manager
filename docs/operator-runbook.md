@@ -169,7 +169,7 @@ Recommended order:
 
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
 2. Confirm `cookies.xianyu_unb` and `cookies.login_method` are present. Only `password` plus a valid username and encrypted password supports automatic renewal; that path tries `browser_data/user_<unb>` first.
-3. Keep the account listener running. In `action_required`, trigger `/session-refresh` exactly once; repeated Token or connection failures must not create a browser. In `manual_reauth_required`, use the returned `reauth_action` and do not keep calling refresh.
+3. Keep the account listener running. In `action_required`, trigger `/session-refresh` exactly once; repeated Token or connection failures must not create a browser. In `manual_reauth_required`, the listener must remain in passive wait without WebSocket or Token-probe retries; use the returned `reauth_action` and do not keep calling refresh.
 4. Wait for `verification_required` with `browser_active=true`, then use the account-page “open on this Mac” action and complete login in that same official browser session; background polling continues without a completion button.
 5. Complete any platform verification when required; the headed browser session waits for up to 15 minutes.
 6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off, is disabled for non-password sources, and should use conservative intervals such as 24 hours or longer.

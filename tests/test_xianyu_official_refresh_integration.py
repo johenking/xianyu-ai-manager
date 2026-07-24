@@ -111,6 +111,45 @@ class FailingOfficialRefreshService(FakeOfficialRefreshService):
 
 
 class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_reauth_state_waits_without_opening_websocket(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=expired"
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.base_url = "wss://example.invalid"
+        live.current_token = None
+        live.heartbeat_task = None
+        live.token_refresh_task = None
+        live.cleanup_task = None
+        live.cookie_refresh_task = None
+        live.background_tasks = set()
+        live.create_session = AsyncMock()
+        live._interruptible_sleep = AsyncMock(side_effect=asyncio.CancelledError)
+        live._create_websocket_connection = AsyncMock(
+            side_effect=asyncio.CancelledError
+        )
+        live._set_connection_state = unittest.mock.Mock()
+        live.close_session = AsyncMock()
+        live._unregister_instance = unittest.mock.Mock()
+        database = SimpleNamespace(
+            get_account_session_refresh=lambda _cookie_id: {
+                "state": "manual_reauth_required"
+            }
+        )
+
+        with (
+            patch(
+                "cookie_manager.manager",
+                SimpleNamespace(get_cookie_status=lambda _cookie_id: True),
+            ),
+            patch("XianyuAutoAsync.db_manager", database),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await live.main()
+
+        live._interruptible_sleep.assert_awaited_once_with(30)
+        live._create_websocket_connection.assert_not_awaited()
+
     def test_expected_websocket_disconnect_avoids_error_and_traceback_logs(self):
         output = io.StringIO()
         sink_id = logger.add(output, level="DEBUG", format="{level}|{message}")
