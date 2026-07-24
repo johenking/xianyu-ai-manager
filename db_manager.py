@@ -59,6 +59,14 @@ SKILL_MONITOR_DELIVERY_LEASE_SECONDS = 60
 SKILL_MONITOR_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
+def _account_log_reference(account_id: str) -> str:
+    value = str(account_id or "")
+    if value.startswith("account_") and len(value) == 18:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    return f"account_{digest}"
+
+
 class AccountIdentityMismatchError(ValueError):
     code = "account_identity_mismatch"
 
@@ -2597,7 +2605,10 @@ class DBManager:
                     sql = f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(insert_placeholders)})"
                     self._execute_sql(cursor, sql, tuple(insert_values))
                     self.conn.commit()
-                    logger.info(f"创建新账号 {cookie_id} 并保存信息成功: {insert_fields}")
+                    logger.info(
+                        f"创建新账号 {_account_log_reference(cookie_id)} "
+                        f"并保存信息成功: {insert_fields}"
+                    )
                     return True
                 else:
                     if user_id is not None and int(existing_row[0]) != int(user_id):
@@ -2681,7 +2692,10 @@ class DBManager:
                             (cookie_id,),
                         )
                     self.conn.commit()
-                    logger.info(f"更新账号 {cookie_id} 信息成功: {update_fields}")
+                    logger.info(
+                        f"更新账号 {_account_log_reference(cookie_id)} "
+                        f"信息成功: {update_fields}"
+                    )
                     return True
             except AccountIdentityMismatchError:
                 self.conn.rollback()

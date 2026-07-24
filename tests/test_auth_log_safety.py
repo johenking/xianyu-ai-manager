@@ -1,4 +1,5 @@
 import io
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -7,12 +8,43 @@ from fastapi.testclient import TestClient
 from loguru import logger
 
 import reply_server
+import db_manager as db_manager_module
 from db_manager import DBManager
 from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLoginService
 from utils.qr_verification_browser import QRVerificationBrowser
 
 
 class AuthLogSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_new_account_persistence_logs_only_a_digest_reference(self):
+        stable_identity = "2219255254384"
+        expected_reference = (
+            "account_"
+            + hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:10]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = DBManager(f"{temp_dir}/test.db")
+            try:
+                with patch.object(db_manager_module, "logger") as database_logger:
+                    saved = database.update_cookie_account_info(
+                        stable_identity,
+                        cookie_value=f"unb={stable_identity}; cookie2=synthetic-session",
+                        user_id=1,
+                        browser_user_agent="Synthetic Chrome",
+                        login_method="qr",
+                        login_validated=True,
+                    )
+            finally:
+                database.close()
+
+        self.assertTrue(saved)
+        logged = "\n".join(
+            str(call.args[0])
+            for call in database_logger.info.call_args_list
+            if call.args
+        )
+        self.assertNotIn(stable_identity, logged)
+        self.assertIn(expected_reference, logged)
+
     def test_request_logs_use_route_template_instead_of_account_identity(self):
         stable_identity = "2219255254384"
         output = io.StringIO()
