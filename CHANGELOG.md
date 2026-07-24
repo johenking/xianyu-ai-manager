@@ -4,6 +4,23 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-07-24
+
+### Added
+
+- Add an explicit QR chooser to account binding: recommended local headed Chrome through the unified official-login session, or the existing web QR flow for remote access. Opening the account modal no longer starts either flow.
+- Share one frontend polling flow for interactive official QR and SMS sessions, including preparing, user wait, verification, persistence, listener restart, all terminal states, browser display, cancellation, and account refresh.
+
+### Changed
+
+- On a definite H5 Token-expired response that also rotates `_m_h5_tk`, merge every response Cookie, recompute timestamp and signature, and retry once in the same HTTP client. Verification, missing-token, expired-identity, and ordinary transient responses remain single-attempt.
+- Keep account-specific headed Chrome profiles at `browser_data/user_<unb>`; QR success still resolves the real platform `unb` before one persistence and listener handoff.
+
+### Fixed
+
+- Best-effort clean only `.login_*`, `.window_*`, and `user_*.backup-*` directories older than six hours during official-login service initialization. Canonical, unknown, fresh, and non-directory entries remain untouched, and cleanup errors do not block login.
+- Stop the matching polling loop when a QR method is switched or the modal closes, cancel and close an active local Chrome session, and leave web QR expiry to its existing server TTL cleanup.
+
 ## [1.8.1] - 2026-07-24
 
 ### Fixed

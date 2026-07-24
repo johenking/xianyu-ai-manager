@@ -436,7 +436,7 @@ describe('AccountList session verification UI', () => {
     });
   });
 
-  it('keeps API QR as the default and offers a one-time local Chrome extension pairing', async () => {
+  it('opens the login chooser without starting either QR flow and still offers extension pairing', async () => {
     vi.mocked(createBrowserExtensionPairing).mockResolvedValue({
       pairing_id: 'pairing-id',
       pairing_code: 'ABCD1234',
@@ -455,7 +455,10 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    expect(await screen.findByAltText('闲鱼登录二维码')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '本机 Chrome 扫码' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '网页二维码' })).toBeInTheDocument();
+    expect(generateQRLogin).not.toHaveBeenCalled();
+    expect(createOfficialLoginSession).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: '高级方式' }));
     fireEvent.click(screen.getByRole('button', { name: '本机 Chrome' }));
@@ -474,11 +477,13 @@ describe('AccountList session verification UI', () => {
     });
   });
 
-  it('opens with an API QR and does not expose a browser action before verification', async () => {
+  it('starts the API QR only after the user chooses the web QR entry', async () => {
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    expect(generateQRLogin).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
 
     expect(await screen.findByAltText('闲鱼登录二维码')).toHaveAttribute(
       'src',
@@ -489,11 +494,117 @@ describe('AccountList session verification UI', () => {
     expect(screen.queryByRole('button', { name: '本机打开官方窗口' })).not.toBeInTheDocument();
   });
 
+  it('starts, shows, and cancels one official Chrome QR session', async () => {
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 扫码' }));
+
+    await waitFor(() => {
+      expect(createOfficialLoginSession).toHaveBeenCalledWith({
+        mode: 'qr',
+        show_browser: true,
+      });
+    });
+    expect(generateQRLogin).not.toHaveBeenCalled();
+    expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新显示 Chrome 窗口' }));
+    await waitFor(() => expect(showOfficialLoginBrowser).toHaveBeenCalledWith('official-session'));
+
+    fireEvent.click(screen.getByRole('button', { name: '取消本机扫码' }));
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
+  });
+
+  it('cancels an active official Chrome QR session when the add modal closes', async () => {
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 扫码' }));
+    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭添加账号' }));
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
+  });
+
+  it('cancels a Chrome QR session whose create response arrives after the modal closes', async () => {
+    let resolveSession!: (value: Awaited<ReturnType<typeof createOfficialLoginSession>>) => void;
+    vi.mocked(createOfficialLoginSession).mockImplementation(() => new Promise((resolve) => {
+      resolveSession = resolve;
+    }));
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 扫码' }));
+    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '关闭添加账号' }));
+
+    resolveSession({
+      success: true,
+      session_id: 'late-official-session',
+      mode: 'qr',
+      state: 'waiting_user',
+      message: '迟到的扫码会话',
+      error_code: '',
+    });
+
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('late-official-session'));
+    expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument();
+    expect(getOfficialLoginSession).not.toHaveBeenCalled();
+  });
+
+  it('cancels the Chrome QR session before switching to another login method', async () => {
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 扫码' }));
+    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
+
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
+    expect(await screen.findByText('支持自动续期')).toBeInTheDocument();
+  });
+
+  it('stops Chrome QR polling and refreshes accounts after success', async () => {
+    vi.mocked(getOfficialLoginSession).mockResolvedValue({
+      success: true,
+      session_id: 'official-session',
+      mode: 'qr',
+      state: 'success',
+      message: '官方 Chrome 扫码成功',
+      error_code: '',
+      account_id: 'account-1',
+      is_new_account: false,
+    });
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    const initialAccountLoads = vi.mocked(getAccountDetails).mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 扫码' }));
+
+    await waitFor(() => expect(getOfficialLoginSession).toHaveBeenCalledTimes(1), {
+      timeout: 3500,
+    });
+    await waitFor(() => expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument(), {
+      timeout: 2500,
+    });
+    expect(getOfficialLoginSession).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getAccountDetails).mock.calls.length).toBeGreaterThan(initialAccountLoads);
+    expect(cancelOfficialLoginSession).not.toHaveBeenCalled();
+  });
+
   it('does not create or cancel an official browser session for ordinary QR', async () => {
     const view = render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByAltText('闲鱼登录二维码');
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
 
@@ -517,6 +628,7 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByText('二维码接口暂时不可用');
     fireEvent.click(screen.getByRole('button', { name: '重试' }));
 
@@ -542,6 +654,7 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByText('二维码已过期');
     fireEvent.click(screen.getByRole('button', { name: '重新生成二维码' }));
 
@@ -564,6 +677,7 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     expect(await screen.findByAltText('闲鱼安全验证页面', {}, { timeout: 2500 })).toHaveAttribute(
       'src',
       '/static/uploads/images/verification.png',
@@ -585,6 +699,7 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByRole('heading', { name: '添加账号' });
 
     await waitFor(() => expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument(), {
@@ -595,12 +710,12 @@ describe('AccountList session verification UI', () => {
   });
 
   it.each([
-    ['qr_login', '重新扫码', 'alt', '闲鱼登录二维码'],
+    ['qr_login', '重新扫码', 'button', '本机 Chrome 扫码'],
     ['sms_login', '验证码登录', 'text', '在闲鱼官方窗口完成验证码登录'],
     ['password_login', '账号密码登录', 'text', '支持自动续期'],
     ['chrome_extension_import', '重新导入', 'text', '从日常 Chrome 主动导入'],
     ['manual_cookie', '重新填写', 'placeholder', '粘贴从浏览器复制的 Cookie'],
-    ['choose_login', '重新登录', 'alt', '闲鱼登录二维码'],
+    ['choose_login', '重新登录', 'button', '本机 Chrome 扫码'],
   ] as const)(
     'routes the %s reminder CTA to its matching login entry',
     async (reauthAction, buttonName, queryKind, expectedContent) => {
@@ -633,8 +748,8 @@ describe('AccountList session verification UI', () => {
       const reminder = await screen.findByRole('dialog', { name: '账号登录已过期' });
       fireEvent.click(within(reminder).getByRole('button', { name: buttonName }));
 
-      const target = queryKind === 'alt'
-        ? await screen.findByAltText(expectedContent)
+      const target = queryKind === 'button'
+          ? await screen.findByRole('button', { name: expectedContent })
         : queryKind === 'placeholder'
           ? await screen.findByPlaceholderText(expectedContent)
           : await screen.findByText(expectedContent);

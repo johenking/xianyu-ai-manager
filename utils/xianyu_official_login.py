@@ -182,6 +182,7 @@ class XianyuOfficialLoginService:
 
     _profile_locks_guard = threading.Lock()
     _profile_locks: dict[str, threading.Lock] = {}
+    _STALE_PROFILE_MAX_AGE_SECONDS = 6 * 3600.0
 
     def __init__(
         self,
@@ -205,6 +206,48 @@ class XianyuOfficialLoginService:
         self.poll_interval = poll_interval
         self.probe_interval = max(self.poll_interval, float(probe_interval))
         self.session_validator = session_validator
+        self._cleanup_stale_profiles()
+
+    @staticmethod
+    def _is_stale_profile_candidate(name: str) -> bool:
+        return (
+            name.startswith((".login_", ".window_"))
+            or (name.startswith("user_") and ".backup-" in name)
+        )
+
+    def _cleanup_stale_profiles(self, *, now: Optional[float] = None) -> None:
+        """Best-effort removal of aged temporary profile directories only."""
+        current_time = time.time() if now is None else float(now)
+        try:
+            entries = list(self.profile_root.iterdir())
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "扫描浏览器档案目录失败，跳过残骸清理: {}",
+                type(exc).__name__,
+            )
+            return
+
+        removed = 0
+        for entry in entries:
+            try:
+                if (
+                    not entry.is_dir()
+                    or not self._is_stale_profile_candidate(entry.name)
+                    or current_time - entry.stat().st_mtime
+                    < self._STALE_PROFILE_MAX_AGE_SECONDS
+                ):
+                    continue
+                shutil.rmtree(entry)
+                removed += 1
+            except Exception as exc:
+                logger.warning(
+                    "清理残留浏览器档案目录失败: {}",
+                    type(exc).__name__,
+                )
+        if removed:
+            logger.info("已清理 {} 个超龄临时浏览器档案目录", removed)
 
     @staticmethod
     def _default_playwright_factory() -> Any:
