@@ -19,7 +19,7 @@
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
-    "recharts": "^3.6.0"
+    "recharts": "^3.9.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
