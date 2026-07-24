@@ -124,7 +124,7 @@ describe('AuthPortal', () => {
       captcha_code: 'AB12',
     }));
     expect(createAuthCaptcha).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('图形验证已通过，邮件已发送')).toBeInTheDocument();
+    expect(await screen.findByText('图形验证已通过，邮件已发送')).toBeInTheDocument();
     expect(screen.queryByAltText('图形验证码')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /秒后重试/ })).toBeDisabled();
 
