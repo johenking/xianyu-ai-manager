@@ -6,11 +6,11 @@ The dual-QR login release was merged through PR `#35` at
 `a860834a8d73694b7f6c383b7e6b27f96e3c9abb`. Live QR acceptance then exposed
 one raw stable account identifier in an early database persistence log; PR
 `#36` moved that redaction to the log source. The final application commit is
-`29f523659c091526bd393bc3b797dce7fb4570ea`. This document update is docs-only;
-after it merges, production can fast-forward without another restart. Release
-closure will place the annotated `v1.8.2` tag on this final evidence
-merge after production fast-forwards to it; the loaded application payload
-remains byte-equivalent to `29f5236`.
+`29f523659c091526bd393bc3b797dce7fb4570ea`. The release-evidence merge is
+`39eac9fbd129b700f0673cabd63cbc2850994070`; production fast-forwarded to it
+without restarting the loaded application, and annotated tag `v1.8.2` resolves
+to that merge. Any later docs-only closeout commit leaves the loaded application
+payload and static assets byte-equivalent to `29f5236`.
 
 GitHub and clean-worktree gates:
 
