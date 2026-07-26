@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 import base64
@@ -38,6 +39,46 @@ from utils.xianyu_session_probe import (
 
 AUTO_DELIVERY_SOURCE_PAID_NOTICE = "paid_notice"
 AUTO_DELIVERY_SOURCE_BARGAIN_FREESHIPPING = "bargain_freeshipping"
+
+
+def _upsert_realtime_customer_profile(
+    database,
+    cookie_id,
+    sender_user_id,
+    sender_nickname,
+    observed_at,
+) -> bool:
+    """只用实时消息里的 sender 身份维护客户档案，不接触收货字段。"""
+    account_id = str(cookie_id or '').strip()
+    buyer_id = str(sender_user_id or '').strip()
+    nickname = str(sender_nickname or '').strip()
+    try:
+        moment = float(observed_at)
+    except (TypeError, ValueError):
+        return False
+    if (
+        not account_id
+        or not buyer_id
+        or buyer_id.lower() in {'unknown', 'unknown_user', 'none', 'null'}
+        or not nickname
+        or nickname in {'未知用户', '未知买家'}
+        or not math.isfinite(moment)
+        or moment <= 0
+    ):
+        return False
+    try:
+        return bool(database.upsert_customer_observation(
+            cookie_id=account_id,
+            buyer_id=buyer_id,
+            display_name=nickname,
+            avatar_url='',
+            source='realtime_message',
+            observed_at=moment,
+        ))
+    except Exception as exc:
+        logger.warning(f"实时客户身份记录失败: {type(exc).__name__}")
+        return False
+
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -6848,6 +6889,14 @@ class XianyuLive:
 
                 return
             else:
+                observed_at = create_time / 1000 if create_time > 0 else time.time()
+                _upsert_realtime_customer_profile(
+                    database=db_manager,
+                    cookie_id=self.cookie_id,
+                    sender_user_id=send_user_id,
+                    sender_nickname=send_user_name,
+                    observed_at=observed_at,
+                )
                 logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）

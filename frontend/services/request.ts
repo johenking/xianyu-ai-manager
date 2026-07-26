@@ -71,7 +71,8 @@ const request = async <T>(
   method: string,
   path: string,
   body?: unknown,
-  params?: QueryParams
+  params?: QueryParams,
+  signal?: AbortSignal,
 ): Promise<T> => {
   const token = localStorage.getItem('auth_token');
   const isFormData = body instanceof FormData;
@@ -91,6 +92,7 @@ const request = async <T>(
     method,
     headers,
     body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
+    signal,
   });
 
   const contentType = response.headers.get('content-type') || '';
@@ -110,8 +112,8 @@ const request = async <T>(
   return data as T;
 };
 
-export const get = <T>(path: string, params?: QueryParams) =>
-  request<T>('GET', path, undefined, params);
+export const get = <T>(path: string, params?: QueryParams, signal?: AbortSignal) =>
+  request<T>('GET', path, undefined, params, signal);
 
 export const post = <T>(path: string, body?: unknown) =>
   request<T>('POST', path, body);

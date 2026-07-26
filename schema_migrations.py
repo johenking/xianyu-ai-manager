@@ -775,11 +775,9 @@ def _order_identity_snapshots_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     # 订单可信化：成交时身份快照列。快照语义为“只填空值 + 来源等级棘轮”，
     # 商品后续改图/改标题/下架不影响已成交订单的展示；写入守卫在 db_manager。
     # 本迁移只做 DDL，历史数据解析与回填一律走 backfill_order_snapshots.py。
-    # 注意：若某环境曾应用过旧版 WIP 迁移 "2026072601 order_item_image_v1"
-    # （item_image 单列版本），账本里已有 2026072601 会让本迁移被跳过；
-    # 补救方式是 DELETE FROM schema_migrations WHERE version='2026072601' 后重启，
-    # 迁移体全幂等，重放无害。开发库可能已被早期即席 ALTER 提前加过 item_image，
-    # _add_column 幂等兼容；空库（无 orders 表）直接跳过。
+    # 开发库可能已被早期即席 ALTER 提前加过 item_image，_add_column 幂等兼容；
+    # 空库（无 orders 表）直接跳过。旧 WIP 已占用 2026072601 的环境由
+    # 2026072603 修复迁移收敛，历史 schema_migrations 账本保持不变。
     orders_exists = cursor.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
     ).fetchone()
@@ -847,6 +845,16 @@ def _business_observability_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
         )
 
 
+def _order_identity_schema_repair_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
+    """收敛曾把 2026072601 仅用于 item_image 的旧 WIP 数据库。
+
+    两个被复用的迁移体均为幂等 DDL；新版本只补缺失列、customer_profiles 与索引，
+    不删除、不改写任何历史迁移账本记录，也不写订单业务数据。
+    """
+    _order_identity_snapshots_v1(cursor, db_path)
+    _business_observability_v1(cursor, db_path)
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -888,6 +896,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072602",
         "business_observability_v1",
         _business_observability_v1,
+    ),
+    Migration(
+        "2026072603",
+        "order_identity_schema_repair_v1",
+        _order_identity_schema_repair_v1,
     ),
 )
 

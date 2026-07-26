@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601/2026072602）双路径测试。
+"""订单身份快照迁移（2026072601/2026072602/2026072603）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -100,7 +100,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
     def test_applies_only_snapshot_migrations_and_is_idempotent(self):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
-        self.assertEqual(runner.run(), ["2026072601", "2026072602"])
+        self.assertEqual(runner.run(), ["2026072601", "2026072602", "2026072603"])
 
         columns = order_columns(connection)
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(columns))
@@ -124,8 +124,43 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            13,
+            14,
         )
+        connection.close()
+
+    def test_repair_migration_converges_old_2026072601_item_image_ledger(self):
+        """旧 WIP 已占用 2026072601 时，保留账本并由新版本补齐完整 schema。"""
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("ALTER TABLE orders ADD COLUMN item_image TEXT DEFAULT ''")
+        connection.execute(
+            "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+            ("2026072601", "order_item_image_v1"),
+        )
+        connection.commit()
+
+        runner = MigrationRunner(connection, str(self.db_path))
+        self.assertEqual(runner.run(), ["2026072602", "2026072603"])
+        self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
+        self.assertEqual(
+            connection.execute(
+                "SELECT name FROM schema_migrations WHERE version = '2026072601'"
+            ).fetchone()[0],
+            "order_item_image_v1",
+            "修复迁移不得删除或重写历史账本",
+        )
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        }
+        self.assertIn("customer_profiles", tables)
+        self.assertIn("idx_orders_cookie_buyer", indexes)
+        self.assertIn("idx_orders_cookie_ordered_at", indexes)
+        self.assertIn("idx_customer_profiles_last_observed", indexes)
+        self.assertEqual(runner.run(), [])
         connection.close()
 
     def test_backup_contains_database_and_keys(self):

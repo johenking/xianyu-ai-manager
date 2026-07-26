@@ -10,32 +10,55 @@ import type {
 } from '../../types';
 
 // Orders
-export const getOrders = async (
-  cookieId?: string,
-  status?: string,
-  page: number = 1,
-  pageSize: number = 20
-): Promise<PaginatedResponse<Order>> => {
-  const params: any = { page, page_size: pageSize };
-  if (cookieId) params.cookie_id = cookieId;
-  if (status && status !== 'all') params.status = status;
+export interface OrderListQuery {
+  cookieId?: string;
+  status?: string;
+  search?: string;
+  startDate?: string;
+  endDate?: string;
+  page?: number;
+  pageSize?: number;
+}
 
-  const res = await get<any>('/api/orders', params);
+export const getOrders = async (
+  query: OrderListQuery = {},
+  signal?: AbortSignal,
+): Promise<PaginatedResponse<Order>> => {
+  const page = query.page ?? 1;
+  const pageSize = query.pageSize ?? 20;
+  const params: Record<string, string | number | undefined> = {
+    page,
+    page_size: pageSize,
+    cookie_id: query.cookieId || undefined,
+    status: query.status && query.status !== 'all' ? query.status : undefined,
+    search: query.search?.trim() || undefined,
+    start_date: query.startDate || undefined,
+    end_date: query.endDate || undefined,
+  };
+
+  const res = await get<any>('/api/orders', params, signal);
 
   // Handle backend response variations
   const orders = res.orders || res.data || [];
   return {
     success: true,
     data: orders,
-    total: res.total || orders.length,
+    total: res.total ?? orders.length,
     page: res.page || page,
     page_size: res.page_size || pageSize,
-    total_pages: res.total_pages || 1
+    total_pages: res.total_pages ?? 1
   };
 };
 
-export const getOrderDetail = async (orderId: string): Promise<{ success: boolean; data?: Order }> => {
-  const result = await get<{ order?: Order; data?: Order }>(`/api/orders/${orderId}`);
+export const getOrderDetail = async (
+  orderId: string,
+  signal?: AbortSignal,
+): Promise<{ success: boolean; data?: Order }> => {
+  const result = await get<{ order?: Order; data?: Order }>(
+    `/api/orders/${orderId}`,
+    undefined,
+    signal,
+  );
   return {
     success: true,
     data: result.order || result.data
@@ -80,17 +103,9 @@ export const manualShipOrder = async (orderIds: string[], shipMode: 'status_only
     });
 }
 
+// 保留既有 Excel 上传入口；JSON 数组调用仍用于既有程序化导入方。
 export const importOrders = async (data: Partial<Order>[] | FormData): Promise<any> => {
-  const isFormData = data instanceof FormData;
-  const response = await fetch('/api/orders/import', {
-    method: 'POST',
-    headers: {
-      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
-      'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
-    },
-    body: isFormData ? data : JSON.stringify(data)
-  });
-  return response.json();
+  return post('/api/orders/import', data);
 }
 
 // Stats
