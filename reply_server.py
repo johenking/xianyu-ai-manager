@@ -5175,9 +5175,10 @@ async def search_items(
 async def check_valid_cookies(
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
 ):
-    """检查是否有有效的cookies账户（必须是启用状态）"""
+    """检查当前用户是否有有效的cookies账户（必须是启用状态）"""
     try:
-        if cookie_manager.manager is None:
+        # 匿名访问或管理器未就绪：一律返回 0，不泄露全站账号计数
+        if current_user is None or cookie_manager.manager is None:
             return {
                 "success": True,
                 "hasValidCookies": False,
@@ -5186,10 +5187,8 @@ async def check_valid_cookies(
                 "totalCount": 0
             }
 
-        from db_manager import db_manager
-
-        # 获取所有cookies
-        all_cookies = db_manager.get_all_cookies()
+        # 仅统计当前用户名下的账号，防止跨租户计数泄露
+        all_cookies = db_manager.get_all_cookies(current_user['user_id'])
 
         # 检查启用状态和有效性
         valid_cookies = []
