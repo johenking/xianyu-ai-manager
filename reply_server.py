@@ -8717,12 +8717,20 @@ async def clear_logs(_: None = Depends(require_auth)):
 # ==================== 商品管理API ====================
 
 @content_router.post("/items/get-all-from-account")
-async def get_all_items_from_account(request: dict, _: None = Depends(require_auth)):
+async def get_all_items_from_account(
+    request: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """从指定账号获取所有商品信息"""
     try:
         cookie_id = request.get('cookie_id')
         if not cookie_id:
             return {"success": False, "message": "缺少cookie_id参数"}
+
+        # 校验账号归属：禁止用他人账号的 Cookie 向闲鱼发起请求
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权操作此账号")
 
         # 获取指定账号的cookie信息
         cookie_info = db_manager.get_cookie_by_id(cookie_id)
@@ -8779,6 +8787,8 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
                 "failed_count": failed_count,
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取账号商品信息异常: {str(e)}")
         return {"success": False, "message": f"获取商品信息异常: {str(e)}"}
