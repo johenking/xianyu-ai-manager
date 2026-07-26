@@ -234,6 +234,73 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(row["buyer_avatar_url"], "https://a/catalog.jpg")
         self.assertEqual(row["buyer_avatar_source"], "catalog")
 
+    def test_list_exposes_independent_order_buyer_field_sources(self):
+        self.db.apply_order_sync_update(
+            order_id="order-1",
+            cookie_id="acct-one",
+            incoming_status="pending_ship",
+            buyer_snapshot={
+                "buyer_nickname": "详情昵称",
+                "source": "order_detail",
+            },
+        )
+        self.db.apply_order_sync_update(
+            order_id="order-1",
+            cookie_id="acct-one",
+            incoming_status="pending_ship",
+            buyer_snapshot={
+                "buyer_avatar_url": "https://a/realtime.jpg",
+                "source": "realtime_message",
+            },
+        )
+
+        response = self.client.get(
+            "/api/orders", headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(response.status_code, 200)
+        row = response.json()["data"][0]
+        self.assertEqual(row["buyer_display_name"], "详情昵称")
+        self.assertEqual(row["buyer_display_name_source"], "order_detail")
+        self.assertEqual(row["buyer_avatar_url"], "https://a/realtime.jpg")
+        self.assertEqual(row["buyer_avatar_source"], "realtime_message")
+
+        self.db.apply_order_sync_update(
+            order_id="order-1",
+            cookie_id="acct-one",
+            incoming_status="pending_ship",
+            buyer_snapshot={
+                "buyer_avatar_url": "https://a/detail.jpg",
+                "source": "order_detail",
+            },
+        )
+        upgraded = self.client.get(
+            "/api/orders", headers=self.headers_for(self.user_one),
+        ).json()["data"][0]
+        self.assertEqual(upgraded["buyer_avatar_url"], "https://a/detail.jpg")
+        self.assertEqual(upgraded["buyer_avatar_source"], "order_detail")
+
+    def test_import_cannot_take_over_existing_order_from_another_cookie(self):
+        before = self.db.get_order_by_id("order-1")
+        response = self.client.post(
+            "/api/orders/import",
+            headers=self.headers_for(self.user_two),
+            json=[{
+                "order_id": "order-1",
+                "cookie_id": "acct-two",
+                "item_id": "item-takeover",
+                "buyer_id": "buyer-takeover",
+                "amount": "999.00",
+                "order_status": "completed",
+                "receiver_name": "越权收件人",
+            }],
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["success_count"], 0)
+        self.assertEqual(payload["failed_count"], 1)
+        self.assertFalse(payload["results"][0]["success"])
+        self.assertEqual(self.db.get_order_by_id("order-1"), before)
+
     def test_detail_returns_receiver_fields_and_enforces_ownership(self):
         headers = self.headers_for(self.user_one)
         detail = self.client.get("/api/orders/order-1", headers=headers)

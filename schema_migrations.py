@@ -915,6 +915,47 @@ def _customer_profile_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) ->
     )
 
 
+def _order_buyer_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """拆分订单买家昵称/头像来源，并修复旧 WIP 历史图片来源。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    _add_column(
+        cursor,
+        "orders",
+        "buyer_nickname_source TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column(
+        cursor,
+        "orders",
+        "buyer_avatar_source TEXT NOT NULL DEFAULT ''",
+    )
+    cursor.execute(
+        "UPDATE orders SET buyer_nickname_source = buyer_snapshot_source"
+        " WHERE buyer_nickname != '' AND buyer_nickname_source = ''"
+    )
+    cursor.execute(
+        "UPDATE orders SET buyer_avatar_source = buyer_snapshot_source"
+        " WHERE buyer_avatar_url != '' AND buyer_avatar_source = ''"
+    )
+
+    # 早期 WIP 把 2026072601 仅用于 item_image；这类非空图片是历史目录
+    # 回填，而不是由当前 item_info URL 是否仍相等来决定来源。
+    old_image_wip = cursor.execute(
+        "SELECT 1 FROM schema_migrations"
+        " WHERE version = '2026072601' AND name = 'order_item_image_v1'"
+    ).fetchone()
+    if old_image_wip:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = 'catalog_backfill',"
+            " item_snapshot_source = CASE"
+            "   WHEN item_snapshot_source IN ('', 'history_unsaved', 'catalog_metadata')"
+            "   THEN 'catalog_backfill' ELSE item_snapshot_source END"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -971,6 +1012,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072605",
         "customer_profile_field_sources_v1",
         _customer_profile_field_sources_v1,
+    ),
+    Migration(
+        "2026072606",
+        "order_buyer_field_sources_v1",
+        _order_buyer_field_sources_v1,
     ),
 )
 

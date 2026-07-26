@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 
 from db_manager import DBManager
-from order_sync_service import OrderSyncCoordinator
+from order_sync_service import OrderSyncCoordinator, parse_amount_fen
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,6 +160,82 @@ class ApplySyncSnapshotRatchetTests(SnapshotWriteTestCase):
         self.apply(buyer_snapshot={"buyer_nickname": "买家A真名", "source": "order_detail"})
         self.assertEqual(self.order_row("order-1", "buyer_nickname")[0], "买家A真名")
 
+    def test_buyer_nickname_and_avatar_sources_ratchet_independently(self):
+        self.apply(buyer_snapshot={
+            "buyer_nickname": "详情昵称",
+            "source": "order_detail",
+        })
+        self.apply(buyer_snapshot={
+            "buyer_avatar_url": "https://a/realtime.jpg",
+            "source": "realtime_message",
+        })
+        self.assertEqual(
+            self.order_row(
+                "order-1",
+                "buyer_nickname",
+                "buyer_avatar_url",
+                "buyer_nickname_source",
+                "buyer_avatar_source",
+                "buyer_snapshot_source",
+            ),
+            (
+                "详情昵称",
+                "https://a/realtime.jpg",
+                "order_detail",
+                "realtime_message",
+                "order_detail",
+            ),
+        )
+
+        self.apply(buyer_snapshot={
+            "buyer_avatar_url": "https://a/detail.jpg",
+            "source": "order_detail",
+        })
+        self.assertEqual(
+            self.order_row(
+                "order-1",
+                "buyer_nickname",
+                "buyer_avatar_url",
+                "buyer_nickname_source",
+                "buyer_avatar_source",
+                "buyer_snapshot_source",
+            ),
+            (
+                "详情昵称",
+                "https://a/detail.jpg",
+                "order_detail",
+                "order_detail",
+                "order_detail",
+            ),
+        )
+
+    def test_catalog_backfill_image_can_be_upgraded_by_order_detail(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE orders SET item_image = ?, item_image_source = ?,"
+                " item_snapshot_source = ? WHERE order_id = ?",
+                (
+                    "https://img/historical.jpg",
+                    "catalog_backfill",
+                    "catalog_backfill",
+                    "order-1",
+                ),
+            )
+            self.db.conn.commit()
+        self.apply(item_snapshot={
+            "item_image": "https://img/detail.jpg",
+            "source": "order_detail",
+        })
+        self.assertEqual(
+            self.order_row(
+                "order-1",
+                "item_image",
+                "item_image_source",
+                "item_snapshot_source",
+            ),
+            ("https://img/detail.jpg", "order_detail", "order_detail"),
+        )
+
     def test_legacy_item_image_kwarg_folds_into_snapshot(self):
         self.apply(status_source="order_list", item_image="https://img/legacy.jpg")
         row = self.order_row("order-1", "item_image", "item_snapshot_source")
@@ -188,6 +264,54 @@ class ApplySyncSnapshotRatchetTests(SnapshotWriteTestCase):
 
 
 class InsertOrUpdateGuardTests(SnapshotWriteTestCase):
+    def test_cross_cookie_update_is_rejected_without_mutating_owner_or_data(self):
+        self.assertTrue(self.db.insert_or_update_order(
+            order_id="order-cross",
+            item_id="item-original",
+            buyer_id="buyer-original",
+            amount="12.50",
+            order_status="pending_ship",
+            cookie_id="account-1",
+            receiver_name="原收件人",
+            item_image="https://img/original.jpg",
+        ))
+        before = self.order_row(
+            "order-cross",
+            "cookie_id",
+            "item_id",
+            "buyer_id",
+            "amount",
+            "order_status",
+            "receiver_name",
+            "item_image",
+            "version",
+        )
+
+        self.assertFalse(self.db.insert_or_update_order(
+            order_id="order-cross",
+            item_id="item-takeover",
+            buyer_id="buyer-takeover",
+            amount="999.00",
+            order_status="completed",
+            cookie_id="account-2",
+            receiver_name="越权收件人",
+            item_image="https://img/takeover.jpg",
+        ))
+        self.assertEqual(
+            self.order_row(
+                "order-cross",
+                "cookie_id",
+                "item_id",
+                "buyer_id",
+                "amount",
+                "order_status",
+                "receiver_name",
+                "item_image",
+                "version",
+            ),
+            before,
+        )
+
     def test_update_branch_never_clobbers_existing_item_image(self):
         self.db.insert_or_update_order(
             order_id="order-1", item_id="item-1", cookie_id="account-1",
@@ -343,6 +467,21 @@ class CustomerObservationTests(SnapshotWriteTestCase):
         remaining = self.db.get_customer_profiles(["account-1", "account-2"])
         self.assertNotIn(("account-1", "buyer-1"), remaining)
         self.assertIn(("account-2", "buyer-9"), remaining)
+
+
+class AmountParsingTests(unittest.TestCase):
+    def test_non_finite_amounts_are_rejected(self):
+        for value in (
+            "NaN",
+            "sNaN",
+            "Infinity",
+            "-Infinity",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(parse_amount_fen(value))
 
 
 class CoordinatorWiringTests(unittest.IsolatedAsyncioTestCase):

@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601..2026072605）双路径测试。
+"""订单身份快照迁移（2026072601..2026072606）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -30,6 +30,8 @@ SNAPSHOT_COLUMNS = {
     "buyer_nickname",
     "buyer_avatar_url",
     "buyer_snapshot_source",
+    "buyer_nickname_source",
+    "buyer_avatar_source",
     "buyer_snapshot_at",
 }
 
@@ -104,7 +106,14 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            ["2026072601", "2026072602", "2026072603", "2026072604", "2026072605"],
+            [
+                "2026072601",
+                "2026072602",
+                "2026072603",
+                "2026072604",
+                "2026072605",
+                "2026072606",
+            ],
         )
 
         columns = order_columns(connection)
@@ -129,7 +138,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            16,
+            17,
         )
         connection.close()
 
@@ -141,12 +150,16 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
             ("2026072601", "order_item_image_v1"),
         )
+        connection.execute(
+            "UPDATE orders SET item_image = ? WHERE order_id = ?",
+            ("https://img.example.test/historical-only.jpg", "order-1"),
+        )
         connection.commit()
 
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            ["2026072602", "2026072603", "2026072604", "2026072605"],
+            ["2026072602", "2026072603", "2026072604", "2026072605", "2026072606"],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
         self.assertEqual(
@@ -168,6 +181,16 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertIn("idx_orders_cookie_buyer", indexes)
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
         self.assertIn("idx_customer_profiles_last_observed", indexes)
+        self.assertEqual(
+            connection.execute(
+                "SELECT item_image, item_image_source FROM orders WHERE order_id = 'order-1'"
+            ).fetchone(),
+            (
+                "https://img.example.test/historical-only.jpg",
+                "catalog_backfill",
+            ),
+            "旧 WIP 图片的来源由历史账本决定，不依赖当前目录 URL 是否相同",
+        )
         self.assertEqual(runner.run(), [])
         connection.close()
 
@@ -176,7 +199,11 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         MigrationRunner(
             connection,
             str(self.db_path),
-            migrations=MIGRATIONS[:-2],
+            migrations=[
+                migration
+                for migration in MIGRATIONS
+                if migration.version < "2026072604"
+            ],
             backup_enabled=False,
         ).run()
         connection.execute(
@@ -190,7 +217,11 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             MigrationRunner(
                 connection,
                 str(self.db_path),
-                migrations=MIGRATIONS[:-1],
+                migrations=[
+                    migration
+                    for migration in MIGRATIONS
+                    if migration.version <= "2026072604"
+                ],
                 backup_enabled=False,
             ).run(),
             ["2026072604"],
@@ -207,7 +238,11 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         MigrationRunner(
             connection,
             str(self.db_path),
-            migrations=MIGRATIONS[:-1],
+            migrations=[
+                migration
+                for migration in MIGRATIONS
+                if migration.version < "2026072605"
+            ],
             backup_enabled=False,
         ).run()
         connection.executemany(
@@ -224,7 +259,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
 
         self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
-            ["2026072605"],
+            ["2026072605", "2026072606"],
         )
         columns = {
             row[1]
@@ -240,6 +275,51 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             [
                 ("buyer-both", "order_list", "order_list", "order_list"),
                 ("buyer-name", "realtime_message", "", "realtime_message"),
+            ],
+        )
+        self.assertEqual(
+            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            [],
+        )
+        connection.close()
+
+    def test_order_buyer_field_sources_backfill_only_nonempty_legacy_fields(self):
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[
+                migration
+                for migration in MIGRATIONS
+                if migration.version < "2026072606"
+            ],
+            backup_enabled=False,
+        ).run()
+        connection.executemany(
+            "UPDATE orders SET buyer_nickname = ?, buyer_avatar_url = ?,"
+            " buyer_snapshot_source = ? WHERE order_id = ?",
+            (
+                ("旧昵称", "https://avatar.example.test/both.jpg", "order_detail", "order-1"),
+                ("只有昵称", "", "realtime_message", "order-2"),
+                ("", "https://avatar.example.test/avatar.jpg", "order_list", "order-3"),
+            ),
+        )
+        connection.commit()
+
+        self.assertEqual(
+            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            ["2026072606"],
+        )
+        rows = connection.execute(
+            "SELECT order_id, buyer_nickname_source, buyer_avatar_source,"
+            " buyer_snapshot_source FROM orders ORDER BY order_id"
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [
+                ("order-1", "order_detail", "order_detail", "order_detail"),
+                ("order-2", "realtime_message", "", "realtime_message"),
+                ("order-3", "", "order_list", "order_list"),
             ],
         )
         self.assertEqual(

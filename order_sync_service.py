@@ -246,6 +246,8 @@ def parse_amount_fen(value: Any) -> Optional[int]:
         amount = Decimal(text)
     except InvalidOperation:
         return None
+    if not amount.is_finite():
+        return None
     if amount < 0 or amount > Decimal("10000000"):
         return None
     return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))

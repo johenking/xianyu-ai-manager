@@ -6767,10 +6767,23 @@ class DBManager:
                         return False
 
                 # 检查订单是否已存在（同时取快照现值，供写一次守卫判断）
-                cursor.execute("SELECT order_id, item_image FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute(
+                    "SELECT order_id, item_image, cookie_id FROM orders WHERE order_id = ?",
+                    (order_id,),
+                )
                 existing = cursor.fetchone()
 
                 if existing:
+                    existing_cookie_id = existing[2]
+                    if (
+                        cookie_id is not None
+                        and str(cookie_id) != str(existing_cookie_id)
+                    ):
+                        logger.warning(
+                            f"订单归属不匹配，拒绝更新: {order_id}"
+                        )
+                        return False
+
                     # 更新现有订单
                     update_fields = []
                     update_values = []
@@ -6796,9 +6809,6 @@ class DBManager:
                     if order_status is not None:
                         update_fields.append("order_status = ?")
                         update_values.append(order_status)
-                    if cookie_id is not None:
-                        update_fields.append("cookie_id = ?")
-                        update_values.append(cookie_id)
                     if is_bargain is not None:
                         update_fields.append("is_bargain = ?")
                         update_values.append(1 if is_bargain else 0)
@@ -6838,19 +6848,25 @@ class DBManager:
                         # 构建WHERE条件
                         if expected_version is not None:
                             # 使用乐观锁：只有version匹配时才更新
-                            where_clause = "order_id = ? AND version = ?"
-                            update_values.extend([order_id, expected_version])
+                            where_clause = "order_id = ? AND cookie_id IS ? AND version = ?"
+                            update_values.extend(
+                                [order_id, existing_cookie_id, expected_version]
+                            )
                         else:
-                            # 不使用乐观锁
-                            where_clause = "order_id = ?"
-                            update_values.append(order_id)
+                            # 归属也进入原子 UPDATE 条件；任何路径都不改写 cookie_id。
+                            where_clause = "order_id = ? AND cookie_id IS ?"
+                            update_values.extend([order_id, existing_cookie_id])
 
                         sql = f"UPDATE orders SET {', '.join(update_fields)} WHERE {where_clause}"
                         cursor.execute(sql, update_values)
 
-                        # 检查是否更新成功（乐观锁）
-                        if expected_version is not None and cursor.rowcount == 0:
-                            logger.warning(f"订单更新失败（版本冲突）: {order_id}, expected_version={expected_version}")
+                        # 版本或归属在 SELECT 后发生变化时，原子条件拒绝更新。
+                        if cursor.rowcount == 0:
+                            self.conn.rollback()
+                            logger.warning(
+                                f"订单更新失败（版本或归属冲突）: {order_id},"
+                                f" expected_version={expected_version}"
+                            )
                             return False
 
                         logger.info(f"更新订单信息: {order_id}")
@@ -6911,6 +6927,7 @@ class DBManager:
         'item_title', 'item_image', 'item_image_cache_key', 'item_snapshot_source',
         'item_title_source', 'item_image_source',
         'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source',
+        'buyer_nickname_source', 'buyer_avatar_source',
         'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
     )
 
@@ -6932,6 +6949,7 @@ class DBManager:
         update_fields: List[str] = []
         update_values: List[Any] = []
         changed = False
+        filled_empty = False
         image_overwritten = False
         for field in fields:
             value = str(incoming.get(field) or '').strip()
@@ -6939,7 +6957,7 @@ class DBManager:
                 continue
             current = str(existing.get(field) or '')
             if current == value:
-                if not old_source and incoming_source:
+                if incoming_source and new_rank > old_rank:
                     changed = True
                 continue
             if current and new_rank <= old_rank:
@@ -6947,10 +6965,14 @@ class DBManager:
             update_fields.append(f"{field} = ?")
             update_values.append(value)
             changed = True
+            filled_empty = not current
             if field == 'item_image' and current:
                 image_overwritten = True
         if changed:
-            if new_rank > old_rank:
+            if filled_empty and incoming_source and incoming_source != old_source:
+                update_fields.append(f"{source_column} = ?")
+                update_values.append(incoming_source)
+            elif new_rank > old_rank:
                 update_fields.append(f"{source_column} = ?")
                 update_values.append(incoming_source)
             elif not old_source and incoming_source:
@@ -7067,18 +7089,46 @@ class DBManager:
                         update_values.append(compatibility_source)
 
             if buyer_snapshot:
-                snap_fields, snap_values, snap_changed = self._ratchet_snapshot_group(
-                    existing,
-                    ('buyer_nickname', 'buyer_avatar_url'),
-                    buyer_snapshot,
-                    str(buyer_snapshot.get('source') or status_source or ''),
-                    'buyer_snapshot_source',
-                    'buyer_snapshot_at',
-                    observed_at,
-                )
-                update_fields.extend(snap_fields)
-                update_values.extend(snap_values)
-                details_changed = details_changed or snap_changed
+                from order_sync_service import snapshot_source_rank
+
+                changed_buyer_sources = []
+                for field, source_col in (
+                    ('buyer_nickname', 'buyer_nickname_source'),
+                    ('buyer_avatar_url', 'buyer_avatar_source'),
+                ):
+                    field_source = str(
+                        buyer_snapshot.get(f'{field}_source')
+                        or buyer_snapshot.get('source')
+                        or status_source
+                        or ''
+                    )
+                    snap_fields, snap_values, snap_changed = self._ratchet_snapshot_group(
+                        existing,
+                        (field,),
+                        buyer_snapshot,
+                        field_source,
+                        source_col,
+                        'buyer_snapshot_at',
+                        observed_at,
+                    )
+                    update_fields.extend(snap_fields)
+                    update_values.extend(snap_values)
+                    if snap_changed:
+                        changed_buyer_sources.append(field_source)
+                    details_changed = details_changed or snap_changed
+                if changed_buyer_sources:
+                    compatibility_source = max(
+                        [
+                            str(existing.get('buyer_snapshot_source') or ''),
+                            *changed_buyer_sources,
+                        ],
+                        key=snapshot_source_rank,
+                    )
+                    if compatibility_source != str(
+                        existing.get('buyer_snapshot_source') or ''
+                    ):
+                        update_fields.append('buyer_snapshot_source = ?')
+                        update_values.append(compatibility_source)
 
             if ordered_at is not None:
                 epoch, time_source = ordered_at
@@ -7256,6 +7306,7 @@ class DBManager:
         'o.item_title', 'o.item_image', 'o.item_snapshot_source',
         'o.item_title_source', 'o.item_image_source',
         'o.buyer_nickname', 'o.buyer_avatar_url', 'o.buyer_snapshot_source',
+        'o.buyer_nickname_source', 'o.buyer_avatar_source',
         'o.ordered_at_utc', 'o.ordered_at_source', 'o.paid_amount_fen',
         'ci.item_title AS catalog_title', 'ci.item_image AS catalog_image',
         'ci.item_price AS catalog_price',
@@ -7338,7 +7389,8 @@ class DBManager:
         'status_synced_at', 'last_sync_error',
         'item_title', 'item_image', 'item_image_cache_key',
         'item_snapshot_source', 'item_title_source', 'item_image_source', 'item_snapshot_at',
-        'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source', 'buyer_snapshot_at',
+        'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source',
+        'buyer_nickname_source', 'buyer_avatar_source', 'buyer_snapshot_at',
         'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
         'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
         'system_shipped',

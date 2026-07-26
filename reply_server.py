@@ -10104,13 +10104,19 @@ def _compose_order_display(order: Dict[str, Any], catalog_item: Dict[str, str],
     order['buyer_display_name'] = snapshot_nickname or profile_name
     order['buyer_avatar_url'] = snapshot_avatar or profile_avatar
     buyer_snapshot_source = str(order.get('buyer_snapshot_source') or '')
+    buyer_nickname_source = str(
+        order.get('buyer_nickname_source') or buyer_snapshot_source
+    )
+    buyer_avatar_source = str(
+        order.get('buyer_avatar_source') or buyer_snapshot_source
+    )
     order['buyer_display_name_source'] = (
-        buyer_snapshot_source if snapshot_nickname
+        buyer_nickname_source if snapshot_nickname
         else str((profile or {}).get('display_name_source') or '') if profile_name
         else ''
     )
     order['buyer_avatar_source'] = (
-        buyer_snapshot_source if snapshot_avatar
+        buyer_avatar_source if snapshot_avatar
         else str((profile or {}).get('avatar_source') or '') if profile_avatar
         else ''
     )
