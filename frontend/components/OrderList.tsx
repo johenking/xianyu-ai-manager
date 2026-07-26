@@ -84,6 +84,9 @@ const OrderList: React.FC = () => {
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [accountFilter, setAccountFilter] = useState('');
+  const [startDate, setStartDate] = useState(''); // 成交时间区间起（YYYY-MM-DD，含）
+  const [endDate, setEndDate] = useState('');       // 成交时间区间止（YYYY-MM-DD，含）
+  const [dateError, setDateError] = useState('');   // 前端日期区间校验错误
   const [filter, setFilter] = useState('all');
   const [searchText, setSearchText] = useState(''); // 输入框即时值
   const [debouncedSearch, setDebouncedSearch] = useState(''); // 防抖后的请求值
@@ -121,6 +124,22 @@ const OrderList: React.FC = () => {
     [items]
   );
 
+  // 账号 cookie_id → 展示名映射（备注优先），供多账号用户在列表行内识别订单归属
+  const accountNames = useMemo(
+    () => Object.fromEntries(
+      accounts.map((account) => [account.id, account.remark || account.note || account.id])
+    ),
+    [accounts]
+  );
+
+  // 仅多账号用户在行内显示账号标识（与筛选下拉一致）；单账号无歧义则不占用视觉空间
+  const accountLabelOf = (order: Order): string => {
+    if (accounts.length <= 1) return '';
+    const cookieId = String(order.cookie_id || '').trim();
+    if (!cookieId) return '';
+    return accountNames[cookieId] || cookieId;
+  };
+
   // 搜索防抖：输入停顿后才发起服务端搜索
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -131,6 +150,12 @@ const OrderList: React.FC = () => {
   }, [searchText]);
 
   const loadOrders = async () => {
+      // 前端拦截「开始晚于结束」，与后端 422 同语义，避免无谓请求
+      if (startDate && endDate && startDate > endDate) {
+          setDateError('开始日期不得晚于结束日期');
+          return;
+      }
+      setDateError('');
       const generation = ++requestGeneration.current;
       listAbortController.current?.abort();
       const controller = new AbortController();
@@ -141,6 +166,8 @@ const OrderList: React.FC = () => {
               cookieId: accountFilter || undefined,
               status: filter,
               search: debouncedSearch || undefined,
+              startDate: startDate || undefined,
+              endDate: endDate || undefined,
               page,
               pageSize: 20,
           }, controller.signal);
@@ -192,7 +219,7 @@ const OrderList: React.FC = () => {
 
   useEffect(() => {
     void loadOrders();
-  }, [filter, page, debouncedSearch, accountFilter]);
+  }, [filter, page, debouncedSearch, accountFilter, startDate, endDate]);
 
   useEffect(() => {
     return () => {
@@ -492,6 +519,46 @@ const OrderList: React.FC = () => {
                 ))}
               </select>
             )}
+            <div className="flex items-center gap-1.5 text-sm">
+              <input
+                type="date"
+                value={startDate}
+                max={endDate || undefined}
+                onChange={(e) => {
+                  setStartDate(e.target.value);
+                  setPage(1);
+                }}
+                className="ios-input px-3 py-2.5 rounded-xl bg-white border-none shadow-sm text-sm font-medium text-gray-700 min-h-11"
+                aria-label="成交开始日期"
+              />
+              <span className="text-gray-400">至</span>
+              <input
+                type="date"
+                value={endDate}
+                min={startDate || undefined}
+                onChange={(e) => {
+                  setEndDate(e.target.value);
+                  setPage(1);
+                }}
+                className="ios-input px-3 py-2.5 rounded-xl bg-white border-none shadow-sm text-sm font-medium text-gray-700 min-h-11"
+                aria-label="成交结束日期"
+              />
+              {(startDate || endDate) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStartDate('');
+                    setEndDate('');
+                    setDateError('');
+                    setPage(1);
+                  }}
+                  className="p-2 rounded-xl text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors min-h-11"
+                  aria-label="清除日期筛选"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
             <div className="relative w-full md:w-auto group">
                <Search className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-[#FFE815] transition-colors" />
                <input
@@ -504,6 +571,12 @@ const OrderList: React.FC = () => {
             </div>
           </div>
         </div>
+
+        {dateError && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-100 text-sm font-medium text-red-600">
+            {dateError}
+          </div>
+        )}
 
         {/* Mobile order list */}
         <div className="md:hidden divide-y divide-gray-100 min-h-[320px]">
@@ -524,6 +597,11 @@ const OrderList: React.FC = () => {
                     {getItemNameById(order.item_id, order.item_title)}
                   </div>
                   <div className="mt-1 text-xs text-gray-500 break-all">订单号：{order.order_id}</div>
+                  {accountLabelOf(order) && (
+                    <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-[11px] font-semibold text-gray-600">
+                      {accountLabelOf(order)}
+                    </div>
+                  )}
                 </div>
                 <StatusBadge status={order.status} />
               </div>
@@ -596,6 +674,11 @@ const OrderList: React.FC = () => {
                         </div>
                         <div className="text-xs text-gray-500 mt-1 font-medium">订单ID: {order.order_id}</div>
                         <div className="text-xs text-gray-400 mt-0.5">数量: {order.quantity} • {orderTimeLabel(order)}</div>
+                        {accountLabelOf(order) && (
+                          <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-[11px] font-semibold text-gray-600">
+                            {accountLabelOf(order)}
+                          </div>
+                        )}
                       </div>
                     </div>
                   </td>

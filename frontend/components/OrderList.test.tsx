@@ -3,7 +3,7 @@ import React from 'react';
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { deleteOrder, getOrderDetail, getOrders, syncOrders } from '../services/api';
+import { deleteOrder, getOrderDetail, getOrders, getAccountDetails, syncOrders } from '../services/api';
 import OrderList from './OrderList';
 import { clearOrderItemImageCache } from './ui/OrderItemImage';
 
@@ -346,5 +346,115 @@ describe('OrderList request races and media failures', () => {
     ) as HTMLImageElement;
     fireEvent.error(avatar);
     expect((await screen.findAllByLabelText('买家头像占位')).length).toBeGreaterThan(0);
+  });
+});
+
+describe('OrderList account attribution', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    clearOrderItemImageCache();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it('labels each order with its owning account when multiple accounts exist', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([
+      { id: 'account-1', remark: '主号小铺' },
+      { id: 'account-2', remark: '备用号' },
+    ] as any);
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+
+    render(<OrderList />);
+
+    // 桌面表格 + 移动卡片双 DOM 各渲染一次账号标识
+    expect((await screen.findAllByText('主号小铺')).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('falls back to the raw cookie id when the account has no remark', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([
+      { id: 'account-1' },
+      { id: 'account-2', remark: '备用号' },
+    ] as any);
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+
+    render(<OrderList />);
+
+    expect((await screen.findAllByText('account-1')).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('hides the account label for single-account users to avoid noise', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([
+      { id: 'account-1', remark: '唯一号' },
+    ] as any);
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+
+    render(<OrderList />);
+
+    await screen.findByText('已退款');
+    expect(screen.queryByText('唯一号')).toBeNull();
+  });
+});
+
+describe('OrderList date range filter', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    clearOrderItemImageCache();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it('passes the selected date range to the backend query', async () => {
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    render(<OrderList />);
+    await screen.findByText('已退款');
+
+    fireEvent.change(screen.getByLabelText('成交开始日期'), { target: { value: '2026-07-01' } });
+    fireEvent.change(screen.getByLabelText('成交结束日期'), { target: { value: '2026-07-20' } });
+
+    await waitFor(() => {
+      const latest = vi.mocked(getOrders).mock.calls.at(-1)?.[0];
+      expect(latest?.startDate).toBe('2026-07-01');
+      expect(latest?.endDate).toBe('2026-07-20');
+      expect(latest?.page).toBe(1);
+    });
+  });
+
+  it('blocks a start-after-end range in the UI without hitting the backend', async () => {
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    render(<OrderList />);
+    await screen.findByText('已退款');
+
+    // 先设合法的开始日期并等其请求落地，作为干净基线
+    fireEvent.change(screen.getByLabelText('成交开始日期'), { target: { value: '2026-07-20' } });
+    await waitFor(() => {
+      expect(vi.mocked(getOrders).mock.calls.at(-1)?.[0]?.startDate).toBe('2026-07-20');
+    });
+    const callsBefore = vi.mocked(getOrders).mock.calls.length;
+
+    // 结束日期早于开始日期：进入非法态的这一步不得发起新请求
+    fireEvent.change(screen.getByLabelText('成交结束日期'), { target: { value: '2026-07-01' } });
+
+    expect(await screen.findByText('开始日期不得晚于结束日期')).toBeTruthy();
+    expect(vi.mocked(getOrders).mock.calls.length).toBe(callsBefore);
+  });
+
+  it('clears the range and refetches without date bounds', async () => {
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    render(<OrderList />);
+    await screen.findByText('已退款');
+
+    fireEvent.change(screen.getByLabelText('成交开始日期'), { target: { value: '2026-07-01' } });
+    await waitFor(() => {
+      expect(vi.mocked(getOrders).mock.calls.at(-1)?.[0]?.startDate).toBe('2026-07-01');
+    });
+
+    fireEvent.click(screen.getByLabelText('清除日期筛选'));
+    await waitFor(() => {
+      const latest = vi.mocked(getOrders).mock.calls.at(-1)?.[0];
+      expect(latest?.startDate).toBeUndefined();
+      expect(latest?.endDate).toBeUndefined();
+    });
   });
 });
