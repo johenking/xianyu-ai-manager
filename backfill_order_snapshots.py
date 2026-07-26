@@ -67,8 +67,11 @@ class _ReadOnlyDatabase:
     def __init__(self, db_path: str):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.lock = threading.RLock()
+        # 仅用 mode=ro：immutable=1 会让 SQLite 断定文件不可变、跳过 -wal，
+        # 而 dry-run 时服务器仍在运行随时可能写库，该断言不成立，会漏读
+        # WAL 中未 checkpoint 的新行。mode=ro 才是「只读但如实读」的正确语义。
         self.conn = sqlite3.connect(
-            f"{Path(self.db_path).as_uri()}?mode=ro&immutable=1",
+            f"{Path(self.db_path).as_uri()}?mode=ro",
             uri=True,
         )
 
@@ -222,9 +225,12 @@ def _plan_backfill(
                 (str(item_snapshot_source or "history_unsaved"), order_key)
             )
         if item_image and not (item_image_source or ""):
-            plan["image_source_fill"].append(
-                (str(item_snapshot_source or "history_unsaved"), order_key)
-            )
+            # 图片已落库即属历史目录回填，绝不写 history_unsaved：
+            # 已知快照来源沿用，未知来源一律记 catalog_backfill。
+            image_source = str(item_snapshot_source or "").strip()
+            if image_source in ("", "history_unsaved"):
+                image_source = "catalog_backfill"
+            plan["image_source_fill"].append((image_source, order_key))
         if not (item_snapshot_source or ""):
             if recovered_item:
                 plan["item_source_fill"].append(

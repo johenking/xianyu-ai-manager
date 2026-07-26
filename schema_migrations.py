@@ -879,12 +879,15 @@ def _order_item_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
             "     AND ci.item_image = orders.item_image"
             " ) THEN 'catalog'"
             " WHEN item_snapshot_source = 'catalog_metadata' THEN 'catalog_backfill'"
+            " WHEN item_snapshot_source IN ('', 'history_unsaved') THEN 'catalog_backfill'"
             " ELSE item_snapshot_source END"
             " WHERE item_image != '' AND item_image_source = ''"
         )
     else:
         cursor.execute(
-            "UPDATE orders SET item_image_source = item_snapshot_source"
+            "UPDATE orders SET item_image_source = CASE"
+            " WHEN item_snapshot_source IN ('', 'history_unsaved') THEN 'catalog_backfill'"
+            " ELSE item_snapshot_source END"
             " WHERE item_image != '' AND item_image_source = ''"
         )
 
@@ -1018,6 +1021,59 @@ def _tenant_isolation_hardening_v1(
         )
 
 
+def _order_snapshot_source_repair_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """收口两项来源审查遗留：头像来源高估与 history_unsaved 图片来源。
+
+    遗留一（头像来源保守降档）：早期 _customer_profile_field_sources_v1 /
+    _order_buyer_field_sources_v1 把聚合级 profile_source/buyer_snapshot_source
+    整段套给头像字段，可能把「实际只到过昵称」的记录也标成头像有真实来源。
+    对「头像来源仍等于当初套用的组级来源」这类未经字段级订正的记录，把头像
+    来源降回空串（宁可少标来源，也不虚报可信度）；若头像来源已被后续字段级
+    写入改成与组级不同的值（例如实时消息独立刷新），说明确有独立来源，保留。
+
+    遗留二（history_unsaved 图片来源收敛）：非空图片一旦落库即属历史目录
+    回填，绝不该带 history_unsaved 这一「快照未保存」语义。将这类图片来源
+    统一收敛为 catalog_backfill；标题来源不在本次收口范围，保持不动。
+    """
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+
+    # 遗留一：客户档案头像来源保守降档
+    if "customer_profiles" in tables:
+        profile_cols = _columns(cursor, "customer_profiles")
+        if {"avatar_source", "profile_source"} <= profile_cols:
+            cursor.execute(
+                "UPDATE customer_profiles SET avatar_source = ''"
+                " WHERE avatar_source != ''"
+                "   AND avatar_source = profile_source"
+            )
+
+    # 遗留一：订单买家头像来源保守降档
+    if "orders" in tables:
+        order_cols = _columns(cursor, "orders")
+        if {"buyer_avatar_source", "buyer_snapshot_source"} <= order_cols:
+            cursor.execute(
+                "UPDATE orders SET buyer_avatar_source = ''"
+                " WHERE buyer_avatar_source != ''"
+                "   AND buyer_avatar_source = buyer_snapshot_source"
+            )
+
+        # 遗留二：非空图片的 history_unsaved 来源收敛为 catalog_backfill
+        if "item_image_source" in order_cols:
+            cursor.execute(
+                "UPDATE orders SET item_image_source = 'catalog_backfill'"
+                " WHERE item_image != ''"
+                "   AND item_image_source = 'history_unsaved'"
+            )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1089,6 +1145,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072608",
         "tenant_isolation_hardening_v1",
         _tenant_isolation_hardening_v1,
+    ),
+    Migration(
+        "2026072609",
+        "order_snapshot_source_repair_v1",
+        _order_snapshot_source_repair_v1,
     ),
 )
 

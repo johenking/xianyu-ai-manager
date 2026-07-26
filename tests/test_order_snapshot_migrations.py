@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601..2026072608）双路径测试。
+"""订单身份快照迁移（2026072601..2026072609）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -115,6 +115,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072606",
                 "2026072607",
                 "2026072608",
+                "2026072609",
             ],
         )
 
@@ -170,6 +171,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072606",
                 "2026072607",
                 "2026072608",
+                "2026072609",
             ],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
@@ -245,6 +247,38 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertEqual(row, ("order_list", "catalog"))
         connection.close()
 
+    def test_item_image_source_producer_never_emits_history_unsaved(self):
+        """遗留2生产者修正：:882 的 ELSE 分支对未知非空图片记 catalog_backfill，
+        不再把 history_unsaved 写进 item_image_source（fresh build 上零副作用）。"""
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version < "2026072604"],
+            backup_enabled=False,
+        ).run()
+        # 图片非空但组级来源是 history_unsaved：生产者不得把该标签写给图片来源
+        connection.execute(
+            "UPDATE orders SET item_image = 'https://img/unsaved.jpg',"
+            " item_snapshot_source = 'history_unsaved' WHERE order_id = 'order-2'"
+        )
+        connection.commit()
+
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version <= "2026072604"],
+            backup_enabled=False,
+        ).run()
+        self.assertEqual(
+            connection.execute(
+                "SELECT item_image_source FROM orders WHERE order_id = 'order-2'"
+            ).fetchone()[0],
+            "catalog_backfill",
+            "非空图片的未知来源应记为 catalog_backfill，绝不写 history_unsaved",
+        )
+        connection.close()
+
     def test_customer_profile_field_sources_migrate_from_legacy_aggregate_source(self):
         connection = sqlite3.connect(self.db_path)
         MigrationRunner(
@@ -269,8 +303,17 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         )
         connection.commit()
 
+        # 本测试只验证 2605 的字段级来源拆分；2609 的头像保守降档由
+        # test_repair_downgrades_group_applied_avatar_sources 专门覆盖，
+        # 故此处将迁移范围限定到 <= 2026072608，保持对拆分行为的独立观测。
+        split_only = [m for m in MIGRATIONS if m.version <= "2026072608"]
         self.assertEqual(
-            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            MigrationRunner(
+                connection,
+                str(self.db_path),
+                migrations=split_only,
+                backup_enabled=False,
+            ).run(),
             ["2026072605", "2026072606", "2026072607", "2026072608"],
         )
         columns = {
@@ -290,7 +333,12 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             ],
         )
         self.assertEqual(
-            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            MigrationRunner(
+                connection,
+                str(self.db_path),
+                migrations=split_only,
+                backup_enabled=False,
+            ).run(),
             [],
         )
         connection.close()
@@ -318,8 +366,15 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         )
         connection.commit()
 
+        # 同上，只观测 2606 的买家字段级来源拆分，2609 降档另行覆盖。
+        split_only = [m for m in MIGRATIONS if m.version <= "2026072608"]
         self.assertEqual(
-            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            MigrationRunner(
+                connection,
+                str(self.db_path),
+                migrations=split_only,
+                backup_enabled=False,
+            ).run(),
             ["2026072606", "2026072607", "2026072608"],
         )
         rows = connection.execute(
@@ -335,8 +390,132 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             ],
         )
         self.assertEqual(
+            MigrationRunner(
+                connection,
+                str(self.db_path),
+                migrations=split_only,
+                backup_enabled=False,
+            ).run(),
+            [],
+        )
+        connection.close()
+
+    def test_repair_downgrades_group_applied_avatar_sources(self):
+        """遗留1：组级聚合来源被 :913/:939 套用给头像后，2026072609 保守降档。
+
+        组级 profile_source/buyer_snapshot_source 只反映最后一次聚合观测，
+        无法证实头像字段的真实来源。修复迁移必须把「由组级套用」的头像来源
+        清空，交还运行时字段级棘轮重采，避免高估后被 db_manager 永久锁死。
+        """
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version < "2026072609"],
+            backup_enabled=False,
+        ).run()
+        # customer_profiles：昵称 order_detail 高来源，头像被套用成同级
+        connection.execute(
+            "INSERT INTO customer_profiles"
+            " (cookie_id, buyer_id, display_name, avatar_url, profile_source,"
+            " display_name_source, avatar_source, first_observed_at, last_observed_at)"
+            " VALUES ('acct-a', 'buyer-split', '高来源昵称', 'https://img/split.jpg',"
+            " 'order_detail', 'order_detail', 'order_detail', 1, 1)"
+        )
+        # orders：买家昵称 order_detail，头像来源被套用
+        connection.execute(
+            "UPDATE orders SET buyer_nickname = '昵称', buyer_avatar_url = 'https://a/x.jpg',"
+            " buyer_snapshot_source = 'order_detail', buyer_nickname_source = 'order_detail',"
+            " buyer_avatar_source = 'order_detail' WHERE order_id = 'order-1'"
+        )
+        connection.commit()
+
+        applied = MigrationRunner(
+            connection, str(self.db_path), backup_enabled=False
+        ).run()
+        self.assertEqual(applied, ["2026072609"])
+
+        profile = connection.execute(
+            "SELECT display_name_source, avatar_source FROM customer_profiles"
+            " WHERE buyer_id = 'buyer-split'"
+        ).fetchone()
+        self.assertEqual(
+            profile,
+            ("order_detail", ""),
+            "昵称来源保留，头像来源（组级套用）保守降档为空",
+        )
+        order = connection.execute(
+            "SELECT buyer_nickname_source, buyer_avatar_source FROM orders"
+            " WHERE order_id = 'order-1'"
+        ).fetchone()
+        self.assertEqual(
+            order,
+            ("order_detail", ""),
+            "买家昵称来源保留，买家头像来源（组级套用）保守降档为空",
+        )
+        self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
             [],
+        )
+        connection.close()
+
+    def test_repair_keeps_field_level_avatar_source_that_diverges_from_group(self):
+        """反例护栏：头像来源与组级来源不一致时，是运行时字段级写入，不得动它。"""
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version < "2026072609"],
+            backup_enabled=False,
+        ).run()
+        connection.execute(
+            "INSERT INTO customer_profiles"
+            " (cookie_id, buyer_id, display_name, avatar_url, profile_source,"
+            " display_name_source, avatar_source, first_observed_at, last_observed_at)"
+            " VALUES ('acct-a', 'buyer-rt', '昵称', 'https://img/rt.jpg',"
+            " 'order_detail', 'order_detail', 'realtime_message', 1, 1)"
+        )
+        connection.commit()
+
+        MigrationRunner(connection, str(self.db_path), backup_enabled=False).run()
+        self.assertEqual(
+            connection.execute(
+                "SELECT avatar_source FROM customer_profiles WHERE buyer_id = 'buyer-rt'"
+            ).fetchone()[0],
+            "realtime_message",
+            "字段级独立来源与组级不同 → 是真实运行时写入，必须原样保留",
+        )
+        connection.close()
+
+    def test_repair_converges_history_unsaved_image_source(self):
+        """遗留2：非空图片被污染成 history_unsaved 时，2026072609 收敛为 catalog_backfill。"""
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version < "2026072609"],
+            backup_enabled=False,
+        ).run()
+        connection.execute(
+            "UPDATE orders SET item_image = 'https://img/leak.jpg',"
+            " item_image_source = 'history_unsaved' WHERE order_id = 'order-2'"
+        )
+        # 对照行：真实高来源图片不得被动
+        connection.execute(
+            "UPDATE orders SET item_image = 'https://img/real.jpg',"
+            " item_image_source = 'order_detail' WHERE order_id = 'order-3'"
+        )
+        connection.commit()
+
+        MigrationRunner(connection, str(self.db_path), backup_enabled=False).run()
+        rows = connection.execute(
+            "SELECT order_id, item_image_source FROM orders"
+            " WHERE order_id IN ('order-2', 'order-3') ORDER BY order_id"
+        ).fetchall()
+        self.assertEqual(
+            rows,
+            [("order-2", "catalog_backfill"), ("order-3", "order_detail")],
+            "history_unsaved 图片来源收敛为 catalog_backfill；真实高来源不动",
         )
         connection.close()
 

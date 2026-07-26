@@ -173,6 +173,50 @@ class BackfillIntegrityTests(unittest.TestCase):
             all(not Path(path).exists() for path in self.key_paths.values())
         )
 
+    def test_dry_run_sees_uncheckpointed_wal_rows(self):
+        """遗留3：dry-run 必须读得到 WAL 中未 checkpoint 的行。
+
+        immutable=1 会让 SQLite 断定文件不可变、跳过 -wal，导致 dry-run
+        统计漏掉服务器新写、尚未 checkpoint 的订单。去掉 immutable=1、
+        仅保留 mode=ro 后，只读连接会正常读 WAL，统计包含新行。
+        """
+        self._create_old_schema_database()
+        # 切 WAL 并写入第二行但不 checkpoint：保持写连接打开，-wal 不合并进主库
+        writer = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(
+                writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower(),
+                "wal",
+            )
+            writer.execute(
+                """
+                INSERT INTO orders (
+                    order_id, item_id, buyer_id, amount, order_status,
+                    cookie_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "wal-order",
+                    "wal-item",
+                    "wal-buyer",
+                    "¥3.00",
+                    "completed",
+                    "legacy-acct",
+                    "2026-07-21 08:00:00",
+                ),
+            )
+            writer.commit()  # 提交进 WAL，但连接不关、不 checkpoint
+
+            result = self._run_script()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                "订单总数: 2",
+                result.stdout,
+                "dry-run 应读到 WAL 中未 checkpoint 的新订单（共 2 行）",
+            )
+        finally:
+            writer.close()
+
     def test_apply_backfills_null_cookie_order_locally_and_counts_skips(self):
         database = self._create_current_database()
         with database.lock:
@@ -220,6 +264,56 @@ class BackfillIntegrityTests(unittest.TestCase):
         self.assertIn("无账号孤儿订单: 1", result.stdout)
         self.assertIn("目录回填跳过(无账号): 1", result.stdout)
         self.assertIn("客户档案播种跳过(无账号): 1", result.stdout)
+
+    def test_apply_labels_orphan_image_source_as_catalog_backfill_not_history_unsaved(self):
+        """遗留2生产者修正：非空图片但来源缺失时，backfill 记 catalog_backfill，
+        不再写 history_unsaved（图片已存在即非「历史未保存」态）。"""
+        database = self._create_current_database()
+        with database.lock:
+            owner_id = database.conn.execute(
+                "SELECT id FROM users ORDER BY id LIMIT 1"
+            ).fetchone()[0]
+            database.conn.execute(
+                "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
+                ("acct-img", "unb=9; cookie2=x", owner_id),
+            )
+            # 图片非空、图片来源与组级来源均为空
+            database.conn.execute(
+                """
+                INSERT INTO orders (
+                    order_id, item_id, buyer_id, amount, order_status,
+                    cookie_id, created_at, item_image, item_image_source,
+                    item_snapshot_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')
+                """,
+                (
+                    "img-orphan",
+                    "img-item",
+                    "img-buyer",
+                    "¥1.00",
+                    "completed",
+                    "acct-img",
+                    "2026-07-20 08:00:00",
+                    "https://img.alicdn.com/orphan.jpg",
+                ),
+            )
+            database.conn.commit()
+        database.close()
+
+        result = self._run_script("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            source = connection.execute(
+                "SELECT item_image_source FROM orders WHERE order_id = 'img-orphan'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(
+            source,
+            "catalog_backfill",
+            "非空图片的缺失来源应回填 catalog_backfill，绝不写 history_unsaved",
+        )
 
     def test_apply_holds_immediate_write_lock_from_scan_through_write(self):
         database = self._create_current_database()
