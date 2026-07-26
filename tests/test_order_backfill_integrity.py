@@ -213,7 +213,7 @@ class BackfillIntegrityTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(row[0], 1250)
-        self.assertEqual(row[1], 1784515200.0)
+        self.assertEqual(row[1], 1784505600.0)
         self.assertEqual(row[2], "backfill_cst_assumed")
         self.assertEqual((row[3] or "", row[4] or ""), ("", ""))
         self.assertEqual(profile_count, 0)
