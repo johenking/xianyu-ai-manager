@@ -1,5 +1,38 @@
 # Handoff
 
+## v1.8.3 Production Release On 2026-07-26
+
+The Skill Center closeout was deployed from commit
+`45dd8f1e2438f039d38ebfd0c025b467cb504e31`, authored on 2026-07-26. It rebuilds
+the capability area as a single-row horizontal status track, merges the
+standalone AI expert entry into per-account reply-strategy settings, demotes
+runtime diagnostics to a bottom section, adds `runtime_mode` and
+`operation_gates` to the capability API with a collection-level
+`PUT /api/ai/reply-strategies`, restricts skill runtime evidence to persisted
+playwright/mtop records, fixes the architecture method count (227) and OpenAPI
+snapshot, and upgrades PostCSS. No schema migration was added; the production
+migration remains `2026072301`.
+
+Ledger reconciliation:
+
+- This release ran in production before its ledger existed: the commit was
+  deployed to the production worktree ahead of any push to `origin/main`, tag,
+  CHANGELOG entry, or handoff record. On 2026-07-26 the ledger was reconciled:
+  `origin/main` fast-forwarded from `b310a76` to `45dd8f1`, annotated tag
+  `v1.8.3` was created on the exact production SHA, and this docs-only closeout
+  records the drift as it happened. The `main` push CI run `30192564473` passed
+  both `secrets` and `test` jobs.
+- Deploy-time evidence (a dedicated pre-deploy snapshot name, the 15-minute
+  observation window, and the byte-offset log scan) was not recorded when the
+  release went live and is not reconstructed here. Live verification on
+  2026-07-26 confirmed the production worktree at `45dd8f1`, local
+  `/health/ready` reporting `ready` with migration `2026072301`, and production
+  static serving entry assets `index-26oHvBgF.js` / `index-DvxrGUwO.css`.
+- The Verification Baseline compilation list below and the operator runbook
+  were synchronized with `.github/workflows/ci.yml`, which had gained
+  `browser_extension_pairing.py`, two skill-monitor modules, and the two QR
+  utility modules since the lists were last updated.
+
 ## v1.8.2 Production Release On 2026-07-24
 
 The dual-QR login release was merged through PR `#35` at
@@ -238,7 +271,7 @@ Run before release or deployment:
 source .venv/bin/activate
 pip install -r requirements-dev.lock
 ruff check .
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py skill_monitor_scheduler.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py
 python -m unittest discover -s tests -v
 
 cd frontend
