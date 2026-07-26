@@ -6592,42 +6592,46 @@ class DBManager:
                 return False
 
     def get_dashboard_stats(self, user_id: Optional[int] = None) -> Dict[str, int]:
-        """Return business counters scoped to one owner or the whole system."""
+        """Return business counters scoped to a single owner.
+
+        必须提供 user_id：仪表盘只统计该用户自己的数据，禁止退化为全表扫描。
+        """
+        if user_id is None:
+            raise ValueError("get_dashboard_stats 必须提供 user_id")
         with self.lock:
             cursor = self.conn.cursor()
-            cookie_filter = "" if user_id is None else "WHERE c.user_id = ?"
-            params: Tuple[Any, ...] = () if user_id is None else (user_id,)
+            params: Tuple[Any, ...] = (user_id,)
             cookie_row = cursor.execute(
-                f"""
+                """
                 SELECT COUNT(*),
                        SUM(CASE WHEN COALESCE(cs.enabled, 1) = 1 THEN 1 ELSE 0 END)
                 FROM cookies AS c
                 LEFT JOIN cookie_status AS cs ON cs.cookie_id = c.id
-                {cookie_filter}
+                WHERE c.user_id = ?
                 """,
                 params,
             ).fetchone()
             cards = cursor.execute(
-                "SELECT COUNT(*) FROM cards" + ("" if user_id is None else " WHERE user_id = ?"),
+                "SELECT COUNT(*) FROM cards WHERE user_id = ?",
                 params,
             ).fetchone()[0]
             keywords = cursor.execute(
                 """
                 SELECT COUNT(*) FROM keywords AS k
                 JOIN cookies AS c ON c.id = k.cookie_id
-                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                WHERE c.user_id = ?
+                """,
                 params,
             ).fetchone()[0]
             orders = cursor.execute(
                 """
                 SELECT COUNT(*) FROM orders AS o
                 JOIN cookies AS c ON c.id = o.cookie_id
-                """ + ("" if user_id is None else " WHERE c.user_id = ?"),
+                WHERE c.user_id = ?
+                """,
                 params,
             ).fetchone()[0]
-            users = 1 if user_id is not None else cursor.execute(
-                "SELECT COUNT(*) FROM users"
-            ).fetchone()[0]
+            users = 1
             return {
                 "total_users": int(users or 0),
                 "total_cookies": int((cookie_row or (0, 0))[0] or 0),
@@ -6642,16 +6646,17 @@ class DBManager:
         user_id: Optional[int],
         item_ids: List[str],
     ) -> Dict[str, str]:
+        # 必须提供 user_id：仅返回该用户自己商品的标题，禁止跨租户查询
+        if user_id is None:
+            raise ValueError("get_dashboard_item_names 必须提供 user_id")
         bounded_item_ids = list(dict.fromkeys(str(item_id) for item_id in item_ids if item_id))[:20]
         if not bounded_item_ids:
             return {}
         with self.lock:
             placeholders = ",".join("?" for _ in bounded_item_ids)
-            conditions = [f"i.item_id IN ({placeholders})"]
+            conditions = [f"i.item_id IN ({placeholders})", "c.user_id = ?"]
             params: List[Any] = list(bounded_item_ids)
-            if user_id is not None:
-                conditions.append("c.user_id = ?")
-                params.append(user_id)
+            params.append(user_id)
             rows = self.conn.execute(
                 f"""
                 SELECT i.item_id, MAX(COALESCE(NULLIF(i.item_title, ''), i.item_id))
@@ -8375,12 +8380,15 @@ class DBManager:
         Args:
             start_date: 开始日期 (格式: YYYY-MM-DD)
             end_date: 结束日期 (格式: YYYY-MM-DD)
-            user_id: 用户ID (可选)
+            user_id: 用户ID (必填，只统计该用户自己的订单)
             include_statuses: 要包含的订单状态列表 (可选，如果指定则只统计这些状态)
 
         Returns:
             包含订单分析数据的字典
         """
+        # 必须提供 user_id：BI 报表只统计该用户自己的订单，禁止退化为全表扫描
+        if user_id is None:
+            raise ValueError("get_order_analytics 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -8388,7 +8396,7 @@ class DBManager:
                 # Use timestamp boundaries so SQLite can use the analysis indexes.
                 where_conditions = []
                 params = []
-                from_clause = "orders AS o"
+                from_clause = "orders AS o JOIN cookies AS c ON c.id = o.cookie_id"
 
                 if start_date:
                     start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -8400,10 +8408,8 @@ class DBManager:
                     where_conditions.append("o.created_at < ?")
                     params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                if user_id is not None:
-                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
-                    where_conditions.append("c.user_id = ?")
-                    params.append(user_id)
+                where_conditions.append("c.user_id = ?")
+                params.append(user_id)
 
                 # 只包含指定状态（小写形式）
                 if include_statuses:
@@ -8590,19 +8596,22 @@ class DBManager:
         Args:
             start_date: 开始日期
             end_date: 结束日期
-            user_id: 用户ID
+            user_id: 用户ID (必填，只返回该用户自己的订单)
             include_statuses: 要包含的订单状态列表（如果指定则只返回这些状态的订单）
 
         Returns:
             订单列表
         """
+        # 必须提供 user_id：只返回该用户自己的订单，禁止退化为全表扫描
+        if user_id is None:
+            raise ValueError("get_orders_for_analytics 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
                 where_conditions = []
                 params = []
-                from_clause = "orders AS o"
+                from_clause = "orders AS o JOIN cookies AS c ON c.id = o.cookie_id"
 
                 if start_date:
                     start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -8614,10 +8623,8 @@ class DBManager:
                     where_conditions.append("o.created_at < ?")
                     params.append(end.strftime("%Y-%m-%d 00:00:00"))
 
-                if user_id is not None:
-                    from_clause += " JOIN cookies AS c ON c.id = o.cookie_id"
-                    where_conditions.append("c.user_id = ?")
-                    params.append(user_id)
+                where_conditions.append("c.user_id = ?")
+                params.append(user_id)
 
                 # 只包含指定状态
                 if include_statuses:

@@ -9282,8 +9282,8 @@ def get_dashboard_summary(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     period = _dashboard_period(range_key, start_date, end_date)
-    is_admin = bool(current_user.get('is_admin')) or current_user.get('username') == ADMIN_USERNAME
-    scoped_user_id = None if is_admin else current_user['user_id']
+    # 仪表盘一律只统计当前登录用户自己的数据，admin 也不例外（不再提供全局视图）
+    scoped_user_id = current_user['user_id']
     valid_statuses = ['pending_ship', 'shipped', 'completed']
     current = db_manager.get_order_analytics(
         start_date=period['start_date'],
@@ -9304,7 +9304,7 @@ def get_dashboard_summary(
         )
     return {
         "success": True,
-        "scope": "system" if is_admin else "user",
+        "scope": "user",
         "range": period,
         "stats": db_manager.get_dashboard_stats(scoped_user_id),
         "current": current,

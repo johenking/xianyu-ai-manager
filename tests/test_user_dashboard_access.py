@@ -185,7 +185,7 @@ class UserDashboardAccessTests(unittest.TestCase):
         self.assertEqual(payload["sources"]["item_sync_enabled"], "global")
         self.assertEqual(payload["sources"]["item_sync_max_pages"], "global")
 
-    def test_dashboard_summary_is_user_scoped_and_admin_is_system_scoped(self):
+    def test_dashboard_summary_is_user_scoped_including_admin(self):
         ordinary = self.client.get(
             "/api/dashboard/summary",
             params={"range": "7days", "end_date": "2026-07-11"},
@@ -203,18 +203,69 @@ class UserDashboardAccessTests(unittest.TestCase):
         self.assertEqual(ordinary_payload["item_names"], {"item-one": "用户一商品"})
         self.assertNotIn("item-two", ordinary.text)
 
+        # admin 不再拥有系统级全局视图：和普通用户一样只统计自己名下数据
         admin = self.db.get_user_by_username("admin")
-        system = self.client.get(
+        response = self.client.get(
             "/api/dashboard/summary",
             params={"range": "7days", "end_date": "2026-07-11"},
             headers=self.headers_for(admin),
         )
-        self.assertEqual(system.status_code, 200, system.text)
-        system_payload = system.json()
-        self.assertEqual(system_payload["scope"], "system")
-        self.assertEqual(system_payload["stats"]["total_cookies"], 3)
-        self.assertEqual(system_payload["current"]["revenue_stats"]["total_orders"], 2)
-        self.assertEqual(system_payload["current"]["revenue_stats"]["total_amount"], 111.5)
+        self.assertEqual(response.status_code, 200, response.text)
+        admin_payload = response.json()
+        self.assertEqual(admin_payload["scope"], "user")
+        self.assertNotEqual(admin_payload["scope"], "system")
+        self.assertEqual(admin_payload["stats"]["total_cookies"], 0)
+        self.assertEqual(admin_payload["current"]["revenue_stats"]["total_orders"], 0)
+        self.assertEqual(admin_payload["current"]["revenue_stats"]["total_amount"], 0)
+        self.assertEqual(admin_payload["item_names"], {})
+        self.assertNotIn("item-one", response.text)
+        self.assertNotIn("item-two", response.text)
+
+    def test_admin_dashboard_only_counts_own_data(self):
+        # 给 admin 也造一份业务数据，确认仪表盘只统计到 admin 自己名下的那份
+        admin = self.db.get_user_by_username("admin")
+        with self.db.lock:
+            cursor = self.db.conn.cursor()
+            cursor.execute(
+                "INSERT INTO cookies (id, value, user_id, xianyu_unb) VALUES (?, ?, ?, ?)",
+                ("admin-active", "unb=admin-active; cookie2=session", admin["id"], "admin-active"),
+            )
+            cursor.execute(
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status, cookie_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("order-admin", "item-admin", "buyer-admin", "5.00", "completed", "admin-active", "2026-07-10 12:00:00"),
+            )
+            cursor.execute(
+                "INSERT INTO item_info (cookie_id, item_id, item_title) VALUES (?, ?, ?)",
+                ("admin-active", "item-admin", "管理员商品"),
+            )
+            self.db.conn.commit()
+
+        response = self.client.get(
+            "/api/dashboard/summary",
+            params={"range": "7days", "end_date": "2026-07-11"},
+            headers=self.headers_for(admin),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["scope"], "user")
+        self.assertEqual(payload["stats"]["total_cookies"], 1)
+        self.assertEqual(payload["current"]["revenue_stats"]["total_orders"], 1)
+        self.assertEqual(payload["current"]["revenue_stats"]["total_amount"], 5.0)
+        self.assertEqual(payload["item_names"], {"item-admin": "管理员商品"})
+        self.assertNotIn("item-one", response.text)
+        self.assertNotIn("item-two", response.text)
+
+    def test_analytics_helpers_reject_missing_user_id(self):
+        # 仪表盘/分析查询必须显式携带 user_id，禁止 None 静默退化为全表
+        with self.assertRaises(ValueError):
+            self.db.get_dashboard_stats(None)
+        with self.assertRaises(ValueError):
+            self.db.get_dashboard_item_names(None, ["item-one"])
+        with self.assertRaises(ValueError):
+            self.db.get_order_analytics(user_id=None)
+        with self.assertRaises(ValueError):
+            self.db.get_orders_for_analytics(user_id=None)
 
     def test_ai_reply_test_rejects_another_users_account(self):
         manager = type("Manager", (), {"cookies": {"two-active": "secret"}})()
