@@ -2592,12 +2592,14 @@ class DBManager:
                         logger.warning(f"账号 {cookie_id} 不存在，且未提供cookie_value，无法创建新记录")
                         return False
 
-                    # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
+                    # 创建新记录必须显式提供归属 user_id：
+                    # 禁止回退到 admin，否则被删除/未知归属的账号凭证会被
+                    # 静默划给 admin（跨租户凭证接管）
                     if user_id is None:
-                        # 获取admin用户ID作为默认值
-                        self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
-                        admin_user = cursor.fetchone()
-                        user_id = admin_user[0] if admin_user else 1
+                        logger.warning(
+                            f"账号 {_account_log_reference(cookie_id)} 不存在且未提供归属 user_id，拒绝创建"
+                        )
+                        return False
 
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
