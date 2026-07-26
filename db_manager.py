@@ -5145,8 +5145,8 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None):
-        """更新卡券"""
+                   spec_value: str = None, user_id: int = None):
+        """更新卡券（支持用户隔离：提供 user_id 时只能改自己的卡券）"""
         with self.lock:
             try:
                 # 处理api_config参数
@@ -5207,7 +5207,12 @@ class DBManager:
                 update_fields.append("updated_at = CURRENT_TIMESTAMP")
                 params.append(card_id)
 
-                sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
+                # 用户隔离：提供 user_id 时把归属纳入 WHERE，越权改动直接 0 行命中
+                if user_id is not None:
+                    sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ? AND user_id = ?"
+                    params.append(user_id)
+                else:
+                    sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
                 self._execute_sql(cursor, sql, params)
 
                 if cursor.rowcount > 0:
@@ -5626,12 +5631,15 @@ class DBManager:
                 logger.error(f"获取发货规则失败: {e}")
                 return []
 
-    def delete_card(self, card_id: int):
-        """删除卡券"""
+    def delete_card(self, card_id: int, user_id: int = None):
+        """删除卡券（支持用户隔离：提供 user_id 时只能删自己的卡券）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()

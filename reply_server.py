@@ -4786,10 +4786,11 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
 
 
 @content_router.put("/cards/{card_id}")
-def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
+def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新卡券"""
     try:
         from db_manager import db_manager
+        user_id = current_user['user_id']
         # 验证多规格字段
         is_multi_spec = card_data.get('is_multi_spec')
         if is_multi_spec:
@@ -4809,12 +4810,15 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
+            user_id=user_id
         )
         if success:
             return {"message": "卡券更新成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4871,7 +4875,8 @@ async def update_card_with_image(
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
             spec_name=spec_name if is_multi_spec else None,
-            spec_value=spec_value if is_multi_spec else None
+            spec_value=spec_value if is_multi_spec else None,
+            user_id=current_user['user_id']
         )
 
         if success:
@@ -4960,15 +4965,17 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
 
 
 @content_router.delete("/cards/{card_id}")
-def delete_card(card_id: int, _: None = Depends(require_auth)):
+def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除卡券"""
     try:
         from db_manager import db_manager
-        success = db_manager.delete_card(card_id)
+        success = db_manager.delete_card(card_id, user_id=current_user['user_id'])
         if success:
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
