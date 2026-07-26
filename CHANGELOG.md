@@ -4,6 +4,27 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-07-26
+
+### Added
+
+- Add `runtime_mode` and `operation_gates` to the skill capability API, and a collection-level `PUT /api/ai/reply-strategies` that saves reply strategies transactionally while keeping the single-item endpoint.
+
+### Changed
+
+- Rebuild the Skill Center capability area as a single-row horizontal status track with pointer dragging, scroll snapping, edge buttons, and ArrowLeft/ArrowRight/Home/End keyboard support; remove the top segmented tabs and demote runtime diagnostics to a bottom page section.
+- Require a ready account when creating tasks, add a reusable "complete configuration" entry, and disable manual run, scheduling, and notification controls in preview mode with inline reasons from `operation_gates`.
+- Merge the standalone AI expert entry into per-account AI reply-strategy settings, and base `config_ready` on configuration completeness only.
+- Accept only persisted playwright/mtop records as skill runtime evidence, excluding mock and test sources.
+
+### Fixed
+
+- Fix the architecture method count (227) and the OpenAPI snapshot with targeted tests.
+
+### Security
+
+- Upgrade PostCSS to clear a high-severity npm audit advisory.
+
 ## [1.8.2] - 2026-07-24
 
 ### Added
