@@ -299,7 +299,33 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(payload["success_count"], 0)
         self.assertEqual(payload["failed_count"], 1)
         self.assertFalse(payload["results"][0]["success"])
+        # 端点层显式归属校验：给出明确拒绝语义，而不是依赖 DB 层守卫的通用失败
+        self.assertEqual(payload["results"][0]["message"], "无权操作此订单")
         self.assertEqual(self.db.get_order_by_id("order-1"), before)
+
+    def test_import_cannot_claim_orphan_order(self):
+        # 历史孤儿订单（cookie_id=NULL）不允许任何用户通过导入认领
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO orders (order_id, item_id, order_status) VALUES ('orphan-1', 'item-x', 'unknown')"
+            )
+            self.db.conn.commit()
+        response = self.client.post(
+            "/api/orders/import",
+            headers=self.headers_for(self.user_one),
+            json=[{
+                "order_id": "orphan-1",
+                "cookie_id": "acct-one",
+                "amount": "1.00",
+            }],
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["failed_count"], 1)
+        self.assertEqual(payload["results"][0]["message"], "无权操作此订单")
+        orphan = self.db.get_order_by_id("orphan-1")
+        self.assertIsNone(orphan.get("cookie_id"))
+        self.assertNotEqual(orphan.get("amount"), "1.00")
 
     def test_detail_returns_receiver_fields_and_enforces_ownership(self):
         headers = self.headers_for(self.user_one)

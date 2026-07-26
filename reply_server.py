@@ -11819,6 +11819,18 @@ async def import_orders(
                 # 检查订单是否已存在
                 existing_order = orders_db.get_order_by_id(order_id)
 
+                # 已存在订单必须归属当前用户名下的账号：
+                # 归属其他账号（含 cookie_id 为 NULL 的历史孤儿订单）一律拒绝，
+                # 防止通过导入接口接管/认领他人订单
+                if existing_order and existing_order.get('cookie_id') not in user_cookies:
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'message': '无权操作此订单'
+                    })
+                    failed_count += 1
+                    continue
+
                 # 映射为 insert_or_update_order 的合法参数，映射外字段丢弃并提示
                 mapped_params, ignored_fields = _map_import_order_params(order_data)
                 insert_params = {
