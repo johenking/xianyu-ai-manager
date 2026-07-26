@@ -1,14 +1,16 @@
-"""订单中心 API 契约测试：列表隐私分离、账号授权语义、媒体端点失败分级。"""
+"""订单中心 API 契约：隐私/授权、媒体安全、JSON 与 `.xlsx` 并列导入。"""
 
 import io
 import asyncio
 import os
+import socket
 from pathlib import Path
 import tempfile
 import unittest
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from PIL import Image as PILImage
@@ -37,6 +39,7 @@ def _fake_aiohttp_session(
     error: Exception = None,
     headers: dict = None,
     calls: list = None,
+    session_kwargs: list = None,
 ):
     """替身 aiohttp.ClientSession：让媒体端点在测试里不发真实网络请求。"""
 
@@ -56,7 +59,8 @@ def _fake_aiohttp_session(
 
     class FakeSession:
         def __init__(self, *args, **kwargs):
-            pass
+            if session_kwargs is not None:
+                session_kwargs.append(dict(kwargs))
 
         async def __aenter__(self):
             return self
@@ -379,16 +383,33 @@ class OrderApiContractTests(unittest.TestCase):
     def test_item_image_rejects_private_dns_after_redirect(self):
         self._attach_snapshot_image()
         calls = []
+        dns_hosts = []
         responses = [{
             "status": 302,
             "headers": {"Location": "https://gw.alicdn.com/private.png"},
         }]
-        with patch(
-            "reply_server._resolve_order_image_host",
-            new=AsyncMock(side_effect=[
-                ("203.0.113.10",),
-                ValueError("redirect resolved private"),
-            ]),
+
+        async def fake_getaddrinfo(host, port, **_kwargs):
+            dns_hosts.append(host)
+            address = (
+                "93.184.216.34"
+                if host == "img.alicdn.com"
+                else "10.0.0.8"
+            )
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    socket.IPPROTO_TCP,
+                    "",
+                    (address, port),
+                )
+            ]
+
+        with patch.object(
+            asyncio.BaseEventLoop,
+            "getaddrinfo",
+            new=AsyncMock(side_effect=fake_getaddrinfo),
         ), _fake_aiohttp_sequence(responses, calls):
             response = self.client.get(
                 "/api/orders/order-1/item-image",
@@ -397,16 +418,25 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"]["reason"], "source_expired")
         self.assertEqual(calls, ["https://img.alicdn.com/item-1.png"])
+        self.assertEqual(dns_hosts, ["img.alicdn.com", "gw.alicdn.com"])
 
-    def test_item_image_maps_total_timeout_to_source_expired(self):
+    def test_item_image_enforces_ten_second_total_timeout_and_maps_expiry(self):
         self._attach_snapshot_image()
-        with _public_image_network(error=asyncio.TimeoutError()):
+        session_kwargs = []
+        with _public_image_network(
+            error=asyncio.TimeoutError(),
+            session_kwargs=session_kwargs,
+        ):
             response = self.client.get(
                 "/api/orders/order-1/item-image",
                 headers=self.headers_for(self.user_one),
             )
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"]["reason"], "source_expired")
+        self.assertEqual(len(session_kwargs), 1)
+        timeout = session_kwargs[0]["timeout"]
+        self.assertIsInstance(timeout, aiohttp.ClientTimeout)
+        self.assertEqual(timeout.total, 10)
 
     def test_item_image_rejects_declared_and_streamed_oversize_payloads(self):
         self._attach_snapshot_image()
@@ -464,7 +494,7 @@ class OrderApiContractTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
 
-    def test_import_accepts_json_array_contract(self):
+    def test_programmatic_import_accepts_json_order_array_contract(self):
         headers = self.headers_for(self.user_one)
         response = self.client.post(
             "/api/orders/import",
@@ -483,7 +513,7 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertIn("已忽略字段", payload["results"][0]["message"])
         self.assertIn("无权操作", payload["results"][1]["message"])
 
-    def test_import_accepts_real_xlsx_upload(self):
+    def test_spreadsheet_import_accepts_real_xlsx_upload_contract(self):
         workbook = Workbook()
         sheet = workbook.active
         sheet.append(["order_id", "cookie_id", "item_id", "status", "amount"])

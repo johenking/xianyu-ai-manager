@@ -11639,6 +11639,11 @@ def _orders_from_xlsx(raw: bytes, filename: str) -> List[Dict[str, Any]]:
 
 
 async def _parse_order_import_request(request: Request) -> List[Dict[str, Any]]:
+    """解析两个并列导入契约：程序化 JSON 对象数组，或 multipart `.xlsx` 文件。
+
+    `.xlsx` 是唯一支持的电子表格格式；JSON 数组是既有程序化 API 能力，
+    不属于电子表格格式限制。
+    """
     content_type = str(request.headers.get('content-type') or '').lower()
     if content_type.startswith('application/json'):
         content_length = request.headers.get('content-length')
@@ -11662,7 +11667,10 @@ async def _parse_order_import_request(request: Request) -> List[Dict[str, Any]]:
         if len(raw) > _ORDER_IMPORT_MAX_BYTES:
             raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
         return _orders_from_xlsx(raw, str(getattr(upload, 'filename', '') or ''))
-    raise HTTPException(status_code=415, detail="仅支持 JSON 或 multipart Excel")
+    raise HTTPException(
+        status_code=415,
+        detail="仅支持程序化 JSON 数组或 multipart .xlsx 文件",
+    )
 
 
 @orders_router.post('/api/orders/import')
@@ -11671,10 +11679,7 @@ async def import_orders(
     current_user: Dict[str, Any] = Depends(get_current_user),
     orders_db: Any = Depends(get_orders_db),
 ):
-    """
-    导入订单
-    支持批量导入自定义订单数据
-    """
+    """批量导入订单：支持程序化 JSON 数组与 multipart `.xlsx` 两个并列契约。"""
     try:
         orders = await _parse_order_import_request(request)
         user_id = current_user['user_id']

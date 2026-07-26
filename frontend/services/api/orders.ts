@@ -103,8 +103,14 @@ export const manualShipOrder = async (orderIds: string[], shipMode: 'status_only
     });
 }
 
-// 保留既有 Excel 上传入口；JSON 数组调用仍用于既有程序化导入方。
-export const importOrders = async (data: Partial<Order>[] | FormData): Promise<any> => {
+// 两个并列契约：程序化调用传 JSON 订单数组；电子表格上传传仅含 .xlsx 的 FormData。
+export type ProgrammaticOrderImportPayload = Partial<Order>[];
+export type SpreadsheetOrderImportPayload = FormData;
+export type OrderImportPayload =
+  | ProgrammaticOrderImportPayload
+  | SpreadsheetOrderImportPayload;
+
+export const importOrders = async (data: OrderImportPayload): Promise<any> => {
   return post('/api/orders/import', data);
 }
 
