@@ -889,6 +889,32 @@ def _order_item_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
         )
 
 
+def _customer_profile_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """把历史聚合来源拆成昵称/头像字段级来源，同时保留兼容列。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'customer_profiles'"
+    ).fetchone():
+        return
+    _add_column(
+        cursor,
+        "customer_profiles",
+        "display_name_source TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column(
+        cursor,
+        "customer_profiles",
+        "avatar_source TEXT NOT NULL DEFAULT ''",
+    )
+    cursor.execute(
+        "UPDATE customer_profiles SET display_name_source = profile_source"
+        " WHERE display_name != '' AND display_name_source = ''"
+    )
+    cursor.execute(
+        "UPDATE customer_profiles SET avatar_source = profile_source"
+        " WHERE avatar_url != '' AND avatar_source = ''"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -940,6 +966,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072604",
         "order_item_field_sources_v1",
         _order_item_field_sources_v1,
+    ),
+    Migration(
+        "2026072605",
+        "customer_profile_field_sources_v1",
+        _customer_profile_field_sources_v1,
     ),
 )
 

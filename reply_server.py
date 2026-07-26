@@ -10103,11 +10103,22 @@ def _compose_order_display(order: Dict[str, Any], catalog_item: Dict[str, str],
     profile_avatar = str((profile or {}).get('avatar_url') or '')
     order['buyer_display_name'] = snapshot_nickname or profile_name
     order['buyer_avatar_url'] = snapshot_avatar or profile_avatar
+    buyer_snapshot_source = str(order.get('buyer_snapshot_source') or '')
+    order['buyer_display_name_source'] = (
+        buyer_snapshot_source if snapshot_nickname
+        else str((profile or {}).get('display_name_source') or '') if profile_name
+        else ''
+    )
+    order['buyer_avatar_source'] = (
+        buyer_snapshot_source if snapshot_avatar
+        else str((profile or {}).get('avatar_source') or '') if profile_avatar
+        else ''
+    )
     if snapshot_nickname or snapshot_avatar:
         order['buyer_identity'] = 'snapshot'
     elif profile_name or profile_avatar:
         order['buyer_identity'] = 'profile'
-    elif str(order.get('buyer_snapshot_source') or '') == 'history_unsaved':
+    elif buyer_snapshot_source == 'history_unsaved':
         order['buyer_identity'] = 'history_unsaved'
     else:
         order['buyer_identity'] = 'missing'
@@ -11591,6 +11602,8 @@ def _orders_from_xlsx(raw: bytes, filename: str) -> List[Dict[str, Any]]:
 
         workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
         sheet = workbook.active
+        if sheet.max_row is None or sheet.max_column is None:
+            sheet.calculate_dimension(force=True)
         if sheet.max_row > _ORDER_IMPORT_MAX_ROWS + 1 or sheet.max_column > _ORDER_IMPORT_MAX_COLUMNS:
             raise HTTPException(status_code=413, detail="Excel 行列数超过限制")
         rows = sheet.iter_rows(values_only=True)

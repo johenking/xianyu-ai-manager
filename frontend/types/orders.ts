@@ -28,6 +28,8 @@ export interface Order {
   buyer_id: string;
   buyer_display_name?: string;
   buyer_avatar_url?: string;
+  buyer_display_name_source?: string;
+  buyer_avatar_source?: string;
   /** 买家身份来源：订单快照 / 客户档案 / 历史未保存 / 缺失 */
   buyer_identity?: BuyerIdentity;
   is_bargain?: boolean;

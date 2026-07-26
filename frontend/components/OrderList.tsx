@@ -337,6 +337,15 @@ const OrderList: React.FC = () => {
     }
   };
 
+  const selectImportFile = (file: File | null) => {
+    if (file && !file.name.toLowerCase().endsWith('.xlsx')) {
+      setImportFile(null);
+      setPageNotice({ tone: 'error', text: '仅支持 .xlsx 文件，请重新选择' });
+      return;
+    }
+    setImportFile(file);
+  };
+
   const handleImportOrders = async () => {
     if (!importFile) return;
     try {
@@ -908,11 +917,11 @@ const OrderList: React.FC = () => {
                 <label className="block text-sm font-bold text-gray-700 mb-2">选择Excel文件</label>
                 <input
                   type="file"
-                  accept=".xlsx,.xls"
-                  onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+                  accept=".xlsx"
+                  onChange={(e) => selectImportFile(e.target.files?.[0] || null)}
                   className="w-full ios-input px-4 py-3 rounded-xl text-sm"
                 />
-                <p className="text-xs text-gray-500 mt-2">支持 .xlsx 和 .xls 格式</p>
+                <p className="text-xs text-gray-500 mt-2">仅支持 .xlsx 格式</p>
               </div>
               {importFile && (
                 <div className="p-3 bg-blue-50 rounded-xl">

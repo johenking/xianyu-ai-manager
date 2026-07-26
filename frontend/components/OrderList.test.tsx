@@ -245,8 +245,27 @@ describe('OrderList truthful list presentation', () => {
     fireEvent.click(await screen.findByRole('button', { name: '插入订单' }));
     expect(await screen.findByText('选择Excel文件')).toBeTruthy();
     const input = document.querySelector('input[type="file"]');
-    expect(input).toHaveAttribute('accept', '.xlsx,.xls');
+    expect(input).toHaveAttribute('accept', '.xlsx');
+    expect(screen.getByText('仅支持 .xlsx 格式')).toBeTruthy();
+    expect(screen.queryByText(/\.xls 格式/)).toBeNull();
     expect(screen.queryByText('订单 JSON 数组')).toBeNull();
+  });
+
+  it('rejects a legacy .xls selection with a clear UI error', async () => {
+    vi.mocked(getOrders).mockResolvedValue(pageOf([]) as any);
+    render(<OrderList />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '插入订单' }));
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: {
+        files: [new File(['legacy'], 'orders.xls', { type: 'application/vnd.ms-excel' })],
+      },
+    });
+
+    expect(await screen.findByText('仅支持 .xlsx 文件，请重新选择')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '导入订单' })).toBeDisabled();
+    expect(screen.queryByText('orders.xls')).toBeNull();
   });
 });
 

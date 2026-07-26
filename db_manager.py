@@ -7109,11 +7109,14 @@ class DBManager:
 
     def upsert_customer_observation(self, cookie_id: str, buyer_id: str,
                                     display_name: str = '', avatar_url: str = '',
-                                    source: str = '', observed_at: Optional[float] = None) -> bool:
+                                    source: str = '', observed_at: Optional[float] = None,
+                                    display_name_source: Optional[str] = None,
+                                    avatar_source: Optional[str] = None) -> bool:
         """记录一次买家观察：维护 (cookie_id, buyer_id) 的当前可用身份档案。
 
         first_observed_at 取历史最小（回填旧订单可前移），last_observed_at 取最大；
-        身份字段按 SNAPSHOT_SOURCE_RANK 棘轮（空则填，非空仅更高级来源覆盖）。
+        昵称与头像按各自来源独立棘轮（空则填，非空仅更高级来源覆盖）；
+        profile_source 保留为两个字段当前来源中等级更高者，供旧调用方兼容。
         行为计数不在本表维护，一律查询时从 orders 现算。
         """
         from order_sync_service import snapshot_source_rank
@@ -7124,42 +7127,84 @@ class DBManager:
         display_name = str(display_name or '').strip()
         avatar_url = str(avatar_url or '').strip()
         source = str(source or '')
+        incoming_name_source = str(
+            source if display_name_source is None else display_name_source
+        )
+        incoming_avatar_source = str(
+            source if avatar_source is None else avatar_source
+        )
         if not display_name and not avatar_url:
             return False
+
+        def aggregate_source(name_source: str, image_source: str) -> str:
+            candidates = [value for value in (name_source, image_source) if value]
+            return max(candidates, key=snapshot_source_rank) if candidates else ''
+
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 row = cursor.execute(
-                    "SELECT display_name, avatar_url, profile_source, first_observed_at,"
-                    " last_observed_at FROM customer_profiles WHERE cookie_id = ? AND buyer_id = ?",
+                    "SELECT display_name, avatar_url, profile_source,"
+                    " display_name_source, avatar_source, first_observed_at,"
+                    " last_observed_at FROM customer_profiles"
+                    " WHERE cookie_id = ? AND buyer_id = ?",
                     (cookie_id, buyer_id),
                 ).fetchone()
                 if row is None:
+                    name_source = incoming_name_source if display_name else ''
+                    image_source = incoming_avatar_source if avatar_url else ''
                     cursor.execute(
                         "INSERT INTO customer_profiles (cookie_id, buyer_id, display_name,"
-                        " avatar_url, profile_source, first_observed_at, last_observed_at,"
-                        " observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-                        (cookie_id, buyer_id, display_name, avatar_url, source, moment, moment),
+                        " avatar_url, profile_source, display_name_source, avatar_source,"
+                        " first_observed_at, last_observed_at, observation_count)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                        (
+                            cookie_id, buyer_id, display_name, avatar_url,
+                            aggregate_source(name_source, image_source),
+                            name_source, image_source, moment, moment,
+                        ),
                     )
                 else:
-                    new_rank = snapshot_source_rank(source)
-                    old_rank = snapshot_source_rank(row[2])
-                    allow_overwrite = new_rank > old_rank
-                    wrote_name = bool(display_name and (not row[0] or allow_overwrite))
-                    wrote_avatar = bool(avatar_url and (not row[1] or allow_overwrite))
+                    old_name_source = str(row[3] or (row[2] if row[0] else ''))
+                    old_avatar_source = str(row[4] or (row[2] if row[1] else ''))
+                    wrote_name = bool(
+                        display_name
+                        and (
+                            not row[0]
+                            or snapshot_source_rank(incoming_name_source)
+                            > snapshot_source_rank(old_name_source)
+                        )
+                    )
+                    wrote_avatar = bool(
+                        avatar_url
+                        and (
+                            not row[1]
+                            or snapshot_source_rank(incoming_avatar_source)
+                            > snapshot_source_rank(old_avatar_source)
+                        )
+                    )
                     next_name = display_name if wrote_name else row[0]
                     next_avatar = avatar_url if wrote_avatar else row[1]
-                    # 空字段由任意真实观察填入时，来源必须跟随实际提供者；
-                    # 仅已有非空身份被更高等级覆盖时才应用等级棘轮。
-                    next_source = source if source and (wrote_name or wrote_avatar) else row[2]
+                    next_name_source = (
+                        incoming_name_source if wrote_name else old_name_source
+                    )
+                    next_avatar_source = (
+                        incoming_avatar_source if wrote_avatar else old_avatar_source
+                    )
+                    next_source = aggregate_source(
+                        next_name_source if next_name else '',
+                        next_avatar_source if next_avatar else '',
+                    )
                     cursor.execute(
                         "UPDATE customer_profiles SET display_name = ?, avatar_url = ?,"
-                        " profile_source = ?, first_observed_at = ?, last_observed_at = ?,"
+                        " profile_source = ?, display_name_source = ?, avatar_source = ?,"
+                        " first_observed_at = ?, last_observed_at = ?,"
                         " observation_count = observation_count + 1,"
                         " updated_at = CAST(strftime('%s','now') AS REAL)"
                         " WHERE cookie_id = ? AND buyer_id = ?",
                         (next_name, next_avatar, next_source,
-                         min(float(row[3]), moment), max(float(row[4]), moment),
+                         next_name_source, next_avatar_source,
+                         min(float(row[5]), moment), max(float(row[6]), moment),
                          cookie_id, buyer_id),
                     )
                 self.conn.commit()
@@ -7179,6 +7224,7 @@ class DBManager:
                 placeholders = ','.join('?' for _ in cookie_ids)
                 rows = cursor.execute(
                     "SELECT cookie_id, buyer_id, display_name, avatar_url, profile_source,"
+                    " display_name_source, avatar_source,"
                     f" first_observed_at, last_observed_at, observation_count"
                     f" FROM customer_profiles WHERE cookie_id IN ({placeholders})",
                     [str(cid) for cid in cookie_ids],
@@ -7188,9 +7234,11 @@ class DBManager:
                         'display_name': row[2],
                         'avatar_url': row[3],
                         'profile_source': row[4],
-                        'first_observed_at': row[5],
-                        'last_observed_at': row[6],
-                        'observation_count': row[7],
+                        'display_name_source': row[5],
+                        'avatar_source': row[6],
+                        'first_observed_at': row[7],
+                        'last_observed_at': row[8],
+                        'observation_count': row[9],
                     }
                     for row in rows
                 }

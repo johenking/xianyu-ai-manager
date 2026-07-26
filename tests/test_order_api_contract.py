@@ -200,6 +200,7 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(row["item_identity"], "snapshot")
         self.assertEqual(row["buyer_display_name"], "买家甲")
         self.assertEqual(row["buyer_identity"], "snapshot")
+        self.assertEqual(row["buyer_display_name_source"], "order_list")
 
     def test_list_search_and_unowned_cookie_semantics(self):
         headers = self.headers_for(self.user_one)
@@ -210,6 +211,24 @@ class OrderApiContractTests(unittest.TestCase):
         # 未授权账号：404，而不是静默回退到全账号
         foreign = self.client.get("/api/orders", params={"cookie_id": "acct-two"}, headers=headers)
         self.assertEqual(foreign.status_code, 404)
+
+    def test_list_exposes_independent_profile_field_sources(self):
+        self.db.upsert_customer_observation(
+            "acct-two", "buyer-2", "档案昵称", "", "order_detail", 1000.0,
+        )
+        self.db.upsert_customer_observation(
+            "acct-two", "buyer-2", "", "https://a/catalog.jpg", "catalog", 2000.0,
+        )
+        response = self.client.get(
+            "/api/orders", headers=self.headers_for(self.user_two),
+        )
+        self.assertEqual(response.status_code, 200)
+        row = response.json()["data"][0]
+        self.assertEqual(row["buyer_identity"], "profile")
+        self.assertEqual(row["buyer_display_name"], "档案昵称")
+        self.assertEqual(row["buyer_display_name_source"], "order_detail")
+        self.assertEqual(row["buyer_avatar_url"], "https://a/catalog.jpg")
+        self.assertEqual(row["buyer_avatar_source"], "catalog")
 
     def test_detail_returns_receiver_fields_and_enforces_ownership(self):
         headers = self.headers_for(self.user_one)
@@ -357,6 +376,62 @@ class OrderApiContractTests(unittest.TestCase):
         )
         self.assertEqual(resolve_mock.await_count, 2)
 
+    def test_item_image_rejects_private_dns_after_redirect(self):
+        self._attach_snapshot_image()
+        calls = []
+        responses = [{
+            "status": 302,
+            "headers": {"Location": "https://gw.alicdn.com/private.png"},
+        }]
+        with patch(
+            "reply_server._resolve_order_image_host",
+            new=AsyncMock(side_effect=[
+                ("203.0.113.10",),
+                ValueError("redirect resolved private"),
+            ]),
+        ), _fake_aiohttp_sequence(responses, calls):
+            response = self.client.get(
+                "/api/orders/order-1/item-image",
+                headers=self.headers_for(self.user_one),
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"]["reason"], "source_expired")
+        self.assertEqual(calls, ["https://img.alicdn.com/item-1.png"])
+
+    def test_item_image_maps_total_timeout_to_source_expired(self):
+        self._attach_snapshot_image()
+        with _public_image_network(error=asyncio.TimeoutError()):
+            response = self.client.get(
+                "/api/orders/order-1/item-image",
+                headers=self.headers_for(self.user_one),
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"]["reason"], "source_expired")
+
+    def test_item_image_rejects_declared_and_streamed_oversize_payloads(self):
+        self._attach_snapshot_image()
+        headers = self.headers_for(self.user_one)
+        with _public_image_network(
+            status=200,
+            body=_png_bytes(),
+            headers={
+                "Content-Type": "image/png",
+                "Content-Length": str(reply_server.ORDER_ITEM_IMAGE_MAX_BYTES + 1),
+            },
+        ):
+            declared = self.client.get("/api/orders/order-1/item-image", headers=headers)
+        self.assertEqual(declared.status_code, 422)
+        self.assertEqual(declared.json()["detail"]["reason"], "unsupported_format")
+
+        with _public_image_network(
+            status=200,
+            body=b"x" * (reply_server.ORDER_ITEM_IMAGE_MAX_BYTES + 1),
+            headers={"Content-Type": "image/png"},
+        ):
+            streamed = self.client.get("/api/orders/order-1/item-image", headers=headers)
+        self.assertEqual(streamed.status_code, 422)
+        self.assertEqual(streamed.json()["detail"]["reason"], "unsupported_format")
+
     def test_image_connector_pins_the_validated_public_address(self):
         async def exercise():
             with patch(
@@ -474,6 +549,68 @@ class OrderApiContractTests(unittest.TestCase):
              missing_headers.status_code],
             [400, 415, 413, 400],
         )
+        self.assertEqual(wrong_extension.json()["detail"], "仅支持 .xlsx 文件")
+        self.assertEqual(oversized.json()["detail"], "Excel 文件超过 5MB")
+
+    def test_import_rejects_legacy_xls_with_clear_contract_error(self):
+        response = self.client.post(
+            "/api/orders/import",
+            files={"file": (
+                "orders.xls",
+                b"legacy-binary-excel",
+                "application/vnd.ms-excel",
+            )},
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(response.status_code, 415)
+        self.assertEqual(response.json()["detail"], "仅支持 .xlsx 文件")
+
+    def test_import_rejects_xlsx_over_row_and_column_limits(self):
+        headers = self.headers_for(self.user_one)
+
+        too_many_rows = Workbook(write_only=True)
+        row_sheet = too_many_rows.create_sheet()
+        row_sheet.append(["order_id", "cookie_id"])
+        for index in range(reply_server._ORDER_IMPORT_MAX_ROWS + 1):
+            row_sheet.append([f"row-{index}", "acct-one"])
+        row_payload = io.BytesIO()
+        too_many_rows.save(row_payload)
+        row_response = self.client.post(
+            "/api/orders/import",
+            files={"file": (
+                "too-many-rows.xlsx",
+                row_payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )},
+            headers=headers,
+        )
+
+        too_many_columns = Workbook(write_only=True)
+        column_sheet = too_many_columns.create_sheet()
+        column_sheet.append(
+            ["order_id", "cookie_id"]
+            + [f"extra_{index}" for index in range(reply_server._ORDER_IMPORT_MAX_COLUMNS - 1)]
+        )
+        column_sheet.append(
+            ["column-order", "acct-one"]
+            + ["x"] * (reply_server._ORDER_IMPORT_MAX_COLUMNS - 1)
+        )
+        column_payload = io.BytesIO()
+        too_many_columns.save(column_payload)
+        column_response = self.client.post(
+            "/api/orders/import",
+            files={"file": (
+                "too-many-columns.xlsx",
+                column_payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )},
+            headers=headers,
+        )
+
+        self.assertEqual(row_response.status_code, 413)
+        self.assertEqual(column_response.status_code, 413)
+        self.assertEqual(row_response.json()["detail"], "Excel 行列数超过限制")
+        self.assertEqual(column_response.json()["detail"], "Excel 行列数超过限制")
 
     def test_unowned_order_mutations_do_not_reveal_existence(self):
         headers = self.headers_for(self.user_two)

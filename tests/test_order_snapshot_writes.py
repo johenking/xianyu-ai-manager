@@ -245,6 +245,56 @@ class CustomerObservationTests(SnapshotWriteTestCase):
         self.assertEqual(profile["last_observed_at"], 3000.0)
         self.assertEqual(profile["observation_count"], 3)
 
+    def test_name_and_avatar_sources_ratchet_independently(self):
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-fields", "权威昵称", "", "order_detail", 1000.0,
+        )
+        # 低级来源可填头像空值，但不得降低已有昵称的来源。
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-fields", "目录昵称", "https://a/catalog.jpg",
+            "catalog", 2000.0,
+        )
+        profile = self.db.get_customer_profiles(["account-1"])[
+            ("account-1", "buyer-fields")
+        ]
+        self.assertEqual(profile["display_name"], "权威昵称")
+        self.assertEqual(profile["display_name_source"], "order_detail")
+        self.assertEqual(profile["avatar_url"], "https://a/catalog.jpg")
+        self.assertEqual(profile["avatar_source"], "catalog")
+        self.assertEqual(profile["profile_source"], "order_detail")
+
+        # 中级来源只升级头像；同次携带的昵称冲不掉更高级非空值。
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-fields", "实时昵称", "https://a/realtime.jpg",
+            "realtime_message", 3000.0,
+        )
+        profile = self.db.get_customer_profiles(["account-1"])[
+            ("account-1", "buyer-fields")
+        ]
+        self.assertEqual(profile["display_name"], "权威昵称")
+        self.assertEqual(profile["display_name_source"], "order_detail")
+        self.assertEqual(profile["avatar_url"], "https://a/realtime.jpg")
+        self.assertEqual(profile["avatar_source"], "realtime_message")
+        self.assertEqual(profile["profile_source"], "order_detail")
+
+        # 高级来源封顶；后续低级观察不得覆盖任一非空字段。
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-fields", "", "https://a/detail.jpg",
+            "order_detail", 4000.0,
+        )
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-fields", "回退昵称", "https://a/fallback.jpg",
+            "catalog", 5000.0,
+        )
+        profile = self.db.get_customer_profiles(["account-1"])[
+            ("account-1", "buyer-fields")
+        ]
+        self.assertEqual(profile["display_name"], "权威昵称")
+        self.assertEqual(profile["display_name_source"], "order_detail")
+        self.assertEqual(profile["avatar_url"], "https://a/detail.jpg")
+        self.assertEqual(profile["avatar_source"], "order_detail")
+        self.assertEqual(profile["profile_source"], "order_detail")
+
     def test_missing_ids_are_rejected(self):
         self.assertFalse(self.db.upsert_customer_observation("", "buyer-1"))
         self.assertFalse(self.db.upsert_customer_observation("account-1", ""))
