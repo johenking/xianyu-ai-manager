@@ -1670,6 +1670,7 @@ class XianyuLive:
                                 from db_manager import db_manager
                                 db_manager.insert_or_update_order(
                                     order_id=order_id,
+                                    cookie_id=self.cookie_id,
                                     system_shipped=True,
                                     chat_id=chat_id
                                 )

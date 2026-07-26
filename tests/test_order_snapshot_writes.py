@@ -264,6 +264,16 @@ class ApplySyncSnapshotRatchetTests(SnapshotWriteTestCase):
 
 
 class InsertOrUpdateGuardTests(SnapshotWriteTestCase):
+    def test_insert_without_cookie_id_is_rejected(self):
+        """全新订单缺少 cookie_id 时必须拒绝，避免产生无归属的孤儿订单。"""
+        self.assertFalse(self.db.insert_or_update_order(
+            order_id="order-orphan",
+            item_id="item-x",
+            amount="9.90",
+            order_status="pending_ship",
+        ))
+        self.assertIsNone(self.order_row("order-orphan", "order_id"))
+
     def test_cross_cookie_update_is_rejected_without_mutating_owner_or_data(self):
         self.assertTrue(self.db.insert_or_update_order(
             order_id="order-cross",

@@ -11411,6 +11411,7 @@ async def manual_ship_orders(
                             # 更新本地数据库状态
                             orders_db.insert_or_update_order(
                                 order_id=order_id,
+                                cookie_id=cookie_id,
                                 order_status='shipped',
                                 system_shipped=True
                             )
@@ -11558,6 +11559,7 @@ async def manual_ship_orders(
                     # 更新本地数据库状态
                     orders_db.insert_or_update_order(
                         order_id=order_id,
+                        cookie_id=cookie_id,
                         order_status='shipped',
                         system_shipped=True
                     )

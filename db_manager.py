@@ -6901,8 +6901,13 @@ class DBManager:
                         logger.info(f"更新订单信息: {order_id}")
                 else:
                     # 插入新订单
+                    # 全新订单必须带归属 cookie_id，否则会成为无法被任何租户查询命中
+                    # 的孤儿数据（cookie_id=NULL），拒绝写入。
+                    if not cookie_id:
+                        logger.warning(f"缺少 cookie_id，拒绝插入无归属订单 {order_id}")
+                        return False
                     # 成交时快照主图：调用方未显式提供时从商品目录兜底，
-                    # 避免商品后续下架导致订单图片失联；缺 cookie/item 的状态类空壳插入保持为空
+                    # 避免商品后续下架导致订单图片失联
                     if not item_image and cookie_id and item_id:
                         catalog_row = cursor.execute(
                             "SELECT item_image FROM item_info WHERE cookie_id = ? AND item_id = ?",
