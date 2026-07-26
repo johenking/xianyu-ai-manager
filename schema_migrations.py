@@ -771,6 +771,18 @@ def _account_login_metadata_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _order_item_image_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    # 成交时从商品目录快照的主图 URL，避免商品下架后订单图片失联。
+    # db_manager 的即席 ALTER 轨道（order_sync_columns）先于本迁移执行，
+    # 运行中的库此列通常已存在；_add_column 幂等，空库（无 orders 表）直接跳过。
+    orders_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone()
+    if not orders_exists:
+        return
+    _add_column(cursor, "orders", "item_image TEXT DEFAULT ''")
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -803,6 +815,7 @@ MIGRATIONS: Sequence[Migration] = (
         "account_login_metadata_v1",
         _account_login_metadata_v1,
     ),
+    Migration("2026072601", "order_item_image_v1", _order_item_image_v1),
 )
 
 

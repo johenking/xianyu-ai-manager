@@ -515,6 +515,11 @@ class OrderSyncCoordinator:
             cookie_string = updated_cookie_string
 
         errors = []
+        # 成交时从商品目录快照主图，避免商品后续下架导致订单图片失联
+        try:
+            catalog_lookup = self.db.get_item_catalog_lookup([cookie_id])
+        except Exception:
+            catalog_lookup = {}
         for discovered_order in discovery.get("orders") or []:
             order = dict(discovered_order)
             order_id = str(order.get("order_id") or "")
@@ -523,6 +528,9 @@ class OrderSyncCoordinator:
                 errors.append("订单列表包含缺少订单号的记录")
                 continue
             summary["total_seen"] += 1
+            # 用成交商品 ID 关联当前目录主图，取不到则留空（不覆盖已有快照）
+            catalog_item = catalog_lookup.get((str(cookie_id), str(order.get("item_id") or "")))
+            catalog_image = (catalog_item or {}).get("item_image") or None
             existing = self.db.get_order_by_id(order_id)
             if not existing:
                 inserted = self.db.insert_or_update_order(
@@ -534,6 +542,7 @@ class OrderSyncCoordinator:
                     order_status=order.get("order_status") or "unknown",
                     cookie_id=cookie_id,
                     created_at=order.get("created_at") or None,
+                    item_image=catalog_image,
                 )
                 if not inserted:
                     summary["failed"] += 1
@@ -553,6 +562,7 @@ class OrderSyncCoordinator:
                 quantity=order.get("quantity"),
                 amount=order.get("amount"),
                 created_at=order.get("created_at"),
+                item_image=catalog_image,
             )
             if existing and update_result.get("status_changed"):
                 summary["status_updated"] += 1

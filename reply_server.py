@@ -10077,7 +10077,8 @@ def get_user_orders(
                 catalog_item = item_lookup.get((cid, str(order.get('item_id') or '')), {})
                 order['item_title'] = catalog_item.get('item_title', '')
                 order['item_price'] = catalog_item.get('item_price', '')
-                order['item_image'] = catalog_item.get('item_image', '')
+                # 图片快照优先：优先用订单成交时留存的快照，商品仍在架则用目录主图兜底
+                order['item_image'] = order.get('item_image') or catalog_item.get('item_image', '')
                 # 状态筛选
                 if status and order.get('status') != status:
                     continue
@@ -10124,6 +10125,11 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
         for cookie_id in user_cookies.keys():
             order = db_manager.get_order_by_id(order_id)
             if order and order.get('cookie_id') == cookie_id:
+                # 图片与列表接口同口径：成交时快照优先，商品仍在架则用目录主图兜底
+                if not order.get('item_image'):
+                    catalog_item = db_manager.get_item_catalog_lookup([cookie_id]).get(
+                        (str(cookie_id), str(order.get('item_id') or '')), {})
+                    order['item_image'] = catalog_item.get('item_image', '')
                 log_with_user('info', f"订单详情查询成功: {order_id}", current_user)
                 return {"success": True, "data": order}
 
@@ -11139,6 +11145,42 @@ async def manual_ship_orders(
         raise HTTPException(status_code=500, detail=f"手动发货失败: {str(e)}")
 
 
+# 订单导入的合法字段映射：前端字段名 -> insert_or_update_order 参数名。
+# status_text/pay_time/item_title/item_price 无对应订单列（商品信息以目录 join 为准），
+# 不在映射内的字段一律丢弃并在结果 message 中提示，避免传入非法关键字参数。
+_IMPORT_ORDER_PARAM_MAPPING = {
+    'item_id': 'item_id',
+    'buyer_id': 'buyer_id',
+    'receiver_name': 'receiver_name',
+    'receiver_phone': 'receiver_phone',
+    'receiver_address': 'receiver_address',
+    'receiver_city': 'receiver_city',
+    'status': 'order_status',  # 注意：前端用 status，后端用 order_status
+    'order_time': 'created_at',
+    'quantity': 'quantity',
+    'amount': 'amount',
+    'item_image': 'item_image',
+}
+
+
+def _map_import_order_params(order_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """把导入的订单数据映射为 insert_or_update_order 的合法关键字参数。
+
+    返回 (合法参数字典, 被忽略的字段名列表)。order_id/cookie_id 由调用方单独处理。
+    """
+    params: Dict[str, Any] = {}
+    ignored: List[str] = []
+    for field, value in order_data.items():
+        if value is None or field in ('order_id', 'cookie_id'):
+            continue
+        param_name = _IMPORT_ORDER_PARAM_MAPPING.get(field)
+        if param_name:
+            params[param_name] = value
+        else:
+            ignored.append(field)
+    return params, ignored
+
+
 @orders_router.post('/api/orders/import')
 async def import_orders(
     orders: List[Dict[str, Any]] = Body(..., description="订单列表"),
@@ -11163,13 +11205,6 @@ async def import_orders(
 
         # 必需字段验证
         required_fields = ['order_id', 'cookie_id']
-        optional_fields = [
-            'item_id', 'item_title', 'item_price', 'item_image',
-            'buyer_id',
-            'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
-            'status', 'status_text', 'order_time', 'pay_time',
-            'quantity', 'amount'
-        ]
 
         for order_data in orders:
             try:
@@ -11200,45 +11235,31 @@ async def import_orders(
                 # 检查订单是否已存在
                 existing_order = db_manager.get_order_by_id(order_id)
 
-                # 准备订单数据，直接使用 insert_or_update_order 的参数名
-                # 构建参数字典，只传递非 None 的值
+                # 映射为 insert_or_update_order 的合法参数，映射外字段丢弃并提示
+                mapped_params, ignored_fields = _map_import_order_params(order_data)
                 insert_params = {
                     'order_id': order_id,
-                    'cookie_id': cookie_id
+                    'cookie_id': cookie_id,
+                    **mapped_params,
                 }
-
-                # 前端字段名 -> 数据库参数名映射
-                param_mapping = {
-                    'item_id': 'item_id',
-                    'buyer_id': 'buyer_id',
-                    'receiver_name': 'receiver_name',
-                    'receiver_phone': 'receiver_phone',
-                    'receiver_address': 'receiver_address',
-                    'receiver_city': 'receiver_city',
-                    'status': 'order_status',  # 注意：前端用 status，后端用 order_status
-                    'status_text': 'status_text',
-                    'order_time': 'order_time',
-                    'pay_time': 'pay_time',
-                    'quantity': 'quantity',
-                    'amount': 'amount',
-                    'item_title': 'item_title',
-                    'item_price': 'item_price',
-                    'item_image': 'item_image'
-                }
-
-                # 遍历订单数据，添加到参数字典
-                for field, value in order_data.items():
-                    if value is not None and field in param_mapping:
-                        param_name = param_mapping[field]
-                        insert_params[param_name] = value
 
                 # 使用 insert_or_update_order 统一处理
-                db_manager.insert_or_update_order(**insert_params)
+                if not db_manager.insert_or_update_order(**insert_params):
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'message': '写入订单失败'
+                    })
+                    failed_count += 1
+                    continue
 
+                message = '订单已更新' if existing_order else '订单已导入'
+                if ignored_fields:
+                    message += f"（已忽略字段: {', '.join(ignored_fields)}）"
                 results.append({
                     'order_id': order_id,
                     'success': True,
-                    'message': '订单已更新' if existing_order else '订单已导入'
+                    'message': message
                 })
 
                 success_count += 1

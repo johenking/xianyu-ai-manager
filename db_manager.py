@@ -494,6 +494,8 @@ class DBManager:
                 'status_source': "TEXT DEFAULT ''",
                 'status_synced_at': "TIMESTAMP",
                 'last_sync_error': "TEXT DEFAULT ''",
+                # 成交时从商品目录快照的主图 URL，避免商品下架后订单图片失联
+                'item_image': "TEXT DEFAULT ''",
             }
             for column_name, column_sql in order_sync_columns.items():
                 if column_name not in order_columns:
@@ -6746,8 +6748,9 @@ class DBManager:
                               amount: str = None, order_status: str = None, cookie_id: str = None,
                               is_bargain: bool = None, created_at: str = None, receiver_name: str = None,
                               receiver_phone: str = None, receiver_address: str = None,
+                              receiver_city: str = None,
                               system_shipped: bool = None, expected_version: int = None,
-                              chat_id: str = None):
+                              chat_id: str = None, item_image: str = None):
         """插入或更新订单信息"""
         with self.lock:
             try:
@@ -6810,12 +6813,18 @@ class DBManager:
                     if receiver_address is not None:
                         update_fields.append("receiver_address = ?")
                         update_values.append(receiver_address)
+                    if receiver_city is not None:
+                        update_fields.append("receiver_city = ?")
+                        update_values.append(receiver_city)
                     if system_shipped is not None:
                         update_fields.append("system_shipped = ?")
                         update_values.append(1 if system_shipped else 0)
                     if chat_id is not None:
                         update_fields.append("chat_id = ?")
                         update_values.append(chat_id)
+                    if item_image is not None:
+                        update_fields.append("item_image = ?")
+                        update_values.append(item_image)
 
                     if update_fields:
                         update_fields.append("updated_at = CURRENT_TIMESTAMP")
@@ -6843,30 +6852,40 @@ class DBManager:
                         logger.info(f"更新订单信息: {order_id}")
                 else:
                     # 插入新订单
+                    # 成交时快照主图：调用方未显式提供时从商品目录兜底，
+                    # 避免商品后续下架导致订单图片失联；缺 cookie/item 的状态类空壳插入保持为空
+                    if not item_image and cookie_id and item_id:
+                        catalog_row = cursor.execute(
+                            "SELECT item_image FROM item_info WHERE cookie_id = ? AND item_id = ?",
+                            (str(cookie_id), str(item_id)),
+                        ).fetchone()
+                        item_image = (catalog_row[0] if catalog_row else '') or ''
                     if created_at:
                         # 使用提供的创建时间
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
                                           quantity, amount, order_status, cookie_id, is_bargain, created_at,
-                                          receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          receiver_name, receiver_phone, receiver_address, receiver_city,
+                                          system_shipped, chat_id, item_image)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0, created_at,
-                              receiver_name, receiver_phone, receiver_address,
-                              1 if system_shipped else 0, chat_id or ''))
+                              receiver_name, receiver_phone, receiver_address, receiver_city,
+                              1 if system_shipped else 0, chat_id or '', item_image or ''))
                     else:
                         # 使用默认的创建时间（CURRENT_TIMESTAMP，UTC时间）
                         cursor.execute('''
                         INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
                                           quantity, amount, order_status, cookie_id, is_bargain,
-                                          receiver_name, receiver_phone, receiver_address, system_shipped, chat_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          receiver_name, receiver_phone, receiver_address, receiver_city,
+                                          system_shipped, chat_id, item_image)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (order_id, item_id, buyer_id, spec_name, spec_value,
                               quantity, amount, order_status or 'unknown', cookie_id,
                               1 if is_bargain else 0,
-                              receiver_name, receiver_phone, receiver_address,
-                              1 if system_shipped else 0, chat_id or ''))
+                              receiver_name, receiver_phone, receiver_address, receiver_city,
+                              1 if system_shipped else 0, chat_id or '', item_image or ''))
                     logger.info(f"插入新订单: {order_id}")
 
                 self.conn.commit()
@@ -6899,7 +6918,7 @@ class DBManager:
             allowed_details = {
                 'item_id', 'buyer_id', 'spec_name', 'spec_value', 'quantity', 'amount',
                 'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
-                'created_at', 'chat_id',
+                'created_at', 'chat_id', 'item_image',
             }
             update_fields = [
                 'order_status = ?',
@@ -6927,7 +6946,11 @@ class DBManager:
                     f"SELECT {field} FROM orders WHERE order_id = ?",
                     (order_id,),
                 ).fetchone()
-                if existing and str(existing[0] or '') != str(value):
+                existing_value = str(existing[0] or '') if existing else ''
+                # 成交时快照只写一次：已有图片不被后续同步的目录主图冲掉
+                if field == 'item_image' and existing_value:
+                    continue
+                if existing and existing_value != str(value):
                     details_changed = True
                 update_fields.append(f"{field} = ?")
                 update_values.append(value)
@@ -6954,7 +6977,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT order_id, item_id, buyer_id, spec_name, spec_value,
                        quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id,
-                       platform_status_code, platform_status_text, status_source, status_synced_at, last_sync_error
+                       platform_status_code, platform_status_text, status_source, status_synced_at, last_sync_error, item_image
                 FROM orders WHERE order_id = ?
                 ''', (order_id,))
 
@@ -6982,6 +7005,7 @@ class DBManager:
                         'status_source': row[16] if len(row) > 16 else '',
                         'status_synced_at': row[17] if len(row) > 17 else None,
                         'last_sync_error': row[18] if len(row) > 18 else '',
+                        'item_image': row[19] if len(row) > 19 else '',
                     }
                 return None
 
@@ -7154,7 +7178,7 @@ class DBManager:
                        quantity, amount, order_status, is_bargain, created_at, updated_at,
                        receiver_name, receiver_phone, receiver_address, receiver_city,
                        platform_status_code, platform_status_text, status_source,
-                       status_synced_at, last_sync_error
+                       status_synced_at, last_sync_error, item_image
                 FROM orders WHERE cookie_id = ?
                 ORDER BY created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
@@ -7183,6 +7207,7 @@ class DBManager:
                         'status_source': row[17],
                         'status_synced_at': row[18],
                         'last_sync_error': row[19],
+                        'item_image': row[20] or '',
                     })
 
                 return orders
