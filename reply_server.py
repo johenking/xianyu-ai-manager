@@ -4922,6 +4922,9 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
             user_id=user_id
         )
         return {"id": rule_id, "message": "发货规则创建成功"}
+    except ValueError as e:
+        # 卡券归属校验失败（绑定了不存在或他人的卡券）
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4960,6 +4963,11 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
             return {"message": "发货规则更新成功"}
         else:
             raise HTTPException(status_code=404, detail="发货规则不存在")
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # 卡券归属校验失败（绑定了不存在或他人的卡券）
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

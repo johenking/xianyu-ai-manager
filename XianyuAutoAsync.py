@@ -4992,6 +4992,12 @@ class XianyuLive:
                     logger.error(f"获取订单规格信息失败: {self._safe_str(e)}，将跳过自动发货")
                     return None
 
+            # 发货规则匹配必须限定在当前账号归属用户内，防止命中其他租户的规则
+            rule_owner_user_id = db_manager.get_cookie_user_id(self.cookie_id)
+            if rule_owner_user_id is None:
+                logger.warning(f"账号 {self.cookie_id} 未找到归属用户，跳过自动发货")
+                return None
+
             # 智能匹配发货规则：多规格商品只匹配多规格卡券，非多规格商品只匹配非多规格卡券
             delivery_rules = []
 
@@ -4999,7 +5005,7 @@ class XianyuLive:
                 # 多规格商品：只匹配多规格发货规则
                 if spec_name and spec_value:
                     logger.info(f"多规格商品，尝试匹配多规格发货规则: {search_text[:50]}... [{spec_name}:{spec_value}]")
-                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value)
+                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value, user_id=rule_owner_user_id)
                     # 过滤只保留多规格卡券
                     delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
 
@@ -5014,7 +5020,7 @@ class XianyuLive:
             else:
                 # 非多规格商品：只匹配非多规格发货规则
                 logger.info(f"非多规格商品，尝试匹配普通发货规则: {search_text[:50]}...")
-                delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text)
+                delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text, user_id=rule_owner_user_id)
                 # 过滤只保留非多规格卡券
                 delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
 

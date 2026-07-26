@@ -2035,6 +2035,18 @@ class DBManager:
                 logger.error(f"根据ID获取Cookie失败: {e}")
                 return None
 
+    def get_cookie_user_id(self, cookie_id: str) -> Optional[int]:
+        """获取 cookie（闲鱼账号）归属的用户 ID，不存在返回 None"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+            except Exception as e:
+                logger.error(f"获取Cookie归属用户失败: {e}")
+                return None
+
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
         """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password和show_browser"""
         with self.lock:
@@ -5255,12 +5267,21 @@ class DBManager:
 
     # ==================== 自动发货规则方法 ====================
 
+    def _assert_card_owned_by_user(self, cursor, card_id: int, user_id: int):
+        """校验卡券归属：不存在或属于其他用户时抛 ValueError（防止跨租户绑定卡券）"""
+        self._execute_sql(cursor, "SELECT user_id FROM cards WHERE id = ?", (card_id,))
+        row = cursor.fetchone()
+        if not row or row[0] != user_id:
+            raise ValueError(f"卡券 {card_id} 不存在或无权绑定")
+
     def create_delivery_rule(self, keyword: str, card_id: int, delivery_count: int = 1,
                            enabled: bool = True, description: str = None, user_id: int = None):
-        """创建发货规则"""
+        """创建发货规则（提供 user_id 时校验卡券归属）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if user_id is not None and card_id is not None:
+                    self._assert_card_owned_by_user(cursor, card_id, user_id)
                 cursor.execute('''
                 INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -5324,8 +5345,12 @@ class DBManager:
                 logger.error(f"获取发货规则列表失败: {e}")
                 return []
 
-    def get_delivery_rules_by_keyword(self, keyword: str):
-        """根据关键字获取匹配的发货规则"""
+    def get_delivery_rules_by_keyword(self, keyword: str, user_id: int = None):
+        """根据关键字获取匹配的发货规则（强制按用户隔离）"""
+        # 自动发货匹配必须限定租户，否则用户 A 的商品会命中用户 B 的规则，
+        # 把 B 的卡券内容发给 A 的买家（内容泄露 + 消耗他人库存），fail-closed。
+        if user_id is None:
+            raise ValueError("get_delivery_rules_by_keyword 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -5340,6 +5365,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND dr.user_id = ?
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 ORDER BY
                     CASE
@@ -5347,7 +5373,7 @@ class DBManager:
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.id ASC
-                ''', (keyword, keyword, keyword))
+                ''', (user_id, keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
@@ -5435,10 +5461,13 @@ class DBManager:
     def update_delivery_rule(self, rule_id: int, keyword: str = None, card_id: int = None,
                            delivery_count: int = None, enabled: bool = None,
                            description: str = None, user_id: int = None):
-        """更新发货规则（支持用户隔离）"""
+        """更新发货规则（支持用户隔离；改绑卡券时校验卡券归属）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+
+                if user_id is not None and card_id is not None:
+                    self._assert_card_owned_by_user(cursor, card_id, user_id)
 
                 # 构建更新语句
                 update_fields = []
@@ -5501,8 +5530,11 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新发货次数失败: {e}")
 
-    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None):
-        """根据关键字和规格信息获取匹配的发货规则（支持多规格）"""
+    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None, user_id: int = None):
+        """根据关键字和规格信息获取匹配的发货规则（支持多规格，强制按用户隔离）"""
+        # 同 get_delivery_rules_by_keyword：自动发货匹配必须限定租户，fail-closed。
+        if user_id is None:
+            raise ValueError("get_delivery_rules_by_keyword_and_spec 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -5519,6 +5551,7 @@ class DBManager:
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND dr.user_id = ?
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
@@ -5527,7 +5560,7 @@ class DBManager:
                             ELSE LENGTH(dr.keyword) / 2
                         END DESC,
                         dr.delivery_times ASC
-                    ''', (keyword, keyword, spec_name, spec_value, keyword))
+                    ''', (user_id, keyword, keyword, spec_name, spec_value, keyword))
 
                     rules = []
                     for row in cursor.fetchall():
@@ -5577,6 +5610,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND dr.user_id = ?
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
                 ORDER BY
@@ -5585,7 +5619,7 @@ class DBManager:
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                ''', (user_id, keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
