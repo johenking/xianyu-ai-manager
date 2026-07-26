@@ -141,6 +141,13 @@
   "/api/ai/providers/{profile_id}/test": [
     "POST"
   ],
+  "/api/ai/reply-strategies": [
+    "GET",
+    "PUT"
+  ],
+  "/api/ai/reply-strategies/{prompt_type}": [
+    "PUT"
+  ],
   "/api/auth/captcha": [
     "POST"
   ],

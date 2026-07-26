@@ -86,6 +86,37 @@ export const updateAccountAISettings = async (cookieId: string, settings: Partia
   return put(`/ai-reply-settings/${cookieId}`, payload);
 }
 
+// ===== 高级回复策略（归并自原「AI 专家客服」，用户级、跨账号共享）=====
+export interface ReplyStrategy {
+  prompt_type: 'price' | 'tech' | 'default';
+  title: string;
+  content: string;
+  enabled: boolean;
+  updated_at?: string | null;
+}
+
+export const getAiReplyStrategies = async (): Promise<ReplyStrategy[]> => {
+  const res = await get<{ success: boolean; data: ReplyStrategy[] }>('/api/ai/reply-strategies');
+  return res.data || [];
+};
+
+export const updateAiReplyStrategy = async (
+  promptType: ReplyStrategy['prompt_type'],
+  data: { content: string; enabled: boolean },
+): Promise<ApiResponse> => {
+  return put(`/api/ai/reply-strategies/${promptType}`, data);
+};
+
+export const updateAiReplyStrategies = async (
+  strategies: ReplyStrategy[],
+): Promise<ApiResponse & { data?: ReplyStrategy[] }> => {
+  const byType = Object.fromEntries(strategies.map((strategy) => [strategy.prompt_type, {
+    content: strategy.content,
+    enabled: strategy.enabled,
+  }]));
+  return put('/api/ai/reply-strategies', byType);
+};
+
 export const getAIProviders = async (): Promise<AIProviderListResponse> => get('/api/ai/providers');
 
 export const createAIProvider = async (data: {

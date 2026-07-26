@@ -18,6 +18,9 @@ import uvicorn
 import pandas as pd
 import io
 import asyncio
+import importlib.util
+import sqlite3
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 import requests
@@ -1023,6 +1026,16 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 # 极验验证状态存储: {challenge: {"status": int, "expires_at": float}}
 geetest_status_store: dict = {}
 
+# Lightweight, process-local diagnostics caches. They deliberately avoid account
+# browser profiles and never call the Xianyu website.
+_OPS_DB_PROBE_TTL_SECONDS = 60.0
+_ops_db_probe_lock = threading.Lock()
+_ops_db_probe_cache: Dict[str, Any] = {}
+_BROWSER_PROBE_TTL_SECONDS = 600.0
+_browser_probe_lock = threading.Lock()
+_browser_probe_cache: Dict[str, Any] = {}
+_browser_probe_checking = False
+
 
 def cleanup_expired_geetest_status():
     """清理过期的极验验证状态"""
@@ -1802,6 +1815,14 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         )
         refresh_status = _current_session_refresh_status(cookie_id)
         reauth_required = refresh_status.get('state') == 'manual_reauth_required'
+        search_context = db_manager.get_owned_cookie_search_context(user_id, cookie_id)
+        search_state = str(search_context.get('state') or 'error')
+        search_blocker_by_state = {
+            'action_required': '账号身份不完整，请先完成登录恢复',
+            'ownership_mismatch': '当前账号不属于此用户',
+            'not_found': '账号记录不存在',
+            'error': '账号身份状态读取失败，请稍后重试',
+        }
 
         result.append({
             'id': cookie_id,
@@ -1830,6 +1851,18 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'last_validated_at': cookie_details.get('last_validated_at') if cookie_details else None,
             'last_expired_at': cookie_details.get('last_expired_at') if cookie_details else None,
             'reauth_updated_at': refresh_status.get('updated_at') if reauth_required else None,
+            'search_readiness': {
+                'ready': search_state == 'ready',
+                'state': search_state,
+                'blockers': (
+                    []
+                    if search_state == 'ready'
+                    else [search_blocker_by_state.get(
+                        search_state,
+                        '账号身份不完整，请先完成登录恢复',
+                    )]
+                ),
+            },
         })
     return result
 
@@ -5738,6 +5771,131 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
         raise HTTPException(status_code=400, detail='测试回复生成失败，请检查平台、Key、地址和模型 ID')
 
 
+# ===== 高级回复策略（用户级，跨账号共享）=====
+# 归并自原“AI 专家客服”。底层复用 skill_agent_prompts 存储，仅暴露 price/tech/default，
+# classify（意图分类）保留在库中但不通过本接口暴露。优先级低于产品事实/硬性价格规则/商品训练规则。
+REPLY_STRATEGY_TYPES = ['price', 'tech', 'default']
+
+
+class ReplyStrategyIn(BaseModel):
+    content: str
+    enabled: bool = True
+
+
+class ReplyStrategiesUpdateIn(BaseModel):
+    price: ReplyStrategyIn
+    tech: ReplyStrategyIn
+    default: ReplyStrategyIn
+
+    model_config = {'extra': 'forbid'}
+
+
+def _reply_strategy_payload(user_id: int) -> List[Dict[str, Any]]:
+    prompts = _ensure_skill_agent_prompts(user_id)
+    payload: List[Dict[str, Any]] = []
+    for prompt_type in REPLY_STRATEGY_TYPES:
+        item = prompts.get(prompt_type)
+        if not item:
+            continue
+        payload.append({
+            'prompt_type': prompt_type,
+            'title': item.get('title') or SKILL_AGENT_PROMPT_TITLES.get(prompt_type, prompt_type),
+            'content': item.get('content', ''),
+            'enabled': bool(item.get('enabled', True)),
+            'updated_at': item.get('updated_at'),
+        })
+    return payload
+
+
+@ai_router.get('/api/ai/reply-strategies')
+def get_ai_reply_strategies(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取高级回复策略（price/tech/default，当前用户所有账号共享）"""
+    return {
+        'success': True,
+        'data': _reply_strategy_payload(current_user['user_id']),
+        'shared_scope': 'user',
+        'note': '当前用户所有账号共享；优先级低于产品事实、硬性价格规则与商品训练规则',
+    }
+
+
+@ai_router.put('/api/ai/reply-strategies')
+def update_ai_reply_strategies(
+    payload: ReplyStrategiesUpdateIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Atomically replace price/tech/default reply strategies."""
+    strategy_values = {
+        prompt_type: getattr(payload, prompt_type)
+        for prompt_type in REPLY_STRATEGY_TYPES
+    }
+    empty_types = [
+        prompt_type
+        for prompt_type, strategy in strategy_values.items()
+        if not strategy.content.strip()
+    ]
+    if empty_types:
+        raise HTTPException(status_code=400, detail="三类回复策略内容均不能为空")
+
+    user_id = int(current_user['user_id'])
+    _ensure_skill_agent_prompts(user_id)
+    prompts = {
+        prompt_type: {
+            'title': SKILL_AGENT_PROMPT_TITLES[prompt_type],
+            'content': strategy.content.strip(),
+            'enabled': strategy.enabled,
+        }
+        for prompt_type, strategy in strategy_values.items()
+    }
+    if not db_manager.upsert_skill_agent_prompts_transaction(user_id, prompts):
+        raise HTTPException(status_code=400, detail="保存回复策略失败，未修改任何策略")
+
+    db_manager.log_skill_event(
+        user_id,
+        'agent',
+        '批量更新高级回复策略',
+        payload={'prompt_types': REPLY_STRATEGY_TYPES},
+    )
+    return {
+        'success': True,
+        'message': '三类回复策略已保存',
+        'data': _reply_strategy_payload(user_id),
+    }
+
+
+@ai_router.put('/api/ai/reply-strategies/{prompt_type}')
+def update_ai_reply_strategy(
+    prompt_type: str,
+    payload: ReplyStrategyIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """更新高级回复策略（仅 price/tech/default）"""
+    if prompt_type not in REPLY_STRATEGY_TYPES:
+        raise HTTPException(status_code=400, detail="不支持的回复策略类型")
+    if not payload.content.strip():
+        raise HTTPException(status_code=400, detail="策略内容不能为空")
+
+    user_id = current_user['user_id']
+    # 确保底层记录已初始化（保留已有的 8 条 prompt 记录，不重置）
+    _ensure_skill_agent_prompts(user_id)
+    success = db_manager.upsert_skill_agent_prompt(
+        user_id,
+        prompt_type,
+        SKILL_AGENT_PROMPT_TITLES.get(prompt_type, prompt_type),
+        payload.content,
+        payload.enabled,
+    )
+    if not success:
+        raise HTTPException(status_code=400, detail="保存回复策略失败")
+
+    db_manager.log_skill_event(
+        user_id,
+        'agent',
+        f"更新高级回复策略: {prompt_type}",
+        payload={'prompt_type': prompt_type},
+    )
+    return {"success": True, "message": "回复策略已保存"}
+
+
 @ai_router.get("/ai-reply-settings/{cookie_id}")
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的AI回复设置"""
@@ -7033,23 +7191,67 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
         ).get('state') == 'ready'
     }
     tasks = db_manager.list_skill_monitor_tasks(user_id)
-    runnable_tasks = [
+    configured_tasks = [
         task
         for task in tasks
-        if task.get('enabled')
+        if str(task.get('keyword') or '').strip()
         and str(task.get('account_id') or '') in ready_account_ids
     ]
-    manual_ready = bool(
-        effective_flags.get('skill_monitor_enabled')
-        and runnable_tasks
-    )
-    blockers = []
-    if not effective_flags.get('skill_monitor_enabled'):
-        blockers.append('全局监控开关关闭')
+    enabled_configured_tasks = [
+        task for task in configured_tasks if task.get('enabled')
+    ]
+    config_blockers = []
     if not ready_account_ids:
-        blockers.append('没有身份完整的所属账号')
-    if not runnable_tasks:
-        blockers.append('没有绑定可用账号的启用任务')
+        config_blockers.append('没有身份完整的所属账号')
+    if not configured_tasks:
+        config_blockers.append('没有绑定可用账号的完整任务')
+
+    gate_messages = {
+        'monitor_disabled': '真实搜索总开关关闭，当前为可用预览',
+        'scheduler_disabled': '定时调度开关关闭',
+        'delivery_disabled': '结果通知开关关闭',
+        'mtop_disabled': 'MTop 适配器开关关闭',
+    }
+
+    def operation_gate(*requirements: tuple[str, str]) -> Dict[str, Any]:
+        blockers = [
+            {
+                'reason_code': reason_code,
+                'message': gate_messages[reason_code],
+            }
+            for setting_key, reason_code in requirements
+            if not effective_flags.get(setting_key)
+        ]
+        enabled = not blockers
+        reason_code = '' if enabled else blockers[0]['reason_code']
+        return {
+            'enabled': enabled,
+            'reason_code': reason_code,
+            'message': (
+                '已满足运行门槛'
+                if enabled
+                else '；'.join(blocker['message'] for blocker in blockers)
+            ),
+            'blockers': blockers,
+        }
+
+    operation_gates = {
+        'manual_run': operation_gate(
+            ('skill_monitor_enabled', 'monitor_disabled'),
+        ),
+        'schedule_activation': operation_gate(
+            ('skill_monitor_enabled', 'monitor_disabled'),
+            ('skill_monitor_scheduler_enabled', 'scheduler_disabled'),
+        ),
+        'delivery': operation_gate(
+            ('skill_monitor_enabled', 'monitor_disabled'),
+            ('skill_monitor_delivery_enabled', 'delivery_disabled'),
+        ),
+        'mtop': operation_gate(
+            ('skill_monitor_enabled', 'monitor_disabled'),
+            ('skill_monitor_mtop_enabled', 'mtop_disabled'),
+        ),
+    }
 
     evidence = db_manager.get_skill_capability_evidence(user_id)
     last_search = evidence.get('last_real_search')
@@ -7082,6 +7284,12 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
 
     return {
         'success': True,
+        'runtime_mode': (
+            'live'
+            if effective_flags.get('skill_monitor_enabled')
+            else 'preview'
+        ),
+        'operation_gates': operation_gates,
         'data': {
             'code_present': {
                 'available': True,
@@ -7094,22 +7302,31 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                 },
             },
             'config_ready': {
-                'available': manual_ready,
-                'state': 'ready' if manual_ready else 'blocked',
-                'badge_state': 'ready' if manual_ready else 'missing',
-                'label': '配置就绪' if manual_ready else '尚未就绪',
+                'available': bool(configured_tasks),
+                'state': 'ready' if configured_tasks else 'blocked',
+                'badge_state': 'ready' if configured_tasks else 'missing',
+                'label': '配置完整' if configured_tasks else '待完善配置',
                 'detail': (
-                    f"{len(runnable_tasks)} 个任务可手动执行"
-                    if manual_ready
-                    else '；'.join(blockers)
+                    f"{len(configured_tasks)} 个任务配置完整，可在运行开关开启后执行"
+                    if configured_tasks
+                    else '；'.join(config_blockers)
                 ),
                 'evidence': {
                     'ready_accounts': len(ready_account_ids),
-                    'runnable_tasks': len(runnable_tasks),
-                    'ready_account_ids': sorted(ready_account_ids),
-                    'runnable_task_ids': sorted(
-                        int(task['id']) for task in runnable_tasks
+                    'configured_tasks': len(configured_tasks),
+                    'runnable_tasks': (
+                        len(enabled_configured_tasks)
+                        if operation_gates['manual_run']['enabled']
+                        else 0
                     ),
+                    'ready_account_ids': sorted(ready_account_ids),
+                    'configured_task_ids': sorted(
+                        int(task['id']) for task in configured_tasks
+                    ),
+                    'runnable_task_ids': sorted(
+                        int(task['id'])
+                        for task in enabled_configured_tasks
+                    ) if operation_gates['manual_run']['enabled'] else [],
                     'global_enabled': bool(
                         effective_flags.get('skill_monitor_enabled')
                     ),
@@ -7123,64 +7340,8 @@ def get_skill_capabilities(current_user: Dict[str, Any] = Depends(get_current_us
                         effective_flags.get('skill_monitor_mtop_enabled')
                     ),
                     'operation_gates': {
-                        'manual_run': {
-                            'enabled': bool(
-                                effective_flags.get('skill_monitor_enabled')
-                            ),
-                            'reason_code': (
-                                ''
-                                if effective_flags.get('skill_monitor_enabled')
-                                else 'monitor_disabled'
-                            ),
-                        },
-                        'schedule_activation': {
-                            'enabled': bool(
-                                effective_flags.get('skill_monitor_enabled')
-                                and effective_flags.get(
-                                    'skill_monitor_scheduler_enabled'
-                                )
-                            ),
-                            'reason_code': (
-                                ''
-                                if (
-                                    effective_flags.get('skill_monitor_enabled')
-                                    and effective_flags.get(
-                                        'skill_monitor_scheduler_enabled'
-                                    )
-                                )
-                                else (
-                                    'monitor_disabled'
-                                    if not effective_flags.get(
-                                        'skill_monitor_enabled'
-                                    )
-                                    else 'scheduler_disabled'
-                                )
-                            ),
-                        },
-                        'delivery_activation': {
-                            'enabled': bool(
-                                effective_flags.get('skill_monitor_enabled')
-                                and effective_flags.get(
-                                    'skill_monitor_delivery_enabled'
-                                )
-                            ),
-                            'reason_code': (
-                                ''
-                                if (
-                                    effective_flags.get('skill_monitor_enabled')
-                                    and effective_flags.get(
-                                        'skill_monitor_delivery_enabled'
-                                    )
-                                )
-                                else (
-                                    'monitor_disabled'
-                                    if not effective_flags.get(
-                                        'skill_monitor_enabled'
-                                    )
-                                    else 'delivery_disabled'
-                                )
-                            ),
-                        },
+                        **operation_gates,
+                        'delivery_activation': operation_gates['delivery'],
                     },
                 },
             },
@@ -7837,12 +7998,88 @@ async def execute_skill_monitor_task(
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 
+def _skill_task_readiness(
+    user_id: int,
+    account_id: str,
+    context_cache: Dict[str, Dict[str, Any]],
+    *,
+    keyword: str = '',
+    task_enabled: bool = True,
+    manual_run_enabled: bool = False,
+) -> Dict[str, Any]:
+    """基于账号身份状态计算任务就绪度（只读，不触发任何真实动作）。
+
+    - configured: 必填关键词与所属账号身份是否完整
+    - runnable: configured 且生产手动运行门槛开启
+    - blockers: 阻塞原因的中文说明列表，空列表表示可运行
+    """
+    normalized = str(account_id or '').strip()
+    normalized_keyword = str(keyword or '').strip()
+    if not normalized:
+        return {
+            'configured': False,
+            'runnable': False,
+            'blockers': ['未绑定闲鱼账号'],
+        }
+    if not normalized_keyword:
+        return {
+            'configured': False,
+            'runnable': False,
+            'blockers': ['监控关键词为空'],
+        }
+    if normalized in context_cache:
+        context = context_cache[normalized]
+    else:
+        try:
+            context = db_manager.get_owned_cookie_search_context(int(user_id), normalized) or {}
+        except Exception as e:
+            logger.error(f"读取账号就绪状态失败: {type(e).__name__}")
+            context = {'state': 'error'}
+        context_cache[normalized] = context
+    state = str(context.get('state') or 'error')
+    if state == 'ready':
+        if not task_enabled:
+            return {
+                'configured': True,
+                'runnable': False,
+                'blockers': ['任务已停用'],
+            }
+        if manual_run_enabled:
+            return {'configured': True, 'runnable': True, 'blockers': []}
+        return {
+            'configured': True,
+            'runnable': False,
+            'blockers': ['真实搜索总开关关闭，当前为可用预览'],
+        }
+    blocker_by_state = {
+        'ownership_mismatch': '无权限使用该闲鱼账号',
+        'not_found': '绑定的闲鱼账号不存在',
+    }
+    blocker = blocker_by_state.get(state, '闲鱼账号身份不完整，请先完成账号登录恢复')
+    return {'configured': False, 'runnable': False, 'blockers': [blocker]}
+
+
 @skills_router.get("/api/skills/monitor/tasks")
 def list_skill_monitor_tasks(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取当前用户的技能监控任务"""
+    """获取当前用户的技能监控任务（附带就绪度与最近真实运行证据）"""
+    tasks = db_manager.list_skill_monitor_tasks(current_user['user_id']) or []
+    feature_state = get_skill_monitor_feature_state(db_manager)
+    manual_run_enabled = bool(
+        feature_state.get('effective', {}).get('skill_monitor_enabled')
+    )
+    context_cache: Dict[str, Dict[str, Any]] = {}
+    for task in tasks:
+        task['readiness'] = _skill_task_readiness(
+            current_user['user_id'],
+            task.get('account_id'),
+            context_cache,
+            keyword=task.get('keyword'),
+            task_enabled=bool(task.get('enabled', True)),
+            manual_run_enabled=manual_run_enabled,
+        )
     return {
         "success": True,
-        "data": db_manager.list_skill_monitor_tasks(current_user['user_id'])
+        "data": tasks,
     }
 
 
@@ -7866,12 +8103,14 @@ def create_skill_monitor_task(task: SkillMonitorTaskIn, current_user: Dict[str, 
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # 创建任务必须绑定一个身份完整、属于当前用户的闲鱼账号。
+        # 定时任务额外要求监控全局/调度开关开启（schedule_ready 内部已包含 account_ready 校验）。
         if task.schedule_enabled:
             _require_skill_monitor_schedule_ready(
                 current_user['user_id'],
                 task.account_id,
             )
-        elif task.account_id:
+        else:
             _require_skill_monitor_account_ready(
                 current_user['user_id'],
                 task.account_id,
@@ -8108,9 +8347,16 @@ def test_skill_agent_reply(test_data: SkillAgentTestIn, current_user: Dict[str, 
 def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取技能中心运维健康信息"""
     db_path = Path(db_manager.db_path)
+    database_probe = _get_database_write_probe(db_path)
     logs = db_manager.list_skill_logs(current_user['user_id'], limit=10)
     user_cookie_ids = set(db_manager.get_all_cookies(current_user['user_id']).keys())
     manager_tasks = getattr(cookie_manager.manager, 'tasks', {}) or {}
+    enabled_ids = {
+        str(cookie_id)
+        for cookie_id in user_cookie_ids
+        if cookie_manager.manager is not None
+        and cookie_manager.manager.get_cookie_status(cookie_id)
+    }
     listening_ids = {
         str(cookie_id) for cookie_id, task in manager_tasks.items()
         if str(cookie_id) in user_cookie_ids and not getattr(task, 'done', lambda: False)()
@@ -8134,15 +8380,23 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
             "database": {
                 "path": str(db_path),
                 "exists": db_path.exists(),
-                "writable": os.access(db_path.parent if db_path.parent else Path('.'), os.W_OK),
+                "writable": bool(database_probe.get('writable')),
+                "write_probe_status": database_probe.get('status'),
+                "write_probe_observed_at": database_probe.get('observed_at'),
+                "write_probe_error": database_probe.get('error', ''),
                 "migration_version": getattr(db_manager, "schema_version", "legacy"),
             },
             "runtime_sessions": get_session_registry().summary(),
             "cookie_manager": "ready" if cookie_manager.manager is not None else "not_ready",
             "accounts": {
                 "total": len(user_cookie_ids),
+                "enabled": len(enabled_ids),
                 "listening": len(listening_ids),
-                "listener_state": "running" if listening_ids else "stopped",
+                "listener_state": (
+                    "not_required"
+                    if not enabled_ids
+                    else ("running" if enabled_ids.issubset(listening_ids) else "degraded")
+                ),
             },
             "ai": {
                 "global_configured": global_ai_configured,
@@ -8160,29 +8414,146 @@ def get_skill_ops_health(current_user: Dict[str, Any] = Depends(get_current_user
     }
 
 
+def _get_database_write_probe(db_path: Path) -> Dict[str, Any]:
+    """Verify a rollback-only SQLite write with a short, cached probe."""
+    now = time.time()
+    cache_key = str(db_path.resolve())
+    with _ops_db_probe_lock:
+        observed_at = float(_ops_db_probe_cache.get('observed_at') or 0)
+        if (
+            _ops_db_probe_cache.get('db_path') == cache_key
+            and now - observed_at < _OPS_DB_PROBE_TTL_SECONDS
+        ):
+            return dict(_ops_db_probe_cache)
+
+        result: Dict[str, Any] = {
+            'status': 'failed',
+            'writable': False,
+            'observed_at': now,
+            'error': '',
+            'db_path': cache_key,
+        }
+        if not db_path.exists():
+            result['error'] = 'database_missing'
+        else:
+            connection = None
+            try:
+                connection = sqlite3.connect(str(db_path), timeout=1.0)
+                connection.execute('BEGIN IMMEDIATE')
+                connection.execute('''
+                    INSERT INTO system_settings (key, value)
+                    VALUES ('__ops_write_probe__', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                ''', (str(now),))
+                connection.rollback()
+                result.update(status='ok', writable=True)
+            except Exception as exc:
+                if connection is not None:
+                    connection.rollback()
+                result['error'] = type(exc).__name__
+            finally:
+                if connection is not None:
+                    connection.close()
+        _ops_db_probe_cache.clear()
+        _ops_db_probe_cache.update(result)
+        return dict(result)
+
+
+def _browser_probe_worker() -> None:
+    global _browser_probe_checking
+
+    result: Dict[str, Any] = {
+        'status': 'unavailable',
+        'playwright_importable': False,
+        'playwright_launchable': False,
+        'browser_path': '',
+        'observed_at': time.time(),
+        'playwright_error': '',
+    }
+    try:
+        from playwright.sync_api import sync_playwright
+
+        result['playwright_importable'] = True
+        with sync_playwright() as playwright_runtime:
+            result['browser_path'] = Path(
+                playwright_runtime.chromium.executable_path
+            ).name
+            browser = playwright_runtime.chromium.launch(
+                headless=True,
+                timeout=8000,
+            )
+            try:
+                context = browser.new_context()
+                try:
+                    page = context.new_page()
+                    page.goto('about:blank', wait_until='commit', timeout=8000)
+                finally:
+                    context.close()
+            finally:
+                browser.close()
+        result.update(
+            status='ready',
+            playwright_launchable=True,
+            observed_at=time.time(),
+        )
+    except Exception as exc:
+        result['playwright_importable'] = (
+            result['playwright_importable']
+            or importlib.util.find_spec('playwright') is not None
+        )
+        first_line = str(exc).splitlines()[0].strip() if str(exc) else type(exc).__name__
+        result['playwright_error'] = first_line[:180]
+        result['observed_at'] = time.time()
+    finally:
+        with _browser_probe_lock:
+            _browser_probe_cache.clear()
+            _browser_probe_cache.update(result)
+            _browser_probe_checking = False
+
+
+def _get_browser_probe_snapshot() -> Dict[str, Any]:
+    global _browser_probe_checking
+
+    now = time.time()
+    with _browser_probe_lock:
+        observed_at = float(_browser_probe_cache.get('observed_at') or 0)
+        fresh = bool(
+            _browser_probe_cache
+            and now - observed_at < _BROWSER_PROBE_TTL_SECONDS
+        )
+        if fresh:
+            return {**_browser_probe_cache, 'stale': False, 'checking': False}
+
+        if not _browser_probe_checking:
+            _browser_probe_checking = True
+            threading.Thread(
+                target=_browser_probe_worker,
+                name='skill-browser-diagnostics',
+                daemon=True,
+            ).start()
+
+        if _browser_probe_cache:
+            return {**_browser_probe_cache, 'stale': True, 'checking': True}
+        return {
+            'status': 'checking',
+            'playwright_importable': importlib.util.find_spec('playwright') is not None,
+            'playwright_launchable': False,
+            'browser_path': '',
+            'observed_at': None,
+            'playwright_error': '',
+            'stale': False,
+            'checking': True,
+        }
+
+
 @skills_router.get("/api/skills/ops/browser-status")
 def get_skill_browser_status(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取Playwright/浏览器运行状态"""
+    """Return a cached browser probe without blocking on a Chromium launch."""
     browser_info = {
-        "playwright_importable": False,
-        "playwright_launchable": False,
-        "browser_path": "",
+        **_get_browser_probe_snapshot(),
         "active_cookie_tasks": 0,
         "account_count": len(db_manager.get_all_cookies(current_user['user_id'])),
     }
-    try:
-        import playwright  # noqa: F401
-        browser_info["playwright_importable"] = True
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as playwright_runtime:
-            browser_info["browser_path"] = Path(playwright_runtime.chromium.executable_path).name
-            browser = playwright_runtime.chromium.launch(headless=True)
-            browser.close()
-            browser_info["playwright_launchable"] = True
-    except Exception as e:
-        first_line = str(e).splitlines()[0].strip() if str(e) else type(e).__name__
-        browser_info["playwright_error"] = first_line[:180]
-
     if cookie_manager.manager is not None:
         browser_info["active_cookie_tasks"] = len(cookie_manager.manager.tasks)
 

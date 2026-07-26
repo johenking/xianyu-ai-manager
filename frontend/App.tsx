@@ -216,7 +216,7 @@ const App: React.FC = () => {
 
       <main className="flex-1 min-w-0 lg:ml-64 p-4 sm:p-6 lg:p-10 overflow-y-auto min-h-screen relative scroll-smooth">
         <div className="mb-5 flex items-center gap-3 lg:hidden">
-          <button type="button" onClick={() => setMobileNavOpen(true)} className="h-10 w-10 rounded-xl bg-white border border-gray-100 flex items-center justify-center shadow-sm" aria-label="打开导航">
+          <button type="button" onClick={() => setMobileNavOpen(true)} className="flex h-11 w-11 items-center justify-center rounded-xl border border-gray-100 bg-white shadow-sm" aria-label="打开导航">
             <Menu className="w-5 h-5" />
           </button>
           <span className="font-extrabold text-gray-900">闲鱼智控</span>

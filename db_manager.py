@@ -10059,6 +10059,39 @@ class DBManager:
             'created_at': row[13],
         }
 
+    def _skill_monitor_latest_run_evidence(self, cursor, task_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        """取某任务最近一次运行的真实证据（不含任何密钥），无运行记录返回 None。"""
+        try:
+            row = cursor.execute('''
+                SELECT status, trigger_type, source_adapter,
+                       raw_result_count, accepted_result_count,
+                       COALESCE(finished_at, started_at, created_at)
+                FROM skill_monitor_runs
+                WHERE task_id = ? AND user_id = ?
+                  AND source_adapter IN ('playwright', 'mtop')
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            ''', (int(task_id), int(user_id))).fetchone()
+        except Exception as e:
+            logger.error(f"读取任务最近运行证据失败: {type(e).__name__}")
+            return None
+        if not row:
+            return None
+        observed_at = None
+        if row[5] is not None:
+            try:
+                observed_at = float(row[5])
+            except (TypeError, ValueError):
+                observed_at = None
+        return {
+            'status': str(row[0] or ''),
+            'trigger_type': str(row[1] or ''),
+            'source_adapter': str(row[2] or ''),
+            'raw_result_count': int(row[3] or 0),
+            'accepted_result_count': int(row[4] or 0),
+            'observed_at': observed_at,
+        }
+
     def list_skill_monitor_tasks(self, user_id: int) -> List[Dict[str, Any]]:
         with self.lock:
             try:
@@ -10072,7 +10105,16 @@ class DBManager:
                     WHERE user_id = ?
                     ORDER BY updated_at DESC, id DESC
                 ''', (user_id,))
-                return [self._skill_monitor_task_from_row(row) for row in cursor.fetchall()]
+                rows = cursor.fetchall()
+                tasks: List[Dict[str, Any]] = []
+                for row in rows:
+                    task = self._skill_monitor_task_from_row(row)
+                    # 为每条任务附加最近一次真实运行证据，供前端展示"确实跑过/搜到了什么"
+                    task['latest_run_evidence'] = self._skill_monitor_latest_run_evidence(
+                        cursor, task['id'], user_id,
+                    )
+                    tasks.append(task)
+                return tasks
             except Exception as e:
                 logger.error(f"获取技能监控任务失败: {e}")
                 return []
@@ -10422,6 +10464,45 @@ class DBManager:
                 return True
             except Exception as e:
                 logger.error(f"保存技能AI提示词失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def upsert_skill_agent_prompts_transaction(
+        self,
+        user_id: int,
+        prompts: Dict[str, Dict[str, Any]],
+    ) -> bool:
+        """Save a complete reply-strategy set atomically.
+
+        The caller validates the allowed prompt types. This method deliberately
+        performs every upsert in one SQLite transaction so a partial strategy
+        set is never visible to live replies.
+        """
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                for prompt_type, prompt in prompts.items():
+                    cursor.execute('''
+                        INSERT INTO skill_agent_prompts (
+                            user_id, prompt_type, title, content, enabled, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id, prompt_type) DO UPDATE SET
+                            title = excluded.title,
+                            content = excluded.content,
+                            enabled = excluded.enabled,
+                            updated_at = CURRENT_TIMESTAMP
+                    ''', (
+                        int(user_id),
+                        str(prompt_type),
+                        str(prompt.get('title') or prompt_type),
+                        str(prompt.get('content') or ''),
+                        1 if prompt.get('enabled', True) else 0,
+                    ))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"批量保存技能AI提示词失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
 

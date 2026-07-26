@@ -4,6 +4,7 @@ import type {
   SkillAgentPrompt,
   SkillBrowserStatus,
   SkillCapability,
+  SkillCapabilitiesResponse,
   SkillDeliveryDiagnostics,
   SkillMonitorResult,
   SkillMonitorTask,
@@ -70,9 +71,24 @@ export const testSkillAgentReply = async (data: {
   return post('/api/skills/agent/test-reply', data);
 };
 
-export const getSkillCapabilities = async (): Promise<Record<string, SkillCapability>> => {
-  const result = await get<{ success: boolean; data: Record<string, SkillCapability> }>('/api/skills/capabilities');
-  return result.data || {};
+export const getSkillCapabilities = async (): Promise<SkillCapabilitiesResponse> => {
+  const result = await get<{
+    success: boolean;
+    runtime_mode?: 'preview' | 'live';
+    operation_gates?: SkillCapabilitiesResponse['operation_gates'];
+    data: Record<string, SkillCapability>;
+  }>('/api/skills/capabilities');
+  const disabledGate = { enabled: false, reason_code: 'unknown', message: '运行状态尚未确认' };
+  return {
+    runtime_mode: result.runtime_mode || 'preview',
+    operation_gates: result.operation_gates || {
+      manual_run: disabledGate,
+      schedule_activation: disabledGate,
+      delivery: disabledGate,
+      mtop: disabledGate,
+    },
+    data: result.data || {},
+  };
 };
 
 export const getSkillOpsHealth = async (): Promise<SkillOpsHealth> => {

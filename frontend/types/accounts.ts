@@ -25,6 +25,11 @@ export interface AccountDetail {
   last_validated_at?: number | null;
   last_expired_at?: number | null;
   reauth_updated_at?: number | null;
+  search_readiness?: {
+    ready: boolean;
+    state: string;
+    blockers: string[];
+  };
   // Frontend helpers
   nickname?: string;
   avatar_url?: string;

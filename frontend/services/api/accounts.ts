@@ -36,8 +36,13 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     last_validated_at: item.last_validated_at ?? null,
     last_expired_at: item.last_expired_at ?? null,
     reauth_updated_at: item.reauth_updated_at ?? null,
+    search_readiness: item.search_readiness || {
+      ready: false,
+      state: 'error',
+      blockers: ['账号身份状态尚未确认'],
+    },
     nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
-    avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`, // Placeholder avatar
+    avatar_url: item.avatar_url || undefined,
     ai_enabled: false, // 需要从AI设置API获取
   }));
 };

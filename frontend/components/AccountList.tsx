@@ -35,13 +35,16 @@ import {
   showAccountSessionRefreshBrowser,
   getAIProviders,
   refreshAIProviderModels,
-  testAIProvider
+  testAIProvider,
+  getAiReplyStrategies,
+  updateAiReplyStrategies
 } from '../services/api';
+import type { ReplyStrategy } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
   Upload, Key, Eye, EyeOff, Bot, Settings, ExternalLink, Chrome, Copy,
-  Smartphone, ChevronDown, AlertTriangle, ShieldCheck
+  Smartphone, ChevronDown, ChevronUp, AlertTriangle, ShieldCheck
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -167,6 +170,13 @@ const AccountList: React.FC = () => {
   const [refreshingModels, setRefreshingModels] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [aiSaveNotice, setAiSaveNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+  // 高级回复策略（用户级、跨账号共享，归并自原「AI 专家客服」）
+  const [replyStrategies, setReplyStrategies] = useState<ReplyStrategy[]>([]);
+  const [replyStrategiesExpanded, setReplyStrategiesExpanded] = useState(false);
+  const [replyStrategiesLoading, setReplyStrategiesLoading] = useState(false);
+  const [replyStrategiesError, setReplyStrategiesError] = useState('');
+  const [savingReplyStrategies, setSavingReplyStrategies] = useState(false);
+  const replyStrategiesBaselineRef = useRef('');
 
   const loadSessionStatuses = async (targetAccounts: AccountDetail[] = accounts) => {
     const results = await Promise.all(targetAccounts.map(async (account) => {
@@ -412,13 +422,33 @@ const AccountList: React.FC = () => {
   const openAIModal = async (account: AccountDetail) => {
     setEditingAccount(account);
     setAiSaveNotice(null);
+    setReplyStrategies([]);
+    setReplyStrategiesError('');
+    setReplyStrategiesLoading(true);
+    setReplyStrategiesExpanded(false);
+    replyStrategiesBaselineRef.current = '';
     setSaving(true);
     try {
-      const [settings, providerResult] = await Promise.all([
+      const [settings, providerResult, strategyResult] = await Promise.all([
         getAccountAISettings(account.id),
         getAIProviders(),
+        getAiReplyStrategies()
+          .then((data) => ({ data, error: '' }))
+          .catch((error) => ({
+            data: [] as ReplyStrategy[],
+            error: error instanceof Error ? error.message : '高级回复策略加载失败',
+          })),
       ]);
       setAiProviders(providerResult.providers);
+      setReplyStrategies(strategyResult.data);
+      setReplyStrategiesError(strategyResult.error);
+      const strategiesComplete = ['price', 'tech', 'default'].every((promptType) => (
+        strategyResult.data.some((item) => item.prompt_type === promptType && item.content.trim())
+      ));
+      setReplyStrategiesExpanded(Boolean(strategyResult.error) || !strategiesComplete);
+      replyStrategiesBaselineRef.current = JSON.stringify(
+        strategyResult.data.map(({ prompt_type, content, enabled }) => ({ prompt_type, content, enabled })),
+      );
       setAiSettings({
         ai_enabled: settings.ai_enabled ?? false,
         provider_profile_id: settings.provider_profile_id ?? providerResult.providers.find((item) => item.is_default)?.id ?? providerResult.providers[0]?.id ?? null,
@@ -440,7 +470,11 @@ const AccountList: React.FC = () => {
       });
     } catch (e) {
       console.error('Failed to load AI settings:', e);
+      replyStrategiesBaselineRef.current = JSON.stringify([]);
+      setReplyStrategiesError(e instanceof Error ? e.message : 'AI 设置加载失败');
+      setReplyStrategiesExpanded(true);
     } finally {
+      setReplyStrategiesLoading(false);
       setSaving(false);
     }
     setActiveModal('ai-settings');
@@ -598,6 +632,11 @@ const AccountList: React.FC = () => {
 
   const handleSaveAISettings = async () => {
     if (!editingAccount) return;
+    if (replyStrategiesDirty) {
+      setReplyStrategiesExpanded(true);
+      setAiSaveNotice({ tone: 'error', text: '请先保存或放弃高级回复策略的修改' });
+      return;
+    }
     if (!aiSettings.provider_profile_id) {
       setAiSaveNotice({ tone: 'error', text: '请先在“系统与 AI”中添加平台配置' });
       return;
@@ -632,6 +671,62 @@ const AccountList: React.FC = () => {
     } finally {
       setTestingProvider(false);
       setSaving(false);
+    }
+  };
+
+  const handleReplyStrategyChange = (promptType: ReplyStrategy['prompt_type'], content: string) => {
+    setReplyStrategiesExpanded(true);
+    setReplyStrategiesError('');
+    setReplyStrategies((current) =>
+      current.map((item) => (item.prompt_type === promptType ? { ...item, content } : item)),
+    );
+  };
+
+  const handleReplyStrategyEnabledChange = (promptType: ReplyStrategy['prompt_type'], enabled: boolean) => {
+    setReplyStrategiesExpanded(true);
+    setReplyStrategiesError('');
+    setReplyStrategies((current) => (
+      current.map((item) => (item.prompt_type === promptType ? { ...item, enabled } : item))
+    ));
+  };
+
+  const replyStrategiesDirty = JSON.stringify(
+    replyStrategies.map(({ prompt_type, content, enabled }) => ({ prompt_type, content, enabled })),
+  ) !== replyStrategiesBaselineRef.current;
+
+  const closeAIModal = () => {
+    if (replyStrategiesDirty && !window.confirm('高级回复策略有未保存修改，确定放弃并关闭吗？')) return;
+    setActiveModal(null);
+  };
+
+  const handleSaveReplyStrategies = async () => {
+    const requiredTypes: ReplyStrategy['prompt_type'][] = ['price', 'tech', 'default'];
+    if (!requiredTypes.every((promptType) => (
+      replyStrategies.some((strategy) => strategy.prompt_type === promptType && strategy.content.trim())
+    ))) {
+      setReplyStrategiesExpanded(true);
+      setReplyStrategiesError('议价、技术和默认三类策略内容均不能为空');
+      setAiSaveNotice({ tone: 'error', text: '请补齐三类高级回复策略' });
+      return;
+    }
+    setSavingReplyStrategies(true);
+    setReplyStrategiesError('');
+    try {
+      const result = await updateAiReplyStrategies(replyStrategies);
+      const savedStrategies = result.data || await getAiReplyStrategies();
+      setReplyStrategies(savedStrategies);
+      replyStrategiesBaselineRef.current = JSON.stringify(
+        savedStrategies.map(({ prompt_type, content, enabled }) => ({ prompt_type, content, enabled })),
+      );
+      setReplyStrategiesExpanded(false);
+      setAiSaveNotice({ tone: 'success', text: '三类高级回复策略已统一保存（所有账号共享）' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '保存回复策略失败';
+      setReplyStrategiesError(message);
+      setReplyStrategiesExpanded(true);
+      setAiSaveNotice({ tone: 'error', text: message });
+    } finally {
+      setSavingReplyStrategies(false);
     }
   };
 
@@ -2042,8 +2137,9 @@ const AccountList: React.FC = () => {
                 <p className="text-sm text-gray-500 mt-1">{editingAccount.nickname || editingAccount.remark || editingAccount.id}</p>
               </div>
               <button
-                onClick={() => setActiveModal(null)}
-                className="p-2 rounded-xl hover:bg-gray-100 transition-colors flex-shrink-0"
+                onClick={closeAIModal}
+                className="min-h-11 min-w-11 p-2 rounded-xl hover:bg-gray-100 transition-colors flex-shrink-0 flex items-center justify-center"
+                aria-label="关闭 AI 设置"
               >
                 <X className="w-5 h-5 text-gray-500" />
               </button>
@@ -2267,8 +2363,10 @@ const AccountList: React.FC = () => {
                 <p className="text-sm text-gray-500 mt-1">{editingAccount.nickname || editingAccount.remark || editingAccount.id}</p>
               </div>
               <button
-                onClick={() => setActiveModal(null)}
-                className="p-2 rounded-xl hover:bg-gray-100 transition-colors flex-shrink-0"
+                type="button"
+                onClick={closeAIModal}
+                className="flex min-h-11 min-w-11 flex-shrink-0 items-center justify-center rounded-xl hover:bg-gray-100 transition-colors"
+                aria-label="关闭 AI 设置"
               >
                 <X className="w-5 h-5 text-gray-500" />
               </button>
@@ -2380,15 +2478,74 @@ const AccountList: React.FC = () => {
                 </div>
               </div>
 
-              {/* 自定义提示词 */}
+              {/* 该账号补充说明（账号级，仅影响当前账号的整体风格） */}
               <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">自定义提示词（可选）</label>
+                <label className="block text-sm font-bold text-gray-700 mb-2">该账号补充说明（可选）</label>
                 <textarea
                   value={aiSettings.custom_prompts}
                   onChange={(e) => setAiSettings({ ...aiSettings, custom_prompts: e.target.value })}
-                  placeholder="输入自定义的AI回复规则或风格指引...&#10;&#10;例如：回复时保持礼貌专业、使用简洁的语言、强调产品质量等"
+                  placeholder="仅对当前账号生效的风格补充...&#10;&#10;例如：回复时保持礼貌专业、使用简洁的语言、强调产品质量等"
                   className="w-full ios-input px-4 py-3 rounded-xl h-40 resize-none"
                 />
+                <p className="text-xs text-gray-500 mt-1">只控制该账号整体风格，不覆盖商品事实；跨账号的议价/技术话术请用下方「高级回复策略」。</p>
+              </div>
+
+              {/* 高级回复策略（用户级、跨账号共享，归并自原「AI 专家客服」）*/}
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setReplyStrategiesExpanded((prev) => !prev)}
+                  className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left bg-gray-50 hover:bg-gray-100 transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    <Bot className="w-4 h-4 text-purple-500" />
+                    <span className="font-bold text-gray-900">高级回复策略</span>
+                    <span className="text-xs font-bold text-purple-600 bg-purple-50 rounded-full px-2 py-0.5">所有账号共享</span>
+                  </div>
+                  {replyStrategiesExpanded
+                    ? <ChevronUp className="w-4 h-4 text-gray-500" />
+                    : <ChevronDown className="w-4 h-4 text-gray-500" />}
+                </button>
+                {replyStrategiesExpanded && (
+                  <div className="px-4 py-4 space-y-4 border-t border-gray-200">
+                    <p className="text-xs text-gray-500">
+                      按买家意图（议价 / 技术 / 默认）路由的回复话术，对当前用户所有账号生效。优先级低于商品事实、硬性价格规则与商品训练规则。
+                    </p>
+                    {replyStrategiesLoading && <p className="text-xs text-blue-600">正在读取三类策略…</p>}
+                    {replyStrategiesError && <InlineNotice tone="error">{replyStrategiesError}</InlineNotice>}
+                    {!replyStrategiesLoading && replyStrategies.length === 0 && !replyStrategiesError && <p className="text-xs text-gray-400">暂无可配置策略。</p>}
+                    {replyStrategies.map((strategy) => (
+                      <div key={strategy.prompt_type} className="rounded-xl border border-gray-100 p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="font-bold text-gray-900 text-sm">{strategy.title}</span>
+                          <ToggleControl
+                            checked={strategy.enabled}
+                            onChange={(enabled) => handleReplyStrategyEnabledChange(strategy.prompt_type, enabled)}
+                            label={`启用${strategy.title}`}
+                            disabled={savingReplyStrategies}
+                          />
+                        </div>
+                        <textarea
+                          value={strategy.content}
+                          onChange={(e) => handleReplyStrategyChange(strategy.prompt_type, e.target.value)}
+                          className="w-full ios-input px-3 py-2 rounded-lg h-28 resize-none text-sm"
+                          disabled={savingReplyStrategies}
+                        />
+                      </div>
+                    ))}
+                    {replyStrategies.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void handleSaveReplyStrategies()}
+                        disabled={savingReplyStrategies || !replyStrategiesDirty}
+                        className="ios-btn-primary flex min-h-11 w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {savingReplyStrategies ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                        {savingReplyStrategies ? '保存中…' : '保存全部策略'}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* AI如何工作 */}
@@ -2400,8 +2557,8 @@ const AccountList: React.FC = () => {
                 <ul className="text-xs text-blue-800 space-y-1">
                   <li>• 商品知识与详情优先，避免跨商品套用话术</li>
                   <li>• 关键词规则优先命中，未命中时才调用 AI</li>
-                  <li>• 价格、技术和默认专家按买家意图选择</li>
-                  <li>• 账号通用提示词只控制整体风格，不覆盖商品事实</li>
+                  <li>• 按买家意图套用「高级回复策略」（议价 / 技术 / 默认）</li>
+                  <li>• 账号补充说明只控制整体风格，不覆盖商品事实</li>
                 </ul>
               </div>
               {aiSaveNotice && <InlineNotice tone={aiSaveNotice.tone}>{aiSaveNotice.text}</InlineNotice>}
@@ -2410,9 +2567,9 @@ const AccountList: React.FC = () => {
             <div className="modal-footer">
               <div className="flex gap-3 w-full">
                 <button
-                  onClick={() => setActiveModal(null)}
+                  onClick={closeAIModal}
                   className="flex-1 px-6 py-3 rounded-xl font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition-colors"
-                  disabled={saving}
+                  disabled={saving || savingReplyStrategies}
                 >
                   取消
                 </button>

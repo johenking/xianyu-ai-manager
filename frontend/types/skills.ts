@@ -1,4 +1,39 @@
 // Skill Center
+
+// 任务就绪度：后端基于账号身份状态计算，只读不触发真实动作
+export interface SkillTaskReadiness {
+  configured: boolean;
+  runnable: boolean;
+  blockers: string[];
+}
+
+export interface SkillOperationGate {
+  enabled: boolean;
+  reason_code: string;
+  message: string;
+  blockers?: Array<{
+    reason_code: string;
+    message: string;
+  }>;
+}
+
+export interface SkillOperationGates {
+  manual_run: SkillOperationGate;
+  schedule_activation: SkillOperationGate;
+  delivery: SkillOperationGate;
+  mtop: SkillOperationGate;
+}
+
+// 任务最近一次真实运行证据：无运行记录时为 null
+export interface SkillTaskRunEvidence {
+  status: string;
+  trigger_type: string;
+  source_adapter: string;
+  raw_result_count: number;
+  accepted_result_count: number;
+  observed_at?: number | null;
+}
+
 export interface SkillMonitorTask {
   id: number;
   user_id?: number;
@@ -20,6 +55,9 @@ export interface SkillMonitorTask {
   last_run_at?: string | null;
   created_at?: string;
   updated_at?: string;
+  // 后端 GET /api/skills/monitor/tasks 附带字段
+  readiness?: SkillTaskReadiness;
+  latest_run_evidence?: SkillTaskRunEvidence | null;
 }
 
 export interface SkillMonitorResult {
@@ -46,10 +84,23 @@ export interface SkillMonitorResult {
   created_at?: string;
 }
 
+export type SkillCapabilityBadgeState = 'ready' | 'warning' | 'missing' | 'checking';
+
 export interface SkillCapability {
   available: boolean;
   label: string;
   detail: string;
+  // 后端已返回的真实状态字段（此前前端未接收）
+  state?: string;
+  badge_state?: SkillCapabilityBadgeState;
+  observed_at?: string | null;
+  evidence?: Record<string, any> | null;
+}
+
+export interface SkillCapabilitiesResponse {
+  runtime_mode: 'preview' | 'live';
+  operation_gates: SkillOperationGates;
+  data: Record<string, SkillCapability>;
 }
 
 export interface AutoReplyDiagnostics {
@@ -144,12 +195,16 @@ export interface SkillOpsHealth {
     path: string;
     exists: boolean;
     writable: boolean;
+    write_probe_status?: 'ok' | 'failed';
+    write_probe_observed_at?: number | null;
+    write_probe_error?: string;
   };
   cookie_manager: string;
   accounts: {
     total: number;
+    enabled?: number;
     listening: number;
-    listener_state: 'running' | 'stopped';
+    listener_state: 'running' | 'degraded' | 'not_required' | 'stopped';
   };
   ai: {
     global_configured: boolean;
@@ -172,12 +227,16 @@ export interface SkillOpsHealth {
 }
 
 export interface SkillBrowserStatus {
+  status: 'checking' | 'ready' | 'unavailable';
   playwright_importable: boolean;
   playwright_launchable: boolean;
   browser_path?: string;
   active_cookie_tasks: number;
   account_count: number;
   playwright_error?: string;
+  observed_at?: number | null;
+  stale: boolean;
+  checking: boolean;
 }
 
 export interface SkillDeliveryDiagnostics {

@@ -321,6 +321,239 @@ class SkillMonitorApiValidationTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
         self.assertIn("不能少于15分钟", raised.exception.detail)
 
+    def test_create_rejects_task_without_bound_account(self):
+        """创建任务未绑定账号时应被拒绝（强制绑号）"""
+        task = reply_server.SkillMonitorTaskIn(keyword="iPhone", account_id="")
+        with self.assertRaises(HTTPException) as raised:
+            reply_server.create_skill_monitor_task(task, {"user_id": 7})
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("绑定", raised.exception.detail)
+
+    def test_create_rejects_account_not_owned_by_user(self):
+        """创建任务绑定越权账号时应被拒绝"""
+        task = reply_server.SkillMonitorTaskIn(keyword="iPhone", account_id="account-x")
+        with patch.object(
+            reply_server.db_manager,
+            "get_owned_cookie_search_context",
+            return_value={"state": "ownership_mismatch"},
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                reply_server.create_skill_monitor_task(task, {"user_id": 7})
+
+        self.assertEqual(raised.exception.status_code, 403)
+
+    def test_create_accepts_task_with_ready_account(self):
+        """创建任务绑定身份完整的自有账号时应成功"""
+        task = reply_server.SkillMonitorTaskIn(keyword="iPhone", account_id="account-1")
+        with patch.object(
+            reply_server.db_manager,
+            "get_owned_cookie_search_context",
+            return_value={"state": "ready", "cookie_id": "account-1"},
+        ), patch.object(
+            reply_server.db_manager,
+            "create_skill_monitor_task",
+            return_value=123,
+        ), patch.object(
+            reply_server.db_manager,
+            "log_skill_event",
+            return_value=None,
+        ):
+            result = reply_server.create_skill_monitor_task(task, {"user_id": 7})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["id"], 123)
+
+    def test_list_tasks_attaches_readiness(self):
+        """列表路由为每条任务附加 readiness，复用账号 context"""
+        tasks = [
+            {"id": 1, "keyword": "iPhone", "account_id": ""},
+            {"id": 2, "keyword": "iPhone", "account_id": "account-ready"},
+            {"id": 3, "keyword": "iPhone", "account_id": "account-broken"},
+        ]
+        context_by_account = {
+            "account-ready": {"state": "ready"},
+            "account-broken": {"state": "manual_reauth_required"},
+        }
+        with patch.object(
+            reply_server.db_manager, "list_skill_monitor_tasks", return_value=tasks,
+        ), patch.object(
+            reply_server.db_manager,
+            "get_owned_cookie_search_context",
+            side_effect=lambda uid, acc: context_by_account.get(acc, {"state": "not_found"}),
+        ), patch.object(
+            reply_server, "get_skill_monitor_feature_state",
+            return_value={"effective": {"skill_monitor_enabled": False}},
+        ):
+            result = reply_server.list_skill_monitor_tasks({"user_id": 7})
+
+        data = {t["id"]: t["readiness"] for t in result["data"]}
+        self.assertFalse(data[1]["configured"])
+        self.assertEqual(data[1]["blockers"], ["未绑定闲鱼账号"])
+        self.assertTrue(data[2]["configured"])
+        self.assertFalse(data[2]["runnable"])
+        self.assertIn("真实搜索总开关关闭", data[2]["blockers"][0])
+        self.assertFalse(data[3]["configured"])
+        self.assertFalse(data[3]["runnable"])
+        self.assertTrue(len(data[3]["blockers"]) > 0)
+
+    def test_capability_configuration_is_separate_from_preview_operation_gates(self):
+        tasks = [{"id": 9, "keyword": "iPhone", "enabled": True, "account_id": "account-ready"}]
+        flags = {
+            "skill_monitor_enabled": False,
+            "skill_monitor_scheduler_enabled": False,
+            "skill_monitor_delivery_enabled": False,
+            "skill_monitor_mtop_enabled": False,
+        }
+        with patch.object(
+            reply_server, "get_skill_monitor_feature_state",
+            return_value={"configured": flags, "effective": flags},
+        ), patch.object(
+            reply_server.db_manager, "get_all_cookies", return_value={"account-ready": "secret"},
+        ), patch.object(
+            reply_server.db_manager, "get_owned_cookie_search_context", return_value={"state": "ready"},
+        ), patch.object(
+            reply_server.db_manager, "list_skill_monitor_tasks", return_value=tasks,
+        ), patch.object(
+            reply_server.db_manager, "get_skill_capability_evidence", return_value={},
+        ):
+            result = reply_server.get_skill_capabilities({"user_id": 7})
+
+        self.assertEqual(result["runtime_mode"], "preview")
+        self.assertTrue(result["data"]["config_ready"]["available"])
+        self.assertEqual(result["data"]["config_ready"]["label"], "配置完整")
+        self.assertFalse(result["operation_gates"]["manual_run"]["enabled"])
+        self.assertFalse(result["operation_gates"]["schedule_activation"]["enabled"])
+        self.assertFalse(result["operation_gates"]["delivery"]["enabled"])
+        self.assertFalse(result["operation_gates"]["mtop"]["enabled"])
+        self.assertEqual(
+            [item["reason_code"] for item in result["operation_gates"]["schedule_activation"]["blockers"]],
+            ["monitor_disabled", "scheduler_disabled"],
+        )
+        self.assertIn("定时调度开关关闭", result["operation_gates"]["schedule_activation"]["message"])
+        self.assertEqual(
+            [item["reason_code"] for item in result["operation_gates"]["delivery"]["blockers"]],
+            ["monitor_disabled", "delivery_disabled"],
+        )
+        self.assertIn("结果通知开关关闭", result["operation_gates"]["delivery"]["message"])
+        self.assertEqual(
+            [item["reason_code"] for item in result["operation_gates"]["mtop"]["blockers"]],
+            ["monitor_disabled", "mtop_disabled"],
+        )
+
+
+class ReplyStrategyApiTests(unittest.TestCase):
+    """高级回复策略 /api/ai/reply-strategies（归并自 AI 专家客服）"""
+
+    def _stored_prompts(self):
+        # 模拟库中已有 8 条中的相关 4 条（含被隐藏的 classify）
+        return {
+            "classify": {"prompt_type": "classify", "title": "意图分类专家", "content": "c", "enabled": True},
+            "price": {"prompt_type": "price", "title": "议价专家", "content": "p", "enabled": True},
+            "tech": {"prompt_type": "tech", "title": "技术专家", "content": "t", "enabled": True},
+            "default": {"prompt_type": "default", "title": "默认客服", "content": "d", "enabled": True},
+        }
+
+    def test_get_returns_three_strategies_without_classify(self):
+        with patch.object(
+            reply_server.db_manager, "get_skill_agent_prompts", return_value=self._stored_prompts(),
+        ):
+            result = reply_server.get_ai_reply_strategies({"user_id": 7})
+
+        types = [item["prompt_type"] for item in result["data"]]
+        self.assertEqual(types, ["price", "tech", "default"])
+        self.assertNotIn("classify", types)
+        self.assertEqual(result["shared_scope"], "user")
+
+    def test_put_rejects_unknown_type(self):
+        with self.assertRaises(HTTPException) as raised:
+            reply_server.update_ai_reply_strategy(
+                "classify", reply_server.ReplyStrategyIn(content="x"), {"user_id": 7},
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_put_rejects_empty_content(self):
+        with self.assertRaises(HTTPException) as raised:
+            reply_server.update_ai_reply_strategy(
+                "price", reply_server.ReplyStrategyIn(content="   "), {"user_id": 7},
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_put_saves_valid_strategy(self):
+        with patch.object(
+            reply_server.db_manager, "get_skill_agent_prompts", return_value=self._stored_prompts(),
+        ), patch.object(
+            reply_server.db_manager, "upsert_skill_agent_prompt", return_value=True,
+        ) as upsert, patch.object(
+            reply_server.db_manager, "log_skill_event", return_value=None,
+        ):
+            result = reply_server.update_ai_reply_strategy(
+                "price", reply_server.ReplyStrategyIn(content="更克制的议价话术", enabled=True), {"user_id": 7},
+            )
+
+        self.assertTrue(result["success"])
+        # 确认写入的是 price 类型
+        self.assertEqual(upsert.call_args[0][1], "price")
+
+    def test_collection_put_saves_all_three_strategies_transactionally(self):
+        payload = reply_server.ReplyStrategiesUpdateIn(
+            price=reply_server.ReplyStrategyIn(content="议价策略", enabled=True),
+            tech=reply_server.ReplyStrategyIn(content="技术策略", enabled=False),
+            default=reply_server.ReplyStrategyIn(content="默认策略", enabled=True),
+        )
+        with patch.object(
+            reply_server.db_manager, "get_skill_agent_prompts", return_value=self._stored_prompts(),
+        ), patch.object(
+            reply_server.db_manager, "upsert_skill_agent_prompts_transaction", return_value=True,
+        ) as save_all, patch.object(
+            reply_server.db_manager, "log_skill_event", return_value=True,
+        ):
+            result = reply_server.update_ai_reply_strategies(payload, {"user_id": 7})
+
+        self.assertTrue(result["success"])
+        saved = save_all.call_args.args[1]
+        self.assertEqual(set(saved), {"price", "tech", "default"})
+        self.assertFalse(saved["tech"]["enabled"])
+
+
+class SkillOpsDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        reply_server._browser_probe_cache.clear()
+        reply_server._browser_probe_checking = False
+
+    def tearDown(self):
+        reply_server._browser_probe_cache.clear()
+        reply_server._browser_probe_checking = False
+
+    def test_concurrent_browser_status_reads_start_only_one_probe(self):
+        with patch.object(reply_server.threading, "Thread") as thread_class:
+            first = reply_server._get_browser_probe_snapshot()
+            second = reply_server._get_browser_probe_snapshot()
+
+        self.assertTrue(first["checking"])
+        self.assertTrue(second["checking"])
+        self.assertEqual(thread_class.call_count, 1)
+        thread_class.return_value.start.assert_called_once()
+
+    def test_expired_browser_probe_returns_stale_result_while_refreshing(self):
+        reply_server._browser_probe_cache.update({
+            "status": "ready",
+            "playwright_importable": True,
+            "playwright_launchable": True,
+            "browser_path": "chromium",
+            "observed_at": 1.0,
+            "playwright_error": "",
+        })
+        with patch.object(reply_server.time, "time", return_value=10000.0), patch.object(
+            reply_server.threading, "Thread"
+        ) as thread_class:
+            result = reply_server._get_browser_probe_snapshot()
+
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["stale"])
+        self.assertTrue(result["checking"])
+        thread_class.return_value.start.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

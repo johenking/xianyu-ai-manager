@@ -73,4 +73,13 @@ describe('App identity hydration', () => {
     await waitFor(() => expect(screen.getByText('普通用户设置')).toBeInTheDocument());
     expect(verifyToken).toHaveBeenCalledTimes(2);
   });
+
+  it('keeps the mobile navigation trigger at least 44px square', async () => {
+    localStorage.setItem('auth_token', 'valid-token');
+    vi.mocked(verifyToken).mockResolvedValue({ authenticated: true, user_id: 2, username: 'user', is_admin: false });
+    render(<App />);
+
+    await screen.findByText('仪表盘内容');
+    expect(screen.getByRole('button', { name: '打开导航' })).toHaveClass('h-11', 'w-11');
+  });
 });

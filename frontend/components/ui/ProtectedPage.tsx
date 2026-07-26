@@ -93,7 +93,7 @@ export const IconAction: React.FC<IconActionProps> = ({ icon: Icon, label, busy,
     type="button"
     title={label}
     aria-label={label}
-    className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${danger ? 'border-red-100 bg-red-50 text-red-600 hover:bg-red-100' : 'border-gray-100 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-950'} ${className}`}
+    className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${danger ? 'border-red-100 bg-red-50 text-red-600 hover:bg-red-100' : 'border-gray-100 bg-white text-gray-600 hover:bg-gray-50 hover:text-gray-950'} ${className}`}
     {...props}
   >
     <Icon className={`h-4 w-4 ${busy ? 'animate-spin' : ''}`} />

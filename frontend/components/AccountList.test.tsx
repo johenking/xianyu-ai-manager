@@ -21,6 +21,10 @@ import {
   showAccountSessionRefreshBrowser,
   showOfficialLoginBrowser,
   updateAccountCookieRefreshSettings,
+  getAccountAISettings,
+  getAIProviders,
+  getAiReplyStrategies,
+  updateAiReplyStrategies,
 } from '../services/api';
 
 vi.mock('../services/api', () => ({
@@ -56,6 +60,8 @@ vi.mock('../services/api', () => ({
   getAIProviders: vi.fn(),
   refreshAIProviderModels: vi.fn(),
   testAIProvider: vi.fn(),
+  getAiReplyStrategies: vi.fn(),
+  updateAiReplyStrategies: vi.fn(),
 }));
 
 describe('AccountList session verification UI', () => {
@@ -126,6 +132,22 @@ describe('AccountList session verification UI', () => {
       } as any,
     ]);
     vi.mocked(getAllAISettings).mockResolvedValue({});
+    vi.mocked(getAccountAISettings).mockResolvedValue({
+      ai_enabled: false,
+      model_name: 'deepseek-v4-flash',
+      base_url: 'https://api.deepseek.com',
+      api_key_source: 'missing',
+      api_key_masked: '',
+      has_effective_api_key: false,
+      custom_prompts: '',
+    } as any);
+    vi.mocked(getAIProviders).mockResolvedValue({ providers: [] } as any);
+    vi.mocked(getAiReplyStrategies).mockResolvedValue([
+      { prompt_type: 'price', title: '议价专家', content: '议价话术', enabled: true },
+      { prompt_type: 'tech', title: '技术专家', content: '技术话术', enabled: true },
+      { prompt_type: 'default', title: '默认客服', content: '默认话术', enabled: true },
+    ]);
+    vi.mocked(updateAiReplyStrategies).mockImplementation(async (strategies) => ({ success: true, data: strategies } as any));
     vi.mocked(generateQRLogin).mockResolvedValue({
       success: true,
       session_id: 'qr-session',
@@ -801,5 +823,52 @@ describe('AccountList session verification UI', () => {
     render(<AccountList />);
     expect(await screen.findByRole('dialog', { name: '账号登录已过期' })).toBeInTheDocument();
     expect(window.localStorage.setItem).toHaveBeenCalledWith('xianyu-reauth:expired-account:5678', 'shown');
+  });
+
+  it('loads shared reply strategies and saves all three in one request', async () => {
+    render(<AccountList />);
+    const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('AI设置'));
+
+    // 打开弹窗即加载共享策略（跨账号）
+    await waitFor(() => expect(getAiReplyStrategies).toHaveBeenCalledTimes(1));
+
+    // 折叠面板展开后才渲染策略内容
+    const toggle = await screen.findByRole('button', { name: /高级回复策略/ });
+    fireEvent.click(toggle);
+
+    const priceTextarea = (await screen.findByDisplayValue('议价话术')) as HTMLTextAreaElement;
+    fireEvent.change(priceTextarea, { target: { value: '新的议价话术' } });
+
+    fireEvent.click(screen.getByRole('switch', { name: '启用技术专家' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存全部策略' }));
+
+    await waitFor(() =>
+      expect(updateAiReplyStrategies).toHaveBeenCalledWith(expect.arrayContaining([
+        expect.objectContaining({ prompt_type: 'price', content: '新的议价话术', enabled: true }),
+        expect.objectContaining({ prompt_type: 'tech', enabled: false }),
+        expect.objectContaining({ prompt_type: 'default', enabled: true }),
+      ])),
+    );
+    expect(await screen.findByText(/三类高级回复策略已统一保存/)).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('新的议价话术')).not.toBeInTheDocument();
+  });
+
+  it('uses the unsaved-strategy confirmation from the AI modal close control', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<AccountList />);
+    const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('AI设置'));
+
+    const strategyToggle = await screen.findByRole('button', { name: /高级回复策略/ });
+    fireEvent.click(strategyToggle);
+    fireEvent.change(await screen.findByDisplayValue('议价话术'), { target: { value: '尚未保存的话术' } });
+
+    const closeButton = screen.getByRole('button', { name: '关闭 AI 设置' });
+    expect(closeButton).toHaveClass('min-h-11', 'min-w-11');
+    fireEvent.click(closeButton);
+
+    expect(confirmSpy).toHaveBeenCalledWith('高级回复策略有未保存修改，确定放弃并关闭吗？');
+    expect(screen.getByRole('heading', { name: 'AI助手设置' })).toBeInTheDocument();
   });
 });

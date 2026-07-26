@@ -28,7 +28,7 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onPreloadTab
       <div className="p-6">
         <div className="mb-10 flex items-center px-2">
           <BrandLockup />
-          <button type="button" onClick={onMobileClose} className="ml-auto p-2 rounded-lg hover:bg-gray-100 lg:hidden" aria-label="关闭导航">
+          <button type="button" onClick={onMobileClose} className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-lg hover:bg-gray-100 lg:hidden" aria-label="关闭导航">
             <X className="w-5 h-5" />
           </button>
         </div>
