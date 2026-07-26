@@ -1,6 +1,7 @@
 """订单中心 API 契约测试：列表隐私分离、账号授权语义、媒体端点失败分级。"""
 
 import io
+import asyncio
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
+from openpyxl import Workbook
 from PIL import Image as PILImage
 
 from db_manager import DBManager
@@ -341,7 +343,7 @@ class OrderApiContractTests(unittest.TestCase):
             "reply_server._resolve_order_image_host",
             new=AsyncMock(return_value=("203.0.113.10",)),
             create=True,
-        ), _fake_aiohttp_sequence(responses, calls):
+        ) as resolve_mock, _fake_aiohttp_sequence(responses, calls):
             response = self.client.get(
                 "/api/orders/order-1/item-image", headers=self.headers_for(self.user_one),
             )
@@ -353,6 +355,23 @@ class OrderApiContractTests(unittest.TestCase):
                 "https://gw.alicdn.com/item-1-final.png",
             ],
         )
+        self.assertEqual(resolve_mock.await_count, 2)
+
+    def test_image_connector_pins_the_validated_public_address(self):
+        async def exercise():
+            with patch(
+                "reply_server._resolve_order_image_host",
+                new=AsyncMock(return_value=("93.184.216.34",)),
+            ), patch("aiohttp.TCPConnector") as connector:
+                await reply_server._build_pinned_order_image_connector(
+                    "https://img.alicdn.com/item.jpg"
+                )
+                resolver = connector.call_args.kwargs["resolver"]
+                records = await resolver.resolve("img.alicdn.com", 443)
+                self.assertEqual(records[0]["host"], "93.184.216.34")
+                self.assertEqual(records[0]["hostname"], "img.alicdn.com")
+
+        asyncio.run(exercise())
 
     def test_item_image_cache_publish_is_atomic(self):
         self._attach_snapshot_image()
@@ -388,6 +407,103 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(payload["failed_count"], 1)
         self.assertIn("已忽略字段", payload["results"][0]["message"])
         self.assertIn("无权操作", payload["results"][1]["message"])
+
+    def test_import_accepts_real_xlsx_upload(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["order_id", "cookie_id", "item_id", "status", "amount"])
+        sheet.append(["xlsx-1", "acct-one", "item-x", "pending_ship", "8.50"])
+        sheet.append(["", "acct-one", "empty-order", "pending_ship", "1.00"])
+        payload = io.BytesIO()
+        workbook.save(payload)
+
+        response = self.client.post(
+            "/api/orders/import",
+            files={
+                "file": (
+                    "orders.xlsx",
+                    payload.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["success_count"], 1)
+        self.assertEqual(body["failed_count"], 1)
+        self.assertEqual(self.db.get_order_by_id("xlsx-1")["amount"], "8.50")
+
+    def test_import_rejects_unsafe_excel_shapes(self):
+        headers = self.headers_for(self.user_one)
+        empty = self.client.post(
+            "/api/orders/import",
+            files={"file": ("orders.xlsx", b"", "application/octet-stream")},
+            headers=headers,
+        )
+        wrong_extension = self.client.post(
+            "/api/orders/import",
+            files={"file": ("orders.csv", b"order_id,cookie_id", "text/csv")},
+            headers=headers,
+        )
+        oversized = self.client.post(
+            "/api/orders/import",
+            files={"file": (
+                "orders.xlsx",
+                b"x" * (reply_server._ORDER_IMPORT_MAX_BYTES + 1),
+                "application/octet-stream",
+            )},
+            headers=headers,
+        )
+        workbook = Workbook()
+        workbook.active.append(["item_id", "amount"])
+        workbook.active.append(["item-x", "1.00"])
+        missing_headers_payload = io.BytesIO()
+        workbook.save(missing_headers_payload)
+        missing_headers = self.client.post(
+            "/api/orders/import",
+            files={"file": (
+                "orders.xlsx",
+                missing_headers_payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )},
+            headers=headers,
+        )
+        self.assertEqual(
+            [empty.status_code, wrong_extension.status_code, oversized.status_code,
+             missing_headers.status_code],
+            [400, 415, 413, 400],
+        )
+
+    def test_unowned_order_mutations_do_not_reveal_existence(self):
+        headers = self.headers_for(self.user_two)
+        foreign_requests = (
+            self.client.get("/api/orders/order-1", headers=headers),
+            self.client.get("/api/orders/order-1/item-image", headers=headers),
+            self.client.delete("/api/orders/order-1", headers=headers),
+            self.client.post("/api/orders/order-1/refresh", headers=headers),
+            self.client.put("/api/orders/order-1", json={"amount": "1"}, headers=headers),
+        )
+        missing_requests = (
+            self.client.get("/api/orders/missing-order", headers=headers),
+            self.client.get("/api/orders/missing-order/item-image", headers=headers),
+            self.client.delete("/api/orders/missing-order", headers=headers),
+            self.client.post("/api/orders/missing-order/refresh", headers=headers),
+            self.client.put("/api/orders/missing-order", json={"amount": "1"}, headers=headers),
+        )
+        self.assertEqual([response.status_code for response in foreign_requests], [404] * 5)
+        self.assertEqual(
+            [response.json()["detail"] for response in foreign_requests],
+            [response.json()["detail"] for response in missing_requests],
+        )
+
+        manual = self.client.post(
+            "/api/orders/manual-ship",
+            json={"order_ids": ["order-1"], "ship_mode": "status_only"},
+            headers=headers,
+        )
+        self.assertEqual(manual.status_code, 200)
+        self.assertEqual(manual.json()["results"][0]["message"], "订单不存在或无权访问")
 
 
 if __name__ == "__main__":

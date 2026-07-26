@@ -12,6 +12,7 @@
 """
 
 import os
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -121,6 +122,29 @@ class ApplySyncSnapshotRatchetTests(SnapshotWriteTestCase):
         self.assertEqual(row[1], "https://img/cat.jpg", "低级来源可填补空位")
         self.assertEqual(row[2], "order_list", "组来源单调不降")
 
+    def test_title_and_image_keep_independent_sources(self):
+        self.apply(item_snapshot={
+            "item_title": "列表标题",
+            "source": "order_list",
+        })
+        self.apply(item_snapshot={
+            "item_image": "https://img/catalog.jpg",
+            "source": "catalog_backfill",
+        })
+        row = self.order_row(
+            "order-1",
+            "item_title",
+            "item_image",
+            "item_title_source",
+            "item_image_source",
+        )
+        self.assertEqual(row, (
+            "列表标题",
+            "https://img/catalog.jpg",
+            "order_list",
+            "catalog_backfill",
+        ))
+
     def test_buyer_snapshot_group_uses_same_ratchet(self):
         self.apply(buyer_snapshot={
             "buyer_nickname": "买家A", "buyer_avatar_url": "https://a/1.jpg",
@@ -225,6 +249,39 @@ class CustomerObservationTests(SnapshotWriteTestCase):
         self.assertFalse(self.db.upsert_customer_observation("", "buyer-1"))
         self.assertFalse(self.db.upsert_customer_observation("account-1", ""))
 
+    def test_empty_high_rank_observation_does_not_create_or_mask_real_source(self):
+        self.assertFalse(self.db.upsert_customer_observation(
+            "account-1", "buyer-1", "", "", "order_list", 1000.0,
+        ))
+        self.assertNotIn(
+            ("account-1", "buyer-1"),
+            self.db.get_customer_profiles(["account-1"]),
+        )
+        self.assertTrue(self.db.upsert_customer_observation(
+            "account-1", "buyer-1", "实时昵称", "", "realtime_message", 2000.0,
+        ))
+        profile = self.db.get_customer_profiles(["account-1"])[("account-1", "buyer-1")]
+        self.assertEqual(profile["display_name"], "实时昵称")
+        self.assertEqual(profile["profile_source"], "realtime_message")
+
+        # 兼容历史上已误建的高等级空记录：低等级真实值填空时必须接管来源。
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO customer_profiles"
+                " (cookie_id, buyer_id, display_name, avatar_url, profile_source,"
+                " first_observed_at, last_observed_at, observation_count)"
+                " VALUES ('account-1', 'buyer-legacy', '', '', 'order_list', 1, 1, 1)"
+            )
+            self.db.conn.commit()
+        self.assertTrue(self.db.upsert_customer_observation(
+            "account-1", "buyer-legacy", "后来实时昵称", "", "realtime_message", 2.0,
+        ))
+        legacy = self.db.get_customer_profiles(["account-1"])[
+            ("account-1", "buyer-legacy")
+        ]
+        self.assertEqual(legacy["display_name"], "后来实时昵称")
+        self.assertEqual(legacy["profile_source"], "realtime_message")
+
     def test_delete_cookie_removes_customer_profiles(self):
         self.db.upsert_customer_observation(
             "account-1", "buyer-1", "买家甲", "", "order_list", 1000.0,
@@ -255,6 +312,13 @@ class CoordinatorWiringTests(unittest.IsolatedAsyncioTestCase):
         os.unlink(self.db_path)
 
     async def test_list_phase_persists_snapshots_amount_time_and_customer(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO item_info (cookie_id, item_id, item_title, item_image)"
+                " VALUES ('account-1', 'item-1', '目录标题', 'https://img/catalog.jpg')"
+            )
+            self.db.conn.commit()
+
         async def discoverer(**_kwargs):
             return {
                 "success": True,
@@ -282,6 +346,9 @@ class CoordinatorWiringTests(unittest.IsolatedAsyncioTestCase):
         order = self.db.get_order_by_id("order-new")
         self.assertEqual(order["item_title"], "成交标题")
         self.assertEqual(order["item_snapshot_source"], "order_list")
+        self.assertEqual(order["item_title_source"], "order_list")
+        self.assertEqual(order["item_image"], "https://img/catalog.jpg")
+        self.assertEqual(order["item_image_source"], "catalog")
         self.assertEqual(order["buyer_nickname"], "买家甲")
         self.assertEqual(order["buyer_avatar_url"], "https://a/1.jpg")
         self.assertEqual(order["paid_amount_fen"], 1250)
@@ -379,6 +446,20 @@ class QueryOrdersTests(SnapshotWriteTestCase):
         self.assertEqual([item["order_id"] for item in hits["items"]], ["order-a1"])
         self.assertEqual(self.db.query_orders(["account-1"], search="100%")["total"], 0)
 
+    def test_search_matches_customer_profile_display_name_before_pagination(self):
+        self.seed()
+        self.db.upsert_customer_observation(
+            "account-1", "buyer-2", "实时昵称唯一", "", "realtime_message", 1000.0,
+        )
+        result = self.db.query_orders(
+            ["account-1"],
+            search="实时昵称唯一",
+            page=1,
+            page_size=1,
+        )
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([row["order_id"] for row in result["items"]], ["order-a3"])
+
     def test_date_range_and_pagination(self):
         self.seed()
         window = self.db.query_orders(
@@ -429,8 +510,8 @@ class BackfillScriptTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def run_script(self, *extra_args):
-        env = dict(os.environ, DB_PATH=self.db_path)
+    def run_script(self, *extra_args, env_overrides=None):
+        env = dict(os.environ, DB_PATH=self.db_path, **(env_overrides or {}))
         return subprocess.run(
             [sys.executable, str(PROJECT_ROOT / "backfill_order_snapshots.py"), *extra_args],
             capture_output=True, text=True, env=env, cwd=PROJECT_ROOT, timeout=120,
@@ -459,6 +540,37 @@ class BackfillScriptTests(unittest.TestCase):
         self.assertIn("只读演练", result.stdout)
         self.assertEqual(self.snapshot_state(), before)
 
+    def test_dry_run_is_physically_read_only_and_creates_no_keys(self):
+        key_paths = {
+            "ACCOUNT_CREDENTIAL_KEY_FILE": os.path.join(self.tempdir.name, "account.key"),
+            "SYSTEM_SECRET_KEY_FILE": os.path.join(self.tempdir.name, "system.key"),
+            "AI_PROVIDER_KEY_FILE": os.path.join(self.tempdir.name, "ai.key"),
+        }
+        before_bytes = Path(self.db_path).read_bytes()
+        before_hash = hashlib.sha256(before_bytes).hexdigest()
+        before_stat = os.stat(self.db_path)
+        connection = sqlite3.connect(self.db_path)
+        before_schema = connection.execute(
+            "SELECT version, name FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        connection.close()
+
+        result = self.run_script(env_overrides=key_paths)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(hashlib.sha256(Path(self.db_path).read_bytes()).hexdigest(), before_hash)
+        after_stat = os.stat(self.db_path)
+        self.assertEqual(after_stat.st_mtime_ns, before_stat.st_mtime_ns)
+        connection = sqlite3.connect(self.db_path)
+        self.assertEqual(
+            connection.execute(
+                "SELECT version, name FROM schema_migrations ORDER BY version"
+            ).fetchall(),
+            before_schema,
+        )
+        connection.close()
+        self.assertTrue(all(not Path(path).exists() for path in key_paths.values()))
+
     def test_apply_fills_and_marks_and_reruns_idempotently(self):
         result = self.run_script("--apply")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -472,6 +584,15 @@ class BackfillScriptTests(unittest.TestCase):
         self.assertEqual(order_1[5], 1782864000.0)
         self.assertEqual(order_1[6], "backfill_cst_assumed")
         self.assertEqual(order_1[7], "history_unsaved")
+        connection = sqlite3.connect(self.db_path)
+        self.assertEqual(
+            connection.execute(
+                "SELECT item_title_source, item_image_source FROM orders"
+                " WHERE order_id = 'order-1'"
+            ).fetchone(),
+            ("catalog_backfill", "catalog_backfill"),
+        )
+        connection.close()
         order_2 = orders[1]
         self.assertEqual(order_2[3], "history_unsaved", "目录缺失如实标注")
         self.assertIsNone(order_2[4], "金额 N/A 不得补零")

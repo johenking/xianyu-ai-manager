@@ -6909,6 +6909,7 @@ class DBManager:
     # 单次 SELECT 取回的现值列（顺序即索引）
     _ORDER_SYNC_EXISTING_COLUMNS = ('order_status',) + _ORDER_SYNC_DETAIL_FIELDS + (
         'item_title', 'item_image', 'item_image_cache_key', 'item_snapshot_source',
+        'item_title_source', 'item_image_source',
         'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source',
         'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
     )
@@ -6938,6 +6939,8 @@ class DBManager:
                 continue
             current = str(existing.get(field) or '')
             if current == value:
+                if not old_source and incoming_source:
+                    changed = True
                 continue
             if current and new_rank <= old_rank:
                 continue
@@ -7026,18 +7029,52 @@ class DBManager:
                 update_values.append(value)
 
             observed_at = time.time()
-            for snapshot, fields, source_col, at_col in (
-                (item_snapshot, ('item_title', 'item_image'),
-                 'item_snapshot_source', 'item_snapshot_at'),
-                (buyer_snapshot, ('buyer_nickname', 'buyer_avatar_url'),
-                 'buyer_snapshot_source', 'buyer_snapshot_at'),
-            ):
-                if not snapshot:
-                    continue
+            if item_snapshot:
+                from order_sync_service import snapshot_source_rank
+
+                changed_item_sources = []
+                for field, source_col in (
+                    ('item_title', 'item_title_source'),
+                    ('item_image', 'item_image_source'),
+                ):
+                    field_source = str(
+                        item_snapshot.get(f'{field}_source')
+                        or item_snapshot.get('source')
+                        or status_source
+                        or ''
+                    )
+                    snap_fields, snap_values, snap_changed = self._ratchet_snapshot_group(
+                        existing,
+                        (field,),
+                        item_snapshot,
+                        field_source,
+                        source_col,
+                        'item_snapshot_at',
+                        observed_at,
+                    )
+                    update_fields.extend(snap_fields)
+                    update_values.extend(snap_values)
+                    if snap_changed:
+                        changed_item_sources.append(field_source)
+                    details_changed = details_changed or snap_changed
+                if changed_item_sources:
+                    compatibility_source = max(
+                        [str(existing.get('item_snapshot_source') or ''), *changed_item_sources],
+                        key=snapshot_source_rank,
+                    )
+                    if compatibility_source != str(existing.get('item_snapshot_source') or ''):
+                        update_fields.append('item_snapshot_source = ?')
+                        update_values.append(compatibility_source)
+
+            if buyer_snapshot:
                 snap_fields, snap_values, snap_changed = self._ratchet_snapshot_group(
-                    existing, fields, snapshot,
-                    str(snapshot.get('source') or status_source or ''),
-                    source_col, at_col, observed_at,
+                    existing,
+                    ('buyer_nickname', 'buyer_avatar_url'),
+                    buyer_snapshot,
+                    str(buyer_snapshot.get('source') or status_source or ''),
+                    'buyer_snapshot_source',
+                    'buyer_snapshot_at',
+                    observed_at,
                 )
                 update_fields.extend(snap_fields)
                 update_values.extend(snap_values)
@@ -7087,6 +7124,8 @@ class DBManager:
         display_name = str(display_name or '').strip()
         avatar_url = str(avatar_url or '').strip()
         source = str(source or '')
+        if not display_name and not avatar_url:
+            return False
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -7106,9 +7145,13 @@ class DBManager:
                     new_rank = snapshot_source_rank(source)
                     old_rank = snapshot_source_rank(row[2])
                     allow_overwrite = new_rank > old_rank
-                    next_name = display_name if display_name and (not row[0] or allow_overwrite) else row[0]
-                    next_avatar = avatar_url if avatar_url and (not row[1] or allow_overwrite) else row[1]
-                    next_source = source if (allow_overwrite or not row[2]) and source else row[2]
+                    wrote_name = bool(display_name and (not row[0] or allow_overwrite))
+                    wrote_avatar = bool(avatar_url and (not row[1] or allow_overwrite))
+                    next_name = display_name if wrote_name else row[0]
+                    next_avatar = avatar_url if wrote_avatar else row[1]
+                    # 空字段由任意真实观察填入时，来源必须跟随实际提供者；
+                    # 仅已有非空身份被更高等级覆盖时才应用等级棘轮。
+                    next_source = source if source and (wrote_name or wrote_avatar) else row[2]
                     cursor.execute(
                         "UPDATE customer_profiles SET display_name = ?, avatar_url = ?,"
                         " profile_source = ?, first_observed_at = ?, last_observed_at = ?,"
@@ -7163,6 +7206,7 @@ class DBManager:
         'o.platform_status_code', 'o.platform_status_text', 'o.status_source',
         'o.status_synced_at', 'o.last_sync_error',
         'o.item_title', 'o.item_image', 'o.item_snapshot_source',
+        'o.item_title_source', 'o.item_image_source',
         'o.buyer_nickname', 'o.buyer_avatar_url', 'o.buyer_snapshot_source',
         'o.ordered_at_utc', 'o.ordered_at_source', 'o.paid_amount_fen',
         'ci.item_title AS catalog_title', 'ci.item_image AS catalog_image',
@@ -7200,9 +7244,10 @@ class DBManager:
                     where.append(
                         "(o.order_id LIKE ? ESCAPE '\\' OR o.item_id LIKE ? ESCAPE '\\'"
                         " OR o.item_title LIKE ? ESCAPE '\\' OR o.buyer_nickname LIKE ? ESCAPE '\\'"
-                        " OR IFNULL(ci.item_title, '') LIKE ? ESCAPE '\\')"
+                        " OR IFNULL(ci.item_title, '') LIKE ? ESCAPE '\\'"
+                        " OR IFNULL(cp.display_name, '') LIKE ? ESCAPE '\\')"
                     )
-                    params.extend([like] * 5)
+                    params.extend([like] * 6)
                 # 统一时间轴：快照 UTC 时间优先，缺失回退 created_at 的 UTC 解释
                 epoch_expr = "COALESCE(o.ordered_at_utc, CAST(strftime('%s', o.created_at) AS REAL))"
                 if start_date:
@@ -7213,6 +7258,8 @@ class DBManager:
                     params.append(str(end_date))
                 base = ("FROM orders o LEFT JOIN item_info ci"
                         " ON ci.cookie_id = o.cookie_id AND ci.item_id = o.item_id"
+                        " LEFT JOIN customer_profiles cp"
+                        " ON cp.cookie_id = o.cookie_id AND cp.buyer_id = o.buyer_id"
                         f" WHERE {' AND '.join(where)}")
                 total = cursor.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
                 rows = cursor.execute(
@@ -7242,7 +7289,7 @@ class DBManager:
         'platform_status_code', 'platform_status_text', 'status_source',
         'status_synced_at', 'last_sync_error',
         'item_title', 'item_image', 'item_image_cache_key',
-        'item_snapshot_source', 'item_snapshot_at',
+        'item_snapshot_source', 'item_title_source', 'item_image_source', 'item_snapshot_at',
         'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source', 'buyer_snapshot_at',
         'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
         'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',

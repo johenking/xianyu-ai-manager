@@ -855,6 +855,40 @@ def _order_identity_schema_repair_v1(cursor: sqlite3.Cursor, db_path: str) -> No
     _business_observability_v1(cursor, db_path)
 
 
+def _order_item_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """为商品标题与图片分别记录真实来源，兼容保留旧组级来源。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    _add_column(cursor, "orders", "item_title_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_image_source TEXT NOT NULL DEFAULT ''")
+    cursor.execute(
+        "UPDATE orders SET item_title_source = item_snapshot_source"
+        " WHERE item_title != '' AND item_title_source = ''"
+    )
+    item_info_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_info'"
+    ).fetchone()
+    if item_info_exists:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = CASE"
+            " WHEN item_snapshot_source = 'order_list' AND EXISTS ("
+            "   SELECT 1 FROM item_info ci"
+            "   WHERE ci.cookie_id = orders.cookie_id AND ci.item_id = orders.item_id"
+            "     AND ci.item_image = orders.item_image"
+            " ) THEN 'catalog'"
+            " WHEN item_snapshot_source = 'catalog_metadata' THEN 'catalog_backfill'"
+            " ELSE item_snapshot_source END"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+    else:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = item_snapshot_source"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -901,6 +935,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072603",
         "order_identity_schema_repair_v1",
         _order_identity_schema_repair_v1,
+    ),
+    Migration(
+        "2026072604",
+        "order_item_field_sources_v1",
+        _order_item_field_sources_v1,
     ),
 )
 

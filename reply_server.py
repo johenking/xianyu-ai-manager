@@ -10084,6 +10084,12 @@ def _compose_order_display(order: Dict[str, Any], catalog_item: Dict[str, str],
     snapshot_image = str(order.get('item_image') or '')
     order['item_title'] = snapshot_title or catalog_item.get('item_title', '')
     order['item_image'] = snapshot_image or catalog_item.get('item_image', '')
+    order['item_title_source'] = str(order.get('item_title_source') or (
+        'catalog' if not snapshot_title and order['item_title'] else ''
+    ))
+    order['item_image_source'] = str(order.get('item_image_source') or (
+        'catalog' if not snapshot_image and order['item_image'] else ''
+    ))
     order['item_price'] = catalog_item.get('item_price', '')
     if snapshot_title or snapshot_image:
         order['item_identity'] = 'snapshot'
@@ -10279,10 +10285,57 @@ async def _resolve_order_image_host(image_url: str) -> Tuple[str, ...]:
     return addresses
 
 
-async def _download_order_item_image(session: Any, image_url: str) -> bytes:
+class _PinnedOrderImageResolver:
+    """aiohttp resolver：只返回已验证的公网地址，阻断校验后的 DNS 重绑定。"""
+
+    def __init__(self, host: str, addresses: Tuple[str, ...]):
+        self._records: Dict[str, Tuple[str, ...]] = {host: addresses}
+
+    def pin(self, host: str, addresses: Tuple[str, ...]) -> None:
+        self._records[host] = addresses
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC):
+        addresses = self._records.get(str(host).rstrip('.').lower())
+        if not addresses:
+            raise OSError("host was not validated")
+        return [
+            {
+                "hostname": host,
+                "host": address,
+                "port": port,
+                "family": socket.AF_INET6 if ':' in address else socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+            for address in addresses
+        ]
+
+    async def close(self) -> None:
+        self._records.clear()
+
+
+async def _build_pinned_order_image_connector(image_url: str) -> Any:
+    import aiohttp
+
+    host, _port = _trusted_order_image_url(image_url)
+    addresses = await _resolve_order_image_host(image_url)
+    resolver = _PinnedOrderImageResolver(host, addresses)
+    connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False)
+    setattr(connector, '_order_image_resolver', resolver)
+    return connector
+
+
+async def _download_order_item_image(
+    session: Any,
+    image_url: str,
+    resolver: _PinnedOrderImageResolver,
+) -> bytes:
     current_url = image_url
     for redirect_count in range(ORDER_ITEM_IMAGE_MAX_REDIRECTS + 1):
-        await _resolve_order_image_host(current_url)
+        if redirect_count:
+            addresses = await _resolve_order_image_host(current_url)
+            host, _port = _trusted_order_image_url(current_url)
+            resolver.pin(host, addresses)
         async with session.get(current_url, allow_redirects=False) as source_response:
             if source_response.status in _ORDER_ITEM_IMAGE_REDIRECT_STATUSES:
                 if redirect_count >= ORDER_ITEM_IMAGE_MAX_REDIRECTS:
@@ -10387,8 +10440,17 @@ async def get_order_item_image(order_id: str,
 
     try:
         timeout = aiohttp.ClientTimeout(total=ORDER_ITEM_IMAGE_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            raw = await _download_order_item_image(session, image_url)
+        connector = await _build_pinned_order_image_connector(image_url)
+        resolver = getattr(connector, '_order_image_resolver')
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                connector_owner=False,
+            ) as session:
+                raw = await _download_order_item_image(session, image_url, resolver)
+        finally:
+            await connector.close()
     except HTTPException:
         raise
     except Exception:
@@ -10426,10 +10488,10 @@ def delete_order(
         # 验证订单属于当前用户
         order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         if order.get('cookie_id') not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权删除此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         # 删除订单
         success = orders_db.delete_order(order_id)
@@ -10465,11 +10527,11 @@ async def refresh_single_order(
         # 验证订单存在且属于当前用户
         order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         cookie_id = order.get('cookie_id')
         if not cookie_id or cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权刷新此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         cookies_str = user_cookies[cookie_id]
         if not cookies_str:
@@ -10626,10 +10688,10 @@ async def update_order(
         # 验证订单属于当前用户
         order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         if order.get('cookie_id') not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权修改此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         # 检查订单数据完整性
         is_complete = check_order_data_completeness(order)
@@ -11203,7 +11265,7 @@ async def manual_ship_orders(
                     results.append({
                         'order_id': order_id,
                         'success': False,
-                        'message': '订单不存在'
+                        'message': '订单不存在或无权访问'
                     })
                     failed_count += 1
                     continue
@@ -11214,7 +11276,7 @@ async def manual_ship_orders(
                     results.append({
                         'order_id': order_id,
                         'success': False,
-                        'message': '无权操作此订单'
+                        'message': '订单不存在或无权访问'
                     })
                     failed_count += 1
                     continue
@@ -11469,6 +11531,24 @@ _IMPORT_ORDER_PARAM_MAPPING = {
     'amount': 'amount',
     'item_image': 'item_image',
 }
+_ORDER_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+_ORDER_IMPORT_MAX_ROWS = 10_000
+_ORDER_IMPORT_MAX_COLUMNS = 50
+_ORDER_IMPORT_HEADER_ALIASES = {
+    '订单号': 'order_id',
+    '账号ID': 'cookie_id',
+    '商品ID': 'item_id',
+    '买家ID': 'buyer_id',
+    '状态': 'status',
+    '金额': 'amount',
+    '数量': 'quantity',
+    '订单时间': 'order_time',
+    '收货人': 'receiver_name',
+    '手机号': 'receiver_phone',
+    '收货地址': 'receiver_address',
+    '城市': 'receiver_city',
+    '商品图片': 'item_image',
+}
 
 
 def _map_import_order_params(order_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -11489,9 +11569,92 @@ def _map_import_order_params(order_data: Dict[str, Any]) -> Tuple[Dict[str, Any]
     return params, ignored
 
 
+def _cell_import_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, 'isoformat'):
+        return value.isoformat(sep=' ')
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _orders_from_xlsx(raw: bytes, filename: str) -> List[Dict[str, Any]]:
+    if not str(filename or '').lower().endswith('.xlsx'):
+        raise HTTPException(status_code=415, detail="仅支持 .xlsx 文件")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Excel 文件为空")
+    if len(raw) > _ORDER_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheet = workbook.active
+        if sheet.max_row > _ORDER_IMPORT_MAX_ROWS + 1 or sheet.max_column > _ORDER_IMPORT_MAX_COLUMNS:
+            raise HTTPException(status_code=413, detail="Excel 行列数超过限制")
+        rows = sheet.iter_rows(values_only=True)
+        header_row = next(rows, None)
+        if not header_row:
+            raise HTTPException(status_code=400, detail="Excel 缺少表头")
+        headers = [
+            _ORDER_IMPORT_HEADER_ALIASES.get(str(value or '').strip(), str(value or '').strip())
+            for value in header_row
+        ]
+        if not headers or any(not header for header in headers) or len(set(headers)) != len(headers):
+            raise HTTPException(status_code=400, detail="Excel 表头为空或重复")
+        missing = [field for field in ('order_id', 'cookie_id') if field not in headers]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel 缺少必需表头: {', '.join(missing)}",
+            )
+        orders = []
+        for row in rows:
+            values = [_cell_import_value(value) for value in row[:len(headers)]]
+            if not any(value not in (None, '') for value in values):
+                continue
+            orders.append(dict(zip(headers, values)))
+        return orders
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Excel 文件损坏或格式不受支持")
+    finally:
+        if 'workbook' in locals():
+            workbook.close()
+
+
+async def _parse_order_import_request(request: Request) -> List[Dict[str, Any]]:
+    content_type = str(request.headers.get('content-type') or '').lower()
+    if content_type.startswith('application/json'):
+        content_length = request.headers.get('content-length')
+        if content_length and content_length.isdigit() and int(content_length) > _ORDER_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="导入内容超过 5MB")
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="JSON 格式错误")
+        if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+            raise HTTPException(status_code=422, detail="JSON 必须是订单对象数组")
+        if len(payload) > _ORDER_IMPORT_MAX_ROWS:
+            raise HTTPException(status_code=413, detail="订单行数超过限制")
+        return payload
+    if content_type.startswith('multipart/form-data'):
+        form = await request.form()
+        upload = form.get('file')
+        if upload is None or not hasattr(upload, 'read'):
+            raise HTTPException(status_code=400, detail="缺少 Excel 文件")
+        raw = await upload.read(_ORDER_IMPORT_MAX_BYTES + 1)
+        if len(raw) > _ORDER_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
+        return _orders_from_xlsx(raw, str(getattr(upload, 'filename', '') or ''))
+    raise HTTPException(status_code=415, detail="仅支持 JSON 或 multipart Excel")
+
+
 @orders_router.post('/api/orders/import')
 async def import_orders(
-    orders: List[Dict[str, Any]] = Body(..., description="订单列表"),
+    request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
     orders_db: Any = Depends(get_orders_db),
 ):
@@ -11500,6 +11663,7 @@ async def import_orders(
     支持批量导入自定义订单数据
     """
     try:
+        orders = await _parse_order_import_request(request)
         user_id = current_user['user_id']
         log_with_user('info', f"开始导入订单: 订单数量={len(orders)}", current_user)
 

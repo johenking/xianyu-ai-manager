@@ -5,7 +5,7 @@
 商品/买家快照，展示靠 (cookie_id, item_id) 实时 join 商品目录。迁移
 2026072601/2026072602 只加列不写值，历史数据的解析与回填全部由本脚本承担：
 
-- item_title / item_image：从当前商品目录近似回填，来源标 catalog_metadata
+- item_title / item_image：从当前商品目录近似回填，各自来源标 catalog_backfill
   （最低可信档，后续任何真实订单报文来源都可棘轮升级）；目录里也找不到的
   订单标 history_unsaved，如实承认历史未保存，不伪装成成交时信息。
 - paid_amount_fen：amount 文本 → 整数分；解析失败留 NULL，绝不用 0 冒充。
@@ -20,7 +20,8 @@
 安全设计：
 - 默认「只读演练」，只统计不写库；加 --apply 才真正 UPDATE。
 - 所有 UPDATE 带空值断言（IS NULL / = ''），只填补空位，绝不覆盖已有快照。
-- 库路径复用 DBManager（读 DB_PATH 环境变量），初始化时自动执行版本化迁移。
+- dry-run 用 SQLite `mode=ro` 直接读取 DB_PATH，不初始化 DBManager、不迁移、不建密钥；
+  只有显式 --apply 才初始化 DBManager 并执行版本化迁移。
 
 用法：
     # dev 只读演练
@@ -32,8 +33,42 @@
     DB_PATH="/path/to/prod.db" .venv/bin/python backfill_order_snapshots.py --apply
 """
 import argparse
+import os
+import sqlite3
 import sys
+import threading
 import time
+from pathlib import Path
+
+
+class _ReadOnlyDatabase:
+    """dry-run 专用最小数据库视图；不会初始化 DBManager 或执行迁移。"""
+
+    def __init__(self, db_path: str):
+        self.db_path = str(Path(db_path).expanduser().resolve())
+        self.lock = threading.RLock()
+        self.conn = sqlite3.connect(
+            f"{Path(self.db_path).as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+
+    def get_item_catalog_lookup(self, cookie_ids):
+        if not cookie_ids:
+            return {}
+        placeholders = ','.join('?' for _ in cookie_ids)
+        rows = self.conn.execute(
+            "SELECT cookie_id, item_id, item_title, item_image, item_price"
+            f" FROM item_info WHERE cookie_id IN ({placeholders})",
+            [str(value) for value in cookie_ids],
+        ).fetchall()
+        return {
+            (str(row[0]), str(row[1])): {
+                "item_title": row[2] or "",
+                "item_image": row[3] or "",
+                "item_price": row[4] or "",
+            }
+            for row in rows
+        }
 
 
 def main() -> int:
@@ -45,9 +80,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # 延迟导入：DBManager 初始化会读取 DB_PATH 并执行版本化迁移补齐快照列
-    from db_manager import db_manager
     from order_sync_service import parse_amount_fen, parse_order_time_utc
+
+    if args.apply:
+        # 只有显式 --apply 才允许初始化 DBManager、迁移与密钥。
+        from db_manager import db_manager
+    else:
+        db_manager = _ReadOnlyDatabase(
+            os.environ.get("DB_PATH", "data/xianyu_data.db")
+        )
 
     print(f"数据库路径: {db_manager.db_path}")
     print(f"模式: {'正式回填 (--apply)' if args.apply else '只读演练 (dry-run)'}")
@@ -59,6 +100,7 @@ def main() -> int:
             """
             SELECT order_id, cookie_id, item_id, buyer_id, amount, created_at,
                    item_title, item_image, item_snapshot_source,
+                   item_title_source, item_image_source,
                    buyer_nickname, buyer_snapshot_source,
                    paid_amount_fen, ordered_at_utc
             FROM orders
@@ -79,6 +121,8 @@ def main() -> int:
     # 分类桶（统计口径见打印）
     title_fill = []        # (title, order_id, cookie_id)
     image_fill = []        # (image, order_id, cookie_id)
+    title_source_fill = []
+    image_source_fill = []
     item_source_fill = []  # (source, order_id, cookie_id)
     item_unsaved = 0
     amount_fill = []       # (fen, order_id, cookie_id)
@@ -90,6 +134,7 @@ def main() -> int:
 
     for (order_id, cookie_id, item_id, buyer_id, amount, created_at,
          item_title, item_image, item_snapshot_source,
+         item_title_source, item_image_source,
          buyer_nickname, buyer_snapshot_source,
          paid_amount_fen, ordered_at_utc) in rows:
         order_id = str(order_id)
@@ -102,12 +147,26 @@ def main() -> int:
             catalog_title = str(catalog_item.get("item_title") or "").strip()
             if catalog_title:
                 title_fill.append((catalog_title, order_id, cookie_key))
+                title_source_fill.append(("catalog_backfill", order_id, cookie_key))
                 recovered_item = True
         if not (item_image or ""):
             catalog_image = str(catalog_item.get("item_image") or "").strip()
             if catalog_image:
                 image_fill.append((catalog_image, order_id, cookie_key))
+                image_source_fill.append(("catalog_backfill", order_id, cookie_key))
                 recovered_item = True
+        if item_title and not (item_title_source or ""):
+            title_source_fill.append((
+                str(item_snapshot_source or "history_unsaved"),
+                order_id,
+                cookie_key,
+            ))
+        if item_image and not (item_image_source or ""):
+            image_source_fill.append((
+                str(item_snapshot_source or "history_unsaved"),
+                order_id,
+                cookie_key,
+            ))
         if not (item_snapshot_source or ""):
             if recovered_item:
                 item_source_fill.append(("catalog_metadata", order_id, cookie_key))
@@ -156,6 +215,7 @@ def main() -> int:
     if not args.apply:
         print("-" * 48)
         print("只读演练结束，未写库。确认无误后加 --apply 正式回填。")
+        db_manager.conn.close()
         return 0
 
     counts = {}
@@ -179,6 +239,24 @@ def main() -> int:
                 (image, now, order_id, cookie_key),
             )
             counts["item_image"] += cursor.rowcount
+        counts["item_title_source"] = 0
+        for source, order_id, cookie_key in title_source_fill:
+            cursor.execute(
+                "UPDATE orders SET item_title_source = ?"
+                " WHERE order_id = ? AND cookie_id = ?"
+                "   AND (item_title_source IS NULL OR item_title_source = '')",
+                (source, order_id, cookie_key),
+            )
+            counts["item_title_source"] += cursor.rowcount
+        counts["item_image_source"] = 0
+        for source, order_id, cookie_key in image_source_fill:
+            cursor.execute(
+                "UPDATE orders SET item_image_source = ?"
+                " WHERE order_id = ? AND cookie_id = ?"
+                "   AND (item_image_source IS NULL OR item_image_source = '')",
+                (source, order_id, cookie_key),
+            )
+            counts["item_image_source"] += cursor.rowcount
         counts["item_snapshot_source"] = 0
         for source, order_id, cookie_key in item_source_fill:
             cursor.execute(

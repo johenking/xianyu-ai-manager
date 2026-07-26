@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601/2026072602/2026072603）双路径测试。
+"""订单身份快照迁移（2026072601..2026072604）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -24,6 +24,8 @@ SNAPSHOT_COLUMNS = {
     "item_image",
     "item_image_cache_key",
     "item_snapshot_source",
+    "item_title_source",
+    "item_image_source",
     "item_snapshot_at",
     "buyer_nickname",
     "buyer_avatar_url",
@@ -100,7 +102,10 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
     def test_applies_only_snapshot_migrations_and_is_idempotent(self):
         connection = sqlite3.connect(self.db_path)
         runner = MigrationRunner(connection, str(self.db_path))
-        self.assertEqual(runner.run(), ["2026072601", "2026072602", "2026072603"])
+        self.assertEqual(
+            runner.run(),
+            ["2026072601", "2026072602", "2026072603", "2026072604"],
+        )
 
         columns = order_columns(connection)
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(columns))
@@ -124,7 +129,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            14,
+            15,
         )
         connection.close()
 
@@ -139,7 +144,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         connection.commit()
 
         runner = MigrationRunner(connection, str(self.db_path))
-        self.assertEqual(runner.run(), ["2026072602", "2026072603"])
+        self.assertEqual(runner.run(), ["2026072602", "2026072603", "2026072604"])
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
         self.assertEqual(
             connection.execute(
@@ -161,6 +166,32 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
         self.assertIn("idx_customer_profiles_last_observed", indexes)
         self.assertEqual(runner.run(), [])
+        connection.close()
+
+    def test_field_source_migration_corrects_old_mixed_order_list_catalog_image(self):
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=MIGRATIONS[:-1],
+            backup_enabled=False,
+        ).run()
+        connection.execute(
+            "UPDATE orders SET item_title = '列表标题',"
+            " item_image = 'https://img.example.test/item-1.jpg',"
+            " item_snapshot_source = 'order_list' WHERE order_id = 'order-1'"
+        )
+        connection.commit()
+
+        self.assertEqual(
+            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            ["2026072604"],
+        )
+        row = connection.execute(
+            "SELECT item_title_source, item_image_source FROM orders"
+            " WHERE order_id = 'order-1'"
+        ).fetchone()
+        self.assertEqual(row, ("order_list", "catalog"))
         connection.close()
 
     def test_backup_contains_database_and_keys(self):

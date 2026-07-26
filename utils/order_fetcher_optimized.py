@@ -6,7 +6,7 @@ import asyncio
 import time
 import json
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from playwright.async_api import Browser, BrowserContext, Page
 from loguru import logger
 from collections import defaultdict
@@ -110,6 +110,7 @@ class OrderFetcherOptimized:
                             'order_status': existing_order.get('order_status', 'unknown'),
                             'status_text': existing_order.get('status_text', ''),
                             'item_title': existing_order.get('item_title', ''),
+                            'item_image': existing_order.get('item_image', ''),
                             'spec_name': existing_order.get('spec_name', ''),
                             'spec_value': existing_order.get('spec_value', ''),
                             'quantity': existing_order.get('quantity', ''),
@@ -120,6 +121,8 @@ class OrderFetcherOptimized:
                             'receiver_address': receiver_address,
                             'receiver_city': existing_order.get('receiver_city', ''),
                             'buyer_id': existing_order.get('buyer_id', ''),
+                            'buyer_nickname': existing_order.get('buyer_nickname', ''),
+                            'buyer_avatar_url': existing_order.get('buyer_avatar_url', ''),
                             'item_id': existing_order.get('item_id', ''),
                             'can_rate': existing_order.get('can_rate', False),
                             'timestamp': time.time(),
@@ -250,7 +253,10 @@ class OrderFetcherOptimized:
                     logger.info(f"使用API的订单状态: {api_status}")
                 result['status_text'] = api_data.get('status_text', '')
                 result['item_title'] = api_data.get('item_title', '')
+                result['item_image'] = api_data.get('item_image', '')
                 result['buyer_id'] = api_data.get('buyer_id', '')
+                result['buyer_nickname'] = api_data.get('buyer_nickname', '')
+                result['buyer_avatar_url'] = api_data.get('buyer_avatar_url', '')
                 result['item_id'] = api_data.get('item_id', '')
                 result['can_rate'] = api_data.get('can_rate', False)
 
@@ -309,8 +315,15 @@ class OrderFetcherOptimized:
                 if component.get('render') == 'orderInfoVO':
                     # 商品信息
                     item_info = component.get('data', {}).get('itemInfo', {})
-                    result['item_title'] = item_info.get('title', '')
-                    result['item_id'] = item_info.get('itemId', '')
+                    result['item_title'] = self._first_text(
+                        item_info, 'title', 'itemTitle', 'name',
+                    )
+                    result['item_id'] = self._first_text(
+                        item_info, 'itemId', 'id',
+                    )
+                    result['item_image'] = self._first_text(
+                        item_info, 'picUrl', 'imageUrl', 'itemImage', 'cover', 'pic',
+                    ) or self._first_path(item_info, ('itemPic', 'url'), ('image', 'url'))
 
                     # 价格信息
                     price_info = component.get('data', {}).get('priceInfo', {})
@@ -340,7 +353,19 @@ class OrderFetcherOptimized:
 
                     # 买家ID
                     buyer_info = component.get('data', {}).get('buyerInfo', {})
-                    result['buyer_id'] = buyer_info.get('userId', '')
+                    result['buyer_id'] = self._first_text(
+                        buyer_info, 'userId', 'user_id', 'id',
+                    )
+                    result['buyer_nickname'] = self._first_text(
+                        buyer_info, 'nick', 'nickname', 'displayName', 'userNick',
+                    ) or self._first_path(
+                        buyer_info, ('userBaseInfo', 'nickName'), ('baseInfo', 'nickname'),
+                    )
+                    result['buyer_avatar_url'] = self._first_text(
+                        buyer_info, 'avatar', 'avatarUrl', 'headImg', 'headPic',
+                    ) or self._first_path(
+                        buyer_info, ('userBaseInfo', 'avatarUrl'), ('baseInfo', 'avatar'),
+                    )
 
             # 检查是否可评价
             bottom_bar = order_data.get('bottomBarVO', {})
@@ -351,6 +376,32 @@ class OrderFetcherOptimized:
             logger.error(f"解析API响应失败: {e}")
 
         return result
+
+    @staticmethod
+    def _first_text(container: Any, *keys: str) -> str:
+        """只接受响应中已验证为非空标量的候选字段，不推断、不拼造。"""
+        if not isinstance(container, dict):
+            return ''
+        for key in keys:
+            value = container.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        return ''
+
+    @staticmethod
+    def _first_path(container: Any, *paths: Tuple[str, ...]) -> str:
+        if not isinstance(container, dict):
+            return ''
+        for path in paths:
+            value: Any = container
+            for key in path:
+                if not isinstance(value, dict):
+                    value = None
+                    break
+                value = value.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        return ''
 
     async def _parse_dom_content(self) -> Dict[str, Any]:
         """

@@ -311,12 +311,18 @@ describe('OrderList request races and media failures', () => {
       buyer_display_name: '买家甲',
       buyer_avatar_url: 'https://img.alicdn.com/avatar.jpg',
     }]) as any);
-    render(<OrderList />);
+    const { container } = render(<OrderList />);
 
     await waitFor(() => {
-      expect(document.querySelector('img[src="https://img.alicdn.com/avatar.jpg"]')).not.toBeNull();
+      expect(container.querySelectorAll(
+        'img[src="https://img.alicdn.com/avatar.jpg"]',
+      ).length).toBeGreaterThanOrEqual(2);
     });
-    const avatar = document.querySelector(
+    const mobileAvatar = container.querySelector(
+      '.md\\:hidden img[src="https://img.alicdn.com/avatar.jpg"]',
+    ) as HTMLImageElement;
+    expect(mobileAvatar).not.toBeNull();
+    const avatar = container.querySelector(
       'img[src="https://img.alicdn.com/avatar.jpg"]',
     ) as HTMLImageElement;
     fireEvent.error(avatar);

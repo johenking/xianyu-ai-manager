@@ -23,6 +23,8 @@ export interface Order {
   item_price?: string;
   /** 商品展示信息来源：成交快照 / 目录兜底 / 缺失 */
   item_identity?: ItemIdentity;
+  item_title_source?: string;
+  item_image_source?: string;
   buyer_id: string;
   buyer_display_name?: string;
   buyer_avatar_url?: string;

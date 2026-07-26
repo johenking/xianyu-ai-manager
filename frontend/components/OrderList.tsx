@@ -2,9 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, OrderSyncResponse, AccountDetail } from '../types';
 import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails } from '../services/api';
-import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, ExternalLink, Trash2, Upload } from 'lucide-react';
+import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
 import OrderItemImage from './ui/OrderItemImage';
+import BuyerAvatar from './ui/BuyerAvatar';
 
 // 买家身份来源标注：让「历史未保存」如实呈现，不伪装成成交时信息
 const BUYER_IDENTITY_LABELS: Record<string, string> = {
@@ -44,30 +45,6 @@ const orderTimeLabel = (order: Order): string => {
   }
   if (order.created_at) return `${order.created_at}（创建时间回退）`;
   return '时间未记录';
-};
-
-const BuyerAvatar: React.FC<{ src?: string; className: string }> = ({ src, className }) => {
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [src]);
-  if (!src || failed) {
-    return (
-      <div
-        aria-label="买家头像占位"
-        className={`${className} bg-gray-100 flex items-center justify-center text-gray-300`}
-      >
-        <UserIcon className="w-5 h-5" />
-      </div>
-    );
-  }
-  return (
-    <img
-      src={src}
-      alt=""
-      referrerPolicy="no-referrer"
-      className={className}
-      onError={() => setFailed(true)}
-    />
-  );
 };
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
@@ -544,8 +521,14 @@ const OrderList: React.FC = () => {
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div>
                   <div className="text-gray-400">买家</div>
-                  <div className="mt-1 font-semibold text-gray-700 break-all">
-                    {buyerListLabel(order)}
+                  <div className="mt-1 flex items-center gap-2">
+                    <BuyerAvatar
+                      src={order.buyer_avatar_url}
+                      className="w-8 h-8 rounded-full object-cover border border-gray-100 flex-shrink-0"
+                    />
+                    <div className="font-semibold text-gray-700 break-all">
+                      {buyerListLabel(order)}
+                    </div>
                   </div>
                   {!order.buyer_display_name && BUYER_IDENTITY_LABELS[order.buyer_identity || ''] && (
                     <div className="mt-0.5 text-[10px] text-gray-400">{BUYER_IDENTITY_LABELS[order.buyer_identity || '']}</div>

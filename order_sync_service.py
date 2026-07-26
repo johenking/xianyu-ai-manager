@@ -41,6 +41,7 @@ SNAPSHOT_SOURCE_RANK: Dict[str, int] = {
     "": 0,
     "history_unsaved": 0,
     "catalog_metadata": 1,
+    "catalog_backfill": 1,
     "catalog": 2,
     "realtime_message": 3,
     "order_list": 4,
@@ -652,7 +653,8 @@ class OrderSyncCoordinator:
                 item_snapshot = {
                     "item_title": record_title or catalog_title,
                     "item_image": catalog_image or "",
-                    "source": "order_list" if record_title else "catalog",
+                    "item_title_source": "order_list" if record_title else "catalog",
+                    "item_image_source": "catalog",
                 }
             buyer_nickname = str(order.get("buyer_nickname") or "").strip()
             buyer_avatar = str(order.get("buyer_avatar_url") or "").strip()
