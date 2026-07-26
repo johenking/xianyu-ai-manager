@@ -186,10 +186,20 @@ class OrderQueryIntegrityTests(unittest.TestCase):
         list_sql = next(
             statement
             for statement in reversed(statements)
-            if statement.lstrip().upper().startswith("SELECT")
-            and " ORDER BY " in statement
-            and " FROM orders o " in statement
+            if " ORDER BY o.cookie_id ASC" in statement
+            and " LEFT JOIN item_info ci" in statement
+            and " LEFT JOIN customer_profiles cp" in statement
         )
+        with self.db.lock:
+            plan = self.db.conn.execute(
+                f"EXPLAIN QUERY PLAN {list_sql}"
+            ).fetchall()
+        plan_text = " ".join(str(row[3]) for row in plan)
+
+        self.assertIn("idx_orders_cookie_ordered_order", plan_text)
+        self.assertIn("ordered_at_utc>?", plan_text)
+        self.assertIn("ordered_at_utc<?", plan_text)
+        self.assertIn("UNION ALL", list_sql)
         self.assertNotIn("COALESCE(", list_sql)
         self.assertNotIn("date(", list_sql)
         self.assertIn("o.ordered_at_utc >=", list_sql)
@@ -232,21 +242,52 @@ class OrderQueryIntegrityTests(unittest.TestCase):
                 row[1]
                 for row in self.db.conn.execute("PRAGMA index_list(orders)").fetchall()
             }
-            plan = self.db.conn.execute(
-                """
-                EXPLAIN QUERY PLAN
-                SELECT order_id FROM orders
-                WHERE cookie_id = ?
-                  AND ordered_at_utc >= ?
-                  AND ordered_at_utc < ?
-                ORDER BY cookie_id, ordered_at_utc DESC, order_id DESC
-                """,
-                ("acct-a", 0.0, 1000.0),
-            ).fetchall()
         self.assertIn("idx_orders_cookie_ordered_order", indexes)
-        plan_text = " ".join(str(row[3]) for row in plan)
-        self.assertIn("idx_orders_cookie_ordered_order", plan_text)
-        self.assertNotIn("USE TEMP B-TREE", plan_text)
+
+    def test_date_union_paginates_stably_across_accounts_and_time_ties(self):
+        tied_epoch = datetime(2026, 7, 20, 12, tzinfo=SHANGHAI).timestamp()
+        for cookie_id in ("acct-a", "acct-b"):
+            for suffix in ("1", "2", "3"):
+                self._insert_order(
+                    f"order-{cookie_id[-1]}-{suffix}",
+                    cookie_id,
+                    ordered_at_utc=tied_epoch,
+                )
+            self._insert_order(
+                f"legacy-{cookie_id[-1]}",
+                cookie_id,
+                created_at="2026-07-20 04:00:00",
+            )
+
+        pages = [
+            self.db.query_orders(
+                ["acct-b", "acct-a"],
+                start_date="2026-07-20",
+                end_date="2026-07-20",
+                page=page,
+                page_size=3,
+            )
+            for page in (1, 2, 3)
+        ]
+
+        self.assertEqual([page["total"] for page in pages], [8, 8, 8])
+        self.assertEqual(
+            [
+                row["order_id"]
+                for page in pages
+                for row in page["items"]
+            ],
+            [
+                "order-a-3",
+                "order-a-2",
+                "order-a-1",
+                "legacy-a",
+                "order-b-3",
+                "order-b-2",
+                "order-b-1",
+                "legacy-b",
+            ],
+        )
 
 
 class OrderQueryApiFailureTests(unittest.TestCase):
@@ -391,6 +432,27 @@ class OrderQueryApiFailureTests(unittest.TestCase):
         self.assertEqual(response.json()["data"]["buyer_display_name"], "单买家昵称")
         exact_profile.assert_called_once_with("acct-a", "buyer-api")
         full_scan.assert_not_called()
+
+    def test_list_rejects_invalid_calendar_date(self):
+        response = self.client.get(
+            "/api/orders",
+            params={"start_date": "2026-02-30"},
+            headers=self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_list_rejects_reversed_date_range(self):
+        response = self.client.get(
+            "/api/orders",
+            params={
+                "start_date": "2026-07-21",
+                "end_date": "2026-07-20",
+            },
+            headers=self._headers(),
+        )
+
+        self.assertEqual(response.status_code, 422)
 
 
 if __name__ == "__main__":

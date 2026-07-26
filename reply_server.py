@@ -10130,6 +10130,36 @@ def _compose_order_display(order: Dict[str, Any], catalog_item: Dict[str, str],
         order['buyer_identity'] = 'missing'
 
 
+def _parse_order_query_date(
+    value: Any,
+    field_name: str,
+) -> Optional[datetime]:
+    """校验订单筛选日期；保持外部 YYYY-MM-DD 字符串契约。"""
+    if value is None or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_order_date",
+                "field": field_name,
+                "message": "日期必须是有效的 YYYY-MM-DD 日历日期",
+            },
+        ) from exc
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_order_date",
+                "field": field_name,
+                "message": "日期必须是有效的 YYYY-MM-DD 日历日期",
+            },
+        )
+    return parsed
+
+
 @orders_router.get('/api/orders')
 def get_user_orders(
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -10146,6 +10176,20 @@ def get_user_orders(
     try:
         user_id = current_user['user_id']
         log_with_user('info', f"查询用户订单信息 (page={page}, page_size={page_size})", current_user)
+        parsed_start = _parse_order_query_date(start_date, "start_date")
+        parsed_end = _parse_order_query_date(end_date, "end_date")
+        if parsed_start and parsed_end and parsed_start > parsed_end:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_order_date_range",
+                    "message": "开始日期不得晚于结束日期",
+                },
+            )
+        normalized_start = (
+            parsed_start.strftime("%Y-%m-%d") if parsed_start else None
+        )
+        normalized_end = parsed_end.strftime("%Y-%m-%d") if parsed_end else None
 
         user_cookies = orders_db.get_all_cookies(user_id)
         if cookie_id:
@@ -10158,7 +10202,7 @@ def get_user_orders(
 
         result = orders_db.query_orders(
             scope_ids, status=status, search=search or '',
-            start_date=start_date, end_date=end_date,
+            start_date=normalized_start, end_date=normalized_end,
             page=page, page_size=page_size,
         )
         for order in result['items']:

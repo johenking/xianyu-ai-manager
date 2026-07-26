@@ -7393,22 +7393,23 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 placeholders = ','.join('?' for _ in cookie_ids)
-                where = [f"o.cookie_id IN ({placeholders})"]
-                params: List[Any] = [str(cid) for cid in cookie_ids]
+                normalized_cookie_ids = [str(cid) for cid in cookie_ids]
+                outer_where: List[str] = []
+                outer_params: List[Any] = []
                 if status:
-                    where.append("o.order_status = ?")
-                    params.append(str(status))
+                    outer_where.append("o.order_status = ?")
+                    outer_params.append(str(status))
                 if search:
                     escaped = (str(search).replace('\\', '\\\\')
                                .replace('%', '\\%').replace('_', '\\_'))
                     like = f"%{escaped}%"
-                    where.append(
+                    outer_where.append(
                         "(o.order_id LIKE ? ESCAPE '\\' OR o.item_id LIKE ? ESCAPE '\\'"
                         " OR o.item_title LIKE ? ESCAPE '\\' OR o.buyer_nickname LIKE ? ESCAPE '\\'"
                         " OR IFNULL(ci.item_title, '') LIKE ? ESCAPE '\\'"
                         " OR IFNULL(cp.display_name, '') LIKE ? ESCAPE '\\')"
                     )
-                    params.extend([like] * 6)
+                    outer_params.extend([like] * 6)
                 start_epoch = start_created_at = None
                 end_epoch = end_created_at = None
                 if start_date:
@@ -7421,9 +7422,25 @@ class DBManager:
                         end_date,
                         next_day=True,
                     )
+                if (
+                    start_epoch is not None
+                    and end_epoch is not None
+                    and start_epoch >= end_epoch
+                ):
+                    raise ValueError("开始日期不得晚于结束日期")
+
+                cte = ""
+                scoped_source = "orders o"
+                scoped_params: List[Any] = []
                 if start_date or end_date:
-                    normalized_terms = ["o.ordered_at_utc IS NOT NULL"]
-                    legacy_terms = ["o.ordered_at_utc IS NULL"]
+                    normalized_terms = [
+                        f"o.cookie_id IN ({placeholders})",
+                        "o.ordered_at_utc IS NOT NULL",
+                    ]
+                    legacy_terms = [
+                        f"o.cookie_id IN ({placeholders})",
+                        "o.ordered_at_utc IS NULL",
+                    ]
                     normalized_params: List[Any] = []
                     legacy_params: List[Any] = []
                     if start_epoch is not None:
@@ -7436,22 +7453,49 @@ class DBManager:
                         legacy_terms.append("o.created_at < ?")
                         normalized_params.append(end_epoch)
                         legacy_params.append(end_created_at)
-                    where.append(
-                        f"(({' AND '.join(normalized_terms)})"
-                        f" OR ({' AND '.join(legacy_terms)}))"
+                    cte = (
+                        "WITH scoped_orders AS ("
+                        "SELECT o.* FROM orders o"
+                        f" WHERE {' AND '.join(normalized_terms)}"
+                        " UNION ALL "
+                        "SELECT o.* FROM orders o"
+                        f" WHERE {' AND '.join(legacy_terms)}"
+                        ") "
                     )
-                    params.extend([*normalized_params, *legacy_params])
-                base = ("FROM orders o LEFT JOIN item_info ci"
+                    scoped_source = "scoped_orders o"
+                    scoped_params = [
+                        *normalized_cookie_ids,
+                        *normalized_params,
+                        *normalized_cookie_ids,
+                        *legacy_params,
+                    ]
+                else:
+                    outer_where.insert(
+                        0,
+                        f"o.cookie_id IN ({placeholders})",
+                    )
+                    scoped_params = normalized_cookie_ids
+
+                where_sql = (
+                    f" WHERE {' AND '.join(outer_where)}"
+                    if outer_where
+                    else ""
+                )
+                base = (f"FROM {scoped_source} LEFT JOIN item_info ci"
                         " ON ci.cookie_id = o.cookie_id AND ci.item_id = o.item_id"
                         " LEFT JOIN customer_profiles cp"
                         " ON cp.cookie_id = o.cookie_id AND cp.buyer_id = o.buyer_id"
-                        f" WHERE {' AND '.join(where)}")
-                total = cursor.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+                        f"{where_sql}")
+                query_params = [*scoped_params, *outer_params]
+                total = cursor.execute(
+                    f"{cte}SELECT COUNT(*) {base}",
+                    query_params,
+                ).fetchone()[0]
                 rows = cursor.execute(
-                    f"SELECT {', '.join(self._ORDER_LIST_COLUMNS)} {base}"
+                    f"{cte}SELECT {', '.join(self._ORDER_LIST_COLUMNS)} {base}"
                     " ORDER BY o.cookie_id ASC, o.ordered_at_utc DESC,"
                     " o.order_id DESC LIMIT ? OFFSET ?",
-                    [*params, page_size, (page - 1) * page_size],
+                    [*query_params, page_size, (page - 1) * page_size],
                 ).fetchall()
                 column_names = [
                     col.split(' AS ')[-1].split('.')[-1] for col in self._ORDER_LIST_COLUMNS
