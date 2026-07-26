@@ -771,16 +771,80 @@ def _account_login_metadata_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
-def _order_item_image_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
-    # 成交时从商品目录快照的主图 URL，避免商品下架后订单图片失联。
-    # db_manager 的即席 ALTER 轨道（order_sync_columns）先于本迁移执行，
-    # 运行中的库此列通常已存在；_add_column 幂等，空库（无 orders 表）直接跳过。
+def _order_identity_snapshots_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    # 订单可信化：成交时身份快照列。快照语义为“只填空值 + 来源等级棘轮”，
+    # 商品后续改图/改标题/下架不影响已成交订单的展示；写入守卫在 db_manager。
+    # 本迁移只做 DDL，历史数据解析与回填一律走 backfill_order_snapshots.py。
+    # 注意：若某环境曾应用过旧版 WIP 迁移 "2026072601 order_item_image_v1"
+    # （item_image 单列版本），账本里已有 2026072601 会让本迁移被跳过；
+    # 补救方式是 DELETE FROM schema_migrations WHERE version='2026072601' 后重启，
+    # 迁移体全幂等，重放无害。开发库可能已被早期即席 ALTER 提前加过 item_image，
+    # _add_column 幂等兼容；空库（无 orders 表）直接跳过。
     orders_exists = cursor.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
     ).fetchone()
     if not orders_exists:
         return
+    # 规范化时间与金额（NULL = 未解析成功，绝不用 0 冒充缺失）
+    _add_column(cursor, "orders", "ordered_at_utc REAL")
+    _add_column(cursor, "orders", "ordered_at_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "paid_amount_fen INTEGER")
+    # 商品成交快照
+    _add_column(cursor, "orders", "item_title TEXT NOT NULL DEFAULT ''")
     _add_column(cursor, "orders", "item_image TEXT DEFAULT ''")
+    _add_column(cursor, "orders", "item_image_cache_key TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_snapshot_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_snapshot_at REAL")
+    # 买家成交快照
+    _add_column(cursor, "orders", "buyer_nickname TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_avatar_url TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_snapshot_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_snapshot_at REAL")
+
+
+def _business_observability_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    # 经营驾驶舱基础：客户身份档案 + 聚合查询索引。
+    # customer_profiles 只存“当前可用身份”（昵称/头像/观察时间），
+    # 行为计数（有效单量/退款量）一律查询时从 orders 现算，避免增量计数器漂移。
+    # 账号删除路径显式清理本表（SQLite 外键未必启用，不依赖 CASCADE）。
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_profiles (
+            cookie_id TEXT NOT NULL,
+            buyer_id TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            avatar_url TEXT NOT NULL DEFAULT '',
+            profile_source TEXT NOT NULL DEFAULT '',
+            first_observed_at REAL NOT NULL,
+            last_observed_at REAL NOT NULL,
+            observation_count INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            PRIMARY KEY (cookie_id, buyer_id),
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        ) WITHOUT ROWID
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_profiles_last_observed "
+        "ON customer_profiles(cookie_id, last_observed_at DESC)"
+    )
+    orders_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone()
+    if not orders_exists:
+        return
+    # 索引列逐一防卫：buyer_id 属基础建表列，但存量测试/极简库可能没有；
+    # ordered_at_utc 由同批 2026072601 保证，防卫代价为零，口径统一。
+    order_columns = _columns(cursor, "orders")
+    if {"cookie_id", "buyer_id"} <= order_columns:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_buyer ON orders(cookie_id, buyer_id)"
+        )
+    if {"cookie_id", "ordered_at_utc"} <= order_columns:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_ordered_at ON orders(cookie_id, ordered_at_utc)"
+        )
 
 
 MIGRATIONS: Sequence[Migration] = (
@@ -815,7 +879,16 @@ MIGRATIONS: Sequence[Migration] = (
         "account_login_metadata_v1",
         _account_login_metadata_v1,
     ),
-    Migration("2026072601", "order_item_image_v1", _order_item_image_v1),
+    Migration(
+        "2026072601",
+        "order_identity_snapshots_v1",
+        _order_identity_snapshots_v1,
+    ),
+    Migration(
+        "2026072602",
+        "business_observability_v1",
+        _business_observability_v1,
+    ),
 )
 
 

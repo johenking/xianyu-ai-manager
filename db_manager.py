@@ -494,9 +494,9 @@ class DBManager:
                 'status_source': "TEXT DEFAULT ''",
                 'status_synced_at': "TIMESTAMP",
                 'last_sync_error': "TEXT DEFAULT ''",
-                # 成交时从商品目录快照的主图 URL，避免商品下架后订单图片失联
-                'item_image': "TEXT DEFAULT ''",
             }
+            # 订单身份快照列（item_image / item_title / buyer_* / ordered_at_utc 等）
+            # 只走版本化迁移 2026072601/2026072602，不再进入本即席 ALTER 轨道。
             for column_name, column_sql in order_sync_columns.items():
                 if column_name not in order_columns:
                     cursor.execute(f"ALTER TABLE orders ADD COLUMN {column_name} {column_sql}")
