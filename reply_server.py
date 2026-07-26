@@ -10161,7 +10161,6 @@ def get_user_orders(
             start_date=start_date, end_date=end_date,
             page=page, page_size=page_size,
         )
-        profiles = orders_db.get_customer_profiles(scope_ids)
         for order in result['items']:
             order['id'] = order['order_id']
             catalog_item = {
@@ -10169,8 +10168,15 @@ def get_user_orders(
                 'item_image': order.pop('catalog_image', '') or '',
                 'item_price': order.pop('catalog_price', '') or '',
             }
-            profile = profiles.get((str(order.get('cookie_id') or ''),
-                                    str(order.get('buyer_id') or '')))
+            profile = {
+                'display_name': order.pop('profile_display_name', '') or '',
+                'avatar_url': order.pop('profile_avatar_url', '') or '',
+                'profile_source': order.pop('profile_source', '') or '',
+                'display_name_source': order.pop(
+                    'profile_display_name_source', ''
+                ) or '',
+                'avatar_source': order.pop('profile_avatar_source', '') or '',
+            }
             _compose_order_display(order, catalog_item, profile)
 
         total = result['total']
@@ -10188,8 +10194,18 @@ def get_user_orders(
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"查询用户订单失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
+        log_with_user(
+            'error',
+            f"查询用户订单失败 ({type(e).__name__})",
+            current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "order_query_failed",
+                "message": "订单列表查询失败，请稍后重试",
+            },
+        )
 
 
 @orders_router.get('/api/orders/{order_id}')
@@ -10212,8 +10228,10 @@ def get_order_detail(
         cookie_id = order['cookie_id']
         catalog_item = orders_db.get_item_catalog_lookup([cookie_id]).get(
             (str(cookie_id), str(order.get('item_id') or '')), {})
-        profile = orders_db.get_customer_profiles([cookie_id]).get(
-            (str(cookie_id), str(order.get('buyer_id') or '')))
+        profile = orders_db.get_customer_profile(
+            str(cookie_id),
+            str(order.get('buyer_id') or ''),
+        )
         _compose_order_display(order, catalog_item, profile)
         log_with_user('info', f"订单详情查询成功: {order_id}", current_user)
         return {"success": True, "data": order}
@@ -10221,8 +10239,18 @@ def get_order_detail(
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"查询订单详情失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
+        log_with_user(
+            'error',
+            f"查询订单详情失败 ({type(e).__name__})",
+            current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "order_detail_query_failed",
+                "message": "订单详情查询失败，请稍后重试",
+            },
+        )
 
 
 # 订单商品图媒体缓存目录（不在 /static 挂载下，必须经鉴权端点访问）

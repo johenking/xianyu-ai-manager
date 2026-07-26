@@ -198,6 +198,23 @@ class OrderQueryIntegrityTests(unittest.TestCase):
         self.assertIn("o.created_at >=", list_sql)
         self.assertIn("o.created_at <", list_sql)
 
+        start_only = self.db.query_orders(
+            ["acct-a"], start_date="2026-07-20"
+        )
+        self.assertNotIn(
+            "normalized-before",
+            {row["order_id"] for row in start_only["items"]},
+        )
+        self.assertIn(
+            "normalized-end",
+            {row["order_id"] for row in start_only["items"]},
+        )
+        end_only = self.db.query_orders(["acct-a"], end_date="2026-07-20")
+        end_only_ids = {row["order_id"] for row in end_only["items"]}
+        self.assertIn("normalized-before", end_only_ids)
+        self.assertNotIn("normalized-end", end_only_ids)
+        self.assertNotIn("legacy-end", end_only_ids)
+
     def test_sort_and_covering_index_follow_account_time_order_contract(self):
         self._insert_order("z-a-old", "acct-a", ordered_at_utc=100.0)
         self._insert_order("a-a-new", "acct-a", ordered_at_utc=200.0)

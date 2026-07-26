@@ -11,10 +11,11 @@ import io
 import base64
 import binascii
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any, Sequence
+from zoneinfo import ZoneInfo
 from loguru import logger
 
 from schema_migrations import MigrationRunner, get_schema_version
@@ -72,6 +73,29 @@ class AccountIdentityMismatchError(ValueError):
 
     def __init__(self) -> None:
         super().__init__("Cookie 中的闲鱼账号身份与当前账号不一致")
+
+
+class OrderQueryError(RuntimeError):
+    """订单读路径失败；调用方必须与“空结果/未找到”区分处理。"""
+
+
+_ORDER_QUERY_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def _order_query_date_bound(
+    value: str,
+    *,
+    next_day: bool,
+) -> Tuple[float, str]:
+    """把上海本地日历边界转换为 UTC epoch 与旧 created_at 文本边界。"""
+    parsed = datetime.strptime(str(value), "%Y-%m-%d")
+    if next_day:
+        parsed += timedelta(days=1)
+    local_boundary = parsed.replace(tzinfo=_ORDER_QUERY_TIMEZONE)
+    utc_boundary = local_boundary.astimezone(timezone.utc)
+    return utc_boundary.timestamp(), utc_boundary.strftime("%Y-%m-%d %H:%M:%S")
+
+
 SKILL_MONITOR_BUDGET_RETENTION_SECONDS = 24 * 60 * 60
 SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
@@ -7294,7 +7318,39 @@ class DBManager:
                 }
             except Exception as exc:
                 logger.error(f"获取买家档案失败: {type(exc).__name__}")
-                return {}
+                raise OrderQueryError("获取买家档案失败") from exc
+
+    def get_customer_profile(
+        self,
+        cookie_id: str,
+        buyer_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """精确读取一个账号买家档案；未找到返回 None，查询故障抛异常。"""
+        with self.lock:
+            try:
+                row = self.conn.execute(
+                    "SELECT display_name, avatar_url, profile_source,"
+                    " display_name_source, avatar_source,"
+                    " first_observed_at, last_observed_at, observation_count"
+                    " FROM customer_profiles"
+                    " WHERE cookie_id = ? AND buyer_id = ?",
+                    (str(cookie_id), str(buyer_id)),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {
+                    'display_name': row[0],
+                    'avatar_url': row[1],
+                    'profile_source': row[2],
+                    'display_name_source': row[3],
+                    'avatar_source': row[4],
+                    'first_observed_at': row[5],
+                    'last_observed_at': row[6],
+                    'observation_count': row[7],
+                }
+            except Exception as exc:
+                logger.error(f"获取单个买家档案失败: {type(exc).__name__}")
+                raise OrderQueryError("获取买家档案失败") from exc
 
     # query_orders 列表列：明确排除 receiver_* 收货隐私（只在详情返回）
     _ORDER_LIST_COLUMNS = (
@@ -7310,6 +7366,11 @@ class DBManager:
         'o.ordered_at_utc', 'o.ordered_at_source', 'o.paid_amount_fen',
         'ci.item_title AS catalog_title', 'ci.item_image AS catalog_image',
         'ci.item_price AS catalog_price',
+        'cp.display_name AS profile_display_name',
+        'cp.avatar_url AS profile_avatar_url',
+        'cp.profile_source AS profile_source',
+        'cp.display_name_source AS profile_display_name_source',
+        'cp.avatar_source AS profile_avatar_source',
     )
 
     def query_orders(self, cookie_ids: List[str], status: Optional[str] = None,
@@ -7319,9 +7380,10 @@ class DBManager:
         """服务端过滤+分页的订单列表查询（不含收货隐私字段）。
 
         cookie_ids 必须是调用方已校验归属的账号集合；空集合直接返回空页。
-        日期过滤与排序基于 COALESCE(ordered_at_utc, created_at 的 UTC 解释)，
-        历史无时区行最多有 8 小时偏差，回填后收敛。搜索覆盖订单号/商品ID/
-        快照标题/目录标题/买家昵称。
+        日期在 Python 中按 Asia/Shanghai 日历换算为 UTC 半开区间；
+        标准化行走 ordered_at_utc 的数值可索引分支，旧行仅在该列为 NULL
+        时走 created_at 文本兼容分支。搜索覆盖订单号/商品ID/快照标题/
+        目录标题/买家昵称。
         """
         page = max(1, int(page))
         page_size = max(1, min(100, int(page_size)))
@@ -7347,14 +7409,38 @@ class DBManager:
                         " OR IFNULL(cp.display_name, '') LIKE ? ESCAPE '\\')"
                     )
                     params.extend([like] * 6)
-                # 统一时间轴：快照 UTC 时间优先，缺失回退 created_at 的 UTC 解释
-                epoch_expr = "COALESCE(o.ordered_at_utc, CAST(strftime('%s', o.created_at) AS REAL))"
+                start_epoch = start_created_at = None
+                end_epoch = end_created_at = None
                 if start_date:
-                    where.append(f"date({epoch_expr}, 'unixepoch', '+8 hours') >= date(?)")
-                    params.append(str(start_date))
+                    start_epoch, start_created_at = _order_query_date_bound(
+                        start_date,
+                        next_day=False,
+                    )
                 if end_date:
-                    where.append(f"date({epoch_expr}, 'unixepoch', '+8 hours') <= date(?)")
-                    params.append(str(end_date))
+                    end_epoch, end_created_at = _order_query_date_bound(
+                        end_date,
+                        next_day=True,
+                    )
+                if start_date or end_date:
+                    normalized_terms = ["o.ordered_at_utc IS NOT NULL"]
+                    legacy_terms = ["o.ordered_at_utc IS NULL"]
+                    normalized_params: List[Any] = []
+                    legacy_params: List[Any] = []
+                    if start_epoch is not None:
+                        normalized_terms.append("o.ordered_at_utc >= ?")
+                        legacy_terms.append("o.created_at >= ?")
+                        normalized_params.append(start_epoch)
+                        legacy_params.append(start_created_at)
+                    if end_epoch is not None:
+                        normalized_terms.append("o.ordered_at_utc < ?")
+                        legacy_terms.append("o.created_at < ?")
+                        normalized_params.append(end_epoch)
+                        legacy_params.append(end_created_at)
+                    where.append(
+                        f"(({' AND '.join(normalized_terms)})"
+                        f" OR ({' AND '.join(legacy_terms)}))"
+                    )
+                    params.extend([*normalized_params, *legacy_params])
                 base = ("FROM orders o LEFT JOIN item_info ci"
                         " ON ci.cookie_id = o.cookie_id AND ci.item_id = o.item_id"
                         " LEFT JOIN customer_profiles cp"
@@ -7363,7 +7449,8 @@ class DBManager:
                 total = cursor.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
                 rows = cursor.execute(
                     f"SELECT {', '.join(self._ORDER_LIST_COLUMNS)} {base}"
-                    f" ORDER BY {epoch_expr} DESC, o.order_id DESC LIMIT ? OFFSET ?",
+                    " ORDER BY o.cookie_id ASC, o.ordered_at_utc DESC,"
+                    " o.order_id DESC LIMIT ? OFFSET ?",
                     [*params, page_size, (page - 1) * page_size],
                 ).fetchall()
                 column_names = [
@@ -7377,8 +7464,8 @@ class DBManager:
                     items.append(record)
                 return {'items': items, 'total': total, 'page': page, 'page_size': page_size}
             except Exception as exc:
-                logger.error(f"查询订单列表失败: {type(exc).__name__}: {exc}")
-                return {'items': [], 'total': 0, 'page': page, 'page_size': page_size}
+                logger.error(f"查询订单列表失败: {type(exc).__name__}")
+                raise OrderQueryError("查询订单列表失败") from exc
 
     # 详情列：在列表列基础上追加收货隐私（仅详情返回）与快照时间戳/缓存键
     _ORDER_DETAIL_COLUMNS = (
@@ -7417,9 +7504,11 @@ class DBManager:
                 record['chat_id'] = record['chat_id'] or ''
                 return record
 
-            except Exception as e:
-                logger.error(f"获取订单信息失败: {order_id} - {e}")
-                return None
+            except Exception as exc:
+                logger.error(
+                    f"获取订单信息失败: {order_id} - {type(exc).__name__}"
+                )
+                raise OrderQueryError("获取订单详情失败") from exc
 
     def set_order_item_image_cache_key(self, order_id: str, cache_key: str,
                                        expected_image: str) -> bool:

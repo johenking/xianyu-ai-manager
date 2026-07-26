@@ -956,6 +956,22 @@ def _order_buyer_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None
         )
 
 
+def _order_query_covering_index_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """支持账号分组、标准化成交时间倒序与稳定 order_id 次序。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    if {"cookie_id", "ordered_at_utc", "order_id"} <= _columns(cursor, "orders"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_ordered_order"
+            " ON orders(cookie_id, ordered_at_utc DESC, order_id DESC)"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1017,6 +1033,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072606",
         "order_buyer_field_sources_v1",
         _order_buyer_field_sources_v1,
+    ),
+    Migration(
+        "2026072607",
+        "order_query_covering_index_v1",
+        _order_query_covering_index_v1,
     ),
 )
 

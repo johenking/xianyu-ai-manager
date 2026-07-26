@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601..2026072606）双路径测试。
+"""订单身份快照迁移（2026072601..2026072607）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -113,6 +113,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072604",
                 "2026072605",
                 "2026072606",
+                "2026072607",
             ],
         )
 
@@ -129,6 +130,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         }
         self.assertIn("idx_orders_cookie_buyer", indexes)
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
+        self.assertIn("idx_orders_cookie_ordered_order", indexes)
         self.assertIn("idx_customer_profiles_last_observed", indexes)
         self.assertEqual(
             connection.execute("PRAGMA quick_check").fetchone()[0], "ok"
@@ -138,7 +140,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertEqual(runner.run(), [])
         self.assertEqual(
             connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-            17,
+            len(MIGRATIONS),
         )
         connection.close()
 
@@ -159,7 +161,14 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            ["2026072602", "2026072603", "2026072604", "2026072605", "2026072606"],
+            [
+                "2026072602",
+                "2026072603",
+                "2026072604",
+                "2026072605",
+                "2026072606",
+                "2026072607",
+            ],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
         self.assertEqual(
@@ -180,6 +189,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertIn("customer_profiles", tables)
         self.assertIn("idx_orders_cookie_buyer", indexes)
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
+        self.assertIn("idx_orders_cookie_ordered_order", indexes)
         self.assertIn("idx_customer_profiles_last_observed", indexes)
         self.assertEqual(
             connection.execute(
@@ -259,7 +269,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
 
         self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
-            ["2026072605", "2026072606"],
+            ["2026072605", "2026072606", "2026072607"],
         )
         columns = {
             row[1]
@@ -308,7 +318,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
 
         self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
-            ["2026072606"],
+            ["2026072606", "2026072607"],
         )
         rows = connection.execute(
             "SELECT order_id, buyer_nickname_source, buyer_avatar_source,"
