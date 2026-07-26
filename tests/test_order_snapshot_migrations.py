@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601..2026072607）双路径测试。
+"""订单身份快照迁移（2026072601..2026072608）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -114,6 +114,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072605",
                 "2026072606",
                 "2026072607",
+                "2026072608",
             ],
         )
 
@@ -168,6 +169,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072605",
                 "2026072606",
                 "2026072607",
+                "2026072608",
             ],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
@@ -269,7 +271,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
 
         self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
-            ["2026072605", "2026072606", "2026072607"],
+            ["2026072605", "2026072606", "2026072607", "2026072608"],
         )
         columns = {
             row[1]
@@ -318,7 +320,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
 
         self.assertEqual(
             MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
-            ["2026072606", "2026072607"],
+            ["2026072606", "2026072607", "2026072608"],
         )
         rows = connection.execute(
             "SELECT order_id, buyer_nickname_source, buyer_avatar_source,"

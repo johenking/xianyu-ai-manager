@@ -972,6 +972,52 @@ def _order_query_covering_index_v1(
         )
 
 
+def _tenant_isolation_hardening_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """租户隔离加固：修正发货规则归属并补租户过滤索引。
+
+    历史 legacy 启动逻辑会把 user_id IS NULL 的规则批量划给 admin，
+    可能留下「规则归属 ≠ 所绑卡券归属」的脏数据；这类规则在匹配时
+    会把他人卡券内容发出去。以卡券归属为准修正，卡券主人不受损。
+    """
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    rules_ready = (
+        {"delivery_rules", "cards"} <= tables
+        and "user_id" in _columns(cursor, "delivery_rules")
+        and "user_id" in _columns(cursor, "cards")
+    )
+    if rules_ready:
+        cursor.execute(
+            "UPDATE delivery_rules SET user_id = ("
+            "  SELECT user_id FROM cards WHERE cards.id = delivery_rules.card_id"
+            ") WHERE card_id IS NOT NULL AND EXISTS ("
+            "  SELECT 1 FROM cards"
+            "  WHERE cards.id = delivery_rules.card_id"
+            "    AND cards.user_id IS NOT NULL"
+            "    AND (delivery_rules.user_id IS NULL"
+            "         OR cards.user_id != delivery_rules.user_id)"
+            ")"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_rules_user"
+            " ON delivery_rules(user_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cards_user ON cards(user_id)"
+        )
+    if "cookies" in tables and "user_id" in _columns(cursor, "cookies"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cookies_user ON cookies(user_id)"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1038,6 +1084,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072607",
         "order_query_covering_index_v1",
         _order_query_covering_index_v1,
+    ),
+    Migration(
+        "2026072608",
+        "tenant_isolation_hardening_v1",
+        _tenant_isolation_hardening_v1,
     ),
 )
 
