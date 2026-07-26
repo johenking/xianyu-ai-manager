@@ -643,6 +643,27 @@ class OrderSyncCoordinator:
                     continue
                 summary["discovered"] += 1
 
+            # 成交快照与规范化字段：标题以订单报文优先（目录仅兜底），
+            # 图片当前只有目录来源；组来源按主导字段定级，棘轮防目录周期重扫回冲
+            record_title = str(order.get("item_title") or "").strip()
+            catalog_title = str((catalog_item or {}).get("item_title") or "").strip()
+            item_snapshot = None
+            if record_title or catalog_title or catalog_image:
+                item_snapshot = {
+                    "item_title": record_title or catalog_title,
+                    "item_image": catalog_image or "",
+                    "source": "order_list" if record_title else "catalog",
+                }
+            buyer_nickname = str(order.get("buyer_nickname") or "").strip()
+            buyer_avatar = str(order.get("buyer_avatar_url") or "").strip()
+            buyer_snapshot = None
+            if buyer_nickname or buyer_avatar:
+                buyer_snapshot = {
+                    "buyer_nickname": buyer_nickname,
+                    "buyer_avatar_url": buyer_avatar,
+                    "source": "order_list",
+                }
+            ordered_at = parse_order_time_utc(order.get("created_at"))
             update_result = self.db.apply_order_sync_update(
                 order_id=order_id,
                 cookie_id=cookie_id,
@@ -650,13 +671,26 @@ class OrderSyncCoordinator:
                 platform_status_code=order.get("platform_status_code") or "",
                 platform_status_text=order.get("platform_status_text") or "",
                 status_source="order_list",
+                item_snapshot=item_snapshot,
+                buyer_snapshot=buyer_snapshot,
+                ordered_at=ordered_at,
+                paid_amount_fen=parse_amount_fen(order.get("amount")),
                 item_id=order.get("item_id"),
                 buyer_id=order.get("buyer_id"),
                 quantity=order.get("quantity"),
                 amount=order.get("amount"),
                 created_at=order.get("created_at"),
-                item_image=catalog_image,
             )
+            buyer_id = str(order.get("buyer_id") or "").strip()
+            if buyer_id:
+                self.db.upsert_customer_observation(
+                    cookie_id=cookie_id,
+                    buyer_id=buyer_id,
+                    display_name=buyer_nickname,
+                    avatar_url=buyer_avatar,
+                    source="order_list",
+                    observed_at=ordered_at[0] if ordered_at[0] is not None else self.now_fn(),
+                )
             if existing and update_result.get("status_changed"):
                 summary["status_updated"] += 1
             if update_result.get("details_changed"):
@@ -725,6 +759,26 @@ class OrderSyncCoordinator:
                         detail.get("order_status"),
                         detail.get("status_text") or "",
                     )
+                    # 详情为最高级快照来源：报文里带什么就升级什么，缺省字段自动跳过
+                    detail_item_snapshot = None
+                    detail_title = str(detail.get("item_title") or "").strip()
+                    detail_image = str(detail.get("item_image") or detail.get("item_pic") or "").strip()
+                    if detail_title or detail_image:
+                        detail_item_snapshot = {
+                            "item_title": detail_title,
+                            "item_image": detail_image,
+                            "source": "order_detail",
+                        }
+                    detail_nickname = str(detail.get("buyer_nickname") or detail.get("buyer_nick") or "").strip()
+                    detail_avatar = str(detail.get("buyer_avatar_url") or detail.get("buyer_avatar") or "").strip()
+                    detail_buyer_snapshot = None
+                    if detail_nickname or detail_avatar:
+                        detail_buyer_snapshot = {
+                            "buyer_nickname": detail_nickname,
+                            "buyer_avatar_url": detail_avatar,
+                            "source": "order_detail",
+                        }
+                    detail_ordered_at = parse_order_time_utc(detail.get("order_time"))
                     update_result = self.db.apply_order_sync_update(
                         order_id=order_id,
                         cookie_id=cookie_id,
@@ -733,6 +787,10 @@ class OrderSyncCoordinator:
                         platform_status_text=str(detail.get("status_text") or ""),
                         status_source="order_detail",
                         sync_error="" if incoming_status != "unknown" else "无法确认平台订单状态",
+                        item_snapshot=detail_item_snapshot,
+                        buyer_snapshot=detail_buyer_snapshot,
+                        ordered_at=detail_ordered_at,
+                        paid_amount_fen=parse_amount_fen(detail.get("amount")),
                         item_id=detail.get("item_id"),
                         buyer_id=detail.get("buyer_id"),
                         spec_name=detail.get("spec_name"),
@@ -745,6 +803,17 @@ class OrderSyncCoordinator:
                         receiver_address=detail.get("receiver_address"),
                         receiver_city=detail.get("receiver_city"),
                     )
+                    detail_buyer_id = str(detail.get("buyer_id") or "").strip()
+                    if detail_buyer_id and (detail_nickname or detail_avatar):
+                        self.db.upsert_customer_observation(
+                            cookie_id=cookie_id,
+                            buyer_id=detail_buyer_id,
+                            display_name=detail_nickname,
+                            avatar_url=detail_avatar,
+                            source="order_detail",
+                            observed_at=detail_ordered_at[0]
+                            if detail_ordered_at[0] is not None else self.now_fn(),
+                        )
                     if update_result.get("status_changed"):
                         summary["status_updated"] += 1
                     if update_result.get("details_changed"):

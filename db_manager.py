@@ -14,7 +14,7 @@ import secrets
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Sequence
 from loguru import logger
 
 from schema_migrations import MigrationRunner, get_schema_version
@@ -1945,6 +1945,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 # 删除关联的关键字
                 self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
+                # 删除买家档案（SQLite 外键未必启用，不依赖 CASCADE）
+                self._execute_sql(cursor, "DELETE FROM customer_profiles WHERE cookie_id = ?", (cookie_id,))
                 # 删除Cookie
                 self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (cookie_id,))
                 self.conn.commit()
@@ -6764,8 +6766,8 @@ class DBManager:
                         logger.warning(f"Cookie ID {cookie_id} 不存在于cookies表中，拒绝插入订单 {order_id}")
                         return False
 
-                # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                # 检查订单是否已存在（同时取快照现值，供写一次守卫判断）
+                cursor.execute("SELECT order_id, item_image FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
 
                 if existing:
@@ -6822,7 +6824,9 @@ class DBManager:
                     if chat_id is not None:
                         update_fields.append("chat_id = ?")
                         update_values.append(chat_id)
-                    if item_image is not None:
+                    if item_image is not None and not (existing[1] or ''):
+                        # 成交时快照只写一次：已有图片不被任何后续写入路径
+                        # （实时消息/导入/废弃批量刷新）冲掉，口径与 apply_order_sync_update 一致
                         update_fields.append("item_image = ?")
                         update_values.append(item_image)
 
@@ -6896,30 +6900,104 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    # apply_order_sync_update 的普通明细白名单（快照/规范化字段单独走棘轮，不在此列）
+    _ORDER_SYNC_DETAIL_FIELDS = (
+        'item_id', 'buyer_id', 'spec_name', 'spec_value', 'quantity', 'amount',
+        'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
+        'created_at', 'chat_id',
+    )
+    # 单次 SELECT 取回的现值列（顺序即索引）
+    _ORDER_SYNC_EXISTING_COLUMNS = ('order_status',) + _ORDER_SYNC_DETAIL_FIELDS + (
+        'item_title', 'item_image', 'item_image_cache_key', 'item_snapshot_source',
+        'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source',
+        'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
+    )
+
+    @staticmethod
+    def _ratchet_snapshot_group(existing: Dict[str, Any], fields: Sequence[str],
+                                incoming: Dict[str, Any], incoming_source: str,
+                                source_column: str, at_column: str,
+                                observed_at: float) -> Tuple[List[str], List[Any], bool]:
+        """快照组棘轮写入：空则填；非空仅当新来源等级严格更高才覆盖。
+
+        返回 (update_fields, update_values, changed)。组来源列单调不降
+        （取现有与新来源的等级最大者），at 列在任一字段实际写入时刷新。
+        """
+        from order_sync_service import snapshot_source_rank
+
+        new_rank = snapshot_source_rank(incoming_source)
+        old_source = str(existing.get(source_column) or '')
+        old_rank = snapshot_source_rank(old_source)
+        update_fields: List[str] = []
+        update_values: List[Any] = []
+        changed = False
+        image_overwritten = False
+        for field in fields:
+            value = str(incoming.get(field) or '').strip()
+            if not value:
+                continue
+            current = str(existing.get(field) or '')
+            if current == value:
+                continue
+            if current and new_rank <= old_rank:
+                continue
+            update_fields.append(f"{field} = ?")
+            update_values.append(value)
+            changed = True
+            if field == 'item_image' and current:
+                image_overwritten = True
+        if changed:
+            if new_rank > old_rank:
+                update_fields.append(f"{source_column} = ?")
+                update_values.append(incoming_source)
+            elif not old_source and incoming_source:
+                update_fields.append(f"{source_column} = ?")
+                update_values.append(incoming_source)
+            update_fields.append(f"{at_column} = ?")
+            update_values.append(observed_at)
+            if image_overwritten:
+                # 图片被更高级来源替换时，旧缓存键作废，媒体端点将按需重建
+                update_fields.append("item_image_cache_key = ?")
+                update_values.append('')
+        return update_fields, update_values, changed
+
     def apply_order_sync_update(self, order_id: str, cookie_id: str,
                                 incoming_status: str, platform_status_code: str = '',
                                 platform_status_text: str = '', status_source: str = '',
-                                sync_error: str = '', **details) -> Dict[str, Any]:
-        """Apply one verified sync result without downgrading a known status to unknown."""
+                                sync_error: str = '',
+                                item_snapshot: Optional[Dict[str, Any]] = None,
+                                buyer_snapshot: Optional[Dict[str, Any]] = None,
+                                ordered_at: Optional[Tuple[Optional[float], str]] = None,
+                                paid_amount_fen: Optional[int] = None,
+                                **details) -> Dict[str, Any]:
+        """Apply one verified sync result without downgrading a known status to unknown.
+
+        快照组（item_snapshot: item_title/item_image + source；buyer_snapshot:
+        buyer_nickname/buyer_avatar_url + source）按 SNAPSHOT_SOURCE_RANK 棘轮写入；
+        规范化字段 ordered_at=(epoch, source) 与 paid_amount_fen 只填空值，
+        仅 backfill 假定时区的时间允许被真实报文解析结果纠正。
+        """
         from order_sync_service import choose_order_status, normalize_order_status
 
         with self.lock:
             cursor = self.conn.cursor()
             row = cursor.execute(
-                "SELECT order_status FROM orders WHERE order_id = ? AND cookie_id = ?",
+                f"SELECT {', '.join(self._ORDER_SYNC_EXISTING_COLUMNS)} "
+                "FROM orders WHERE order_id = ? AND cookie_id = ?",
                 (order_id, cookie_id),
             ).fetchone()
             if not row:
                 return {'updated': False, 'status_changed': False, 'details_changed': False}
+            existing = dict(zip(self._ORDER_SYNC_EXISTING_COLUMNS, row))
 
-            current_status = normalize_order_status(row[0])
+            # 兼容旧调用：**details 里的 item_image 折叠进 item_snapshot，来源取 status_source
+            legacy_image = details.pop('item_image', None)
+            if legacy_image and not item_snapshot:
+                item_snapshot = {'item_image': legacy_image, 'source': status_source}
+
+            current_status = normalize_order_status(existing['order_status'])
             next_status = choose_order_status(current_status, incoming_status)
             status_changed = next_status != current_status
-            allowed_details = {
-                'item_id', 'buyer_id', 'spec_name', 'spec_value', 'quantity', 'amount',
-                'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
-                'created_at', 'chat_id', 'item_image',
-            }
             update_fields = [
                 'order_status = ?',
                 'platform_status_code = ?',
@@ -6930,7 +7008,7 @@ class DBManager:
                 'updated_at = CURRENT_TIMESTAMP',
                 'version = version + 1',
             ]
-            update_values = [
+            update_values: List[Any] = [
                 next_status,
                 str(platform_status_code or ''),
                 str(platform_status_text or ''),
@@ -6938,22 +7016,46 @@ class DBManager:
                 str(sync_error or ''),
             ]
             details_changed = False
-            for field in allowed_details:
+            for field in self._ORDER_SYNC_DETAIL_FIELDS:
                 value = details.get(field)
                 if value in (None, ''):
                     continue
-                existing = cursor.execute(
-                    f"SELECT {field} FROM orders WHERE order_id = ?",
-                    (order_id,),
-                ).fetchone()
-                existing_value = str(existing[0] or '') if existing else ''
-                # 成交时快照只写一次：已有图片不被后续同步的目录主图冲掉
-                if field == 'item_image' and existing_value:
-                    continue
-                if existing and existing_value != str(value):
+                if str(existing.get(field) or '') != str(value):
                     details_changed = True
                 update_fields.append(f"{field} = ?")
                 update_values.append(value)
+
+            observed_at = time.time()
+            for snapshot, fields, source_col, at_col in (
+                (item_snapshot, ('item_title', 'item_image'),
+                 'item_snapshot_source', 'item_snapshot_at'),
+                (buyer_snapshot, ('buyer_nickname', 'buyer_avatar_url'),
+                 'buyer_snapshot_source', 'buyer_snapshot_at'),
+            ):
+                if not snapshot:
+                    continue
+                snap_fields, snap_values, snap_changed = self._ratchet_snapshot_group(
+                    existing, fields, snapshot,
+                    str(snapshot.get('source') or status_source or ''),
+                    source_col, at_col, observed_at,
+                )
+                update_fields.extend(snap_fields)
+                update_values.extend(snap_values)
+                details_changed = details_changed or snap_changed
+
+            if ordered_at is not None:
+                epoch, time_source = ordered_at
+                may_correct = existing['ordered_at_source'] == 'backfill_cst_assumed'
+                if epoch is not None and (existing['ordered_at_utc'] is None or may_correct):
+                    if existing['ordered_at_utc'] != epoch:
+                        details_changed = True
+                    update_fields.extend(['ordered_at_utc = ?', 'ordered_at_source = ?'])
+                    update_values.extend([float(epoch), str(time_source or '')])
+            if paid_amount_fen is not None and existing['paid_amount_fen'] is None:
+                update_fields.append('paid_amount_fen = ?')
+                update_values.append(int(paid_amount_fen))
+                details_changed = True
+
             update_values.extend([order_id, cookie_id])
             cursor.execute(
                 f"UPDATE orders SET {', '.join(update_fields)} WHERE order_id = ? AND cookie_id = ?",
@@ -6968,50 +7070,226 @@ class DBManager:
                 'new_status': next_status,
             }
 
-    def get_order_by_id(self, order_id: str):
-        """根据订单ID获取订单信息"""
+    def upsert_customer_observation(self, cookie_id: str, buyer_id: str,
+                                    display_name: str = '', avatar_url: str = '',
+                                    source: str = '', observed_at: Optional[float] = None) -> bool:
+        """记录一次买家观察：维护 (cookie_id, buyer_id) 的当前可用身份档案。
+
+        first_observed_at 取历史最小（回填旧订单可前移），last_observed_at 取最大；
+        身份字段按 SNAPSHOT_SOURCE_RANK 棘轮（空则填，非空仅更高级来源覆盖）。
+        行为计数不在本表维护，一律查询时从 orders 现算。
+        """
+        from order_sync_service import snapshot_source_rank
+
+        if not cookie_id or not buyer_id:
+            return False
+        moment = float(observed_at if observed_at is not None else time.time())
+        display_name = str(display_name or '').strip()
+        avatar_url = str(avatar_url or '').strip()
+        source = str(source or '')
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                # 先尝试查询包含version的订单
-                cursor.execute('''
-                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at, version, chat_id,
-                       platform_status_code, platform_status_text, status_source, status_synced_at, last_sync_error, item_image
-                FROM orders WHERE order_id = ?
-                ''', (order_id,))
+                row = cursor.execute(
+                    "SELECT display_name, avatar_url, profile_source, first_observed_at,"
+                    " last_observed_at FROM customer_profiles WHERE cookie_id = ? AND buyer_id = ?",
+                    (cookie_id, buyer_id),
+                ).fetchone()
+                if row is None:
+                    cursor.execute(
+                        "INSERT INTO customer_profiles (cookie_id, buyer_id, display_name,"
+                        " avatar_url, profile_source, first_observed_at, last_observed_at,"
+                        " observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+                        (cookie_id, buyer_id, display_name, avatar_url, source, moment, moment),
+                    )
+                else:
+                    new_rank = snapshot_source_rank(source)
+                    old_rank = snapshot_source_rank(row[2])
+                    allow_overwrite = new_rank > old_rank
+                    next_name = display_name if display_name and (not row[0] or allow_overwrite) else row[0]
+                    next_avatar = avatar_url if avatar_url and (not row[1] or allow_overwrite) else row[1]
+                    next_source = source if (allow_overwrite or not row[2]) and source else row[2]
+                    cursor.execute(
+                        "UPDATE customer_profiles SET display_name = ?, avatar_url = ?,"
+                        " profile_source = ?, first_observed_at = ?, last_observed_at = ?,"
+                        " observation_count = observation_count + 1,"
+                        " updated_at = CAST(strftime('%s','now') AS REAL)"
+                        " WHERE cookie_id = ? AND buyer_id = ?",
+                        (next_name, next_avatar, next_source,
+                         min(float(row[3]), moment), max(float(row[4]), moment),
+                         cookie_id, buyer_id),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error(f"记录买家观察失败: {type(exc).__name__}")
+                self.conn.rollback()
+                return False
 
-                row = cursor.fetchone()
-                if row:
-                    return {
-                        'id': row[0],  # 使用 order_id 作为 id
-                        'order_id': row[0],
-                        'item_id': row[1],
-                        'buyer_id': row[2],
-                        'spec_name': row[3],
-                        'spec_value': row[4],
-                        'quantity': row[5],
-                        'amount': row[6],
-                        'order_status': row[7],
-                        'status': row[7],  # 同时保留status字段以兼容旧代码
-                        'cookie_id': row[8],
-                        'is_bargain': bool(row[9]) if row[9] is not None else False,
-                        'created_at': row[10],
-                        'updated_at': row[11],
-                        'version': row[12] if len(row) > 12 else 1,  # 默认版本为1
-                        'chat_id': row[13] if len(row) > 13 else '',
-                        'platform_status_code': row[14] if len(row) > 14 else '',
-                        'platform_status_text': row[15] if len(row) > 15 else '',
-                        'status_source': row[16] if len(row) > 16 else '',
-                        'status_synced_at': row[17] if len(row) > 17 else None,
-                        'last_sync_error': row[18] if len(row) > 18 else '',
-                        'item_image': row[19] if len(row) > 19 else '',
+    def get_customer_profiles(self, cookie_ids: List[str]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        """按账号集合取买家档案，键为 (cookie_id, buyer_id)。"""
+        if not cookie_ids:
+            return {}
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join('?' for _ in cookie_ids)
+                rows = cursor.execute(
+                    "SELECT cookie_id, buyer_id, display_name, avatar_url, profile_source,"
+                    f" first_observed_at, last_observed_at, observation_count"
+                    f" FROM customer_profiles WHERE cookie_id IN ({placeholders})",
+                    [str(cid) for cid in cookie_ids],
+                ).fetchall()
+                return {
+                    (row[0], row[1]): {
+                        'display_name': row[2],
+                        'avatar_url': row[3],
+                        'profile_source': row[4],
+                        'first_observed_at': row[5],
+                        'last_observed_at': row[6],
+                        'observation_count': row[7],
                     }
-                return None
+                    for row in rows
+                }
+            except Exception as exc:
+                logger.error(f"获取买家档案失败: {type(exc).__name__}")
+                return {}
+
+    # query_orders 列表列：明确排除 receiver_* 收货隐私（只在详情返回）
+    _ORDER_LIST_COLUMNS = (
+        'o.order_id', 'o.item_id', 'o.buyer_id', 'o.spec_name', 'o.spec_value',
+        'o.quantity', 'o.amount', 'o.order_status', 'o.cookie_id', 'o.is_bargain',
+        'o.created_at', 'o.updated_at', 'o.version', 'o.chat_id',
+        'o.platform_status_code', 'o.platform_status_text', 'o.status_source',
+        'o.status_synced_at', 'o.last_sync_error',
+        'o.item_title', 'o.item_image', 'o.item_snapshot_source',
+        'o.buyer_nickname', 'o.buyer_avatar_url', 'o.buyer_snapshot_source',
+        'o.ordered_at_utc', 'o.ordered_at_source', 'o.paid_amount_fen',
+        'ci.item_title AS catalog_title', 'ci.item_image AS catalog_image',
+        'ci.item_price AS catalog_price',
+    )
+
+    def query_orders(self, cookie_ids: List[str], status: Optional[str] = None,
+                     search: str = '', start_date: Optional[str] = None,
+                     end_date: Optional[str] = None, page: int = 1,
+                     page_size: int = 20) -> Dict[str, Any]:
+        """服务端过滤+分页的订单列表查询（不含收货隐私字段）。
+
+        cookie_ids 必须是调用方已校验归属的账号集合；空集合直接返回空页。
+        日期过滤与排序基于 COALESCE(ordered_at_utc, created_at 的 UTC 解释)，
+        历史无时区行最多有 8 小时偏差，回填后收敛。搜索覆盖订单号/商品ID/
+        快照标题/目录标题/买家昵称。
+        """
+        page = max(1, int(page))
+        page_size = max(1, min(100, int(page_size)))
+        if not cookie_ids:
+            return {'items': [], 'total': 0, 'page': page, 'page_size': page_size}
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join('?' for _ in cookie_ids)
+                where = [f"o.cookie_id IN ({placeholders})"]
+                params: List[Any] = [str(cid) for cid in cookie_ids]
+                if status:
+                    where.append("o.order_status = ?")
+                    params.append(str(status))
+                if search:
+                    escaped = (str(search).replace('\\', '\\\\')
+                               .replace('%', '\\%').replace('_', '\\_'))
+                    like = f"%{escaped}%"
+                    where.append(
+                        "(o.order_id LIKE ? ESCAPE '\\' OR o.item_id LIKE ? ESCAPE '\\'"
+                        " OR o.item_title LIKE ? ESCAPE '\\' OR o.buyer_nickname LIKE ? ESCAPE '\\'"
+                        " OR IFNULL(ci.item_title, '') LIKE ? ESCAPE '\\')"
+                    )
+                    params.extend([like] * 5)
+                # 统一时间轴：快照 UTC 时间优先，缺失回退 created_at 的 UTC 解释
+                epoch_expr = "COALESCE(o.ordered_at_utc, CAST(strftime('%s', o.created_at) AS REAL))"
+                if start_date:
+                    where.append(f"date({epoch_expr}, 'unixepoch', '+8 hours') >= date(?)")
+                    params.append(str(start_date))
+                if end_date:
+                    where.append(f"date({epoch_expr}, 'unixepoch', '+8 hours') <= date(?)")
+                    params.append(str(end_date))
+                base = ("FROM orders o LEFT JOIN item_info ci"
+                        " ON ci.cookie_id = o.cookie_id AND ci.item_id = o.item_id"
+                        f" WHERE {' AND '.join(where)}")
+                total = cursor.execute(f"SELECT COUNT(*) {base}", params).fetchone()[0]
+                rows = cursor.execute(
+                    f"SELECT {', '.join(self._ORDER_LIST_COLUMNS)} {base}"
+                    f" ORDER BY {epoch_expr} DESC, o.order_id DESC LIMIT ? OFFSET ?",
+                    [*params, page_size, (page - 1) * page_size],
+                ).fetchall()
+                column_names = [
+                    col.split(' AS ')[-1].split('.')[-1] for col in self._ORDER_LIST_COLUMNS
+                ]
+                items = []
+                for row in rows:
+                    record = dict(zip(column_names, row))
+                    record['is_bargain'] = bool(record.get('is_bargain'))
+                    record['status'] = record.get('order_status')
+                    items.append(record)
+                return {'items': items, 'total': total, 'page': page, 'page_size': page_size}
+            except Exception as exc:
+                logger.error(f"查询订单列表失败: {type(exc).__name__}: {exc}")
+                return {'items': [], 'total': 0, 'page': page, 'page_size': page_size}
+
+    # 详情列：在列表列基础上追加收货隐私（仅详情返回）与快照时间戳/缓存键
+    _ORDER_DETAIL_COLUMNS = (
+        'order_id', 'item_id', 'buyer_id', 'spec_name', 'spec_value',
+        'quantity', 'amount', 'order_status', 'cookie_id', 'is_bargain',
+        'created_at', 'updated_at', 'version', 'chat_id',
+        'platform_status_code', 'platform_status_text', 'status_source',
+        'status_synced_at', 'last_sync_error',
+        'item_title', 'item_image', 'item_image_cache_key',
+        'item_snapshot_source', 'item_snapshot_at',
+        'buyer_nickname', 'buyer_avatar_url', 'buyer_snapshot_source', 'buyer_snapshot_at',
+        'ordered_at_utc', 'ordered_at_source', 'paid_amount_fen',
+        'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
+        'system_shipped',
+    )
+
+    def get_order_by_id(self, order_id: str):
+        """根据订单ID获取订单详情（含收货信息与成交快照全字段）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    f"SELECT {', '.join(self._ORDER_DETAIL_COLUMNS)} FROM orders WHERE order_id = ?",
+                    (order_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                record = dict(zip(self._ORDER_DETAIL_COLUMNS, row))
+                record['id'] = record['order_id']
+                record['status'] = record['order_status']  # 兼容旧代码的别名
+                record['is_bargain'] = bool(record['is_bargain']) if record['is_bargain'] is not None else False
+                record['system_shipped'] = bool(record['system_shipped']) if record['system_shipped'] is not None else False
+                record['version'] = record['version'] if record['version'] is not None else 1
+                record['chat_id'] = record['chat_id'] or ''
+                return record
 
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")
                 return None
+
+    def set_order_item_image_cache_key(self, order_id: str, cache_key: str,
+                                       expected_image: str) -> bool:
+        """媒体端点缓存落盘后回写缓存键；expected_image 断言防止竞态覆盖新图。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE orders SET item_image_cache_key = ? WHERE order_id = ? AND item_image = ?",
+                    (str(cache_key or ''), order_id, str(expected_image or '')),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as exc:
+                logger.error(f"写入订单图缓存键失败: {order_id} - {type(exc).__name__}")
+                self.conn.rollback()
+                return False
 
     def delete_order(self, order_id: str):
         """删除订单"""
