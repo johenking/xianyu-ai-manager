@@ -2,11 +2,13 @@ import { del, get, post, put } from '../request';
 import type {
   AdminStats,
   ApiResponse,
+  BuyerBehaviorAnalytics,
   DashboardSummary,
   Order,
   OrderAnalytics,
   OrderSyncResponse,
   PaginatedResponse,
+  TrafficAnalytics,
 } from '../../types';
 
 // Orders
@@ -151,4 +153,24 @@ export const getValidOrders = async (dateRange: {start_date: string; end_date: s
         end_date: dateRange.end_date
     });
     return res.orders || [];
+}
+
+// 经营驾驶舱：时段流量分析。租户隔离由后端按登录用户强制执行。
+export const getTrafficAnalytics = async (
+    dateRange: { start_date: string; end_date: string },
+): Promise<TrafficAnalytics> => {
+    return get('/analytics/traffic', {
+        start_date: dateRange.start_date,
+        end_date: dateRange.end_date,
+    });
+}
+
+// 经营驾驶舱：买家行为分析。租户隔离由后端按登录用户强制执行。
+export const getBuyerBehaviorAnalytics = async (
+    dateRange: { start_date: string; end_date: string },
+): Promise<BuyerBehaviorAnalytics> => {
+    return get('/analytics/buyers', {
+        start_date: dateRange.start_date,
+        end_date: dateRange.end_date,
+    });
 }

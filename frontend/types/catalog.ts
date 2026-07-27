@@ -91,6 +91,10 @@ export interface OrderAnalytics {
     total_amount: number;
     avg_amount: number;
   }>;
+  // 按订单状态聚合（受仪表盘 include_statuses 限定为待发货/已发货/已完成）
+  status_stats?: Array<{ status: string; count: number; amount: number }>;
+  // 按收货城市聚合的地区分布（后端按订单量降序 Top 50，仅运营地理统计）
+  city_stats?: Array<{ city: string; order_count: number; total_amount: number }>;
 }
 
 export interface DashboardSummary {
@@ -106,4 +110,36 @@ export interface DashboardSummary {
   current: OrderAnalytics;
   previous: OrderAnalytics;
   item_names: Record<string, string>;
+}
+
+// 经营驾驶舱：时段流量分析（按真实成交时间 ordered_at_utc 分东八区小时/星期）
+export interface TrafficAnalytics {
+  // 覆盖率：窗口内有效订单里有多少笔带成交时间，用于标注时段分布的可信度
+  coverage: {
+    total_orders: number;
+    with_ordered_at: number;
+    coverage_rate: number;
+  };
+  // hour 为东八区 0-23；后端仅返回有数据的小时，缺口由前端补零
+  hourly: Array<{ hour: number; order_count: number; amount: number }>;
+  // weekday 为 strftime('%w') 字符串，'0'=周日 ... '6'=周六
+  weekday: Array<{ weekday: string; order_count: number; amount: number }>;
+}
+
+// 经营驾驶舱：买家行为分析（仅订单可直接得出的行为量，不刻画客户画像）
+export interface BuyerBehaviorAnalytics {
+  summary: {
+    total_buyers: number;
+    repeat_buyers: number;
+    repeat_rate: number;
+  };
+  // order_count=下单次数，buyer_count=该次数对应的买家数
+  frequency: Array<{ order_count: number; buyer_count: number }>;
+  // 贡献榜（后端按金额降序 Top 20）
+  top_buyers: Array<{
+    buyer_id: string;
+    buyer_nickname: string;
+    order_count: number;
+    total_amount: number;
+  }>;
 }

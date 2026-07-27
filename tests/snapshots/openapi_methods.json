@@ -87,10 +87,16 @@
     "DELETE",
     "PATCH"
   ],
+  "/analytics/buyers": [
+    "GET"
+  ],
   "/analytics/orders": [
     "GET"
   ],
   "/analytics/orders/valid": [
+    "GET"
+  ],
+  "/analytics/traffic": [
     "GET"
   ],
   "/api/accounts/{cookie_id}/session-refresh": [
