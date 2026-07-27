@@ -4,12 +4,14 @@ import '@testing-library/jest-dom/vitest';
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getDashboardSummary, getValidOrders } from '../services/api';
+import { getDashboardSummary, getValidOrders, getTrafficAnalytics, getBuyerBehaviorAnalytics } from '../services/api';
 import Dashboard from './Dashboard';
 
 vi.mock('../services/api', () => ({
   getDashboardSummary: vi.fn(),
   getValidOrders: vi.fn(),
+  getTrafficAnalytics: vi.fn(),
+  getBuyerBehaviorAnalytics: vi.fn(),
 }));
 
 const summary = {
@@ -47,6 +49,16 @@ describe('Dashboard summary loading', () => {
     vi.clearAllMocks();
     vi.mocked(getDashboardSummary).mockResolvedValue(summary);
     vi.mocked(getValidOrders).mockResolvedValue([]);
+    vi.mocked(getTrafficAnalytics).mockResolvedValue({
+      coverage: { total_orders: 0, with_ordered_at: 0, coverage_rate: 0 },
+      hourly: [],
+      weekday: [],
+    });
+    vi.mocked(getBuyerBehaviorAnalytics).mockResolvedValue({
+      summary: { total_buyers: 0, repeat_buyers: 0, repeat_rate: 0 },
+      frequency: [],
+      top_buyers: [],
+    });
   });
 
   afterEach(() => cleanup());
