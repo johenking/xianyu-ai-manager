@@ -215,7 +215,7 @@ const Dashboard: React.FC = () => {
       </div>
 
       <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">图表加载中...</div>}>
-        <DashboardCharts analytics={summary.current} itemNames={summary.item_names} />
+        <DashboardCharts analytics={summary.current} previous={summary.previous} itemNames={summary.item_names} />
       </Suspense>
 
       {!isEmpty && (
