@@ -4,7 +4,9 @@ import json
 import inspect
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -27,6 +29,29 @@ ORDER_STATUSES = {
     "refund_cancelled",
     "cancelled",
 }
+
+# 经营统计“有效订单”口径的唯一定义源：待发货/已发货/已完成。
+# dashboard、analytics、驾驶舱等所有统计端点必须引用此常量，禁止再散落硬编码。
+VALID_ORDER_STATUSES: Tuple[str, ...] = ("pending_ship", "shipped", "completed")
+
+# 订单快照来源等级棘轮：空则写；非空仅当新来源等级“严格更高”才覆盖。
+# 因此目录类来源永远冲不掉已有快照（商品改图/改标题不影响成交记录），
+# order_detail 封顶；同级来源（含目录周期重扫）不产生覆盖。
+SNAPSHOT_SOURCE_RANK: Dict[str, int] = {
+    "": 0,
+    "history_unsaved": 0,
+    "catalog_metadata": 1,
+    "catalog_backfill": 1,
+    "catalog": 2,
+    "realtime_message": 3,
+    "order_list": 4,
+    "import": 4,
+    "order_detail": 5,
+}
+
+
+def snapshot_source_rank(source: Any) -> int:
+    return SNAPSHOT_SOURCE_RANK.get(str(source or ""), 0)
 
 STATUS_CODE_MAP = {
     "1": "processing",
@@ -184,6 +209,10 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
         "item_id": str(common_data.get("itemId") or raw.get("item_id") or raw.get("itemId") or raw.get("auctionId") or ""),
         "buyer_id": str(buyer_info.get("buyerId") or raw.get("buyer_id") or raw.get("buyerId") or raw.get("buyerUserId") or ""),
         "item_title": str(common_data.get("itemTitle") or raw.get("title") or raw.get("itemTitle") or raw.get("subject") or ""),
+        # 买家昵称/头像候选链：以 probe_order_buyer_fields.py 对真实响应的探测结果定稿；
+        # 全部落空时留空串，写入守卫对空值免疫，不会产生垃圾快照
+        "buyer_nickname": str(buyer_info.get("nick") or buyer_info.get("buyerNick") or buyer_info.get("userNick") or raw.get("buyerNick") or ""),
+        "buyer_avatar_url": str(buyer_info.get("avatar") or buyer_info.get("headPicUrl") or buyer_info.get("portraitUrl") or buyer_info.get("headPic") or ""),
         "amount": amount,
         "quantity": str(price_info.get("buyNum") or raw.get("quantity") or raw.get("itemNum") or "1"),
         "order_status": normalize_order_status(raw_status, status_text),
@@ -192,6 +221,73 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
         "created_at": common_data.get("createTime") or raw.get("createTime") or raw.get("created_at") or raw.get("gmtCreate"),
         "cookie_id": cookie_id,
     }
+
+
+_AMOUNT_STRIP_TABLE = str.maketrans("", "", "¥￥$,， \t ")
+
+
+def parse_amount_fen(value: Any) -> Optional[int]:
+    """把平台金额文本解析为整数分。
+
+    剥离半/全角货币符与千分位后用 Decimal 精确换算；
+    空值、负数、非数字、超 1000 万元的垃圾值一律返回 None——
+    绝不用 0 冒充缺失，避免“免费”与“未知”在统计里混淆。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        text = repr(float(value))
+    else:
+        text = str(value)
+    text = text.strip().translate(_AMOUNT_STRIP_TABLE)
+    if not text:
+        return None
+    try:
+        amount = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not amount.is_finite():
+        return None
+    if amount < 0 or amount > Decimal("10000000"):
+        return None
+    return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def parse_order_time_utc(
+    value: Any, assume_tz: str = "Asia/Shanghai"
+) -> Tuple[Optional[float], str]:
+    """把平台订单时间解析为 UTC epoch 秒，返回 (epoch, 出处)。
+
+    出处枚举：epoch（纯数字，>10^10 视为毫秒）/ cst_string（无时区字符串，
+    按 assume_tz 解释——平台列表与详情返回的都是北京时间）/ iso_string
+    （自带时区的 ISO）/ unparseable（解析失败，epoch 为 None）。
+    历史回填对疑似 UTC 默认值的行使用 backfill_cst_assumed 单独标注。
+    """
+    if value in (None, ""):
+        return None, ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        return (number / 1000 if number > 10_000_000_000 else number), "epoch"
+    text = str(value).strip()
+    if not text:
+        return None, ""
+    if text.isdigit():
+        number = float(text)
+        return (number / 1000 if number > 10_000_000_000 else number), "epoch"
+    zone = ZoneInfo(assume_tz)
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+        return parsed.replace(tzinfo=zone).timestamp(), "cst_string"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "unparseable"
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=zone).timestamp(), "cst_string"
+    return parsed.timestamp(), "iso_string"
 
 
 def _parse_order_timestamp(value: Any) -> Optional[float]:
@@ -515,6 +611,11 @@ class OrderSyncCoordinator:
             cookie_string = updated_cookie_string
 
         errors = []
+        # 成交时从商品目录快照主图，避免商品后续下架导致订单图片失联
+        try:
+            catalog_lookup = self.db.get_item_catalog_lookup([cookie_id])
+        except Exception:
+            catalog_lookup = {}
         for discovered_order in discovery.get("orders") or []:
             order = dict(discovered_order)
             order_id = str(order.get("order_id") or "")
@@ -523,6 +624,9 @@ class OrderSyncCoordinator:
                 errors.append("订单列表包含缺少订单号的记录")
                 continue
             summary["total_seen"] += 1
+            # 用成交商品 ID 关联当前目录主图，取不到则留空（不覆盖已有快照）
+            catalog_item = catalog_lookup.get((str(cookie_id), str(order.get("item_id") or "")))
+            catalog_image = (catalog_item or {}).get("item_image") or None
             existing = self.db.get_order_by_id(order_id)
             if not existing:
                 inserted = self.db.insert_or_update_order(
@@ -534,6 +638,7 @@ class OrderSyncCoordinator:
                     order_status=order.get("order_status") or "unknown",
                     cookie_id=cookie_id,
                     created_at=order.get("created_at") or None,
+                    item_image=catalog_image,
                 )
                 if not inserted:
                     summary["failed"] += 1
@@ -541,6 +646,28 @@ class OrderSyncCoordinator:
                     continue
                 summary["discovered"] += 1
 
+            # 成交快照与规范化字段：标题以订单报文优先（目录仅兜底），
+            # 图片当前只有目录来源；组来源按主导字段定级，棘轮防目录周期重扫回冲
+            record_title = str(order.get("item_title") or "").strip()
+            catalog_title = str((catalog_item or {}).get("item_title") or "").strip()
+            item_snapshot = None
+            if record_title or catalog_title or catalog_image:
+                item_snapshot = {
+                    "item_title": record_title or catalog_title,
+                    "item_image": catalog_image or "",
+                    "item_title_source": "order_list" if record_title else "catalog",
+                    "item_image_source": "catalog",
+                }
+            buyer_nickname = str(order.get("buyer_nickname") or "").strip()
+            buyer_avatar = str(order.get("buyer_avatar_url") or "").strip()
+            buyer_snapshot = None
+            if buyer_nickname or buyer_avatar:
+                buyer_snapshot = {
+                    "buyer_nickname": buyer_nickname,
+                    "buyer_avatar_url": buyer_avatar,
+                    "source": "order_list",
+                }
+            ordered_at = parse_order_time_utc(order.get("created_at"))
             update_result = self.db.apply_order_sync_update(
                 order_id=order_id,
                 cookie_id=cookie_id,
@@ -548,12 +675,26 @@ class OrderSyncCoordinator:
                 platform_status_code=order.get("platform_status_code") or "",
                 platform_status_text=order.get("platform_status_text") or "",
                 status_source="order_list",
+                item_snapshot=item_snapshot,
+                buyer_snapshot=buyer_snapshot,
+                ordered_at=ordered_at,
+                paid_amount_fen=parse_amount_fen(order.get("amount")),
                 item_id=order.get("item_id"),
                 buyer_id=order.get("buyer_id"),
                 quantity=order.get("quantity"),
                 amount=order.get("amount"),
                 created_at=order.get("created_at"),
             )
+            buyer_id = str(order.get("buyer_id") or "").strip()
+            if buyer_id:
+                self.db.upsert_customer_observation(
+                    cookie_id=cookie_id,
+                    buyer_id=buyer_id,
+                    display_name=buyer_nickname,
+                    avatar_url=buyer_avatar,
+                    source="order_list",
+                    observed_at=ordered_at[0] if ordered_at[0] is not None else self.now_fn(),
+                )
             if existing and update_result.get("status_changed"):
                 summary["status_updated"] += 1
             if update_result.get("details_changed"):
@@ -622,6 +763,26 @@ class OrderSyncCoordinator:
                         detail.get("order_status"),
                         detail.get("status_text") or "",
                     )
+                    # 详情为最高级快照来源：报文里带什么就升级什么，缺省字段自动跳过
+                    detail_item_snapshot = None
+                    detail_title = str(detail.get("item_title") or "").strip()
+                    detail_image = str(detail.get("item_image") or detail.get("item_pic") or "").strip()
+                    if detail_title or detail_image:
+                        detail_item_snapshot = {
+                            "item_title": detail_title,
+                            "item_image": detail_image,
+                            "source": "order_detail",
+                        }
+                    detail_nickname = str(detail.get("buyer_nickname") or detail.get("buyer_nick") or "").strip()
+                    detail_avatar = str(detail.get("buyer_avatar_url") or detail.get("buyer_avatar") or "").strip()
+                    detail_buyer_snapshot = None
+                    if detail_nickname or detail_avatar:
+                        detail_buyer_snapshot = {
+                            "buyer_nickname": detail_nickname,
+                            "buyer_avatar_url": detail_avatar,
+                            "source": "order_detail",
+                        }
+                    detail_ordered_at = parse_order_time_utc(detail.get("order_time"))
                     update_result = self.db.apply_order_sync_update(
                         order_id=order_id,
                         cookie_id=cookie_id,
@@ -630,6 +791,10 @@ class OrderSyncCoordinator:
                         platform_status_text=str(detail.get("status_text") or ""),
                         status_source="order_detail",
                         sync_error="" if incoming_status != "unknown" else "无法确认平台订单状态",
+                        item_snapshot=detail_item_snapshot,
+                        buyer_snapshot=detail_buyer_snapshot,
+                        ordered_at=detail_ordered_at,
+                        paid_amount_fen=parse_amount_fen(detail.get("amount")),
                         item_id=detail.get("item_id"),
                         buyer_id=detail.get("buyer_id"),
                         spec_name=detail.get("spec_name"),
@@ -642,6 +807,17 @@ class OrderSyncCoordinator:
                         receiver_address=detail.get("receiver_address"),
                         receiver_city=detail.get("receiver_city"),
                     )
+                    detail_buyer_id = str(detail.get("buyer_id") or "").strip()
+                    if detail_buyer_id and (detail_nickname or detail_avatar):
+                        self.db.upsert_customer_observation(
+                            cookie_id=cookie_id,
+                            buyer_id=detail_buyer_id,
+                            display_name=detail_nickname,
+                            avatar_url=detail_avatar,
+                            source="order_detail",
+                            observed_at=detail_ordered_at[0]
+                            if detail_ordered_at[0] is not None else self.now_fn(),
+                        )
                     if update_result.get("status_changed"):
                         summary["status_updated"] += 1
                     if update_result.get("details_changed"):

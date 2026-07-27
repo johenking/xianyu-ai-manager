@@ -7,9 +7,12 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from typing import Awaitable, Callable, List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin, urlsplit
 import hashlib
+import ipaddress
 import secrets
+import socket
+import tempfile
 import time
 import json
 import os
@@ -62,7 +65,13 @@ from account_session_refresh import (
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
-from order_sync_service import OrderSyncCoordinator, XianyuOrderListClient, normalize_order_status
+from order_sync_service import (
+    OrderSyncCoordinator,
+    XianyuOrderListClient,
+    normalize_order_status,
+    parse_amount_fen,
+    parse_order_time_utc,
+)
 from api_routers import (
     accounts_router,
     admin_router,
@@ -4777,10 +4786,11 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
 
 
 @content_router.put("/cards/{card_id}")
-def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
+def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新卡券"""
     try:
         from db_manager import db_manager
+        user_id = current_user['user_id']
         # 验证多规格字段
         is_multi_spec = card_data.get('is_multi_spec')
         if is_multi_spec:
@@ -4800,12 +4810,15 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
+            user_id=user_id
         )
         if success:
             return {"message": "卡券更新成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4862,7 +4875,8 @@ async def update_card_with_image(
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
             spec_name=spec_name if is_multi_spec else None,
-            spec_value=spec_value if is_multi_spec else None
+            spec_value=spec_value if is_multi_spec else None,
+            user_id=current_user['user_id']
         )
 
         if success:
@@ -4908,6 +4922,9 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
             user_id=user_id
         )
         return {"id": rule_id, "message": "发货规则创建成功"}
+    except ValueError as e:
+        # 卡券归属校验失败（绑定了不存在或他人的卡券）
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4946,20 +4963,27 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
             return {"message": "发货规则更新成功"}
         else:
             raise HTTPException(status_code=404, detail="发货规则不存在")
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # 卡券归属校验失败（绑定了不存在或他人的卡券）
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @content_router.delete("/cards/{card_id}")
-def delete_card(card_id: int, _: None = Depends(require_auth)):
+def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除卡券"""
     try:
         from db_manager import db_manager
-        success = db_manager.delete_card(card_id)
+        success = db_manager.delete_card(card_id, user_id=current_user['user_id'])
         if success:
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5151,9 +5175,10 @@ async def search_items(
 async def check_valid_cookies(
     current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional)
 ):
-    """检查是否有有效的cookies账户（必须是启用状态）"""
+    """检查当前用户是否有有效的cookies账户（必须是启用状态）"""
     try:
-        if cookie_manager.manager is None:
+        # 匿名访问或管理器未就绪：一律返回 0，不泄露全站账号计数
+        if current_user is None or cookie_manager.manager is None:
             return {
                 "success": True,
                 "hasValidCookies": False,
@@ -5162,10 +5187,8 @@ async def check_valid_cookies(
                 "totalCount": 0
             }
 
-        from db_manager import db_manager
-
-        # 获取所有cookies
-        all_cookies = db_manager.get_all_cookies()
+        # 仅统计当前用户名下的账号，防止跨租户计数泄露
+        all_cookies = db_manager.get_all_cookies(current_user['user_id'])
 
         # 检查启用状态和有效性
         valid_cookies = []
@@ -8694,12 +8717,20 @@ async def clear_logs(_: None = Depends(require_auth)):
 # ==================== 商品管理API ====================
 
 @content_router.post("/items/get-all-from-account")
-async def get_all_items_from_account(request: dict, _: None = Depends(require_auth)):
+async def get_all_items_from_account(
+    request: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """从指定账号获取所有商品信息"""
     try:
         cookie_id = request.get('cookie_id')
         if not cookie_id:
             return {"success": False, "message": "缺少cookie_id参数"}
+
+        # 校验账号归属：禁止用他人账号的 Cookie 向闲鱼发起请求
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权操作此账号")
 
         # 获取指定账号的cookie信息
         cookie_info = db_manager.get_cookie_by_id(cookie_id)
@@ -8756,6 +8787,8 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
                 "failed_count": failed_count,
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取账号商品信息异常: {str(e)}")
         return {"success": False, "message": f"获取商品信息异常: {str(e)}"}
@@ -9273,8 +9306,8 @@ def get_dashboard_summary(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     period = _dashboard_period(range_key, start_date, end_date)
-    is_admin = bool(current_user.get('is_admin')) or current_user.get('username') == ADMIN_USERNAME
-    scoped_user_id = None if is_admin else current_user['user_id']
+    # 仪表盘一律只统计当前登录用户自己的数据，admin 也不例外（不再提供全局视图）
+    scoped_user_id = current_user['user_id']
     valid_statuses = ['pending_ship', 'shipped', 'completed']
     current = db_manager.get_order_analytics(
         start_date=period['start_date'],
@@ -9295,7 +9328,7 @@ def get_dashboard_summary(
         )
     return {
         "success": True,
-        "scope": "system" if is_admin else "user",
+        "scope": "user",
         "range": period,
         "stats": db_manager.get_dashboard_stats(scoped_user_id),
         "current": current,
@@ -9939,6 +9972,11 @@ def update_item_multi_quantity_delivery(
 
 # ==================== 订单管理接口 ====================
 
+def get_orders_db() -> Any:
+    """订单路由统一的可替换数据库依赖。"""
+    return db_manager
+
+
 async def _fetch_order_details_for_sync(**kwargs):
     from utils.order_fetcher_optimized import process_orders_batch
 
@@ -9954,9 +9992,13 @@ async def _fetch_order_details_for_sync(**kwargs):
     )
 
 
-async def _persist_order_sync_cookie(cookie_id: str, cookie_string: str) -> bool:
+async def _persist_order_sync_cookie(
+    cookie_id: str,
+    cookie_string: str,
+    orders_db: Any,
+) -> bool:
     """Persist one verified account-scoped Cookie update and refresh its listener."""
-    if not db_manager.update_cookie_account_info(cookie_id, cookie_value=cookie_string):
+    if not orders_db.update_cookie_account_info(cookie_id, cookie_value=cookie_string):
         return False
     if cookie_manager.manager:
         runtime_update = cookie_manager.manager.update_cookie(
@@ -9971,10 +10013,11 @@ async def _persist_order_sync_cookie(cookie_id: str, cookie_string: str) -> bool
 
 async def _sync_recent_orders(
     current_user: Dict[str, Any],
+    orders_db: Any,
     cookie_id: Optional[str] = None,
     days: int = 90,
 ) -> JSONResponse:
-    user_cookies = db_manager.get_all_cookies(current_user["user_id"])
+    user_cookies = orders_db.get_all_cookies(current_user["user_id"])
     if cookie_id:
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=404, detail="账号不存在或无权访问")
@@ -9982,12 +10025,19 @@ async def _sync_recent_orders(
     if not user_cookies:
         raise HTTPException(status_code=400, detail="当前没有可同步的闲鱼账号")
 
+    async def persist_cookie(account_id: str, cookie_string: str) -> bool:
+        return await _persist_order_sync_cookie(
+            account_id,
+            cookie_string,
+            orders_db,
+        )
+
     client = XianyuOrderListClient()
     coordinator = OrderSyncCoordinator(
-        db_manager,
+        orders_db,
         discoverer=client.discover,
         detail_fetcher=_fetch_order_details_for_sync,
-        cookie_updater=_persist_order_sync_cookie,
+        cookie_updater=persist_cookie,
     )
     account_results = []
     total_summary = {
@@ -9999,7 +10049,7 @@ async def _sync_recent_orders(
         "failed": 0,
     }
     for account_id, cookie_string in user_cookies.items():
-        account_details = db_manager.get_cookie_by_id(account_id) or {}
+        account_details = orders_db.get_cookie_by_id(account_id) or {}
         result = await coordinator.sync_account(
             cookie_id=account_id,
             cookie_string=cookie_string,
@@ -10036,13 +10086,103 @@ async def _sync_recent_orders(
 async def sync_recent_orders(
     request: OrderSyncRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
     """Discover and reconcile recent seller orders with truthful partial failures."""
     return await _sync_recent_orders(
         current_user=current_user,
+        orders_db=orders_db,
         cookie_id=request.cookie_id,
         days=request.days,
     )
+
+
+def _compose_order_display(order: Dict[str, Any], catalog_item: Dict[str, str],
+                           profile: Optional[Dict[str, Any]] = None) -> None:
+    """列表/详情共用的展示补全：快照优先、目录兜底，并标注身份状态。
+
+    item_identity: snapshot / catalog_fallback / missing
+    buyer_identity: snapshot / profile / history_unsaved / missing
+    """
+    snapshot_title = str(order.get('item_title') or '')
+    snapshot_image = str(order.get('item_image') or '')
+    order['item_title'] = snapshot_title or catalog_item.get('item_title', '')
+    order['item_image'] = snapshot_image or catalog_item.get('item_image', '')
+    order['item_title_source'] = str(order.get('item_title_source') or (
+        'catalog' if not snapshot_title and order['item_title'] else ''
+    ))
+    order['item_image_source'] = str(order.get('item_image_source') or (
+        'catalog' if not snapshot_image and order['item_image'] else ''
+    ))
+    order['item_price'] = catalog_item.get('item_price', '')
+    if snapshot_title or snapshot_image:
+        order['item_identity'] = 'snapshot'
+    elif order['item_title'] or order['item_image']:
+        order['item_identity'] = 'catalog_fallback'
+    else:
+        order['item_identity'] = 'missing'
+    snapshot_nickname = str(order.get('buyer_nickname') or '')
+    snapshot_avatar = str(order.get('buyer_avatar_url') or '')
+    profile_name = str((profile or {}).get('display_name') or '')
+    profile_avatar = str((profile or {}).get('avatar_url') or '')
+    order['buyer_display_name'] = snapshot_nickname or profile_name
+    order['buyer_avatar_url'] = snapshot_avatar or profile_avatar
+    buyer_snapshot_source = str(order.get('buyer_snapshot_source') or '')
+    buyer_nickname_source = str(
+        order.get('buyer_nickname_source') or buyer_snapshot_source
+    )
+    buyer_avatar_source = str(
+        order.get('buyer_avatar_source') or buyer_snapshot_source
+    )
+    order['buyer_display_name_source'] = (
+        buyer_nickname_source if snapshot_nickname
+        else str((profile or {}).get('display_name_source') or '') if profile_name
+        else ''
+    )
+    order['buyer_avatar_source'] = (
+        buyer_avatar_source if snapshot_avatar
+        else str((profile or {}).get('avatar_source') or '') if profile_avatar
+        else ''
+    )
+    if snapshot_nickname or snapshot_avatar:
+        order['buyer_identity'] = 'snapshot'
+    elif profile_name or profile_avatar:
+        order['buyer_identity'] = 'profile'
+    elif buyer_snapshot_source == 'history_unsaved':
+        order['buyer_identity'] = 'history_unsaved'
+    else:
+        order['buyer_identity'] = 'missing'
+
+
+def _parse_order_query_date(
+    value: Any,
+    field_name: str,
+) -> Optional[datetime]:
+    """校验订单筛选日期；保持外部 YYYY-MM-DD 字符串契约。"""
+    if value is None or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_order_date",
+                "field": field_name,
+                "message": "日期必须是有效的 YYYY-MM-DD 日历日期",
+            },
+        ) from exc
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_order_date",
+                "field": field_name,
+                "message": "日期必须是有效的 YYYY-MM-DD 日历日期",
+            },
+        )
+    return parsed
+
 
 @orders_router.get('/api/orders')
 def get_user_orders(
@@ -10050,115 +10190,424 @@ def get_user_orders(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     cookie_id: Optional[str] = Query(None, description="筛选Cookie ID"),
-    status: Optional[str] = Query(None, description="筛选状态")
+    status: Optional[str] = Query(None, description="筛选状态"),
+    search: Optional[str] = Query(None, max_length=100, description="搜索订单号/商品/买家"),
+    start_date: Optional[str] = Query(None, description="开始日期 YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD"),
+    orders_db: Any = Depends(get_orders_db),
 ):
-    """获取当前用户的订单信息（支持分页）"""
+    """获取当前用户的订单信息（服务端筛选与分页；列表不含收货隐私字段）"""
     try:
-        from db_manager import db_manager
-
         user_id = current_user['user_id']
         log_with_user('info', f"查询用户订单信息 (page={page}, page_size={page_size})", current_user)
+        parsed_start = _parse_order_query_date(start_date, "start_date")
+        parsed_end = _parse_order_query_date(end_date, "end_date")
+        if parsed_start and parsed_end and parsed_start > parsed_end:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_order_date_range",
+                    "message": "开始日期不得晚于结束日期",
+                },
+            )
+        normalized_start = (
+            parsed_start.strftime("%Y-%m-%d") if parsed_start else None
+        )
+        normalized_end = parsed_end.strftime("%Y-%m-%d") if parsed_end else None
 
-        # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
+        if cookie_id:
+            # 未授权账号与 /api/orders/sync 同语义：404，不再静默回退全账号
+            if cookie_id not in user_cookies:
+                raise HTTPException(status_code=404, detail="账号不存在或无权访问")
+            scope_ids = [cookie_id]
+        else:
+            scope_ids = list(user_cookies.keys())
 
-        # 如果指定了cookie_id筛选
-        if cookie_id and cookie_id in user_cookies:
-            user_cookies = {cookie_id: user_cookies[cookie_id]}
+        result = orders_db.query_orders(
+            scope_ids, status=status, search=search or '',
+            start_date=normalized_start, end_date=normalized_end,
+            page=page, page_size=page_size,
+        )
+        for order in result['items']:
+            order['id'] = order['order_id']
+            catalog_item = {
+                'item_title': order.pop('catalog_title', '') or '',
+                'item_image': order.pop('catalog_image', '') or '',
+                'item_price': order.pop('catalog_price', '') or '',
+            }
+            profile = {
+                'display_name': order.pop('profile_display_name', '') or '',
+                'avatar_url': order.pop('profile_avatar_url', '') or '',
+                'profile_source': order.pop('profile_source', '') or '',
+                'display_name_source': order.pop(
+                    'profile_display_name_source', ''
+                ) or '',
+                'avatar_source': order.pop('profile_avatar_source', '') or '',
+            }
+            _compose_order_display(order, catalog_item, profile)
 
-        # 获取所有订单数据，并按账号+商品ID关联商品，避免多账号串数据。
-        all_orders = []
-        item_lookup = db_manager.get_item_catalog_lookup(list(user_cookies.keys()))
-
-        for cid in user_cookies.keys():
-            orders = db_manager.get_orders_by_cookie(cid, limit=1000)
-            for order in orders:
-                order['cookie_id'] = cid
-                catalog_item = item_lookup.get((cid, str(order.get('item_id') or '')), {})
-                order['item_title'] = catalog_item.get('item_title', '')
-                order['item_price'] = catalog_item.get('item_price', '')
-                order['item_image'] = catalog_item.get('item_image', '')
-                # 状态筛选
-                if status and order.get('status') != status:
-                    continue
-                all_orders.append(order)
-
-        # 按创建时间倒序排列
-        all_orders.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-
-        # 分页处理
-        total = len(all_orders)
-        total_pages = (total + page_size - 1) // page_size
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paginated_orders = all_orders[start_idx:end_idx]
-
-        log_with_user('info', f"用户订单查询成功，共 {total} 条记录，第 {page}/{total_pages} 页", current_user)
+        total = result['total']
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 0
+        log_with_user('info', f"用户订单查询成功，共 {total} 条记录，第 {page}/{total_pages or 1} 页", current_user)
         return {
             "success": True,
-            "data": paginated_orders,
+            "data": result['items'],
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": total_pages
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        log_with_user('error', f"查询用户订单失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"查询订单失败: {str(e)}")
+        log_with_user(
+            'error',
+            f"查询用户订单失败 ({type(e).__name__})",
+            current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "order_query_failed",
+                "message": "订单列表查询失败，请稍后重试",
+            },
+        )
 
 
 @orders_router.get('/api/orders/{order_id}')
-def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取订单详情"""
+def get_order_detail(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
+):
+    """获取订单详情（含收货信息与成交快照全字段）"""
     try:
-        from db_manager import db_manager
-
         user_id = current_user['user_id']
         log_with_user('info', f"查询订单详情: {order_id}", current_user)
 
-        # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
+        order = orders_db.get_order_by_id(order_id)
+        if not order or order.get('cookie_id') not in user_cookies:
+            log_with_user('warning', f"订单不存在或无权访问: {order_id}", current_user)
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
-        # 在用户的订单中查找
-        for cookie_id in user_cookies.keys():
-            order = db_manager.get_order_by_id(order_id)
-            if order and order.get('cookie_id') == cookie_id:
-                log_with_user('info', f"订单详情查询成功: {order_id}", current_user)
-                return {"success": True, "data": order}
-
-        log_with_user('warning', f"订单不存在或无权访问: {order_id}", current_user)
-        raise HTTPException(status_code=404, detail="订单不存在或无权访问")
+        cookie_id = order['cookie_id']
+        catalog_item = orders_db.get_item_catalog_lookup([cookie_id]).get(
+            (str(cookie_id), str(order.get('item_id') or '')), {})
+        profile = orders_db.get_customer_profile(
+            str(cookie_id),
+            str(order.get('buyer_id') or ''),
+        )
+        _compose_order_display(order, catalog_item, profile)
+        log_with_user('info', f"订单详情查询成功: {order_id}", current_user)
+        return {"success": True, "data": order}
 
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"查询订单详情失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
+        log_with_user(
+            'error',
+            f"查询订单详情失败 ({type(e).__name__})",
+            current_user,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "order_detail_query_failed",
+                "message": "订单详情查询失败，请稍后重试",
+            },
+        )
+
+
+# 订单商品图媒体缓存目录（不在 /static 挂载下，必须经鉴权端点访问）
+ORDER_ITEM_IMAGE_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'data', 'media_cache', 'order_items'
+)
+ORDER_ITEM_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+ORDER_ITEM_IMAGE_TIMEOUT_SECONDS = 10
+ORDER_ITEM_IMAGE_MAX_REDIRECTS = 3
+ORDER_ITEM_IMAGE_TRUSTED_HOST_SUFFIXES = (
+    'alicdn.com',
+    'goofish.com',
+    'tbcdn.cn',
+)
+_ORDER_ITEM_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
+def _order_item_image_cache_path(image_url: str) -> Tuple[str, str]:
+    """由源地址导出确定性缓存键与落盘路径（重编码后统一为 JPEG）。"""
+    cache_key = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:32] + '.jpg'
+    return cache_key, os.path.join(ORDER_ITEM_IMAGE_CACHE_DIR, cache_key)
+
+
+def _trusted_order_image_url(image_url: str) -> Tuple[str, int]:
+    parsed = urlsplit(str(image_url or '').strip())
+    host = str(parsed.hostname or '').rstrip('.').lower()
+    if (
+        parsed.scheme.lower() != 'https'
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("untrusted image URL")
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ValueError("invalid image URL port") from exc
+    if port != 443:
+        raise ValueError("untrusted image URL port")
+    if not any(
+        host == suffix or host.endswith(f'.{suffix}')
+        for suffix in ORDER_ITEM_IMAGE_TRUSTED_HOST_SUFFIXES
+    ):
+        raise ValueError("untrusted image host")
+    return host, port
+
+
+async def _resolve_order_image_host(image_url: str) -> Tuple[str, ...]:
+    """解析并拒绝任何非公网地址；每次重定向都会重新调用。"""
+    host, port = _trusted_order_image_url(image_url)
+    try:
+        literal = ipaddress.ip_address(host)
+        addresses = (str(literal),)
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        records = await loop.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+        addresses = tuple(dict.fromkeys(str(record[4][0]) for record in records))
+    if not addresses:
+        raise ValueError("image host did not resolve")
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+            or not ip.is_global
+        ):
+            raise ValueError("image host resolved to a non-public address")
+    return addresses
+
+
+class _PinnedOrderImageResolver:
+    """aiohttp resolver：只返回已验证的公网地址，阻断校验后的 DNS 重绑定。"""
+
+    def __init__(self, host: str, addresses: Tuple[str, ...]):
+        self._records: Dict[str, Tuple[str, ...]] = {host: addresses}
+
+    def pin(self, host: str, addresses: Tuple[str, ...]) -> None:
+        self._records[host] = addresses
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC):
+        addresses = self._records.get(str(host).rstrip('.').lower())
+        if not addresses:
+            raise OSError("host was not validated")
+        return [
+            {
+                "hostname": host,
+                "host": address,
+                "port": port,
+                "family": socket.AF_INET6 if ':' in address else socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+            for address in addresses
+        ]
+
+    async def close(self) -> None:
+        self._records.clear()
+
+
+async def _build_pinned_order_image_connector(image_url: str) -> Any:
+    import aiohttp
+
+    host, _port = _trusted_order_image_url(image_url)
+    addresses = await _resolve_order_image_host(image_url)
+    resolver = _PinnedOrderImageResolver(host, addresses)
+    connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=False)
+    setattr(connector, '_order_image_resolver', resolver)
+    return connector
+
+
+async def _download_order_item_image(
+    session: Any,
+    image_url: str,
+    resolver: _PinnedOrderImageResolver,
+) -> bytes:
+    current_url = image_url
+    for redirect_count in range(ORDER_ITEM_IMAGE_MAX_REDIRECTS + 1):
+        if redirect_count:
+            addresses = await _resolve_order_image_host(current_url)
+            host, _port = _trusted_order_image_url(current_url)
+            resolver.pin(host, addresses)
+        async with session.get(current_url, allow_redirects=False) as source_response:
+            if source_response.status in _ORDER_ITEM_IMAGE_REDIRECT_STATUSES:
+                if redirect_count >= ORDER_ITEM_IMAGE_MAX_REDIRECTS:
+                    raise HTTPException(
+                        status_code=404,
+                        detail={"reason": "source_expired"},
+                    )
+                location = str(source_response.headers.get('Location') or '').strip()
+                if not location:
+                    raise HTTPException(
+                        status_code=404,
+                        detail={"reason": "source_expired"},
+                    )
+                current_url = urljoin(current_url, location)
+                _trusted_order_image_url(current_url)
+                continue
+            if source_response.status != 200:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"reason": "source_expired"},
+                )
+            content_type = str(
+                source_response.headers.get('Content-Type') or ''
+            ).split(';', 1)[0].strip().lower()
+            if not content_type.startswith('image/'):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"reason": "unsupported_format"},
+                )
+            content_length = str(
+                source_response.headers.get('Content-Length') or ''
+            ).strip()
+            if content_length.isdigit() and int(content_length) > ORDER_ITEM_IMAGE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"reason": "unsupported_format"},
+                )
+            raw = await source_response.content.read(ORDER_ITEM_IMAGE_MAX_BYTES + 1)
+            if len(raw) > ORDER_ITEM_IMAGE_MAX_BYTES:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"reason": "unsupported_format"},
+                )
+            return raw
+    raise HTTPException(status_code=404, detail={"reason": "source_expired"})
+
+
+def _publish_order_item_image_atomically(image: Any, cache_path: str) -> None:
+    os.makedirs(ORDER_ITEM_IMAGE_CACHE_DIR, mode=0o700, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix='.order-image-',
+        suffix='.tmp',
+        dir=ORDER_ITEM_IMAGE_CACHE_DIR,
+    )
+    os.close(descriptor)
+    try:
+        image.save(temporary_path, format='JPEG', quality=85)
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, cache_path)
+    finally:
+        Path(temporary_path).unlink(missing_ok=True)
+
+
+@orders_router.get('/api/orders/{order_id}/item-image')
+async def get_order_item_image(order_id: str,
+                               current_user: Dict[str, Any] = Depends(get_current_user),
+                               orders_db: Any = Depends(get_orders_db)):
+    """返回订单商品图的应用内缓存字节流；失败返回机读原因。
+
+    只服务订单绑定的图片地址（快照优先、目录兜底），不做任意 URL 代理。
+    失败区分：not_saved（无可用图源）/ source_expired（源站拉取失败）/
+    unsupported_format（源不是可解码图片，含 HEIC）。
+    """
+    import aiohttp
+    from PIL import Image as PILImage, UnidentifiedImageError
+    from fastapi.responses import FileResponse
+
+    user_id = current_user['user_id']
+    user_cookies = orders_db.get_all_cookies(user_id)
+    order = orders_db.get_order_by_id(order_id)
+    if not order or order.get('cookie_id') not in user_cookies:
+        raise HTTPException(status_code=404, detail={"reason": "not_found"})
+
+    cookie_id = str(order['cookie_id'])
+    snapshot_image = str(order.get('item_image') or '')
+    image_url = snapshot_image
+    if not image_url:
+        catalog_item = orders_db.get_item_catalog_lookup([cookie_id]).get(
+            (cookie_id, str(order.get('item_id') or '')), {})
+        image_url = str(catalog_item.get('item_image') or '')
+    if not image_url:
+        raise HTTPException(status_code=404, detail={"reason": "not_saved"})
+    try:
+        _trusted_order_image_url(image_url)
+    except ValueError:
+        raise HTTPException(status_code=404, detail={"reason": "source_expired"})
+
+    cache_key, cache_path = _order_item_image_cache_path(image_url)
+    response_headers = {"Cache-Control": "private, max-age=86400"}
+    if os.path.isfile(cache_path):
+        return FileResponse(cache_path, media_type='image/jpeg', headers=response_headers)
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=ORDER_ITEM_IMAGE_TIMEOUT_SECONDS)
+        connector = await _build_pinned_order_image_connector(image_url)
+        resolver = getattr(connector, '_order_image_resolver')
+        try:
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                connector_owner=False,
+            ) as session:
+                raw = await _download_order_item_image(session, image_url, resolver)
+        finally:
+            await connector.close()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail={"reason": "source_expired"})
+
+    try:
+        image = PILImage.open(io.BytesIO(raw))
+        image = image.convert('RGB')
+        _publish_order_item_image_atomically(image, cache_path)
+    except UnidentifiedImageError:
+        raise HTTPException(status_code=422, detail={"reason": "unsupported_format"})
+    except Exception:
+        raise HTTPException(status_code=422, detail={"reason": "unsupported_format"})
+
+    # 缓存键只在图源仍是订单快照时回写（目录兜底图不建立订单级联）
+    if image_url == snapshot_image:
+        orders_db.set_order_item_image_cache_key(order_id, cache_key, snapshot_image)
+    return FileResponse(cache_path, media_type='image/jpeg', headers=response_headers)
 
 
 @orders_router.delete('/api/orders/{order_id}')
-def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+def delete_order(
+    order_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
+):
     """删除订单"""
     try:
-        from db_manager import db_manager
-
         user_id = current_user['user_id']
         log_with_user('info', f"删除订单: {order_id}", current_user)
 
         # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
 
         # 验证订单属于当前用户
-        order = db_manager.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         if order.get('cookie_id') not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权删除此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         # 删除订单
-        success = db_manager.delete_order(order_id)
+        success = orders_db.delete_order(order_id)
         if success:
             log_with_user('info', f"订单删除成功: {order_id}", current_user)
             return {"success": True, "message": "删除成功"}
@@ -10175,27 +10624,27 @@ def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_curre
 @orders_router.post('/api/orders/{order_id}/refresh')
 async def refresh_single_order(
     order_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
     """刷新单条订单状态"""
     try:
-        from db_manager import db_manager
         from utils.order_fetcher_optimized import process_orders_batch
 
         user_id = current_user['user_id']
         log_with_user('info', f"刷新单条订单: {order_id}", current_user)
 
         # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
 
         # 验证订单存在且属于当前用户
-        order = db_manager.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         cookie_id = order.get('cookie_id')
         if not cookie_id or cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权刷新此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         cookies_str = user_cookies[cookie_id]
         if not cookies_str:
@@ -10232,7 +10681,26 @@ async def refresh_single_order(
             result.get('order_status', 'unknown'),
             result.get('status_text', ''),
         )
-        update_result = db_manager.apply_order_sync_update(
+        # 详情为最高级快照来源：报文携带的商品/买家身份随状态一并落库
+        refresh_item_snapshot = None
+        refresh_title = str(result.get('item_title') or '').strip()
+        refresh_image = str(result.get('item_image') or result.get('item_pic') or '').strip()
+        if refresh_title or refresh_image:
+            refresh_item_snapshot = {
+                'item_title': refresh_title,
+                'item_image': refresh_image,
+                'source': 'order_detail',
+            }
+        refresh_nickname = str(result.get('buyer_nickname') or result.get('buyer_nick') or '').strip()
+        refresh_avatar = str(result.get('buyer_avatar_url') or result.get('buyer_avatar') or '').strip()
+        refresh_buyer_snapshot = None
+        if refresh_nickname or refresh_avatar:
+            refresh_buyer_snapshot = {
+                'buyer_nickname': refresh_nickname,
+                'buyer_avatar_url': refresh_avatar,
+                'source': 'order_detail',
+            }
+        update_result = orders_db.apply_order_sync_update(
             order_id=order_id,
             cookie_id=cookie_id,
             incoming_status=order_status,
@@ -10240,6 +10708,10 @@ async def refresh_single_order(
             platform_status_text=str(result.get('status_text') or ''),
             status_source='order_detail',
             sync_error='' if order_status != 'unknown' else '无法确认平台订单状态',
+            item_snapshot=refresh_item_snapshot,
+            buyer_snapshot=refresh_buyer_snapshot,
+            ordered_at=parse_order_time_utc(result.get('order_time')),
+            paid_amount_fen=parse_amount_fen(result.get('amount')),
             item_id=result.get('item_id') or None,
             buyer_id=result.get('buyer_id') or None,
             spec_name=result.get('spec_name') or None,
@@ -10252,6 +10724,17 @@ async def refresh_single_order(
             receiver_address=result.get('receiver_address') or None,
             receiver_city=result.get('receiver_city') or None,
         )
+        refresh_buyer_id = str(result.get('buyer_id') or order.get('buyer_id') or '').strip()
+        if refresh_buyer_id and (refresh_nickname or refresh_avatar):
+            refreshed_at = parse_order_time_utc(result.get('order_time'))[0]
+            orders_db.upsert_customer_observation(
+                cookie_id=cookie_id,
+                buyer_id=refresh_buyer_id,
+                display_name=refresh_nickname,
+                avatar_url=refresh_avatar,
+                source='order_detail',
+                observed_at=refreshed_at,
+            )
 
         log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
         return JSONResponse({
@@ -10298,7 +10781,8 @@ def check_order_data_completeness(order: Dict[str, Any]) -> bool:
 async def update_order(
     order_id: str,
     update_data: dict,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
     """
     更新订单信息
@@ -10306,22 +10790,21 @@ async def update_order(
     获取完整信息包括：订单ID、商品ID、买家ID、规格、数量、金额、订单状态、收货人信息
     """
     try:
-        from db_manager import db_manager
         from utils.order_fetcher_optimized import fetch_order_complete
 
         user_id = current_user['user_id']
         log_with_user('info', f"更新订单: {order_id}, 数据: {update_data}", current_user)
 
         # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
 
         # 验证订单属于当前用户
-        order = db_manager.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id)
         if not order:
-            raise HTTPException(status_code=404, detail="订单不存在")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         if order.get('cookie_id') not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权修改此订单")
+            raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         # 检查订单数据完整性
         is_complete = check_order_data_completeness(order)
@@ -10385,7 +10868,7 @@ async def update_order(
                         }
 
                         # 更新数据库
-                        db_manager.insert_or_update_order(**refresh_data)
+                        orders_db.insert_or_update_order(**refresh_data)
                         log_with_user('info', f"订单 {order_id} 完整数据已更新到数据库", current_user)
                     else:
                         log_with_user('warning', f"订单 {order_id} 详情获取失败，继续使用现有数据", current_user)
@@ -10411,7 +10894,7 @@ async def update_order(
             # 如果没有用户提供的更新数据
             if not is_complete:
                 # 数据不完整，已经进行了自动刷新，返回刷新后的订单
-                updated_order = db_manager.get_order_by_id(order_id)
+                updated_order = orders_db.get_order_by_id(order_id)
                 return {
                     "success": True,
                     "message": "订单数据已自动刷新",
@@ -10420,7 +10903,7 @@ async def update_order(
                 }
             else:
                 # 数据完整，直接返回当前订单信息
-                updated_order = db_manager.get_order_by_id(order_id)
+                updated_order = orders_db.get_order_by_id(order_id)
                 return {
                     "success": True,
                     "message": "订单数据已是最新",
@@ -10429,7 +10912,7 @@ async def update_order(
                 }
 
         # 应用用户提供的更新
-        success = db_manager.insert_or_update_order(
+        success = orders_db.insert_or_update_order(
             order_id=order_id,
             **filtered_data
         )
@@ -10437,7 +10920,7 @@ async def update_order(
         if success:
             log_with_user('info', f"订单更新成功: {order_id}", current_user)
             # 返回更新后的订单
-            updated_order = db_manager.get_order_by_id(order_id)
+            updated_order = orders_db.get_order_by_id(order_id)
             return {
                 "success": True,
                 "message": "更新成功",
@@ -10458,7 +10941,8 @@ async def update_order(
 async def refresh_orders_status(
     cookie_id: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
     """
     智能刷新订单状态
@@ -10467,7 +10951,12 @@ async def refresh_orders_status(
     3. 更新数据库中有变化的订单
     """
     # 兼容旧前端；状态筛选不再缩小核对范围，避免漏掉签收或退款变化。
-    return await _sync_recent_orders(current_user=current_user, cookie_id=cookie_id, days=90)
+    return await _sync_recent_orders(
+        current_user=current_user,
+        orders_db=orders_db,
+        cookie_id=cookie_id,
+        days=90,
+    )
 
     try:
         from db_manager import db_manager
@@ -10852,7 +11341,8 @@ async def manual_ship_orders(
     order_ids: List[str] = Body(..., description="订单ID列表"),
     ship_mode: str = Body(..., description="发货模式: status_only（仅修改发货状态）或 full_delivery（完整发货流程）"),
     custom_content: Optional[str] = Body(None, description="自定义发货内容（保留兼容）"),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
     """
     手动发货
@@ -10862,7 +11352,6 @@ async def manual_ship_orders(
     - full_delivery: 完整发货流程（匹配卡券、发送卡券给买家、标记发货状态）
     """
     try:
-        from db_manager import db_manager
         from XianyuAutoAsync import XianyuLive
         import asyncio
 
@@ -10874,7 +11363,7 @@ async def manual_ship_orders(
             raise HTTPException(status_code=400, detail="发货模式必须是 status_only 或 full_delivery")
 
         # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
 
         success_count = 0
         failed_count = 0
@@ -10884,12 +11373,12 @@ async def manual_ship_orders(
         for order_id in order_ids:
             try:
                 # 获取订单信息
-                order = db_manager.get_order_by_id(order_id)
+                order = orders_db.get_order_by_id(order_id)
                 if not order:
                     results.append({
                         'order_id': order_id,
                         'success': False,
-                        'message': '订单不存在'
+                        'message': '订单不存在或无权访问'
                     })
                     failed_count += 1
                     continue
@@ -10900,7 +11389,7 @@ async def manual_ship_orders(
                     results.append({
                         'order_id': order_id,
                         'success': False,
-                        'message': '无权操作此订单'
+                        'message': '订单不存在或无权访问'
                     })
                     failed_count += 1
                     continue
@@ -10944,8 +11433,9 @@ async def manual_ship_orders(
 
                         if confirm_result and confirm_result.get('success'):
                             # 更新本地数据库状态
-                            db_manager.insert_or_update_order(
+                            orders_db.insert_or_update_order(
                                 order_id=order_id,
+                                cookie_id=cookie_id,
                                 order_status='shipped',
                                 system_shipped=True
                             )
@@ -11015,7 +11505,7 @@ async def manual_ship_orders(
                     # 查找与买家的chat_id（优先从订单记录获取，回退到AI对话记录）
                     chat_id = order.get('chat_id') or ''
                     if not chat_id:
-                        chat_id = db_manager.find_chat_id_by_buyer(cookie_id, buyer_id)
+                        chat_id = orders_db.find_chat_id_by_buyer(cookie_id, buyer_id)
                     if not chat_id:
                         results.append({
                             'order_id': order_id,
@@ -11027,7 +11517,7 @@ async def manual_ship_orders(
 
                     # 检查多数量发货
                     quantity_to_send = 1
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(cookie_id, item_id)
+                    multi_quantity_delivery = orders_db.get_item_multi_quantity_delivery_status(cookie_id, item_id)
                     if multi_quantity_delivery:
                         try:
                             order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
@@ -11091,8 +11581,9 @@ async def manual_ship_orders(
                             send_success = False
 
                     # 更新本地数据库状态
-                    db_manager.insert_or_update_order(
+                    orders_db.insert_or_update_order(
                         order_id=order_id,
+                        cookie_id=cookie_id,
                         order_status='shipped',
                         system_shipped=True
                     )
@@ -11139,23 +11630,167 @@ async def manual_ship_orders(
         raise HTTPException(status_code=500, detail=f"手动发货失败: {str(e)}")
 
 
+# 订单导入的合法字段映射：前端字段名 -> insert_or_update_order 参数名。
+# status_text/pay_time/item_title/item_price 无对应订单列（商品信息以目录 join 为准），
+# 不在映射内的字段一律丢弃并在结果 message 中提示，避免传入非法关键字参数。
+_IMPORT_ORDER_PARAM_MAPPING = {
+    'item_id': 'item_id',
+    'buyer_id': 'buyer_id',
+    'receiver_name': 'receiver_name',
+    'receiver_phone': 'receiver_phone',
+    'receiver_address': 'receiver_address',
+    'receiver_city': 'receiver_city',
+    'status': 'order_status',  # 注意：前端用 status，后端用 order_status
+    'order_time': 'created_at',
+    'quantity': 'quantity',
+    'amount': 'amount',
+    'item_image': 'item_image',
+}
+_ORDER_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+_ORDER_IMPORT_MAX_ROWS = 10_000
+_ORDER_IMPORT_MAX_COLUMNS = 50
+_ORDER_IMPORT_HEADER_ALIASES = {
+    '订单号': 'order_id',
+    '账号ID': 'cookie_id',
+    '商品ID': 'item_id',
+    '买家ID': 'buyer_id',
+    '状态': 'status',
+    '金额': 'amount',
+    '数量': 'quantity',
+    '订单时间': 'order_time',
+    '收货人': 'receiver_name',
+    '手机号': 'receiver_phone',
+    '收货地址': 'receiver_address',
+    '城市': 'receiver_city',
+    '商品图片': 'item_image',
+}
+
+
+def _map_import_order_params(order_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """把导入的订单数据映射为 insert_or_update_order 的合法关键字参数。
+
+    返回 (合法参数字典, 被忽略的字段名列表)。order_id/cookie_id 由调用方单独处理。
+    """
+    params: Dict[str, Any] = {}
+    ignored: List[str] = []
+    for field, value in order_data.items():
+        if value is None or field in ('order_id', 'cookie_id'):
+            continue
+        param_name = _IMPORT_ORDER_PARAM_MAPPING.get(field)
+        if param_name:
+            params[param_name] = value
+        else:
+            ignored.append(field)
+    return params, ignored
+
+
+def _cell_import_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, 'isoformat'):
+        return value.isoformat(sep=' ')
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _orders_from_xlsx(raw: bytes, filename: str) -> List[Dict[str, Any]]:
+    if not str(filename or '').lower().endswith('.xlsx'):
+        raise HTTPException(status_code=415, detail="仅支持 .xlsx 文件")
+    if not raw:
+        raise HTTPException(status_code=400, detail="Excel 文件为空")
+    if len(raw) > _ORDER_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
+    try:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheet = workbook.active
+        if sheet.max_row is None or sheet.max_column is None:
+            sheet.calculate_dimension(force=True)
+        if sheet.max_row > _ORDER_IMPORT_MAX_ROWS + 1 or sheet.max_column > _ORDER_IMPORT_MAX_COLUMNS:
+            raise HTTPException(status_code=413, detail="Excel 行列数超过限制")
+        rows = sheet.iter_rows(values_only=True)
+        header_row = next(rows, None)
+        if not header_row:
+            raise HTTPException(status_code=400, detail="Excel 缺少表头")
+        headers = [
+            _ORDER_IMPORT_HEADER_ALIASES.get(str(value or '').strip(), str(value or '').strip())
+            for value in header_row
+        ]
+        if not headers or any(not header for header in headers) or len(set(headers)) != len(headers):
+            raise HTTPException(status_code=400, detail="Excel 表头为空或重复")
+        missing = [field for field in ('order_id', 'cookie_id') if field not in headers]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Excel 缺少必需表头: {', '.join(missing)}",
+            )
+        orders = []
+        for row in rows:
+            values = [_cell_import_value(value) for value in row[:len(headers)]]
+            if not any(value not in (None, '') for value in values):
+                continue
+            orders.append(dict(zip(headers, values)))
+        return orders
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Excel 文件损坏或格式不受支持")
+    finally:
+        if 'workbook' in locals():
+            workbook.close()
+
+
+async def _parse_order_import_request(request: Request) -> List[Dict[str, Any]]:
+    """解析两个并列导入契约：程序化 JSON 对象数组，或 multipart `.xlsx` 文件。
+
+    `.xlsx` 是唯一支持的电子表格格式；JSON 数组是既有程序化 API 能力，
+    不属于电子表格格式限制。
+    """
+    content_type = str(request.headers.get('content-type') or '').lower()
+    if content_type.startswith('application/json'):
+        content_length = request.headers.get('content-length')
+        if content_length and content_length.isdigit() and int(content_length) > _ORDER_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="导入内容超过 5MB")
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="JSON 格式错误")
+        if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
+            raise HTTPException(status_code=422, detail="JSON 必须是订单对象数组")
+        if len(payload) > _ORDER_IMPORT_MAX_ROWS:
+            raise HTTPException(status_code=413, detail="订单行数超过限制")
+        return payload
+    if content_type.startswith('multipart/form-data'):
+        form = await request.form()
+        upload = form.get('file')
+        if upload is None or not hasattr(upload, 'read'):
+            raise HTTPException(status_code=400, detail="缺少 Excel 文件")
+        raw = await upload.read(_ORDER_IMPORT_MAX_BYTES + 1)
+        if len(raw) > _ORDER_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
+        return _orders_from_xlsx(raw, str(getattr(upload, 'filename', '') or ''))
+    raise HTTPException(
+        status_code=415,
+        detail="仅支持程序化 JSON 数组或 multipart .xlsx 文件",
+    )
+
+
 @orders_router.post('/api/orders/import')
 async def import_orders(
-    orders: List[Dict[str, Any]] = Body(..., description="订单列表"),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    orders_db: Any = Depends(get_orders_db),
 ):
-    """
-    导入订单
-    支持批量导入自定义订单数据
-    """
+    """批量导入订单：支持程序化 JSON 数组与 multipart `.xlsx` 两个并列契约。"""
     try:
-        from db_manager import db_manager
-
+        orders = await _parse_order_import_request(request)
         user_id = current_user['user_id']
         log_with_user('info', f"开始导入订单: 订单数量={len(orders)}", current_user)
 
         # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
+        user_cookies = orders_db.get_all_cookies(user_id)
 
         success_count = 0
         failed_count = 0
@@ -11163,13 +11798,6 @@ async def import_orders(
 
         # 必需字段验证
         required_fields = ['order_id', 'cookie_id']
-        optional_fields = [
-            'item_id', 'item_title', 'item_price', 'item_image',
-            'buyer_id',
-            'receiver_name', 'receiver_phone', 'receiver_address', 'receiver_city',
-            'status', 'status_text', 'order_time', 'pay_time',
-            'quantity', 'amount'
-        ]
 
         for order_data in orders:
             try:
@@ -11198,47 +11826,45 @@ async def import_orders(
                     continue
 
                 # 检查订单是否已存在
-                existing_order = db_manager.get_order_by_id(order_id)
+                existing_order = orders_db.get_order_by_id(order_id)
 
-                # 准备订单数据，直接使用 insert_or_update_order 的参数名
-                # 构建参数字典，只传递非 None 的值
+                # 已存在订单必须归属当前用户名下的账号：
+                # 归属其他账号（含 cookie_id 为 NULL 的历史孤儿订单）一律拒绝，
+                # 防止通过导入接口接管/认领他人订单
+                if existing_order and existing_order.get('cookie_id') not in user_cookies:
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'message': '无权操作此订单'
+                    })
+                    failed_count += 1
+                    continue
+
+                # 映射为 insert_or_update_order 的合法参数，映射外字段丢弃并提示
+                mapped_params, ignored_fields = _map_import_order_params(order_data)
                 insert_params = {
                     'order_id': order_id,
-                    'cookie_id': cookie_id
+                    'cookie_id': cookie_id,
+                    **mapped_params,
                 }
-
-                # 前端字段名 -> 数据库参数名映射
-                param_mapping = {
-                    'item_id': 'item_id',
-                    'buyer_id': 'buyer_id',
-                    'receiver_name': 'receiver_name',
-                    'receiver_phone': 'receiver_phone',
-                    'receiver_address': 'receiver_address',
-                    'receiver_city': 'receiver_city',
-                    'status': 'order_status',  # 注意：前端用 status，后端用 order_status
-                    'status_text': 'status_text',
-                    'order_time': 'order_time',
-                    'pay_time': 'pay_time',
-                    'quantity': 'quantity',
-                    'amount': 'amount',
-                    'item_title': 'item_title',
-                    'item_price': 'item_price',
-                    'item_image': 'item_image'
-                }
-
-                # 遍历订单数据，添加到参数字典
-                for field, value in order_data.items():
-                    if value is not None and field in param_mapping:
-                        param_name = param_mapping[field]
-                        insert_params[param_name] = value
 
                 # 使用 insert_or_update_order 统一处理
-                db_manager.insert_or_update_order(**insert_params)
+                if not orders_db.insert_or_update_order(**insert_params):
+                    results.append({
+                        'order_id': order_id,
+                        'success': False,
+                        'message': '写入订单失败'
+                    })
+                    failed_count += 1
+                    continue
 
+                message = '订单已更新' if existing_order else '订单已导入'
+                if ignored_fields:
+                    message += f"（已忽略字段: {', '.join(ignored_fields)}）"
                 results.append({
                     'order_id': order_id,
                     'success': True,
-                    'message': '订单已更新' if existing_order else '订单已导入'
+                    'message': message
                 })
 
                 success_count += 1

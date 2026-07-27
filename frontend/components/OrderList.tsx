@@ -1,10 +1,51 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Order, OrderStatus, Item, OrderSyncResponse } from '../types';
-import { getOrders, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems } from '../services/api';
-import { Search, MoreHorizontal, Truck, RefreshCw, Copy, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, User as UserIcon, Phone, MapPin, Upload, ExternalLink, Trash2 } from 'lucide-react';
+import { Order, OrderStatus, Item, OrderSyncResponse, AccountDetail } from '../types';
+import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails } from '../services/api';
+import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
-import RemoteImage from './ui/RemoteImage';
+import OrderItemImage from './ui/OrderItemImage';
+import BuyerAvatar from './ui/BuyerAvatar';
+
+// 买家身份来源标注：让「历史未保存」如实呈现，不伪装成成交时信息
+const BUYER_IDENTITY_LABELS: Record<string, string> = {
+  history_unsaved: '身份历史未保存',
+  missing: '身份待采集',
+};
+
+const SEARCH_DEBOUNCE_MS = 280;
+
+const buyerListLabel = (order: Order): string => {
+  if (order.buyer_display_name?.trim()) return order.buyer_display_name.trim();
+  const buyerId = String(order.buyer_id || '').trim();
+  return buyerId ? `买家 · ID 尾号 ${buyerId.slice(-4)}` : '买家 · ID 待补充';
+};
+
+const orderAmountLabel = (order: Order): string => {
+  if (typeof order.paid_amount_fen === 'number' && Number.isFinite(order.paid_amount_fen)) {
+    return `¥${(order.paid_amount_fen / 100).toFixed(2)}`;
+  }
+  const amount = String(order.amount ?? '').trim();
+  if (!amount) return '未记录';
+  return /^[¥￥]/.test(amount) ? amount : `¥${amount}`;
+};
+
+const orderTimeLabel = (order: Order): string => {
+  if (typeof order.ordered_at_utc === 'number' && Number.isFinite(order.ordered_at_utc)) {
+    const value = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(order.ordered_at_utc * 1000));
+    return `${value}（成交时间 · 上海）`;
+  }
+  if (order.created_at) return `${order.created_at}（创建时间回退）`;
+  return '时间未记录';
+};
 
 const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   const styles = {
@@ -40,40 +81,40 @@ const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
 
 const OrderList: React.FC = () => {
   const [orders, setOrders] = useState<Order[]>([]);
-  const [allOrders, setAllOrders] = useState<Order[]>([]); // 保存所有订单用于搜索
   const [items, setItems] = useState<Item[]>([]);
+  const [accounts, setAccounts] = useState<AccountDetail[]>([]);
+  const [accountFilter, setAccountFilter] = useState('');
+  const [startDate, setStartDate] = useState(''); // 成交时间区间起（YYYY-MM-DD，含）
+  const [endDate, setEndDate] = useState('');       // 成交时间区间止（YYYY-MM-DD，含）
+  const [dateError, setDateError] = useState('');   // 前端日期区间校验错误
   const [filter, setFilter] = useState('all');
-  const [searchText, setSearchText] = useState(''); // 搜索文本
+  const [searchText, setSearchText] = useState(''); // 输入框即时值
+  const [debouncedSearch, setDebouncedSearch] = useState(''); // 防抖后的请求值
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showImportModal, setShowImportModal] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [editingOrder, setEditingOrder] = useState<Partial<Order> | null>(null);
-  const [editForm, setEditForm] = useState<Partial<Order>>({});
-  const [importText, setImportText] = useState('');
+  const [importFile, setImportFile] = useState<File | null>(null);
   const [showShipModal, setShowShipModal] = useState(false);
   const [shipOrderId, setShipOrderId] = useState<string>('');
   const [shipLoading, setShipLoading] = useState(false);
   const [shipResult, setShipResult] = useState<{success: boolean; message: string} | null>(null);
-  const [importFile, setImportFile] = useState<File | null>(null);
-  const [importFormData, setImportFormData] = useState({
-    order_id: '',
-    item_id: '',
-    buyer_id: '',
-    receiver_name: '',
-    receiver_phone: '',
-    receiver_address: '',
-    status: 'pending_ship' as OrderStatus,
-    quantity: 1,
-    amount: ''
-  });
   const [syncingOrderId, setSyncingOrderId] = useState<string | null>(null);
   const [deletingOrderId, setDeletingOrderId] = useState<string | null>(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [syncResult, setSyncResult] = useState<OrderSyncResponse | null>(null);
+  // 请求代际号：旧响应到达时直接丢弃，避免慢请求覆盖新筛选结果
+  const requestGeneration = useRef(0);
+  const listAbortController = useRef<AbortController | null>(null);
+  const detailGeneration = useRef(0);
+  const detailAbortController = useRef<AbortController | null>(null);
   const itemNames = useMemo(
     () => Object.fromEntries(
       items
@@ -83,63 +124,67 @@ const OrderList: React.FC = () => {
     [items]
   );
 
-  // 搜索过滤订单
-  const filterOrders = (ordersToFilter: Order[]): Order[] => {
-    if (!searchText.trim()) {
-      return ordersToFilter;
-    }
+  // 账号 cookie_id → 展示名映射（备注优先），供多账号用户在列表行内识别订单归属
+  const accountNames = useMemo(
+    () => Object.fromEntries(
+      accounts.map((account) => [account.id, account.remark || account.note || account.id])
+    ),
+    [accounts]
+  );
 
-    const searchLower = searchText.toLowerCase().trim();
-    return ordersToFilter.filter(order =>
-      order.order_id?.toLowerCase().includes(searchLower) ||
-      order.item_id?.toLowerCase().includes(searchLower) ||
-      order.buyer_id?.toLowerCase().includes(searchLower) ||
-      order.item_title?.toLowerCase().includes(searchLower) ||
-      order.receiver_name?.toLowerCase().includes(searchLower) ||
-      order.receiver_phone?.toLowerCase().includes(searchLower)
-    );
+  // 仅多账号用户在行内显示账号标识（与筛选下拉一致）；单账号无歧义则不占用视觉空间
+  const accountLabelOf = (order: Order): string => {
+    if (accounts.length <= 1) return '';
+    const cookieId = String(order.cookie_id || '').trim();
+    if (!cookieId) return '';
+    return accountNames[cookieId] || cookieId;
   };
 
+  // 搜索防抖：输入停顿后才发起服务端搜索
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setPage(1);
+      setDebouncedSearch(searchText.trim());
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [searchText]);
+
   const loadOrders = async () => {
+      // 前端拦截「开始晚于结束」，与后端 422 同语义，避免无谓请求
+      if (startDate && endDate && startDate > endDate) {
+          setDateError('开始日期不得晚于结束日期');
+          return;
+      }
+      setDateError('');
+      const generation = ++requestGeneration.current;
+      listAbortController.current?.abort();
+      const controller = new AbortController();
+      listAbortController.current = controller;
       setLoading(true);
-
       try {
-          // 如果有搜索文本，加载所有页的数据；否则只加载当前页
-          if (searchText.trim()) {
-              // 搜索模式：循环加载所有页
-              let allOrdersData: Order[] = [];
-              let currentPage = 1;
-              let hasMore = true;
-
-              while (hasMore) {
-                  const res = await getOrders(undefined, filter, currentPage, 100);
-                  allOrdersData = [...allOrdersData, ...res.data];
-                  hasMore = currentPage < res.total_pages;
-                  currentPage++;
-              }
-
-              setAllOrders(allOrdersData);
-              setOrders(filterOrders(allOrdersData));
-              setTotalPages(1); // 搜索时不分页
-          } else {
-              // 普通模式：只加载当前页
-              const res = await getOrders(undefined, filter, page, 20);
-              setAllOrders(res.data);
-              setOrders(filterOrders(res.data));
-              setTotalPages(res.total_pages);
-          }
+          const res = await getOrders({
+              cookieId: accountFilter || undefined,
+              status: filter,
+              search: debouncedSearch || undefined,
+              startDate: startDate || undefined,
+              endDate: endDate || undefined,
+              page,
+              pageSize: 20,
+          }, controller.signal);
+          if (generation !== requestGeneration.current) return; // 过期响应
+          setOrders(res.data);
+          setTotal(res.total);
+          setTotalPages(Math.max(1, res.total_pages));
       } catch (e) {
+          if (generation !== requestGeneration.current || controller.signal.aborted) return;
           console.error('加载订单失败:', e);
           setPageNotice({ tone: 'error', text: e instanceof Error ? e.message : '订单加载失败' });
       } finally {
-          setLoading(false);
+          if (generation === requestGeneration.current) {
+              setLoading(false);
+          }
       }
   };
-
-  // 当订单数据改变时，重新过滤订单
-  useEffect(() => {
-    setOrders(filterOrders(allOrders));
-  }, [allOrders, searchText]);
 
   // 从订单的 item_id 查找对应的商品名称（通过标题匹配）
   const getItemNameById = (orderId: string, orderItemTitle?: string): string => {
@@ -173,14 +218,24 @@ const OrderList: React.FC = () => {
   };
 
   useEffect(() => {
-    loadOrders();
-  }, [filter, page, searchText]);
+    void loadOrders();
+  }, [filter, page, debouncedSearch, accountFilter, startDate, endDate]);
+
+  useEffect(() => {
+    return () => {
+      listAbortController.current?.abort();
+      detailAbortController.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     getItems().then((itemsList) => {
       setItems(itemsList);
     }).catch((e) => {
       console.error('加载商品列表失败:', e);
+    });
+    getAccountDetails().then(setAccounts).catch((e) => {
+      console.error('加载账号列表失败:', e);
     });
   }, []);
 
@@ -228,9 +283,38 @@ const OrderList: React.FC = () => {
       }
   };
 
-  const handleViewDetail = (order: Order) => {
+  const handleViewDetail = async (order: Order) => {
+    const generation = ++detailGeneration.current;
+    detailAbortController.current?.abort();
+    const controller = new AbortController();
+    detailAbortController.current = controller;
+    // 先用列表行立即呈现，再取真实详情（收货信息只在详情接口返回）
     setSelectedOrder(order);
+    setConfirmingDelete(false);
     setShowDetailModal(true);
+    setDetailLoading(true);
+    try {
+      const res = await getOrderDetail(order.order_id, controller.signal);
+      if (generation === detailGeneration.current && !controller.signal.aborted && res.data) {
+        setSelectedOrder(prev => (prev && prev.order_id === order.order_id ? { ...prev, ...res.data } : prev));
+      }
+    } catch (e) {
+      if (generation !== detailGeneration.current || controller.signal.aborted) return;
+      console.error('加载订单详情失败:', e);
+      setPageNotice({ tone: 'error', text: '订单详情加载失败，展示的是列表缓存数据' });
+    } finally {
+      if (generation === detailGeneration.current) {
+        setDetailLoading(false);
+      }
+    }
+  };
+
+  const closeDetail = () => {
+    detailGeneration.current += 1;
+    detailAbortController.current?.abort();
+    detailAbortController.current = null;
+    setDetailLoading(false);
+    setShowDetailModal(false);
   };
 
   const handleEdit = (order: Order) => {
@@ -280,16 +364,27 @@ const OrderList: React.FC = () => {
     }
   };
 
+  const selectImportFile = (file: File | null) => {
+    if (file && !file.name.toLowerCase().endsWith('.xlsx')) {
+      setImportFile(null);
+      setPageNotice({ tone: 'error', text: '仅支持 .xlsx 文件，请重新选择' });
+      return;
+    }
+    setImportFile(file);
+  };
+
   const handleImportOrders = async () => {
+    if (!importFile) return;
     try {
-      const orders = JSON.parse(importText);
-      await importOrders(Array.isArray(orders) ? orders : [orders]);
+      const formData = new FormData();
+      formData.append('file', importFile);
+      await importOrders(formData);
       setShowImportModal(false);
-      setImportText('');
+      setImportFile(null);
       await loadOrders();
       setPageNotice({ tone: 'success', text: '订单导入成功' });
     } catch (error) {
-      setPageNotice({ tone: 'error', text: error instanceof Error ? `导入失败：${error.message}` : '导入失败，请检查 JSON 格式' });
+      setPageNotice({ tone: 'error', text: error instanceof Error ? `导入失败：${error.message}` : '导入失败，请检查 Excel 文件' });
     }
   };
 
@@ -311,17 +406,19 @@ const OrderList: React.FC = () => {
     }
   };
 
+  // 删除仅入口于详情弹窗危险区，且需先点一次「确认删除」二次确认
   const handleDelete = async (orderId: string) => {
-    if (!confirm('确认删除该订单吗？删除后无法恢复。')) return;
     setDeletingOrderId(orderId);
     try {
       await deleteOrder(orderId);
-      setAllOrders(prev => prev.filter(o => o.order_id !== orderId));
+      closeDetail();
+      setSelectedOrder(null);
+      setConfirmingDelete(false);
       setPageNotice({ tone: 'success', text: '订单已删除' });
+      await loadOrders();
     } catch (error: any) {
       console.error('删除订单失败:', error);
       setPageNotice({ tone: 'error', text: error?.message || '删除失败，请重试' });
-      await loadOrders();
     } finally {
       setDeletingOrderId(null);
     }
@@ -336,7 +433,7 @@ const OrderList: React.FC = () => {
           <p className="text-gray-500 mt-2 font-medium">查看所有闲鱼交易记录与状态。</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-            <button onClick={loadOrders} className="p-3 rounded-2xl bg-white border border-gray-100 text-gray-600 hover:bg-gray-50 hover:text-black transition-colors shadow-sm">
+            <button aria-label="刷新订单列表" onClick={loadOrders} className="p-3 rounded-2xl bg-white border border-gray-100 text-gray-600 hover:bg-gray-50 hover:text-black transition-colors shadow-sm">
                 <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
             </button>
             <button
@@ -391,75 +488,155 @@ const OrderList: React.FC = () => {
              ].map(opt => (
                  <button
                     key={opt.k}
-                    onClick={() => { setFilter(opt.k); setPage(1); setSearchText(''); }}
+                    onClick={() => {
+                      setFilter(opt.k);
+                      setPage(1);
+                      setSearchText('');
+                      setDebouncedSearch('');
+                    }}
                     className={`px-5 py-2 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${filter === opt.k ? 'bg-white text-black shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                  >
                     {opt.v}
                  </button>
              ))}
           </div>
-          <div className="relative w-full md:w-auto group">
-             <Search className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-[#FFE815] transition-colors" />
-             <input
-                 type="text"
-                 placeholder="搜索订单号/商品/买家..."
-                 value={searchText}
-                 onChange={(e) => { setSearchText(e.target.value); setPage(1); }}
-                 className="ios-input pl-10 pr-4 py-2.5 rounded-xl w-full md:w-64 bg-white border-none shadow-sm focus:ring-0"
-             />
+          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full md:w-auto">
+            {accounts.length > 1 && (
+              <select
+                value={accountFilter}
+                onChange={(e) => {
+                  setAccountFilter(e.target.value);
+                  setPage(1);
+                }}
+                className="ios-input px-3 py-2.5 rounded-xl bg-white border-none shadow-sm text-sm font-medium text-gray-700 min-h-11"
+                aria-label="按账号筛选"
+              >
+                <option value="">全部账号</option>
+                {accounts.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    {account.remark || account.note || account.id}
+                  </option>
+                ))}
+              </select>
+            )}
+            <div className="flex items-center gap-1.5 text-sm">
+              <input
+                type="date"
+                value={startDate}
+                max={endDate || undefined}
+                onChange={(e) => {
+                  setStartDate(e.target.value);
+                  setPage(1);
+                }}
+                className="ios-input px-3 py-2.5 rounded-xl bg-white border-none shadow-sm text-sm font-medium text-gray-700 min-h-11"
+                aria-label="成交开始日期"
+              />
+              <span className="text-gray-400">至</span>
+              <input
+                type="date"
+                value={endDate}
+                min={startDate || undefined}
+                onChange={(e) => {
+                  setEndDate(e.target.value);
+                  setPage(1);
+                }}
+                className="ios-input px-3 py-2.5 rounded-xl bg-white border-none shadow-sm text-sm font-medium text-gray-700 min-h-11"
+                aria-label="成交结束日期"
+              />
+              {(startDate || endDate) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStartDate('');
+                    setEndDate('');
+                    setDateError('');
+                    setPage(1);
+                  }}
+                  className="p-2 rounded-xl text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors min-h-11"
+                  aria-label="清除日期筛选"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+            <div className="relative w-full md:w-auto group">
+               <Search className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-[#FFE815] transition-colors" />
+               <input
+                   type="text"
+                   placeholder="搜索订单号/商品/买家..."
+                   value={searchText}
+                   onChange={(e) => setSearchText(e.target.value)}
+                   className="ios-input pl-10 pr-4 py-2.5 rounded-xl w-full md:w-64 bg-white border-none shadow-sm focus:ring-0"
+               />
+            </div>
           </div>
         </div>
+
+        {dateError && (
+          <div className="px-4 py-2 bg-red-50 border-b border-red-100 text-sm font-medium text-red-600">
+            {dateError}
+          </div>
+        )}
 
         {/* Mobile order list */}
         <div className="md:hidden divide-y divide-gray-100 min-h-[320px]">
           {orders.map((order) => (
             <div key={`mobile-${order.id}`} className="p-4 space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
+              <div className="flex items-start gap-3">
+                <div className="w-16 h-16 rounded-xl bg-gray-100 overflow-hidden border border-gray-100 flex-shrink-0">
+                  <OrderItemImage
+                    orderId={order.order_id}
+                    directSrc={order.item_image}
+                    alt={order.item_title || '订单商品图片'}
+                    className="w-full h-full object-cover"
+                    fallback={<div className="w-full h-full flex items-center justify-center text-gray-300"><PackageCheck /></div>}
+                  />
+                </div>
+                <div className="min-w-0 flex-1">
                   <div className="font-bold text-gray-900 text-sm line-clamp-2">
                     {getItemNameById(order.item_id, order.item_title)}
                   </div>
                   <div className="mt-1 text-xs text-gray-500 break-all">订单号：{order.order_id}</div>
+                  {accountLabelOf(order) && (
+                    <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-[11px] font-semibold text-gray-600">
+                      {accountLabelOf(order)}
+                    </div>
+                  )}
                 </div>
                 <StatusBadge status={order.status} />
               </div>
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <div>
                   <div className="text-gray-400">买家</div>
-                  <div className="mt-1 font-semibold text-gray-700 break-all">{order.buyer_id || '待补充'}</div>
+                  <div className="mt-1 flex items-center gap-2">
+                    <BuyerAvatar
+                      src={order.buyer_avatar_url}
+                      className="w-8 h-8 rounded-full object-cover border border-gray-100 flex-shrink-0"
+                    />
+                    <div className="font-semibold text-gray-700 break-all">
+                      {buyerListLabel(order)}
+                    </div>
+                  </div>
+                  {!order.buyer_display_name && BUYER_IDENTITY_LABELS[order.buyer_identity || ''] && (
+                    <div className="mt-0.5 text-[10px] text-gray-400">{BUYER_IDENTITY_LABELS[order.buyer_identity || '']}</div>
+                  )}
                 </div>
                 <div className="text-right">
                   <div className="text-gray-400">实付金额</div>
-                  <div className="mt-1 text-base font-extrabold text-gray-900">¥{order.amount || '0'}</div>
+                  <div className="mt-1 text-base font-extrabold text-gray-900">{orderAmountLabel(order)}</div>
                 </div>
               </div>
               <div className="flex items-center justify-between gap-2 text-xs text-gray-400">
                 <span>数量 {order.quantity || 1}</span>
-                <span>{order.created_at || '时间待补充'}</span>
+                <span>{orderTimeLabel(order)}</span>
               </div>
               <div className="flex flex-wrap items-center gap-2 pt-1">
                 {order.status === 'pending_ship' && (
-                  <button onClick={() => handleShip(order.order_id)} className="px-3 py-2 rounded-lg bg-black text-white text-xs font-bold">
+                  <button onClick={() => handleShip(order.order_id)} className="px-3 py-2 min-h-11 rounded-lg bg-black text-white text-xs font-bold">
                     立即发货
                   </button>
                 )}
-                <button onClick={() => handleViewDetail(order)} className="px-3 py-2 rounded-lg bg-blue-50 text-blue-700 text-xs font-bold">详情</button>
-                <button onClick={() => handleEdit(order)} className="px-3 py-2 rounded-lg bg-gray-100 text-gray-700 text-xs font-bold">编辑</button>
-                <button
-                  onClick={() => handleSyncSingle(order.order_id)}
-                  disabled={syncingOrderId === order.order_id}
-                  className="px-3 py-2 rounded-lg bg-green-50 text-green-700 text-xs font-bold disabled:opacity-50"
-                >
-                  核对状态
-                </button>
-                <a
-                  href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="px-3 py-2 rounded-lg bg-amber-50 text-amber-700 text-xs font-bold"
-                >
-                  闲鱼详情
-                </a>
+                <button onClick={() => handleViewDetail(order)} className="px-3 py-2 min-h-11 rounded-lg bg-blue-50 text-blue-700 text-xs font-bold">详情</button>
               </div>
             </div>
           ))}
@@ -482,9 +659,10 @@ const OrderList: React.FC = () => {
                 <tr key={order.id} className="hover:bg-[#FFFDE7]/50 transition-colors group">
                   <td className="px-6 py-5">
                     <div className="flex items-center gap-5">
-                      <div className="w-14 h-14 rounded-xl bg-gray-100 overflow-hidden shadow-sm border border-gray-100 flex-shrink-0">
-                        <RemoteImage
-                          src={order.item_image}
+                      <div className="w-16 h-16 rounded-xl bg-gray-100 overflow-hidden shadow-sm border border-gray-100 flex-shrink-0">
+                        <OrderItemImage
+                          orderId={order.order_id}
+                          directSrc={order.item_image}
                           alt={order.item_title || '订单商品图片'}
                           className="w-full h-full object-cover"
                           fallback={<div className="w-full h-full flex items-center justify-center text-gray-300"><PackageCheck /></div>}
@@ -495,35 +673,34 @@ const OrderList: React.FC = () => {
                           {getItemNameById(order.item_id, order.item_title)}
                         </div>
                         <div className="text-xs text-gray-500 mt-1 font-medium">订单ID: {order.order_id}</div>
-                        <div className="text-xs text-gray-400 mt-0.5">数量: {order.quantity} • {order.created_at}</div>
+                        <div className="text-xs text-gray-400 mt-0.5">数量: {order.quantity} • {orderTimeLabel(order)}</div>
+                        {accountLabelOf(order) && (
+                          <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded-md bg-gray-100 text-[11px] font-semibold text-gray-600">
+                            {accountLabelOf(order)}
+                          </div>
+                        )}
                       </div>
                     </div>
                   </td>
                   <td className="px-6 py-5">
-                      <div className="flex flex-col gap-1">
-                          <div className="text-xs text-gray-500">买家ID</div>
-                          <div className="text-sm font-bold text-gray-800">{order.buyer_id}</div>
-                          {order.receiver_name && (
-                              <>
-                                  <div className="text-xs text-gray-500">收货人</div>
-                                  <div className="text-xs text-gray-600">{order.receiver_name}</div>
-                              </>
-                          )}
-                          {order.receiver_phone && (
-                              <>
-                                  <div className="text-xs text-gray-500">联系电话</div>
-                                  <div className="text-xs text-gray-600 font-mono">{order.receiver_phone}</div>
-                              </>
-                          )}
-                          {order.receiver_address && (
-                              <>
-                                  <div className="text-xs text-gray-500">收货地址</div>
-                                  <div className="text-xs text-gray-600 line-clamp-1">{order.receiver_address}</div>
-                              </>
-                          )}
+                      <div className="flex items-center gap-3">
+                          <BuyerAvatar
+                            src={order.buyer_avatar_url}
+                            className="w-9 h-9 rounded-full object-cover border border-gray-100 flex-shrink-0"
+                          />
+                          <div className="min-w-0">
+                              <div className="text-sm font-bold text-gray-800 line-clamp-1">
+                                {buyerListLabel(order)}
+                              </div>
+                              <div className="text-xs text-gray-400 line-clamp-1">
+                                {order.buyer_display_name
+                                  ? `ID 尾号: ${String(order.buyer_id || '').slice(-4) || '待补充'}`
+                                  : (BUYER_IDENTITY_LABELS[order.buyer_identity || ''] || 'ID')}
+                              </div>
+                          </div>
                       </div>
                   </td>
-                  <td className="px-6 py-5 text-base font-extrabold text-gray-900 font-feature-settings-tnum">¥{order.amount}</td>
+                  <td className="px-6 py-5 text-base font-extrabold text-gray-900 font-feature-settings-tnum">{orderAmountLabel(order)}</td>
                   <td className="px-6 py-5">
                     <StatusBadge status={order.status} />
                   </td>
@@ -536,44 +713,12 @@ const OrderList: React.FC = () => {
                             立即发货
                         </button>
                     )}
-                    <a
-                      href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="mr-2 inline-flex text-gray-400 hover:text-amber-600 p-2 rounded-xl hover:bg-amber-50 transition-colors"
-                      title="查看闲鱼详情"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
                     <button
                       onClick={() => handleViewDetail(order)}
-                      className="mr-2 text-gray-400 hover:text-blue-600 p-2 rounded-xl hover:bg-blue-50 transition-colors"
-                      title="查看详情"
+                      className="text-gray-400 hover:text-blue-600 p-2 rounded-xl hover:bg-blue-50 transition-colors"
+                      title="查看详情（编辑、同步、删除入口在详情内）"
                     >
                       <Eye className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={() => handleEdit(order)}
-                      className="mr-2 text-gray-400 hover:text-black p-2 rounded-xl hover:bg-gray-100 transition-colors"
-                      title="编辑订单"
-                    >
-                      <Edit className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={() => handleSyncSingle(order.order_id)}
-                      disabled={syncingOrderId === order.order_id}
-                      className="mr-2 text-gray-400 hover:text-green-600 p-2 rounded-xl hover:bg-green-50 transition-colors disabled:opacity-50"
-                      title="同步订单"
-                    >
-                      <RefreshCw className={`w-4 h-4 ${syncingOrderId === order.order_id ? 'animate-spin' : ''}`} />
-                    </button>
-                    <button
-                      onClick={() => handleDelete(order.order_id)}
-                      disabled={deletingOrderId === order.order_id}
-                      className="text-gray-400 hover:text-red-500 p-2 rounded-xl hover:bg-red-50 transition-colors disabled:opacity-50"
-                      title="删除订单"
-                    >
-                      <Trash2 className="w-4 h-4" />
                     </button>
                   </td>
                 </tr>
@@ -585,10 +730,11 @@ const OrderList: React.FC = () => {
         {/* Pagination */}
         <div className="p-4 border-t border-gray-50 flex items-center justify-between bg-white">
             <div className="text-sm text-gray-500 font-medium pl-2">
-                第 {page} 页 / 共 {totalPages} 页
+                第 {page} 页 / 共 {totalPages} 页 · {total} 条
             </div>
             <div className="flex gap-2">
                 <button
+                    aria-label="上一页"
                     disabled={page <= 1}
                     onClick={() => setPage(p => p - 1)}
                     className="p-2.5 rounded-xl bg-gray-50 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed text-gray-600 transition-colors"
@@ -596,6 +742,7 @@ const OrderList: React.FC = () => {
                     <ChevronLeft className="w-5 h-5" />
                 </button>
                 <button
+                    aria-label="下一页"
                     disabled={page >= totalPages}
                     onClick={() => setPage(p => p + 1)}
                     className="p-2.5 rounded-xl bg-gray-50 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed text-gray-600 transition-colors"
@@ -614,7 +761,7 @@ const OrderList: React.FC = () => {
               <div className="flex items-center justify-between w-full">
                 <h3 className="text-2xl font-extrabold text-gray-900">订单详情</h3>
                 <button
-                  onClick={() => setShowDetailModal(false)}
+                  onClick={closeDetail}
                   className="p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors"
                 >
                   <X className="w-5 h-5 text-gray-600" />
@@ -637,15 +784,15 @@ const OrderList: React.FC = () => {
                   </div>
                   <div>
                     <div className="text-xs text-gray-500 mb-1">实付金额</div>
-                    <div className="text-lg font-extrabold text-gray-900">¥{selectedOrder.amount}</div>
+                    <div className="text-lg font-extrabold text-gray-900">{orderAmountLabel(selectedOrder)}</div>
                   </div>
                   <div>
                     <div className="text-xs text-gray-500 mb-1">数量</div>
                     <div className="font-bold text-gray-900">{selectedOrder.quantity}</div>
                   </div>
                   <div className="col-span-2">
-                    <div className="text-xs text-gray-500 mb-1">创建时间</div>
-                    <div className="text-sm font-medium text-gray-700">{selectedOrder.created_at}</div>
+                    <div className="text-xs text-gray-500 mb-1">订单时间</div>
+                    <div className="text-sm font-medium text-gray-700">{orderTimeLabel(selectedOrder)}</div>
                   </div>
                   <div className="col-span-2 border-t border-gray-200 pt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
@@ -676,8 +823,9 @@ const OrderList: React.FC = () => {
               <div className="space-y-4">
                 <h4 className="text-lg font-bold text-gray-800">商品信息</h4>
                 <div className="p-4 bg-gray-50 rounded-xl flex items-center gap-4">
-                  <RemoteImage
-                    src={selectedOrder.item_image}
+                  <OrderItemImage
+                    orderId={selectedOrder.order_id}
+                    directSrc={selectedOrder.item_image}
                     alt={selectedOrder.item_title || '订单商品图片'}
                     className="w-20 h-20 rounded-xl object-cover border border-gray-200"
                     fallback={(
@@ -694,6 +842,9 @@ const OrderList: React.FC = () => {
                     {selectedOrder.item_price && (
                       <div className="text-sm text-gray-500 mt-1">标价: ¥{selectedOrder.item_price}</div>
                     )}
+                    {selectedOrder.item_identity === 'catalog_fallback' && (
+                      <div className="text-xs text-amber-600 mt-1">展示信息来自商品目录兜底，非成交时快照</div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -702,10 +853,25 @@ const OrderList: React.FC = () => {
               <div className="space-y-4">
                 <h4 className="text-lg font-bold text-gray-800">买家信息</h4>
                 <div className="p-4 bg-gray-50 rounded-xl space-y-3">
-                  <div>
-                    <div className="text-xs text-gray-500 mb-1">买家ID</div>
-                    <div className="font-bold text-gray-900">{selectedOrder.buyer_id}</div>
+                  <div className="flex items-center gap-3">
+                    <BuyerAvatar
+                      src={selectedOrder.buyer_avatar_url}
+                      className="w-10 h-10 rounded-full object-cover border border-gray-200 flex-shrink-0"
+                    />
+                    <div>
+                      <div className="font-bold text-gray-900">
+                        {selectedOrder.buyer_display_name || selectedOrder.buyer_id || '待补充'}
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {selectedOrder.buyer_display_name
+                          ? `买家ID: ${selectedOrder.buyer_id}`
+                          : (BUYER_IDENTITY_LABELS[selectedOrder.buyer_identity || ''] || `买家ID: ${selectedOrder.buyer_id || '未知'}`)}
+                      </div>
+                    </div>
                   </div>
+                  {detailLoading && (
+                    <div className="text-xs text-gray-400">正在加载收货信息…</div>
+                  )}
                   {selectedOrder.receiver_name && (
                     <div>
                       <div className="text-xs text-gray-500 mb-1">收货人</div>
@@ -726,12 +892,71 @@ const OrderList: React.FC = () => {
                   )}
                 </div>
               </div>
+
+              {/* 更多操作 */}
+              <div className="space-y-4">
+                <h4 className="text-lg font-bold text-gray-800">更多操作</h4>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => {
+                      closeDetail();
+                      handleEdit(selectedOrder);
+                    }}
+                    className="px-4 py-2.5 min-h-11 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-800 text-sm font-bold transition-colors flex items-center gap-2"
+                  >
+                    <Edit className="w-4 h-4" /> 编辑订单
+                  </button>
+                  <button
+                    onClick={() => handleSyncSingle(selectedOrder.order_id)}
+                    disabled={syncingOrderId === selectedOrder.order_id}
+                    className="px-4 py-2.5 min-h-11 rounded-xl bg-green-50 hover:bg-green-100 text-green-700 text-sm font-bold transition-colors flex items-center gap-2 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${syncingOrderId === selectedOrder.order_id ? 'animate-spin' : ''}`} /> 同步此订单
+                  </button>
+                  <a
+                    href={`https://www.goofish.com/order-detail?orderId=${selectedOrder.order_id}&role=seller`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2.5 min-h-11 rounded-xl bg-amber-50 hover:bg-amber-100 text-amber-700 text-sm font-bold transition-colors flex items-center gap-2"
+                  >
+                    <ExternalLink className="w-4 h-4" /> 闲鱼详情
+                  </a>
+                </div>
+                {/* 危险区：删除需二次确认 */}
+                <div className="border border-red-100 bg-red-50/50 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-xs text-red-600 font-medium">删除订单后无法恢复。</div>
+                  {confirmingDelete ? (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setConfirmingDelete(false)}
+                        className="px-4 py-2 min-h-11 rounded-xl bg-white border border-gray-200 text-gray-700 text-sm font-bold"
+                      >
+                        取消
+                      </button>
+                      <button
+                        onClick={() => handleDelete(selectedOrder.order_id)}
+                        disabled={deletingOrderId === selectedOrder.order_id}
+                        className="px-4 py-2 min-h-11 rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-bold disabled:opacity-50"
+                      >
+                        确认删除
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmingDelete(true)}
+                      className="px-4 py-2 min-h-11 rounded-xl bg-white border border-red-200 text-red-600 hover:bg-red-50 text-sm font-bold flex items-center gap-2"
+                    >
+                      <Trash2 className="w-4 h-4" /> 删除订单
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div className="modal-footer">
               <div className="flex gap-3 w-full">
                 <button
-                  onClick={() => setShowDetailModal(false)}
+                  onClick={closeDetail}
                   className="flex-1 px-6 py-3 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-800 font-bold transition-colors"
                 >
                   关闭
@@ -739,7 +964,7 @@ const OrderList: React.FC = () => {
                 {selectedOrder.status === 'pending_ship' && (
                   <button
                     onClick={() => {
-                      setShowDetailModal(false);
+                      closeDetail();
                       handleShip(selectedOrder.order_id);
                     }}
                     className="flex-1 px-6 py-3 rounded-xl ios-btn-primary font-bold shadow-lg shadow-yellow-200"
@@ -775,13 +1000,12 @@ const OrderList: React.FC = () => {
                 <label className="block text-sm font-bold text-gray-700 mb-2">选择Excel文件</label>
                 <input
                   type="file"
-                  accept=".xlsx,.xls"
-                  onChange={(e) => setImportFile(e.target.files?.[0] || null)}
+                  accept=".xlsx"
+                  onChange={(e) => selectImportFile(e.target.files?.[0] || null)}
                   className="w-full ios-input px-4 py-3 rounded-xl text-sm"
                 />
-                <p className="text-xs text-gray-500 mt-2">支持 .xlsx 和 .xls 格式</p>
+                <p className="text-xs text-gray-500 mt-2">仅支持 .xlsx 格式</p>
               </div>
-
               {importFile && (
                 <div className="p-3 bg-blue-50 rounded-xl">
                   <div className="flex items-center gap-2">

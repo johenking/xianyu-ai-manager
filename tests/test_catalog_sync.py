@@ -184,36 +184,36 @@ class OrderCatalogAssociationTests(unittest.TestCase):
                 "account-1": "cookie-one",
                 "account-2": "cookie-two",
             },
-            get_item_catalog_lookup=lambda _cookie_ids: {
-                ("account-1", "shared-item"): {
-                    "item_title": "账号一商品",
-                    "item_price": "10",
-                    "item_image": "https://img.alicdn.com/one.jpg",
-                },
-                ("account-2", "shared-item"): {
-                    "item_title": "账号二商品",
-                    "item_price": "20",
-                    "item_image": "https://img.alicdn.com/two.jpg",
-                },
+            query_orders=lambda _cookie_ids, **_kwargs: {
+                "total": 2,
+                "items": [
+                    {
+                        "order_id": f"order-{cookie_id}",
+                        "cookie_id": cookie_id,
+                        "item_id": "shared-item",
+                        "order_status": "completed",
+                        "created_at": "2026-07-20 12:00:00",
+                        "catalog_title": f"账号{label}商品",
+                        "catalog_price": price,
+                        "catalog_image": f"https://img.alicdn.com/{image}.jpg",
+                    }
+                    for cookie_id, label, price, image in (
+                        ("account-1", "一", "10", "one"),
+                        ("account-2", "二", "20", "two"),
+                    )
+                ],
             },
-            get_orders_by_cookie=lambda cookie_id, limit=1000: [{
-                "order_id": f"order-{cookie_id}",
-                "item_id": "shared-item",
-                "status": "completed",
-                "created_at": "2026-07-20 12:00:00",
-            }],
+            get_customer_profiles=lambda _cookie_ids: {},
         )
 
-        with (
-            patch("db_manager.db_manager", fake_db),
-            patch("reply_server.log_with_user"),
-        ):
+        with patch("reply_server.log_with_user"):
             response = get_user_orders(
                 current_user={"user_id": 1},
                 page=1,
                 page_size=20,
                 cookie_id=None,
                 status=None,
+                orders_db=fake_db,
             )
 
         rows = {row["cookie_id"]: row for row in response["data"]}

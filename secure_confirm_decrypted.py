@@ -58,15 +58,8 @@ class SecureConfirm:
                     logger.debug(f"【{self.cookie_id}】获取到真实商品ID: {item_id}")
                     return item_id
 
-            # 如果该账号没有商品，尝试获取任意一个商品ID
-            all_items = db_manager.get_all_items()
-            if all_items:
-                item_id = all_items[0].get('item_id')
-                if item_id:
-                    logger.debug(f"【{self.cookie_id}】使用其他账号的商品ID: {item_id}")
-                    return item_id
-
-            logger.warning(f"【{self.cookie_id}】数据库中没有找到任何商品ID")
+            # 该账号没有商品时不再兜底使用其他账号的商品ID（跨租户数据滥用），直接返回 None
+            logger.warning(f"【{self.cookie_id}】该账号没有可用的商品ID")
             return None
 
         except Exception as e:

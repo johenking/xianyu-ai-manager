@@ -771,6 +771,309 @@ def _account_login_metadata_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _order_identity_snapshots_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    # 订单可信化：成交时身份快照列。快照语义为“只填空值 + 来源等级棘轮”，
+    # 商品后续改图/改标题/下架不影响已成交订单的展示；写入守卫在 db_manager。
+    # 本迁移只做 DDL，历史数据解析与回填一律走 backfill_order_snapshots.py。
+    # 开发库可能已被早期即席 ALTER 提前加过 item_image，_add_column 幂等兼容；
+    # 空库（无 orders 表）直接跳过。旧 WIP 已占用 2026072601 的环境由
+    # 2026072603 修复迁移收敛，历史 schema_migrations 账本保持不变。
+    orders_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone()
+    if not orders_exists:
+        return
+    # 规范化时间与金额（NULL = 未解析成功，绝不用 0 冒充缺失）
+    _add_column(cursor, "orders", "ordered_at_utc REAL")
+    _add_column(cursor, "orders", "ordered_at_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "paid_amount_fen INTEGER")
+    # 商品成交快照
+    _add_column(cursor, "orders", "item_title TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_image TEXT DEFAULT ''")
+    _add_column(cursor, "orders", "item_image_cache_key TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_snapshot_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_snapshot_at REAL")
+    # 买家成交快照
+    _add_column(cursor, "orders", "buyer_nickname TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_avatar_url TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_snapshot_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "buyer_snapshot_at REAL")
+
+
+def _business_observability_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    # 经营驾驶舱基础：客户身份档案 + 聚合查询索引。
+    # customer_profiles 只存“当前可用身份”（昵称/头像/观察时间），
+    # 行为计数（有效单量/退款量）一律查询时从 orders 现算，避免增量计数器漂移。
+    # 账号删除路径显式清理本表（SQLite 外键未必启用，不依赖 CASCADE）。
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS customer_profiles (
+            cookie_id TEXT NOT NULL,
+            buyer_id TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            avatar_url TEXT NOT NULL DEFAULT '',
+            profile_source TEXT NOT NULL DEFAULT '',
+            first_observed_at REAL NOT NULL,
+            last_observed_at REAL NOT NULL,
+            observation_count INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            PRIMARY KEY (cookie_id, buyer_id),
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        ) WITHOUT ROWID
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_profiles_last_observed "
+        "ON customer_profiles(cookie_id, last_observed_at DESC)"
+    )
+    orders_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone()
+    if not orders_exists:
+        return
+    # 索引列逐一防卫：buyer_id 属基础建表列，但存量测试/极简库可能没有；
+    # ordered_at_utc 由同批 2026072601 保证，防卫代价为零，口径统一。
+    order_columns = _columns(cursor, "orders")
+    if {"cookie_id", "buyer_id"} <= order_columns:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_buyer ON orders(cookie_id, buyer_id)"
+        )
+    if {"cookie_id", "ordered_at_utc"} <= order_columns:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_ordered_at ON orders(cookie_id, ordered_at_utc)"
+        )
+
+
+def _order_identity_schema_repair_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
+    """收敛曾把 2026072601 仅用于 item_image 的旧 WIP 数据库。
+
+    两个被复用的迁移体均为幂等 DDL；新版本只补缺失列、customer_profiles 与索引，
+    不删除、不改写任何历史迁移账本记录，也不写订单业务数据。
+    """
+    _order_identity_snapshots_v1(cursor, db_path)
+    _business_observability_v1(cursor, db_path)
+
+
+def _order_item_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """为商品标题与图片分别记录真实来源，兼容保留旧组级来源。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    _add_column(cursor, "orders", "item_title_source TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "orders", "item_image_source TEXT NOT NULL DEFAULT ''")
+    cursor.execute(
+        "UPDATE orders SET item_title_source = item_snapshot_source"
+        " WHERE item_title != '' AND item_title_source = ''"
+    )
+    item_info_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_info'"
+    ).fetchone()
+    if item_info_exists:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = CASE"
+            " WHEN item_snapshot_source = 'order_list' AND EXISTS ("
+            "   SELECT 1 FROM item_info ci"
+            "   WHERE ci.cookie_id = orders.cookie_id AND ci.item_id = orders.item_id"
+            "     AND ci.item_image = orders.item_image"
+            " ) THEN 'catalog'"
+            " WHEN item_snapshot_source = 'catalog_metadata' THEN 'catalog_backfill'"
+            " WHEN item_snapshot_source IN ('', 'history_unsaved') THEN 'catalog_backfill'"
+            " ELSE item_snapshot_source END"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+    else:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = CASE"
+            " WHEN item_snapshot_source IN ('', 'history_unsaved') THEN 'catalog_backfill'"
+            " ELSE item_snapshot_source END"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+
+
+def _customer_profile_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """把历史聚合来源拆成昵称/头像字段级来源，同时保留兼容列。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'customer_profiles'"
+    ).fetchone():
+        return
+    _add_column(
+        cursor,
+        "customer_profiles",
+        "display_name_source TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column(
+        cursor,
+        "customer_profiles",
+        "avatar_source TEXT NOT NULL DEFAULT ''",
+    )
+    cursor.execute(
+        "UPDATE customer_profiles SET display_name_source = profile_source"
+        " WHERE display_name != '' AND display_name_source = ''"
+    )
+    cursor.execute(
+        "UPDATE customer_profiles SET avatar_source = profile_source"
+        " WHERE avatar_url != '' AND avatar_source = ''"
+    )
+
+
+def _order_buyer_field_sources_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """拆分订单买家昵称/头像来源，并修复旧 WIP 历史图片来源。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    _add_column(
+        cursor,
+        "orders",
+        "buyer_nickname_source TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column(
+        cursor,
+        "orders",
+        "buyer_avatar_source TEXT NOT NULL DEFAULT ''",
+    )
+    cursor.execute(
+        "UPDATE orders SET buyer_nickname_source = buyer_snapshot_source"
+        " WHERE buyer_nickname != '' AND buyer_nickname_source = ''"
+    )
+    cursor.execute(
+        "UPDATE orders SET buyer_avatar_source = buyer_snapshot_source"
+        " WHERE buyer_avatar_url != '' AND buyer_avatar_source = ''"
+    )
+
+    # 早期 WIP 把 2026072601 仅用于 item_image；这类非空图片是历史目录
+    # 回填，而不是由当前 item_info URL 是否仍相等来决定来源。
+    old_image_wip = cursor.execute(
+        "SELECT 1 FROM schema_migrations"
+        " WHERE version = '2026072601' AND name = 'order_item_image_v1'"
+    ).fetchone()
+    if old_image_wip:
+        cursor.execute(
+            "UPDATE orders SET item_image_source = 'catalog_backfill',"
+            " item_snapshot_source = CASE"
+            "   WHEN item_snapshot_source IN ('', 'history_unsaved', 'catalog_metadata')"
+            "   THEN 'catalog_backfill' ELSE item_snapshot_source END"
+            " WHERE item_image != '' AND item_image_source = ''"
+        )
+
+
+def _order_query_covering_index_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """支持账号分组、标准化成交时间倒序与稳定 order_id 次序。"""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'orders'"
+    ).fetchone():
+        return
+    if {"cookie_id", "ordered_at_utc", "order_id"} <= _columns(cursor, "orders"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_ordered_order"
+            " ON orders(cookie_id, ordered_at_utc DESC, order_id DESC)"
+        )
+
+
+def _tenant_isolation_hardening_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """租户隔离加固：修正发货规则归属并补租户过滤索引。
+
+    历史 legacy 启动逻辑会把 user_id IS NULL 的规则批量划给 admin，
+    可能留下「规则归属 ≠ 所绑卡券归属」的脏数据；这类规则在匹配时
+    会把他人卡券内容发出去。以卡券归属为准修正，卡券主人不受损。
+    """
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    rules_ready = (
+        {"delivery_rules", "cards"} <= tables
+        and "user_id" in _columns(cursor, "delivery_rules")
+        and "user_id" in _columns(cursor, "cards")
+    )
+    if rules_ready:
+        cursor.execute(
+            "UPDATE delivery_rules SET user_id = ("
+            "  SELECT user_id FROM cards WHERE cards.id = delivery_rules.card_id"
+            ") WHERE card_id IS NOT NULL AND EXISTS ("
+            "  SELECT 1 FROM cards"
+            "  WHERE cards.id = delivery_rules.card_id"
+            "    AND cards.user_id IS NOT NULL"
+            "    AND (delivery_rules.user_id IS NULL"
+            "         OR cards.user_id != delivery_rules.user_id)"
+            ")"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_rules_user"
+            " ON delivery_rules(user_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cards_user ON cards(user_id)"
+        )
+    if "cookies" in tables and "user_id" in _columns(cursor, "cookies"):
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cookies_user ON cookies(user_id)"
+        )
+
+
+def _order_snapshot_source_repair_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """收口两项来源审查遗留：头像来源高估与 history_unsaved 图片来源。
+
+    遗留一（头像来源保守降档）：早期 _customer_profile_field_sources_v1 /
+    _order_buyer_field_sources_v1 把聚合级 profile_source/buyer_snapshot_source
+    整段套给头像字段，可能把「实际只到过昵称」的记录也标成头像有真实来源。
+    对「头像来源仍等于当初套用的组级来源」这类未经字段级订正的记录，把头像
+    来源降回空串（宁可少标来源，也不虚报可信度）；若头像来源已被后续字段级
+    写入改成与组级不同的值（例如实时消息独立刷新），说明确有独立来源，保留。
+
+    遗留二（history_unsaved 图片来源收敛）：非空图片一旦落库即属历史目录
+    回填，绝不该带 history_unsaved 这一「快照未保存」语义。将这类图片来源
+    统一收敛为 catalog_backfill；标题来源不在本次收口范围，保持不动。
+    """
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+
+    # 遗留一：客户档案头像来源保守降档
+    if "customer_profiles" in tables:
+        profile_cols = _columns(cursor, "customer_profiles")
+        if {"avatar_source", "profile_source"} <= profile_cols:
+            cursor.execute(
+                "UPDATE customer_profiles SET avatar_source = ''"
+                " WHERE avatar_source != ''"
+                "   AND avatar_source = profile_source"
+            )
+
+    # 遗留一：订单买家头像来源保守降档
+    if "orders" in tables:
+        order_cols = _columns(cursor, "orders")
+        if {"buyer_avatar_source", "buyer_snapshot_source"} <= order_cols:
+            cursor.execute(
+                "UPDATE orders SET buyer_avatar_source = ''"
+                " WHERE buyer_avatar_source != ''"
+                "   AND buyer_avatar_source = buyer_snapshot_source"
+            )
+
+        # 遗留二：非空图片的 history_unsaved 来源收敛为 catalog_backfill
+        if "item_image_source" in order_cols:
+            cursor.execute(
+                "UPDATE orders SET item_image_source = 'catalog_backfill'"
+                " WHERE item_image != ''"
+                "   AND item_image_source = 'history_unsaved'"
+            )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -802,6 +1105,51 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072301",
         "account_login_metadata_v1",
         _account_login_metadata_v1,
+    ),
+    Migration(
+        "2026072601",
+        "order_identity_snapshots_v1",
+        _order_identity_snapshots_v1,
+    ),
+    Migration(
+        "2026072602",
+        "business_observability_v1",
+        _business_observability_v1,
+    ),
+    Migration(
+        "2026072603",
+        "order_identity_schema_repair_v1",
+        _order_identity_schema_repair_v1,
+    ),
+    Migration(
+        "2026072604",
+        "order_item_field_sources_v1",
+        _order_item_field_sources_v1,
+    ),
+    Migration(
+        "2026072605",
+        "customer_profile_field_sources_v1",
+        _customer_profile_field_sources_v1,
+    ),
+    Migration(
+        "2026072606",
+        "order_buyer_field_sources_v1",
+        _order_buyer_field_sources_v1,
+    ),
+    Migration(
+        "2026072607",
+        "order_query_covering_index_v1",
+        _order_query_covering_index_v1,
+    ),
+    Migration(
+        "2026072608",
+        "tenant_isolation_hardening_v1",
+        _tenant_isolation_hardening_v1,
+    ),
+    Migration(
+        "2026072609",
+        "order_snapshot_source_repair_v1",
+        _order_snapshot_source_repair_v1,
     ),
 )
 

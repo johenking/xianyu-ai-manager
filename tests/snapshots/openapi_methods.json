@@ -246,6 +246,9 @@
     "GET",
     "PUT"
   ],
+  "/api/orders/{order_id}/item-image": [
+    "GET"
+  ],
   "/api/orders/{order_id}/refresh": [
     "POST"
   ],
