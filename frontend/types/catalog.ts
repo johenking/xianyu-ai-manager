@@ -91,6 +91,10 @@ export interface OrderAnalytics {
     total_amount: number;
     avg_amount: number;
   }>;
+  // 按订单状态聚合（受仪表盘 include_statuses 限定为待发货/已发货/已完成）
+  status_stats?: Array<{ status: string; count: number; amount: number }>;
+  // 按收货城市聚合的地区分布（后端按订单量降序 Top 50，仅运营地理统计）
+  city_stats?: Array<{ city: string; order_count: number; total_amount: number }>;
 }
 
 export interface DashboardSummary {

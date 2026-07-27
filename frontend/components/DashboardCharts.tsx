@@ -19,6 +19,17 @@ import type { OrderAnalytics } from '../types';
 
 const COLORS = ['#FFE815', '#3B82F6', '#10B981', '#F59E0B', '#E11D48'];
 
+// 订单状态中文标签，与订单列表/仪表盘保持一致
+const STATUS_LABELS: Record<string, string> = {
+  processing: '处理中',
+  pending_ship: '待发货',
+  shipped: '已发货',
+  completed: '已完成',
+  cancelled: '已取消',
+  refunding: '退款中',
+  unknown: '未知',
+};
+
 const shortName = (value: string, length: number) => (
   value.length > length ? `${value.slice(0, length)}...` : value
 );
@@ -42,6 +53,22 @@ const DashboardCharts: React.FC<{
     name: shortName(itemNames[entry.item_id] || entry.item_id, 10),
     value: entry.order_count,
     color: COLORS[index % COLORS.length],
+  }));
+
+  // 订单状态分布（饼图）
+  const statusStats = analytics.status_stats || [];
+  const statusShares = statusStats.map((entry, index) => ({
+    name: STATUS_LABELS[entry.status] || entry.status,
+    value: entry.count,
+    color: COLORS[index % COLORS.length],
+  }));
+  const totalStatusCount = statusStats.reduce((sum, entry) => sum + entry.count, 0);
+
+  // 地区分布（按收货城市 Top 10，横向柱状图）
+  const cityStats = analytics.city_stats || [];
+  const cityData = cityStats.slice(0, 10).map((entry) => ({
+    name: shortName(entry.city, 6),
+    orders: entry.order_count,
   }));
 
   return (
@@ -107,6 +134,44 @@ const DashboardCharts: React.FC<{
                   <Tooltip />
                   <Legend verticalAlign="bottom" iconType="circle" />
                 </PieChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </section>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <section className="ios-card rounded-2xl p-6">
+          <h3 className="mb-1 text-lg font-bold text-gray-900">订单状态分布</h3>
+          <p className="mb-4 text-sm text-gray-400">仅统计待发货/已发货/已完成订单</p>
+          <div className="h-[280px]">
+            {statusShares.length === 0 || totalStatusCount === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无数据</div> : (
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={statusShares} dataKey="value" nameKey="name" innerRadius={58} outerRadius={88} paddingAngle={2}>
+                    {statusShares.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
+                  </Pie>
+                  <Tooltip formatter={(value) => `${value} 单`} />
+                  <Legend verticalAlign="bottom" iconType="circle" />
+                </PieChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </section>
+
+        <section className="ios-card rounded-2xl p-6">
+          <h3 className="mb-1 text-lg font-bold text-gray-900">地区分布</h3>
+          <p className="mb-4 text-sm text-gray-400">收货城市订单量 Top 10</p>
+          <div className="h-[280px]">
+            {cityData.length === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无收货城市数据</div> : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={cityData} layout="vertical" margin={{ left: 10 }}>
+                  <CartesianGrid strokeDasharray="3 3" horizontal vertical={false} stroke="#F3F4F6" />
+                  <XAxis type="number" axisLine={false} tickLine={false} allowDecimals={false} />
+                  <YAxis type="category" dataKey="name" axisLine={false} tickLine={false} width={70} />
+                  <Tooltip formatter={(value) => `${value} 单`} />
+                  <Bar dataKey="orders" fill="#3B82F6" radius={[0, 6, 6, 0]} />
+                </BarChart>
               </ResponsiveContainer>
             )}
           </div>
