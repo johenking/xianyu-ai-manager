@@ -8593,6 +8593,213 @@ class DBManager:
                 logger.error(f"获取订单分析数据失败: {e}")
                 return {'error': str(e)}
 
+    def _analytics_where(self, o_alias: str = "o", c_alias: str = "c",
+                         start_date: str = None, end_date: str = None,
+                         user_id: int = None, include_statuses: list = None):
+        """构造分析类查询共用的 WHERE 片段与参数。
+
+        与 get_order_analytics 口径完全一致：
+        - 时间边界用 created_at（配合分析索引），左闭右开；
+        - 强制 c.user_id 隔离（租户）；
+        - amount 非空、非 'N/A'，保证金额可 CAST。
+
+        返回 (where_clause_str, params_list)。
+        """
+        where_conditions = []
+        params = []
+        if start_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            where_conditions.append(f"{o_alias}.created_at >= ?")
+            params.append(start.strftime("%Y-%m-%d 00:00:00"))
+        if end_date:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            where_conditions.append(f"{o_alias}.created_at < ?")
+            params.append(end.strftime("%Y-%m-%d 00:00:00"))
+        where_conditions.append(f"{c_alias}.user_id = ?")
+        params.append(user_id)
+        if include_statuses:
+            placeholders = ','.join(['?' for _ in include_statuses])
+            where_conditions.append(f"{o_alias}.order_status IN ({placeholders})")
+            params.extend(include_statuses)
+        where_conditions.extend([
+            f"{o_alias}.amount IS NOT NULL",
+            f"{o_alias}.amount != ''",
+            f"{o_alias}.amount != 'N/A'",
+        ])
+        return f"WHERE {' AND '.join(where_conditions)}", params
+
+    def get_traffic_analytics(self, start_date: str = None, end_date: str = None,
+                              user_id: int = None, include_statuses: list = None):
+        """时段流量分析：按真实成交时间(ordered_at_utc)分桶到东八区小时/星期。
+
+        口径说明（阶段B经营驾驶舱）：
+        - 时间边界沿用 created_at（与 get_order_analytics 一致），作覆盖率分母；
+        - 只有 ordered_at_utc IS NOT NULL 的订单进入时段分桶，避免把订单
+          全堆到同步任务运行时刻而失真；旧订单缺成交时间会被排除，用
+          coverage 字段如实回报覆盖率，供前端标注"基于 N% 有成交时间的订单"。
+        - ordered_at_utc 存 UTC 秒级 epoch，东八区分桶用 '+8 hours' 偏移。
+
+        Args:
+            start_date/end_date: YYYY-MM-DD；user_id 必填（租户隔离）。
+            include_statuses: 订单状态白名单（如有效订单三态）。
+
+        Returns:
+            {coverage:{total_orders,with_ordered_at,coverage_rate},
+             hourly:[{hour:int,order_count,amount}],
+             weekday:[{weekday:str '0'-'6' 周日=0,order_count,amount}]}
+        """
+        if user_id is None:
+            raise ValueError("get_traffic_analytics 必须提供 user_id")
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                from_clause = "orders AS o JOIN cookies AS c ON c.id = o.cookie_id"
+                where_clause, params = self._analytics_where(
+                    start_date=start_date, end_date=end_date,
+                    user_id=user_id, include_statuses=include_statuses,
+                )
+
+                # 覆盖率：分母=窗口内有效订单，分子=其中有成交时间的订单
+                cursor.execute(f"""
+                    SELECT
+                        COUNT(DISTINCT o.order_id) AS total_orders,
+                        COUNT(DISTINCT CASE WHEN o.ordered_at_utc IS NOT NULL
+                              THEN o.order_id END) AS with_ordered_at
+                    FROM {from_clause}
+                    {where_clause}
+                """, params)
+                row = cursor.fetchone()
+                total_orders = (row[0] or 0) if row else 0
+                with_ordered_at = (row[1] or 0) if row else 0
+                coverage = {
+                    'total_orders': total_orders,
+                    'with_ordered_at': with_ordered_at,
+                    'coverage_rate': round(with_ordered_at / total_orders, 4)
+                    if total_orders else 0.0,
+                }
+
+                # 时段分桶只针对有成交时间的订单，按东八区小时/星期聚合
+                bucket_where = where_clause + " AND o.ordered_at_utc IS NOT NULL"
+
+                cursor.execute(f"""
+                    SELECT
+                        CAST(strftime('%H', o.ordered_at_utc, 'unixepoch', '+8 hours') AS INTEGER) AS hour,
+                        COUNT(DISTINCT o.order_id) AS order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS amount
+                    FROM {from_clause}
+                    {bucket_where}
+                    GROUP BY hour
+                    ORDER BY hour ASC
+                """, params)
+                hourly = [{
+                    'hour': r[0],
+                    'order_count': r[1],
+                    'amount': round(r[2] or 0, 2),
+                } for r in cursor.fetchall()]
+
+                cursor.execute(f"""
+                    SELECT
+                        strftime('%w', o.ordered_at_utc, 'unixepoch', '+8 hours') AS weekday,
+                        COUNT(DISTINCT o.order_id) AS order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS amount
+                    FROM {from_clause}
+                    {bucket_where}
+                    GROUP BY weekday
+                    ORDER BY weekday ASC
+                """, params)
+                weekday = [{
+                    'weekday': r[0],
+                    'order_count': r[1],
+                    'amount': round(r[2] or 0, 2),
+                } for r in cursor.fetchall()]
+
+                return {'coverage': coverage, 'hourly': hourly, 'weekday': weekday}
+
+            except Exception as e:
+                logger.error(f"获取时段流量分析失败: {e}")
+                return {'error': str(e)}
+
+    def get_buyer_behavior_analytics(self, start_date: str = None, end_date: str = None,
+                                     user_id: int = None, include_statuses: list = None):
+        """买家行为分析：复购、下单频次分布、买家贡献榜。
+
+        边界说明（阶段B经营驾驶舱）：
+        - 仅做订单可直接得出的行为量（下单次数、复购、贡献金额）；
+          绝不刻画客户类型/年龄/职业/画像标签。
+        - 时间边界用 created_at，覆盖旧订单不丢数据（这些指标不依赖成交时刻）。
+
+        Args:
+            start_date/end_date: YYYY-MM-DD；user_id 必填（租户隔离）。
+            include_statuses: 订单状态白名单。
+
+        Returns:
+            {summary:{total_buyers,repeat_buyers,repeat_rate},
+             frequency:[{order_count:int,buyer_count:int}],
+             top_buyers:[{buyer_id,buyer_nickname,order_count,total_amount}]}
+        """
+        if user_id is None:
+            raise ValueError("get_buyer_behavior_analytics 必须提供 user_id")
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                from_clause = "orders AS o JOIN cookies AS c ON c.id = o.cookie_id"
+                where_clause, params = self._analytics_where(
+                    start_date=start_date, end_date=end_date,
+                    user_id=user_id, include_statuses=include_statuses,
+                )
+                buyer_where = where_clause + " AND o.buyer_id IS NOT NULL AND o.buyer_id != ''"
+
+                # 每个买家的下单次数与贡献金额（后续复用为频次分布与贡献榜的基底）
+                cursor.execute(f"""
+                    SELECT
+                        o.buyer_id,
+                        MAX(o.buyer_nickname) AS buyer_nickname,
+                        COUNT(DISTINCT o.order_id) AS order_count,
+                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS total_amount
+                    FROM {from_clause}
+                    {buyer_where}
+                    GROUP BY o.buyer_id
+                """, params)
+                per_buyer = cursor.fetchall()
+
+                total_buyers = len(per_buyer)
+                repeat_buyers = sum(1 for r in per_buyer if (r[2] or 0) >= 2)
+                summary = {
+                    'total_buyers': total_buyers,
+                    'repeat_buyers': repeat_buyers,
+                    'repeat_rate': round(repeat_buyers / total_buyers, 4)
+                    if total_buyers else 0.0,
+                }
+
+                # 频次分布：下 N 单的买家有几个
+                freq_map = {}
+                for r in per_buyer:
+                    n = r[2] or 0
+                    freq_map[n] = freq_map.get(n, 0) + 1
+                frequency = [{'order_count': n, 'buyer_count': freq_map[n]}
+                             for n in sorted(freq_map)]
+
+                # 贡献榜：按金额降序 Top 20
+                ranked = sorted(
+                    per_buyer, key=lambda r: (r[3] or 0), reverse=True
+                )[:20]
+                top_buyers = [{
+                    'buyer_id': r[0],
+                    'buyer_nickname': r[1] or '',
+                    'order_count': r[2] or 0,
+                    'total_amount': round(r[3] or 0, 2),
+                } for r in ranked]
+
+                return {
+                    'summary': summary,
+                    'frequency': frequency,
+                    'top_buyers': top_buyers,
+                }
+
+            except Exception as e:
+                logger.error(f"获取买家行为分析失败: {e}")
+                return {'error': str(e)}
+
     def update_order_address(self, order_id: str, receiver_address: str = None, receiver_city: str = None):
         """
         更新订单的收货地址信息

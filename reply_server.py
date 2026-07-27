@@ -9421,6 +9421,81 @@ def get_valid_orders(
         log_with_user('error', f"获取有效订单列表失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
+@orders_router.get('/analytics/traffic')
+def get_traffic_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    时段流量分析（经营驾驶舱）
+
+    按真实成交时间 ordered_at_utc 分桶到东八区小时/星期，回报覆盖率。
+    只统计当前登录用户自己名下有效订单（租户隔离）。
+
+    Args:
+        start_date: 开始日期 (格式: YYYY-MM-DD)
+        end_date: 结束日期 (格式: YYYY-MM-DD)
+    """
+    try:
+        log_with_user('info', f"查询时段流量分析: {start_date} - {end_date}", current_user)
+        user_id = current_user['user_id']
+        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        data = db_manager.get_traffic_analytics(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            include_statuses=valid_statuses
+        )
+        if 'error' in data:
+            log_with_user('error', f"获取时段流量分析失败: {data['error']}", current_user)
+            raise HTTPException(status_code=500, detail=data['error'])
+        log_with_user('info', "时段流量分析查询成功", current_user)
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"获取时段流量分析失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@orders_router.get('/analytics/buyers')
+def get_buyer_behavior_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    买家行为分析（经营驾驶舱）
+
+    复购、下单频次分布、买家贡献榜；只做订单可直接得出的行为量，
+    绝不刻画客户类型/年龄/职业/画像标签。只统计当前登录用户自己名下
+    有效订单（租户隔离）。
+
+    Args:
+        start_date: 开始日期 (格式: YYYY-MM-DD)
+        end_date: 结束日期 (格式: YYYY-MM-DD)
+    """
+    try:
+        log_with_user('info', f"查询买家行为分析: {start_date} - {end_date}", current_user)
+        user_id = current_user['user_id']
+        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        data = db_manager.get_buyer_behavior_analytics(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            include_statuses=valid_statuses
+        )
+        if 'error' in data:
+            log_with_user('error', f"获取买家行为分析失败: {data['error']}", current_user)
+            raise HTTPException(status_code=500, detail=data['error'])
+        log_with_user('info', "买家行为分析查询成功", current_user)
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"获取买家行为分析失败: {str(e)}", current_user)
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ------------------------- 指定商品回复接口 -------------------------
 
 @content_router.get("/itemReplays")
