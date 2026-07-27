@@ -1,5 +1,53 @@
 # Handoff
 
+## v1.9.0 Production Release On 2026-07-27
+
+The operations cockpit and dashboard business-insights work was deployed from
+commit `6975deb352de5b5be060b3e3f599885fd97a79a2`. It adds hourly traffic and
+buyer-behavior analysis (behavioral and quantifiable only, no customer
+profiling), order status and regional distribution charts, a product
+hot-sellers board with period-over-period growth detection, and inline account
+identification plus a settled-date range filter on the order list. Migration
+`2026072609` repairs legacy order-snapshot source markers with a defensive,
+DDL-free update.
+
+Deployment evidence:
+
+- Production `origin/main` fast-forwarded from `2e9b950` (`v1.8.3`) to
+  `6975deb` via `git merge --ff-only`; PR #41 (order-data-completeness) and
+  PR #42 (dashboard-business-insights) had already merged to `origin/main`
+  through green CI (`secrets` + `test`). An annotated tag `v1.9.0` was created
+  on the exact production SHA `6975deb`.
+- Migration `2026072609` was rehearsed on a read-only copy of the production
+  database before deployment: all three defensive `UPDATE` conditions matched
+  zero rows and the content fingerprint was unchanged, confirming an idempotent
+  no-op. On the live restart it applied cleanly; `/health/ready` reports
+  migration `2026072609` and database integrity `ok`, and the startup created
+  an automatic pre-schema backup.
+- The frontend was rebuilt from the production worktree at `6975deb`. Local and
+  public HTML both reference entry assets `index-BoejLjfT.js` /
+  `index-BZ0fOHdb.css`; the entry JS served over the public host is
+  byte-identical (SHA-256 `ebb2dee5…`) to the local file, and the build carried
+  zero orphaned assets across two retained generations. The production OpenAPI
+  method count is 230, matching the repository snapshot.
+- The four new analytics endpoints (`/analytics/traffic`, `/analytics/buyers`,
+  `/analytics/orders`, `/analytics/orders/valid`) all return `401` without
+  authentication, confirming the fail-closed tenant guard. The single launchd
+  worker restarted with a new PID and stayed stable across a 60-second,
+  10-sample readiness observation with zero anomalies; the last 200 process log
+  lines contained no error or traceback entries. The service interruption was
+  limited to the restart itself.
+- The pre-deploy rollback unit is the mode-`0700` snapshot
+  `predeploy-dashboard-insights-20260727-135601` outside the repository under
+  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/`. It contains
+  an integrity-checked SQLite backup, all three local keys, the prior static
+  assets, browser profiles, the LaunchAgent, a source archive, and a verified
+  Git bundle, with a 1,969-entry SHA-256 manifest.
+- A shorter 60-second observation replaced the customary 15-minute/31-sample
+  window; extend the window if a longer soak is required. Real end-user order
+  and per-tenant acceptance on the live host remains for the operator to
+  confirm through the authenticated UI.
+
 ## v1.8.3 Production Release On 2026-07-26
 
 The Skill Center closeout was deployed from commit

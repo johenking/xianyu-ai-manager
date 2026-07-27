@@ -4,6 +4,22 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-07-27
+
+### Added
+
+- Add the operations cockpit on the dashboard: hourly traffic analysis (order timestamps normalized to East-8) and buyer behavior analysis at the behavioral, quantifiable level only, with a fail-closed tenant guard on every analytics query.
+- Add order status distribution and regional distribution charts, and a product hot-sellers board that identifies period-over-period growth, served from the `/analytics/orders` and `/analytics/orders/valid` endpoints.
+- Add inline account identification and a settled-date range filter to the order list.
+
+### Changed
+
+- Extend `db_manager` with the analytics aggregations backing the cockpit, and load the chart bundle separately from the main dashboard entry.
+
+### Fixed
+
+- Close out the three order-snapshot source-marker review items and repair legacy source markers via migration `2026072609` (a defensive, DDL-free update that matched zero rows on production data).
+
 ## [1.8.3] - 2026-07-26
 
 ### Added
