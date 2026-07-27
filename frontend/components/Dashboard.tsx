@@ -15,6 +15,7 @@ import type { DashboardSummary, Order, OrderStatus } from '../types';
 import { getDashboardSummary, getValidOrders } from '../services/api';
 
 const DashboardCharts = lazy(() => import('./DashboardCharts'));
+const BusinessInsights = lazy(() => import('./BusinessInsights'));
 
 type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
 
@@ -216,6 +217,12 @@ const Dashboard: React.FC = () => {
       <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">图表加载中...</div>}>
         <DashboardCharts analytics={summary.current} itemNames={summary.item_names} />
       </Suspense>
+
+      {!isEmpty && (
+        <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">经营分析加载中...</div>}>
+          <BusinessInsights range={{ start_date: summary.range.start_date, end_date: summary.range.end_date }} />
+        </Suspense>
+      )}
 
       <section className="ios-card overflow-hidden rounded-2xl bg-white">
         <div className="flex flex-col gap-3 border-b border-gray-100 bg-gray-50/70 p-5 sm:flex-row sm:items-center sm:justify-between">
