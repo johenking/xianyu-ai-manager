@@ -65,6 +65,10 @@ export interface QRLoginStatusResponse {
   session_id?: string;
   message?: string;
   error_code?: string;
+  verification_kind?: '' | 'mobile_scan' | 'interactive' | 'unknown';
+  required_action?: '' | 'render_verification' | 'scan_image' | 'use_local_chrome';
+  browser_active?: boolean;
+  ended_by?: string;
   verification_url?: string;
   verification_qr_code_url?: string;
   verification_screenshot_path?: string | null;
@@ -107,12 +111,17 @@ export type BrowserExtensionPairingStatus =
 
 export interface BrowserExtensionPairing {
   pairing_id: string;
+  protocol_version?: number;
+  pairing_token?: string;
   pairing_code?: string;
   status: BrowserExtensionPairingStatus;
   message: string;
   error_code?: string;
   account_id?: string;
+  ended_by?: string;
   expires_at: number;
+  import_url?: string;
+  console_origin?: string;
   local_import_url?: string;
 }
 
@@ -135,6 +144,10 @@ export interface OfficialLoginSessionResponse {
   state: OfficialLoginState;
   message: string;
   error_code: string;
+  verification_kind?: '' | 'mobile_scan' | 'interactive' | 'unknown';
+  required_action?: '' | 'render_verification' | 'scan_image' | 'use_local_chrome';
+  browser_active?: boolean;
+  ended_by?: string;
   qr_image_url?: string;
   verification_image_url?: string;
   account_id?: string;
@@ -179,6 +192,13 @@ export const checkQRLoginStatus = async (sessionId: string): Promise<QRLoginStat
 
 export const continueQRLoginAfterVerification = async (sessionId: string): Promise<QRLoginStatusResponse> => {
   return post(`/qr-login/continue/${sessionId}`, {});
+};
+
+export const cancelQRLogin = async (
+  sessionId: string,
+  endedBy: 'user_cancelled' | 'switched_method' | 'switched_to_extension' = 'user_cancelled',
+): Promise<QRLoginStatusResponse> => {
+  return post(`/qr-login/cancel/${sessionId}`, { ended_by: endedBy });
 };
 
 export const createBrowserExtensionPairing = async (): Promise<BrowserExtensionPairing> => {

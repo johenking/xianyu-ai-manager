@@ -1,5 +1,4 @@
 import {
-  LOCAL_IMPORT_URL,
   buildImportPayload,
   isAllowedHost,
   parsePairingBundle,
@@ -46,14 +45,14 @@ async function importCookies() {
       throw new Error('未检测到有效登录态，请在当前 Chrome 登录闲鱼后重试');
     }
 
-    const response = await fetch(LOCAL_IMPORT_URL, {
+    const response = await fetch(pairing.importUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !result.success) {
-      throw new Error(result.detail || result.message || `本机后台返回 ${response.status}`);
+      throw new Error(result.detail || result.message || `监控台返回 ${response.status}`);
     }
     pairingInput.value = '';
     setStatus(`导入成功，已验证 ${payload.cookies.length} 个 Cookie 字段。`, 'success');

@@ -25,12 +25,17 @@ class FakeWorker:
     def __init__(self):
         self.cancelled = False
         self.visible_requested = False
+        self.active = True
 
     def close_browser(self):
         self.cancelled = True
+        self.active = False
 
     def request_visible(self):
         self.visible_requested = True
+
+    def browser_active(self):
+        return self.active
 
 
 class SuccessfulQrService:
@@ -113,6 +118,7 @@ class OfficialLoginSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(terminal["state"], "success")
+        self.assertEqual(terminal["ended_by"], "validated_and_persisted")
         self.assertEqual(events, ["handoff_completed", "browser_returned"])
 
     async def test_status_polling_is_read_only_and_completion_runs_once(self):
@@ -161,12 +167,18 @@ class OfficialLoginSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator.wait_until_ready(session_id, 7, timeout=1)
 
         self.assertIsNone(await coordinator.get_status(session_id, 8))
+        active = await coordinator.get_status(session_id, 7)
+        self.assertEqual(active["verification_kind"], "mobile_scan")
+        self.assertEqual(active["required_action"], "scan_image")
+        self.assertTrue(active["browser_active"])
         self.assertTrue(await coordinator.show_browser(session_id, 7))
         self.assertTrue(worker.visible_requested)
         self.assertTrue(await coordinator.cancel(session_id, 7))
         gate.set()
         terminal = await coordinator.wait_for_terminal(session_id, 7, timeout=1)
         self.assertEqual(terminal["state"], "cancelled")
+        self.assertEqual(terminal["ended_by"], "user_cancelled")
+        self.assertFalse(terminal["browser_active"])
 
     async def test_active_status_polling_has_no_lifecycle_side_effects(self):
         import threading
@@ -230,6 +242,7 @@ class OfficialLoginSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         status = await coordinator.get_status(created["session_id"], 7)
 
         self.assertEqual(status["state"], "expired")
+        self.assertEqual(status["ended_by"], "expired")
         self.assertTrue(worker.cancelled)
         gate.set()
 

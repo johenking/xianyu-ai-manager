@@ -13,10 +13,15 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
+from utils.xianyu_session_probe import (
+    SessionProbeResult,
+    detect_default_browser_user_agent,
+    probe_message_session_sync,
+)
 
 
 BrowserUpdateCallback = Callable[[Dict[str, str]], None]
@@ -47,9 +52,25 @@ def remove_public_screenshot(public_path: Optional[str]) -> None:
 class QRVerificationBrowser:
     """在后台浏览器中承载扫码二次验证。"""
 
-    def __init__(self, profile_root: Path | str = "browser_data"):
+    def __init__(
+        self,
+        profile_root: Path | str = "browser_data",
+        *,
+        playwright_factory: Optional[Callable[[], Any]] = None,
+        session_validator: Optional[
+            Callable[[str, str], SessionProbeResult]
+        ] = probe_message_session_sync,
+    ):
         self.profile_root = Path(profile_root)
+        self.playwright_factory = playwright_factory or self._default_playwright_factory
+        self.session_validator = session_validator
         os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+    @staticmethod
+    def _default_playwright_factory():
+        from playwright.sync_api import sync_playwright
+
+        return sync_playwright()
 
     @staticmethod
     def _safe_key(value: str) -> str:
@@ -107,15 +128,13 @@ class QRVerificationBrowser:
         preserve_profile = False
 
         try:
-            from playwright.sync_api import sync_playwright
-
             parsed = urlparse(verification_url)
             logger.info(
                 f"扫码二次验证浏览器启动: session={session_id}, "
                 f"host={parsed.netloc or 'unknown'}"
             )
 
-            with sync_playwright() as playwright:
+            with self.playwright_factory() as playwright:
                 context = playwright.chromium.launch_persistent_context(
                     str(user_data_dir),
                     headless=False,
@@ -139,10 +158,16 @@ class QRVerificationBrowser:
                     logger.warning(f"扫码二次验证页面30秒内未检测到二维码，保存当前页面用于诊断: session={session_id}")
 
                 screenshot_path = self._capture_screenshot(page, session_id)
-                if screenshot_path and on_update:
+                verification_kind = self._classify_verification(page)
+                required_action = (
+                    "scan_image" if verification_kind == "mobile_scan" else "use_local_chrome"
+                )
+                if on_update:
                     on_update({
                         "verification_screenshot_path": screenshot_path,
                         "verification_browser_status": "waiting",
+                        "verification_kind": verification_kind,
+                        "required_action": required_action,
                     })
 
                 started_at = time.time()
@@ -159,18 +184,27 @@ class QRVerificationBrowser:
                         }
 
                     cookies = self._cookies_to_dict(context.cookies())
-                    if self._has_login_cookie(cookies):
-                        preserve_profile = True
-                        logger.info(
-                            f"扫码二次验证已获取登录 Cookie: session={session_id}, "
-                            f"cookie_count={len(cookies)}, has_unb={bool(cookies.get('unb'))}"
+                    if self._has_login_cookie(cookies) and self.session_validator is not None:
+                        probe = self.session_validator(
+                            self._cookies_to_string(cookies),
+                            self._browser_user_agent(page),
                         )
-                        return {
-                            "status": "success",
-                            "cookies": cookies,
-                            "unb": cookies.get("unb"),
-                            "screenshot_path": screenshot_path,
-                        }
+                        if probe.succeeded:
+                            verified_cookies = probe.cookies or cookies
+                            verified_unb = str(verified_cookies.get("unb") or "").strip()
+                            if verified_unb:
+                                preserve_profile = True
+                                logger.info(
+                                    f"扫码二次验证已通过消息 Token 校验: session={session_id}, "
+                                    f"cookie_count={len(verified_cookies)}, has_unb=True"
+                                )
+                                return {
+                                    "status": "success",
+                                    "cookies": verified_cookies,
+                                    "unb": verified_unb,
+                                    "access_token": probe.access_token,
+                                    "screenshot_path": screenshot_path,
+                                }
 
                     if not redirected_after_success_hint and self._has_success_hint(page):
                         redirected_after_success_hint = True
@@ -184,21 +218,6 @@ class QRVerificationBrowser:
                                 f"session={session_id}, 错误类型: {type(exc).__name__}"
                             )
 
-                    if self._looks_logged_in(page):
-                        cookies = self._cookies_to_dict(context.cookies())
-                        if cookies:
-                            preserve_profile = True
-                            logger.info(
-                                f"扫码二次验证检测到页面登录态: session={session_id}, "
-                                f"cookie_count={len(cookies)}, has_unb={bool(cookies.get('unb'))}"
-                            )
-                            return {
-                                "status": "success",
-                                "cookies": cookies,
-                                "unb": cookies.get("unb"),
-                                "screenshot_path": screenshot_path,
-                            }
-
                     if time.time() - last_screenshot_at >= 8:
                         updated_screenshot = self._capture_screenshot(page, session_id)
                         if updated_screenshot:
@@ -207,6 +226,8 @@ class QRVerificationBrowser:
                                 on_update({
                                     "verification_screenshot_path": screenshot_path,
                                     "verification_browser_status": "waiting",
+                                    "verification_kind": verification_kind,
+                                    "required_action": required_action,
                                 })
                         last_screenshot_at = time.time()
 
@@ -314,6 +335,37 @@ class QRVerificationBrowser:
                 continue
 
         return False
+
+    def _classify_verification(self, page) -> str:
+        if self._has_qr_content(page):
+            return "mobile_scan"
+
+        interactive_selectors = (
+            "#nc_1_n1z",
+            ".nc-container",
+            ".nc_scale",
+            "#nocaptcha",
+            "[class*='slider']",
+            "input[type='text']",
+            "input[type='tel']",
+            "input[type='number']",
+            "video",
+            "[class*='camera']",
+        )
+        scopes = [page]
+        try:
+            scopes.extend(page.frames)
+        except Exception:
+            pass
+        for scope in scopes:
+            for selector in interactive_selectors:
+                try:
+                    element = scope.query_selector(selector)
+                    if element is not None and element.is_visible():
+                        return "interactive"
+                except Exception:
+                    continue
+        return "unknown"
 
     def _scope_has_qr_signal(self, scope) -> bool:
         qr_selectors = [
@@ -500,6 +552,20 @@ class QRVerificationBrowser:
             if name and value is not None:
                 cookies[name] = value
         return cookies
+
+    @staticmethod
+    def _cookies_to_string(cookies: Dict[str, str]) -> str:
+        return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+    @staticmethod
+    def _browser_user_agent(page) -> str:
+        try:
+            value = str(page.evaluate("navigator.userAgent") or "").strip()
+            if value:
+                return value
+        except Exception:
+            pass
+        return detect_default_browser_user_agent()
 
     def _has_login_cookie(self, cookies: Dict[str, str]) -> bool:
         return bool(cookies.get("unb"))

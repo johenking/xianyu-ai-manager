@@ -10,14 +10,16 @@ from app_factory import create_app
 class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
-        paths = app.openapi()["paths"]
+        openapi = app.openapi()
+        self.assertEqual(openapi["info"]["version"], "1.9.1")
+        paths = openapi["paths"]
         signatures = {
             (method.upper(), path)
             for path, definition in paths.items()
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 230)
+        self.assertEqual(len(signatures), 231)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -53,6 +55,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/api/official-login/sessions/{session_id}/show-browser"), signatures)
         self.assertIn(("POST", "/api/official-login/sessions/{session_id}/cancel"), signatures)
         self.assertIn(("POST", "/api/accounts/{cookie_id}/session-refresh/show-browser"), signatures)
+        self.assertIn(("POST", "/qr-login/cancel/{session_id}"), signatures)
         self.assertIn(("POST", "/official-window-login"), signatures)
         self.assertIn(("GET", "/official-window-login/check/{session_id}"), signatures)
         self.assertIn(("POST", "/official-window-login/cancel/{session_id}"), signatures)

@@ -7,11 +7,28 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from starlette.requests import Request
+
 import reply_server
 from db_manager import DBManager
 from official_login_sessions import OfficialLoginSessionRecord
 from utils.xianyu_official_login import OfficialLoginResult
 from account_session_refresh import active_refresh_registry
+
+
+def _local_request() -> Request:
+    return Request({
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/password-login",
+        "raw_path": b"/password-login",
+        "query_string": b"",
+        "headers": [(b"host", b"127.0.0.1:8091")],
+        "client": ("127.0.0.1", 43210),
+        "server": ("127.0.0.1", 8091),
+    })
 
 
 class FakeCookieManager:
@@ -86,6 +103,7 @@ class OfficialPasswordLoginBackendTests(unittest.IsolatedAsyncioTestCase):
                     "password": "secret",
                     "show_browser": True,
                 },
+                http_request=_local_request(),
                 current_user={"user_id": 1, "username": "admin"},
             )
 

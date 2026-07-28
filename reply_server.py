@@ -91,8 +91,12 @@ from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLogin
 from browser_extension_pairing import (
     MAX_COOKIE_COUNT,
     MAX_USER_AGENT_LENGTH,
+    PAIRING_PROTOCOL_VERSION,
+    PUBLIC_CONSOLE_ORIGIN,
+    PUBLIC_IMPORT_URL,
     PairingError,
     browser_extension_pairings,
+    is_loopback_host,
     normalize_structured_cookies,
 )
 from utils.xianyu_session_probe import (
@@ -473,6 +477,30 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
     return current_user
 
 
+def _is_loopback_console_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    host_header = str(request.headers.get("host") or "").strip()
+    try:
+        console_host = urlsplit(f"//{host_header}").hostname or ""
+    except ValueError:
+        return False
+    return is_loopback_host(client_host) and is_loopback_host(console_host)
+
+
+def _require_server_browser_access(
+    request: Request,
+    current_user: Dict[str, Any],
+) -> None:
+    is_admin = bool(current_user.get("is_admin")) or (
+        str(current_user.get("username") or "") == ADMIN_USERNAME
+    )
+    if not is_admin or not _is_loopback_console_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="服务器 Chrome 仅允许管理员从本机监控台操作",
+        )
+
+
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
     """带用户信息的日志记录"""
     prefix = get_user_log_prefix(user_info)
@@ -537,7 +565,7 @@ class ResponseModel(BaseModel):
 
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.4.0",
+    version="1.9.1",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -1684,10 +1712,20 @@ class BrowserExtensionCookieIn(BaseModel):
 
 
 class BrowserExtensionImportIn(BaseModel):
+    protocol_version: int = 1
     pairing_id: str = Field(..., min_length=8, max_length=80)
-    pairing_code: str = Field(..., min_length=6, max_length=32)
+    pairing_code: Optional[str] = Field(None, min_length=6, max_length=128)
+    pairing_token: Optional[str] = Field(None, min_length=32, max_length=128)
     cookies: List[BrowserExtensionCookieIn]
     user_agent: str = Field(..., min_length=1, max_length=MAX_USER_AGENT_LENGTH)
+
+
+class QRLoginCancelIn(BaseModel):
+    ended_by: Literal[
+        "user_cancelled",
+        "switched_method",
+        "switched_to_extension",
+    ] = "user_cancelled"
 
 
 class CookieStatusIn(BaseModel):
@@ -1935,16 +1973,20 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
 def create_browser_extension_pairing(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create a five-minute, owner-bound, single-use local pairing."""
+    """Create a five-minute, owner-bound, single-use browser pairing."""
     try:
-        status_info, pairing_code = browser_extension_pairings.create(current_user['user_id'])
+        status_info, pairing_token = browser_extension_pairings.create(current_user['user_id'])
     except PairingError as exc:
         raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     return {
         "success": True,
         "data": {
             **status_info,
-            "pairing_code": pairing_code,
+            "pairing_token": pairing_token,
+            # One release of loopback-only clients still reads this alias.
+            "pairing_code": pairing_token,
+            "import_url": PUBLIC_IMPORT_URL,
+            "console_origin": PUBLIC_CONSOLE_ORIGIN,
             "local_import_url": "http://127.0.0.1:8091/api/browser-extension/import",
         },
     }
@@ -1969,7 +2011,7 @@ async def import_browser_extension_cookies(
     payload: BrowserExtensionImportIn,
     request: Request,
 ):
-    """Validate one loopback-only import without echoing sensitive material."""
+    """Validate one single-use browser import without echoing sensitive material."""
     content_length = request.headers.get("content-length", "")
     try:
         parsed_content_length = int(content_length) if content_length else 0
@@ -1983,9 +2025,28 @@ async def import_browser_extension_cookies(
     remote_host = request.client.host if request.client else ""
     consumed = False
     try:
+        protocol_version = int(payload.protocol_version or 1)
+        if protocol_version == 1 and not _is_loopback_console_request(request):
+            raise PairingError(
+                "旧版扩展导入仅接受本机回环请求",
+                error_code="non_loopback_request",
+                http_status=403,
+            )
+        pairing_secret = (
+            payload.pairing_token
+            if protocol_version == PAIRING_PROTOCOL_VERSION
+            else payload.pairing_code
+        )
+        if not pairing_secret:
+            raise PairingError(
+                "配对凭据缺失",
+                error_code="pairing_credential_missing",
+                http_status=400,
+            )
         record = browser_extension_pairings.consume(
             payload.pairing_id,
-            payload.pairing_code,
+            pairing_secret,
+            protocol_version=protocol_version,
             remote_host=remote_host,
         )
         consumed = True
@@ -2043,6 +2104,7 @@ async def import_browser_extension_cookies(
             "success": True,
             "status": safe_status['status'],
             "message": safe_status['message'],
+            "data": safe_status,
         }
     except PairingError as exc:
         if consumed:
@@ -2503,10 +2565,14 @@ def _expected_owned_unb(user_id: int, account: str) -> str:
 @accounts_router.post("/api/official-login/sessions")
 async def create_official_login_session(
     request: Dict[str, Any],
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     mode = str(request.get("mode") or "qr").strip().lower()
     account = str(request.get("account") or "").strip()
+    show_browser = bool(request.get("show_browser", False))
+    if mode in {"qr", "sms"} or show_browser:
+        _require_server_browser_access(http_request, current_user)
     try:
         session = await official_login_coordinator.start(
             owner_user_id=current_user["user_id"],
@@ -2518,7 +2584,7 @@ async def create_official_login_session(
                 else ""
             ),
             password=str(request.get("password") or ""),
-            show_browser=bool(request.get("show_browser", False)),
+            show_browser=show_browser,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2549,8 +2615,10 @@ async def get_official_login_session(
 @accounts_router.post("/api/official-login/sessions/{session_id}/show-browser")
 async def show_official_login_browser(
     session_id: str,
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    _require_server_browser_access(http_request, current_user)
     shown = await official_login_coordinator.show_browser(session_id, current_user["user_id"])
     if not shown:
         raise HTTPException(status_code=404, detail="登录会话不存在、已结束或不属于当前用户")
@@ -2571,9 +2639,11 @@ async def cancel_official_login_session(
 @accounts_router.post("/official-window-login")
 async def official_window_login(
     payload: OfficialWindowLoginIn,
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Open installed Chrome and wait for SMS login on the official page."""
+    _require_server_browser_access(http_request, current_user)
     account = str(payload.account or "").strip()
     try:
         session = await official_login_coordinator.start(
@@ -2643,6 +2713,7 @@ async def cancel_official_window_login(
 @accounts_router.post("/password-login")
 async def password_login(
     request: Dict[str, Any],
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """兼容旧客户端的账号密码登录入口。"""
@@ -2650,6 +2721,9 @@ async def password_login(
         account = request.get('account')
         password = request.get('password')
         show_browser = request.get('show_browser', False)
+
+        if show_browser:
+            _require_server_browser_access(http_request, current_user)
 
         if not account or not password:
             return {'success': False, 'message': '登录账号和密码不能为空'}
@@ -2935,6 +3009,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                     },
                 )
                 status_info['account_info'] = account_info
+                qr_login_manager.mark_persisted(session_id)
+                status_info['ended_by'] = 'validated_and_persisted'
                 qr_check_processed[session_id] = {
                     'processed': True,
                     'timestamp': now,
@@ -2958,12 +3034,37 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
 @accounts_router.post("/qr-login/continue/{session_id}")
 async def continue_qr_code_after_verification(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Start the dedicated Chrome window only after an explicit user action."""
+    """Compatibility entry that ensures the verification renderer is active."""
     persisted = get_session_registry().get(session_id)
     if persisted and persisted.get('owner_user_id') != current_user['user_id']:
         raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
     qr_login_manager.continue_after_verification(session_id)
     return await check_qr_code_status(session_id, current_user)
+
+
+@accounts_router.post("/qr-login/cancel/{session_id}")
+async def cancel_qr_login_session(
+    session_id: str,
+    payload: QRLoginCancelIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    registry = get_session_registry()
+    persisted = registry.get(session_id)
+    if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+    status_info = qr_login_manager.cancel_session(
+        session_id,
+        ended_by=payload.ended_by,
+    )
+    if status_info.get('status') == 'not_found':
+        raise HTTPException(status_code=404, detail='二维码会话不存在或已过期')
+    registry.update(
+        session_id,
+        status=status_info.get('status') or 'cancelled',
+        error_code='cancelled',
+        error_message=status_info.get('message') or '扫码登录已取消',
+    )
+    return status_info
 
 
 async def process_qr_login_cookies(
@@ -6600,8 +6701,10 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh/show-browser")
 def show_account_session_refresh_browser(
     cookie_id: str,
+    request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    _require_server_browser_access(request, current_user)
     _require_owned_cookie(cookie_id, current_user['user_id'])
     if not active_refresh_registry.show_browser(cookie_id):
         raise HTTPException(status_code=404, detail="没有正在等待人工操作的官方浏览器会话")

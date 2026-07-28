@@ -553,6 +553,9 @@
   "/qr-login/check/{session_id}": [
     "GET"
   ],
+  "/qr-login/cancel/{session_id}": [
+    "POST"
+  ],
   "/qr-login/continue/{session_id}": [
     "POST"
   ],
