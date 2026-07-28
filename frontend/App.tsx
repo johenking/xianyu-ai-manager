@@ -179,7 +179,7 @@ const App: React.FC = () => {
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard />;
-      case 'accounts': return <AccountList />;
+      case 'accounts': return <AccountList isAdmin={isAdmin} />;
       case 'orders': return <OrderList />;
       case 'cards': return <CardList />;
       case 'items': return <ItemList />;

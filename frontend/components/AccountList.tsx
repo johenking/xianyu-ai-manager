@@ -11,7 +11,7 @@ import {
   deleteAccount,
   generateQRLogin,
   checkQRLoginStatus,
-  continueQRLoginAfterVerification,
+  cancelQRLogin,
   createBrowserExtensionPairing,
   getBrowserExtensionPairing,
   createOfficialLoginSession,
@@ -60,6 +60,14 @@ const ACTIVE_BROWSER_QR_VIEW_STATES = new Set([
   'waiting',
   'verification_required',
 ]);
+const ACTIVE_API_QR_STATES = new Set([
+  'loading',
+  'waiting',
+  'scanned',
+  'verification_required',
+  'processing',
+]);
+const ACTIVE_EXTENSION_PAIRING_STATES = new Set(['waiting', 'received', 'validating']);
 const COOKIE_REFRESH_INTERVAL_OPTIONS = [
   { value: 60, label: '1 小时' },
   { value: 360, label: '6 小时' },
@@ -68,6 +76,15 @@ const COOKIE_REFRESH_INTERVAL_OPTIONS = [
   { value: 4320, label: '3 天' },
   { value: 10080, label: '7 天' },
 ];
+
+interface AccountListProps {
+  isAdmin?: boolean;
+}
+
+const isLoopbackHostname = (hostname: string) => {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
+};
 
 const formatCookieRefreshInterval = (minutes?: number) => {
   const value = minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES;
@@ -85,7 +102,8 @@ const reauthActionLabel = (account: AccountDetail) => {
   return '重新登录';
 };
 
-const AccountList: React.FC = () => {
+const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
+  const canUseServerBrowser = isAdmin && isLoopbackHostname(window.location.hostname);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -97,10 +115,13 @@ const AccountList: React.FC = () => {
   const [qrMessage, setQrMessage] = useState<string>('');
   const [qrVerificationImage, setQrVerificationImage] = useState<string>('');
   const qrPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const qrPollingInFlightRef = useRef(false);
   const qrHadVerificationRef = useRef(false);
+  const qrExtensionTransitionRef = useRef(false);
   const passwordPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const officialPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const extensionPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const extensionPollingInFlightRef = useRef(false);
   const loginFlowGenerationRef = useRef(0);
   const [extensionPairing, setExtensionPairing] = useState<Awaited<ReturnType<typeof createBrowserExtensionPairing>> | null>(null);
   const [extensionMessage, setExtensionMessage] = useState('');
@@ -200,6 +221,7 @@ const AccountList: React.FC = () => {
       clearInterval(qrPollingRef.current);
       qrPollingRef.current = null;
     }
+    qrPollingInFlightRef.current = false;
   };
 
   const clearPasswordPolling = () => {
@@ -221,16 +243,20 @@ const AccountList: React.FC = () => {
       clearInterval(extensionPollingRef.current);
       extensionPollingRef.current = null;
     }
+    extensionPollingInFlightRef.current = false;
   };
 
   const cancelActiveOfficialSession = async () => {
     const sessionId = activeOfficialSessionRef.current;
-    activeOfficialSessionRef.current = '';
-    if (!sessionId) return;
+    if (!sessionId) return true;
     try {
       await cancelOfficialLoginSession(sessionId);
+      if (activeOfficialSessionRef.current === sessionId) {
+        activeOfficialSessionRef.current = '';
+      }
+      return true;
     } catch {
-      // The session may already be terminal or expired.
+      return false;
     }
   };
 
@@ -244,19 +270,26 @@ const AccountList: React.FC = () => {
   };
 
   const closeAddModal = () => {
+    setShowAddModal(false);
+  };
+
+  const finishAddFlow = () => {
     loginFlowGenerationRef.current += 1;
     clearQRPolling();
     clearPasswordPolling();
     clearOfficialPolling();
     clearExtensionPolling();
-    void cancelActiveOfficialSession();
+    activeOfficialSessionRef.current = '';
     setShowAddModal(false);
+    setActiveAddMethod('qr');
     setQrEntryMode(null);
     setQrStatus('pending');
     setQrCodeUrl('');
     setQrSessionId('');
     setQrMessage('');
     setQrVerificationImage('');
+    qrHadVerificationRef.current = false;
+    qrExtensionTransitionRef.current = false;
     setPasswordStatus('idle');
     setPasswordMessage('');
     setPasswordVerificationImage('');
@@ -272,23 +305,16 @@ const AccountList: React.FC = () => {
     setOfficialWindowAccount('');
     setOfficialWindowStatus('idle');
     setOfficialWindowMessage('');
+    setOfficialWindowSubmitting(false);
     setShowAdvancedLogin(false);
     setExtensionPairing(null);
     setExtensionMessage('');
     setExtensionCopied(false);
+    setExtensionBusy(false);
   };
 
   const openAddAccountModal = () => {
-    loginFlowGenerationRef.current += 1;
     setReauthReminderAccounts([]);
-    setActiveAddMethod('qr');
-    setQrEntryMode(null);
-    setQrStatus('pending');
-    setQrCodeUrl('');
-    setQrSessionId('');
-    setQrMessage('');
-    setQrVerificationImage('');
-    qrHadVerificationRef.current = false;
     setShowAddModal(true);
   };
 
@@ -316,8 +342,7 @@ const AccountList: React.FC = () => {
     return '';
   };
 
-  const loadAccounts = async () => {
-    setLoading(true);
+  const loadAccounts = async (): Promise<AccountDetail[] | null> => {
     try {
       const data = await getAccountDetails();
 
@@ -340,15 +365,36 @@ const AccountList: React.FC = () => {
       }));
 
       setAccounts(accountsWithAI);
+      return accountsWithAI;
     } catch (error) {
       console.error('Failed to load accounts:', error);
+      return null;
     } finally {
       setLoading(false);
     }
   };
 
+  const refreshAndConfirmAccount = async (
+    accountId: string | undefined,
+    flowGeneration: number,
+  ): Promise<'confirmed' | 'missing' | 'refresh_failed' | 'stale'> => {
+    const refreshedAccounts = await loadAccounts();
+    if (flowGeneration !== loginFlowGenerationRef.current) return 'stale';
+    if (!refreshedAccounts) return 'refresh_failed';
+    if (!accountId || !refreshedAccounts.some((account) => String(account.id) === String(accountId))) {
+      return 'missing';
+    }
+    return 'confirmed';
+  };
+
+  const accountConfirmationMessage = (result: 'missing' | 'refresh_failed') => (
+    result === 'refresh_failed'
+      ? '账号列表刷新失败，请保持此窗口并重试'
+      : '账号保存结果尚未在列表中确认'
+  );
+
   useEffect(() => {
-    loadAccounts();
+    void loadAccounts();
     return () => {
       loginFlowGenerationRef.current += 1;
       clearQRPolling();
@@ -522,8 +568,12 @@ const AccountList: React.FC = () => {
     setActiveModal(null);
     setShowAddModal(true);
     if (account.reauth_action === 'sms_login') {
-      setActiveAddMethod('sms');
-      setOfficialWindowAccount(account.username || '');
+      if (canUseServerBrowser) {
+        setActiveAddMethod('sms');
+        setOfficialWindowAccount(account.username || '');
+      } else {
+        setActiveAddMethod('extension');
+      }
     } else if (account.reauth_action === 'password_login') {
       setActiveAddMethod('password');
       setPasswordForm((current) => ({ ...current, account: account.username || '' }));
@@ -555,6 +605,7 @@ const AccountList: React.FC = () => {
   };
 
   const handleShowAccountSessionBrowser = async (account: AccountDetail) => {
+    if (!canUseServerBrowser) return;
     try {
       const result = await showAccountSessionRefreshBrowser(account.id);
       setPageNotice({ tone: 'info', text: result.message || '已在本机显示闲鱼官方窗口' });
@@ -746,7 +797,136 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const handleQRStatusResult = (
+  const cancelQRSessionById = async (
+    sessionId: string,
+    endedBy: 'user_cancelled' | 'switched_method' | 'switched_to_extension',
+  ) => {
+    if (!sessionId) return true;
+    try {
+      await cancelQRLogin(sessionId, endedBy);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const buildExtensionPairingBundle = (
+    pairing: Awaited<ReturnType<typeof createBrowserExtensionPairing>>,
+  ) => {
+    if ((pairing.protocol_version || 1) < 2) {
+      return {
+        pairing_id: pairing.pairing_id,
+        pairing_code: pairing.pairing_code,
+      };
+    }
+    return {
+      protocol_version: pairing.protocol_version,
+      pairing_id: pairing.pairing_id,
+      pairing_token: pairing.pairing_token,
+      import_url: pairing.import_url,
+      console_origin: pairing.console_origin,
+      expires_at: pairing.expires_at,
+    };
+  };
+
+  const startExtensionPairingPolling = (pairingId: string, flowGeneration: number) => {
+    clearExtensionPolling();
+    extensionPollingRef.current = setInterval(async () => {
+      if (
+        flowGeneration !== loginFlowGenerationRef.current
+        || extensionPollingInFlightRef.current
+      ) return;
+      extensionPollingInFlightRef.current = true;
+      try {
+        const pairing = await getBrowserExtensionPairing(pairingId);
+        if (flowGeneration !== loginFlowGenerationRef.current) return;
+        setExtensionPairing((current) => current ? { ...current, ...pairing } : pairing);
+        setExtensionMessage(pairing.message || '等待扩展导入');
+        if (pairing.status === 'success') {
+          clearExtensionPolling();
+          const confirmation = await refreshAndConfirmAccount(pairing.account_id, flowGeneration);
+          if (confirmation === 'confirmed') {
+            finishAddFlow();
+          } else if (confirmation === 'missing' || confirmation === 'refresh_failed') {
+            setExtensionMessage(accountConfirmationMessage(confirmation));
+          }
+        } else if (pairing.status === 'failed' || pairing.status === 'expired') {
+          clearExtensionPolling();
+        }
+      } catch (error) {
+        if (flowGeneration !== loginFlowGenerationRef.current) return;
+        clearExtensionPolling();
+        setExtensionMessage(error instanceof Error ? error.message : '配对状态检查失败');
+      } finally {
+        extensionPollingInFlightRef.current = false;
+      }
+    }, 1500);
+  };
+
+  const createExtensionPairingForFlow = async (flowGeneration: number) => {
+    clearExtensionPolling();
+    setExtensionBusy(true);
+    setExtensionPairing(null);
+    setExtensionCopied(false);
+    setExtensionMessage('正在创建一次性配对');
+    try {
+      const pairing = await createBrowserExtensionPairing();
+      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      setExtensionPairing(pairing);
+      setExtensionMessage('配对已创建，请复制到 Chrome 扩展；五分钟内有效且只能使用一次。');
+      startExtensionPairingPolling(pairing.pairing_id, flowGeneration);
+    } catch (error) {
+      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      setExtensionMessage(error instanceof Error ? error.message : '创建配对失败');
+    } finally {
+      if (flowGeneration === loginFlowGenerationRef.current) {
+        setExtensionBusy(false);
+      }
+    }
+  };
+
+  const moveQRVerificationToExtension = async (
+    sessionId: string,
+    flowGeneration: number,
+  ) => {
+    if (qrExtensionTransitionRef.current) return;
+    qrExtensionTransitionRef.current = true;
+    clearQRPolling();
+    setQrMessage('此验证需要页面交互，正在切换到你的 Chrome');
+    const cancelled = await cancelQRSessionById(sessionId, 'switched_to_extension');
+    if (flowGeneration !== loginFlowGenerationRef.current) return;
+    if (!cancelled) {
+      qrExtensionTransitionRef.current = false;
+      setQrStatus('verification_required');
+      setQrMessage('原扫码会话结束失败，请重试');
+      startQRStatusPolling(sessionId, flowGeneration);
+      return;
+    }
+    setQrSessionId('');
+    setQrCodeUrl('');
+    setQrVerificationImage('');
+    setActiveAddMethod('extension');
+    setExtensionMessage('正在准备你的 Chrome 登录');
+    await createExtensionPairingForFlow(flowGeneration);
+  };
+
+  const moveOfficialVerificationToExtension = async (flowGeneration: number) => {
+    clearPasswordPolling();
+    setPasswordMessage('此验证需要页面交互，正在切换到你的 Chrome');
+    const cancelled = await cancelActiveOfficialSession();
+    if (flowGeneration !== loginFlowGenerationRef.current) return;
+    if (!cancelled) {
+      setPasswordStatus('verification_required');
+      setPasswordMessage('结束服务器验证会话失败，请重试');
+      return;
+    }
+    setPasswordForm((current) => ({ ...current, password: '', showPassword: false }));
+    setActiveAddMethod('extension');
+    setExtensionMessage('正在准备你的 Chrome 登录');
+    await createExtensionPairingForFlow(flowGeneration);
+  };
+
+  const handleQRStatusResult = async (
     statusRes: Awaited<ReturnType<typeof checkQRLoginStatus>>,
     flowGeneration: number,
     verificationMessage?: string,
@@ -756,24 +936,33 @@ const AccountList: React.FC = () => {
       clearQRPolling();
       setQrStatus('success');
       setQrMessage('登录成功，正在刷新账号列表');
-      setTimeout(() => {
-        if (flowGeneration !== loginFlowGenerationRef.current) return;
-        closeAddModal();
-        loadAccounts();
-      }, 1000);
+      const confirmation = await refreshAndConfirmAccount(
+        statusRes.account_info?.account_id,
+        flowGeneration,
+      );
+      if (confirmation === 'confirmed') {
+        finishAddFlow();
+      } else if (confirmation === 'missing' || confirmation === 'refresh_failed') {
+        setQrMessage(accountConfirmationMessage(confirmation));
+      }
     } else if (statusRes.status === 'scanned' || statusRes.status === 'processing') {
       setQrStatus('scanned');
       setQrMessage(statusRes.message || '正在检查登录状态');
     } else if (statusRes.status === 'verification_required') {
       qrHadVerificationRef.current = true;
       setQrStatus('verification_required');
+      if (statusRes.required_action === 'use_local_chrome') {
+        await moveQRVerificationToExtension(
+          statusRes.session_id || qrSessionId,
+          flowGeneration,
+        );
+        return;
+      }
       const verificationImage = getReachableVerificationImage(
         statusRes.verification_qr_code_url,
         statusRes.verification_screenshot_path,
       );
-      if (verificationImage) {
-        setQrVerificationImage(verificationImage);
-      }
+      setQrVerificationImage(verificationImage);
       if (statusRes.verification_browser_status === 'failed') {
         clearQRPolling();
       }
@@ -781,8 +970,8 @@ const AccountList: React.FC = () => {
         verificationMessage ||
         statusRes.message ||
         (verificationImage
-          ? '请在本机官方窗口完成身份验证，系统会自动检测。'
-          : '闲鱼要求安全验证，请点击“本机打开官方窗口”。')
+          ? '请按官方页面提示完成验证，系统会自动检测'
+          : '正在识别闲鱼安全验证方式，请稍候')
       );
     } else if (statusRes.status === 'not_found') {
       clearQRPolling();
@@ -812,15 +1001,18 @@ const AccountList: React.FC = () => {
   ) => {
     clearQRPolling();
     qrPollingRef.current = setInterval(async () => {
-      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (flowGeneration !== loginFlowGenerationRef.current || qrPollingInFlightRef.current) return;
+      qrPollingInFlightRef.current = true;
       try {
         const statusRes = await checkQRLoginStatus(sessionId);
-        handleQRStatusResult(statusRes, flowGeneration, verificationMessage);
+        await handleQRStatusResult(statusRes, flowGeneration, verificationMessage);
       } catch (error) {
         if (flowGeneration !== loginFlowGenerationRef.current) return;
         clearQRPolling();
         setQrStatus('error');
         setQrMessage(error instanceof Error ? error.message : '检查二维码状态失败，请重试');
+      } finally {
+        qrPollingInFlightRef.current = false;
       }
     }, 2000);
   };
@@ -832,6 +1024,12 @@ const AccountList: React.FC = () => {
     clearPasswordPolling();
     clearOfficialPolling();
     clearExtensionPolling();
+    const previousQRSessionId = qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus)
+      ? qrSessionId
+      : '';
+    if (previousQRSessionId) {
+      await cancelQRSessionById(previousQRSessionId, 'switched_method');
+    }
     await cancelActiveOfficialSession();
     if (flowGeneration !== loginFlowGenerationRef.current) return;
     setShowAddModal(true);
@@ -843,9 +1041,15 @@ const AccountList: React.FC = () => {
     setQrMessage('');
     setQrVerificationImage('');
     qrHadVerificationRef.current = false;
+    qrExtensionTransitionRef.current = false;
     try {
       const res = await generateQRLogin();
-      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (flowGeneration !== loginFlowGenerationRef.current) {
+        if (res.session_id) {
+          await cancelQRSessionById(res.session_id, 'switched_method');
+        }
+        return;
+      }
       if (res.success && res.qr_code_url && res.session_id) {
         setQrCodeUrl(res.qr_code_url);
         setQrSessionId(res.session_id);
@@ -863,77 +1067,13 @@ const AccountList: React.FC = () => {
     }
   };
 
-  const handleContinueQRVerification = async () => {
-    const flowGeneration = loginFlowGenerationRef.current;
-    if (!qrSessionId) {
-      setQrStatus('error');
-      setQrMessage('二维码会话不存在，请重新生成二维码');
-      return;
-    }
-    clearQRPolling();
-    setQrStatus('verification_required');
-    setQrMessage('正在启动本机闲鱼官方窗口，请在窗口内完成验证');
-    try {
-      const result = await continueQRLoginAfterVerification(qrSessionId);
-      if (flowGeneration !== loginFlowGenerationRef.current) return;
-      handleQRStatusResult(result, flowGeneration);
-      if (result.status === 'processing' || result.status === 'scanned' || result.status === 'verification_required') {
-        startQRStatusPolling(qrSessionId, flowGeneration);
-      }
-    } catch (error) {
-      if (flowGeneration !== loginFlowGenerationRef.current) return;
-      setQrStatus('verification_required');
-      setQrMessage(error instanceof Error ? error.message : '打开安全验证窗口失败，请重试');
-    }
-  };
-
-  const startExtensionPairingPolling = (pairingId: string) => {
-    clearExtensionPolling();
-    extensionPollingRef.current = setInterval(async () => {
-      try {
-        const pairing = await getBrowserExtensionPairing(pairingId);
-        setExtensionPairing((current) => current ? { ...current, ...pairing } : pairing);
-        setExtensionMessage(pairing.message || '等待扩展导入');
-        if (pairing.status === 'success') {
-          clearExtensionPolling();
-          setTimeout(() => {
-            closeAddModal();
-            loadAccounts();
-          }, 800);
-        } else if (pairing.status === 'failed' || pairing.status === 'expired') {
-          clearExtensionPolling();
-        }
-      } catch (error) {
-        clearExtensionPolling();
-        setExtensionMessage(error instanceof Error ? error.message : '配对状态检查失败');
-      }
-    }, 1500);
-  };
-
   const handleCreateExtensionPairing = async () => {
-    clearExtensionPolling();
-    setExtensionBusy(true);
-    setExtensionPairing(null);
-    setExtensionCopied(false);
-    setExtensionMessage('正在创建本机一次性配对');
-    try {
-      const pairing = await createBrowserExtensionPairing();
-      setExtensionPairing(pairing);
-      setExtensionMessage('配对已创建，请复制到 Chrome 扩展；五分钟内有效且只能使用一次。');
-      startExtensionPairingPolling(pairing.pairing_id);
-    } catch (error) {
-      setExtensionMessage(error instanceof Error ? error.message : '创建配对失败');
-    } finally {
-      setExtensionBusy(false);
-    }
+    await createExtensionPairingForFlow(loginFlowGenerationRef.current);
   };
 
   const handleCopyExtensionPairing = async () => {
-    if (!extensionPairing?.pairing_code) return;
-    const pairingBundle = JSON.stringify({
-      pairing_id: extensionPairing.pairing_id,
-      pairing_code: extensionPairing.pairing_code,
-    });
+    if (!extensionPairing?.pairing_token && !extensionPairing?.pairing_code) return;
+    const pairingBundle = JSON.stringify(buildExtensionPairingBundle(extensionPairing));
     try {
       await navigator.clipboard.writeText(pairingBundle);
       setExtensionCopied(true);
@@ -944,17 +1084,85 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const handleCancelApiQRLogin = async () => {
+    const sessionId = qrSessionId;
+    if (!sessionId) return;
+    loginFlowGenerationRef.current += 1;
+    const flowGeneration = loginFlowGenerationRef.current;
+    clearQRPolling();
+    qrExtensionTransitionRef.current = false;
+    setQrMessage('正在取消本次扫码');
+    const cancelled = await cancelQRSessionById(sessionId, 'user_cancelled');
+    if (flowGeneration !== loginFlowGenerationRef.current) return;
+    setQrStatus('error');
+    if (cancelled) {
+      setQrSessionId('');
+      setQrMessage('本次扫码已取消');
+    } else {
+      setQrMessage('取消扫码失败，请重试');
+    }
+  };
+
   const handleAddMethodChange = async (method: AddLoginMethod) => {
     if (method === activeAddMethod) return;
+    const activeApiQRSessionId = (
+      activeAddMethod === 'qr'
+      && qrEntryMode === 'api'
+      && qrSessionId
+      && ACTIVE_API_QR_STATES.has(qrStatus)
+    ) ? qrSessionId : '';
+    const hasActiveOfficialSession = Boolean(activeOfficialSessionRef.current);
+    const hasActiveExtensionPairing = Boolean(
+      activeAddMethod === 'extension'
+      && extensionPairing
+      && ACTIVE_EXTENSION_PAIRING_STATES.has(extensionPairing.status),
+    );
+    if (
+      (activeApiQRSessionId || hasActiveOfficialSession || hasActiveExtensionPairing)
+      && !window.confirm('当前登录仍在进行，切换方式会结束本次会话。是否继续？')
+    ) {
+      return;
+    }
+
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     clearQRPolling();
     clearPasswordPolling();
     clearOfficialPolling();
     clearExtensionPolling();
-    await cancelActiveOfficialSession();
+    if (activeApiQRSessionId) {
+      const cancelled = await cancelQRSessionById(activeApiQRSessionId, 'switched_method');
+      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (!cancelled) {
+        setQrStatus('error');
+        setQrMessage('结束原扫码会话失败，请重试');
+        return;
+      }
+    }
+    if (hasActiveOfficialSession) {
+      const cancelled = await cancelActiveOfficialSession();
+      if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (!cancelled) {
+        if (activeAddMethod === 'qr') {
+          setQrStatus('error');
+          setQrMessage('结束服务器 Chrome 会话失败，请重试');
+        } else if (activeAddMethod === 'sms') {
+          setOfficialWindowStatus('failed');
+          setOfficialWindowMessage('结束验证码登录会话失败，请重试');
+        } else {
+          setPasswordStatus('failed');
+          setPasswordMessage('结束账号密码登录会话失败，请重试');
+        }
+        return;
+      }
+    }
     if (flowGeneration !== loginFlowGenerationRef.current) return;
     setActiveAddMethod(method);
+    setExtensionCopied(false);
+    if (method !== 'extension') {
+      setExtensionPairing(null);
+      setExtensionMessage('');
+    }
     if (method === 'qr') {
       setQrEntryMode(null);
       setQrStatus('pending');
@@ -962,14 +1170,16 @@ const AccountList: React.FC = () => {
       setQrSessionId('');
       setQrMessage('');
       setQrVerificationImage('');
+      qrHadVerificationRef.current = false;
+      qrExtensionTransitionRef.current = false;
     }
   };
 
-  const applyInteractiveOfficialStatus = (
+  const applyInteractiveOfficialStatus = async (
     mode: InteractiveOfficialLoginMode,
     status: Awaited<ReturnType<typeof getOfficialLoginSession>>,
     flowGeneration: number,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (flowGeneration !== loginFlowGenerationRef.current) return false;
     const activeStates = ['preparing', 'waiting_user', 'persisting', 'restarting_listener'];
     const terminalStates = ['failed', 'expired', 'cancelled', 'interrupted'];
@@ -1005,11 +1215,14 @@ const AccountList: React.FC = () => {
         setOfficialWindowStatus('success');
         setOfficialWindowMessage(status.message || '手机号验证码登录成功');
       }
-      setTimeout(() => {
-        if (flowGeneration !== loginFlowGenerationRef.current) return;
-        closeAddModal();
-        loadAccounts();
-      }, 1000);
+      const confirmation = await refreshAndConfirmAccount(status.account_id, flowGeneration);
+      if (confirmation === 'confirmed') {
+        finishAddFlow();
+      } else if (confirmation === 'missing' || confirmation === 'refresh_failed') {
+        const message = accountConfirmationMessage(confirmation);
+        if (mode === 'qr') setQrMessage(message);
+        else setOfficialWindowMessage(message);
+      }
       return false;
     }
     if (terminalStates.includes(status.state)) {
@@ -1038,7 +1251,7 @@ const AccountList: React.FC = () => {
       try {
         const status = await getOfficialLoginSession(sessionId);
         if (flowGeneration !== loginFlowGenerationRef.current) return;
-        if (!applyInteractiveOfficialStatus(mode, status, flowGeneration)) {
+        if (!await applyInteractiveOfficialStatus(mode, status, flowGeneration)) {
           clearOfficialPolling();
         }
       } catch (error) {
@@ -1058,14 +1271,24 @@ const AccountList: React.FC = () => {
   };
 
   const startBrowserQRLogin = async () => {
+    if (!canUseServerBrowser) {
+      setQrStatus('error');
+      setQrMessage('服务器 Chrome 仅供本机管理员使用');
+      return;
+    }
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     clearQRPolling();
     clearPasswordPolling();
     clearOfficialPolling();
     clearExtensionPolling();
-    await cancelActiveOfficialSession();
+    const previousSessionCancelled = await cancelActiveOfficialSession();
     if (flowGeneration !== loginFlowGenerationRef.current) return;
+    if (!previousSessionCancelled) {
+      setQrStatus('error');
+      setQrMessage('结束已有服务器 Chrome 会话失败，请重试');
+      return;
+    }
     setShowAddModal(true);
     setActiveAddMethod('qr');
     setQrEntryMode('browser');
@@ -1090,7 +1313,7 @@ const AccountList: React.FC = () => {
       }
       activeOfficialSessionRef.current = result.session_id;
       setQrSessionId(result.session_id);
-      if (applyInteractiveOfficialStatus('qr', result, flowGeneration)) {
+      if (await applyInteractiveOfficialStatus('qr', result, flowGeneration)) {
         startInteractiveOfficialPolling(result.session_id, 'qr', flowGeneration);
       }
     } catch (error) {
@@ -1101,10 +1324,22 @@ const AccountList: React.FC = () => {
   };
 
   const returnToQRChooser = async () => {
+    const activeApiQRSessionId = qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus)
+      ? qrSessionId
+      : '';
+    if (
+      (activeApiQRSessionId || activeOfficialSessionRef.current)
+      && !window.confirm('返回扫码方式会结束本次登录会话。是否继续？')
+    ) return;
     loginFlowGenerationRef.current += 1;
+    const flowGeneration = loginFlowGenerationRef.current;
     clearQRPolling();
     clearOfficialPolling();
+    if (activeApiQRSessionId) {
+      await cancelQRSessionById(activeApiQRSessionId, 'switched_method');
+    }
     await cancelActiveOfficialSession();
+    if (flowGeneration !== loginFlowGenerationRef.current) return;
     setQrEntryMode(null);
     setQrStatus('pending');
     setQrCodeUrl('');
@@ -1114,14 +1349,24 @@ const AccountList: React.FC = () => {
   };
 
   const handleOfficialWindowLogin = async () => {
+    if (!canUseServerBrowser) {
+      setOfficialWindowStatus('failed');
+      setOfficialWindowMessage('验证码窗口仅供本机管理员使用');
+      return;
+    }
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     setOfficialWindowSubmitting(true);
     setOfficialWindowStatus('processing');
     setOfficialWindowMessage('正在打开本机 Chrome');
     try {
-      await cancelActiveOfficialSession();
+      const previousSessionCancelled = await cancelActiveOfficialSession();
       if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (!previousSessionCancelled) {
+        setOfficialWindowStatus('failed');
+        setOfficialWindowMessage('结束已有官方登录会话失败，请重试');
+        return;
+      }
       const result = await createOfficialLoginSession({
         mode: 'sms',
         account: officialWindowAccount.trim(),
@@ -1138,7 +1383,7 @@ const AccountList: React.FC = () => {
       }
       activeOfficialSessionRef.current = result.session_id;
       setOfficialWindowMessage(result.message || '请在官方窗口完成验证码登录');
-      if (applyInteractiveOfficialStatus('sms', result, flowGeneration)) {
+      if (await applyInteractiveOfficialStatus('sms', result, flowGeneration)) {
         startInteractiveOfficialPolling(result.session_id, 'sms', flowGeneration);
       }
     } catch (error) {
@@ -1166,6 +1411,10 @@ const AccountList: React.FC = () => {
           setPasswordStatus('processing');
           setPasswordMessage(statusRes.message || '登录处理中，请稍候');
         } else if (statusRes.state === 'verification_required') {
+          if (!canUseServerBrowser && statusRes.required_action === 'use_local_chrome') {
+            await moveOfficialVerificationToExtension(flowGeneration);
+            return;
+          }
           setPasswordStatus('verification_required');
           setPasswordMessage(statusRes.message || '需要完成闲鱼安全验证');
           setPasswordVerificationImage(statusRes.verification_image_url || '');
@@ -1175,11 +1424,12 @@ const AccountList: React.FC = () => {
           setPasswordStatus('success');
           setPasswordMessage(statusRes.message || '账号密码登录成功，正在刷新账号列表');
           setPasswordForm((current) => ({ ...current, password: '', showPassword: false }));
-          setTimeout(() => {
-            if (flowGeneration !== loginFlowGenerationRef.current) return;
-            closeAddModal();
-            loadAccounts();
-          }, 1000);
+          const confirmation = await refreshAndConfirmAccount(statusRes.account_id, flowGeneration);
+          if (confirmation === 'confirmed') {
+            finishAddFlow();
+          } else if (confirmation === 'missing' || confirmation === 'refresh_failed') {
+            setPasswordMessage(accountConfirmationMessage(confirmation));
+          }
         } else if (
           statusRes.state === 'failed' ||
           statusRes.state === 'expired' ||
@@ -1216,13 +1466,18 @@ const AccountList: React.FC = () => {
     setPasswordStatus('processing');
     setPasswordMessage('正在启动账号密码登录');
     try {
-      await cancelActiveOfficialSession();
+      const previousSessionCancelled = await cancelActiveOfficialSession();
       if (flowGeneration !== loginFlowGenerationRef.current) return;
+      if (!previousSessionCancelled) {
+        setPasswordStatus('failed');
+        setPasswordMessage('结束已有登录会话失败，请重试');
+        return;
+      }
       const result = await createOfficialLoginSession({
         mode: 'password',
         account,
         password: passwordForm.password,
-        show_browser: passwordForm.show_browser,
+        show_browser: canUseServerBrowser && passwordForm.show_browser,
       });
       if (flowGeneration !== loginFlowGenerationRef.current) {
         await cancelOfficialSessionById(result.session_id);
@@ -1246,6 +1501,7 @@ const AccountList: React.FC = () => {
   };
 
   const handleShowOfficialBrowser = async () => {
+    if (!canUseServerBrowser) return;
     const flowGeneration = loginFlowGenerationRef.current;
     const sessionId = activeOfficialSessionRef.current;
     if (!sessionId) return;
@@ -1270,7 +1526,20 @@ const AccountList: React.FC = () => {
     clearQRPolling();
     clearPasswordPolling();
     clearOfficialPolling();
-    await cancelActiveOfficialSession();
+    const cancelled = await cancelActiveOfficialSession();
+    if (!cancelled) {
+      if (activeAddMethod === 'qr') {
+        setQrStatus('error');
+        setQrMessage('取消服务器 Chrome 会话失败，请重试');
+      } else if (activeAddMethod === 'sms') {
+        setOfficialWindowStatus('failed');
+        setOfficialWindowMessage('取消验证码登录失败，请重试');
+      } else {
+        setPasswordStatus('failed');
+        setPasswordMessage('取消登录会话失败，请重试');
+      }
+      return;
+    }
     if (activeAddMethod === 'qr') {
       setQrStatus('error');
       setQrMessage('登录会话已取消');
@@ -1297,14 +1566,17 @@ const AccountList: React.FC = () => {
     setManualCookieStatus('processing');
     setManualCookieMessage('正在保存 Cookie');
     try {
-      await addAccountCookie({ value });
+      const result = await addAccountCookie({ value });
       setManualCookieStatus('success');
       setManualCookieMessage('Cookie 已保存，正在刷新账号列表');
       setManualCookieForm({ value: '' });
-      setTimeout(() => {
-        closeAddModal();
-        loadAccounts();
-      }, 800);
+      const flowGeneration = loginFlowGenerationRef.current;
+      const confirmation = await refreshAndConfirmAccount(result.account_id, flowGeneration);
+      if (confirmation === 'confirmed') {
+        finishAddFlow();
+      } else if (confirmation === 'missing' || confirmation === 'refresh_failed') {
+        setManualCookieMessage(accountConfirmationMessage(confirmation));
+      }
     } catch (error) {
       setManualCookieStatus('failed');
       setManualCookieMessage(error instanceof Error ? error.message : 'Cookie 保存失败');
@@ -1482,7 +1754,7 @@ const AccountList: React.FC = () => {
                   {sessionStatus.updated_at && <div className="mt-1 text-xs text-gray-500">更新于 {new Date(sessionStatus.updated_at * 1000).toLocaleTimeString()}</div>}
                 </div>
                 <div className="flex shrink-0 gap-2">
-                  {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
+                  {canUseServerBrowser && sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
                     <button type="button" onClick={() => void handleCancelSessionRefresh(account)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-xs font-bold text-gray-700">取消</button>
                   )}
                   {sessionStatus.state === 'verification_required' && sessionStatus.browser_active && (
@@ -1592,7 +1864,7 @@ const AccountList: React.FC = () => {
                   </div>
 
                   <div className="modal-body space-y-6">
-                    <div className="grid grid-cols-1 gap-2 rounded-2xl bg-gray-100 p-1 sm:grid-cols-3">
+	                    <div className="grid grid-cols-1 gap-2 rounded-2xl bg-gray-100 p-1 sm:grid-cols-3">
                       <button
                         type="button"
                         onClick={() => void handleAddMethodChange('qr')}
@@ -1603,16 +1875,29 @@ const AccountList: React.FC = () => {
                         <QrCode className="w-4 h-4" />
                         扫码
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleAddMethodChange('sms')}
-                        className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
-                          activeAddMethod === 'sms' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
-                        }`}
-                      >
-                        <Smartphone className="w-4 h-4" />
-                        手机号验证码
-                      </button>
+	                      {canUseServerBrowser ? (
+	                        <button
+	                          type="button"
+	                          onClick={() => void handleAddMethodChange('sms')}
+	                          className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
+	                            activeAddMethod === 'sms' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
+	                          }`}
+	                        >
+	                          <Smartphone className="w-4 h-4" />
+	                          手机号验证码
+	                        </button>
+	                      ) : (
+	                        <button
+	                          type="button"
+	                          onClick={() => void handleAddMethodChange('extension')}
+	                          className={`flex min-h-11 items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-bold transition-colors ${
+	                            activeAddMethod === 'extension' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'
+	                          }`}
+	                        >
+	                          <Chrome className="w-4 h-4" />
+	                          你的 Chrome
+	                        </button>
+	                      )}
                       <button
                         type="button"
                         onClick={() => void handleAddMethodChange('password')}
@@ -1636,14 +1921,16 @@ const AccountList: React.FC = () => {
                         <ChevronDown className={`h-4 w-4 transition-transform ${showAdvancedLogin ? 'rotate-180' : ''}`} />
                       </button>
                       {showAdvancedLogin && (
-                        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                          <button
-                            type="button"
-                            onClick={() => void handleAddMethodChange('extension')}
-                            className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-bold ${activeAddMethod === 'extension' ? 'border-gray-900 bg-gray-900 text-white' : 'border-gray-200 text-gray-600'}`}
-                          >
-                            <Chrome className="h-4 w-4" /> 本机 Chrome
-                          </button>
+	                        <div className={`mt-2 grid grid-cols-1 gap-2 ${canUseServerBrowser ? 'sm:grid-cols-2' : ''}`}>
+	                          {canUseServerBrowser && (
+	                            <button
+	                              type="button"
+	                              onClick={() => void handleAddMethodChange('extension')}
+	                              className={`flex min-h-11 items-center justify-center gap-2 rounded-lg border px-3 text-sm font-bold ${activeAddMethod === 'extension' ? 'border-gray-900 bg-gray-900 text-white' : 'border-gray-200 text-gray-600'}`}
+	                            >
+	                              <Chrome className="h-4 w-4" /> 你的 Chrome
+	                            </button>
+	                          )}
                           <button
                             type="button"
                             onClick={() => void handleAddMethodChange('cookie')}
@@ -1661,24 +1948,30 @@ const AccountList: React.FC = () => {
                           <div className="flex items-start gap-3">
                             <QrCode className="mt-0.5 h-5 w-5 shrink-0 text-yellow-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">选择二维码出现的位置</h4>
-                              <p className="mt-1 text-sm leading-6 text-gray-600">本机 Chrome 更接近官方登录流程；远程访问这台监控台时，可直接使用网页二维码。</p>
+	                              <h4 className="font-bold text-gray-900">选择扫码方式</h4>
+	                              <p className="mt-1 text-sm leading-6 text-gray-600">
+	                                {canUseServerBrowser
+	                                  ? '可在服务器 Chrome 或当前网页中显示二维码。'
+	                                  : '二维码会显示在当前网页；需要滑块或人脸时会切换到你的 Chrome。'}
+	                              </p>
                             </div>
                           </div>
                         </div>
-                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          <button
-                            type="button"
-                            aria-label="本机 Chrome 扫码"
-                            onClick={() => void startBrowserQRLogin()}
-                            className="ios-btn-primary flex min-h-11 items-start gap-3 rounded-2xl p-4 text-left"
-                          >
-                            <Chrome className="mt-0.5 h-5 w-5 shrink-0" />
-                            <span>
-                              <span className="block font-bold">本机 Chrome 扫码</span>
-                              <span className="mt-1 block text-xs font-medium opacity-70">推荐 · 窗口打开在运行服务的 Mac 上</span>
-                            </span>
-                          </button>
+	                        <div className={`grid grid-cols-1 gap-3 ${canUseServerBrowser ? 'sm:grid-cols-2' : ''}`}>
+	                          {canUseServerBrowser && (
+	                            <button
+	                              type="button"
+	                              aria-label="服务器 Chrome 扫码"
+	                              onClick={() => void startBrowserQRLogin()}
+	                              className="ios-btn-primary flex min-h-11 items-start gap-3 rounded-2xl p-4 text-left"
+	                            >
+	                              <Chrome className="mt-0.5 h-5 w-5 shrink-0" />
+	                              <span>
+	                                <span className="block font-bold">服务器 Chrome 扫码</span>
+	                                <span className="mt-1 block text-xs font-medium opacity-70">窗口打开在运行服务的 Mac 上</span>
+	                              </span>
+	                            </button>
+	                          )}
                           <button
                             type="button"
                             aria-label="网页二维码"
@@ -1745,16 +2038,16 @@ const AccountList: React.FC = () => {
                           </p>
                         )}
                         <div className="flex flex-wrap items-center justify-center gap-3">
-                          {qrStatus === 'verification_required' && (
-                            <button
-                              type="button"
-                              onClick={() => void handleContinueQRVerification()}
-                            className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg bg-[#FFE815] px-4 py-2 text-sm font-bold text-gray-900 hover:bg-yellow-300"
-                            >
-                              <Chrome className="h-4 w-4" />
-                              本机打开官方窗口
-                            </button>
-                          )}
+	                          {qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus) && (
+	                            <button
+	                              type="button"
+	                              onClick={() => void handleCancelApiQRLogin()}
+	                              className="inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-red-200 bg-white px-4 py-2 text-sm font-bold text-red-600 hover:bg-red-50"
+	                            >
+	                              <X className="h-4 w-4" />
+	                              取消本次扫码
+	                            </button>
+	                          )}
                           <button
                             type="button"
                             onClick={() => void startApiQRLogin()}
@@ -1772,7 +2065,7 @@ const AccountList: React.FC = () => {
                           </button>
                         </div>
                         <p className="mt-4 rounded-xl bg-gray-50 py-2 text-xs font-medium text-gray-400">
-                          二维码生成和扫码阶段不启动浏览器；只有二次验证时由你主动打开专用 Chrome。
+	                          二维码可直接扫码；需要页面交互时会结束本次二维码并切换到你的 Chrome。
                         </p>
                       </div>
                     )}
@@ -1854,7 +2147,7 @@ const AccountList: React.FC = () => {
                       </div>
                     )}
 
-                    {activeAddMethod === 'sms' && (
+	                    {activeAddMethod === 'sms' && canUseServerBrowser && (
                       <div className="space-y-4">
                         <div className="rounded-lg border border-blue-200 bg-blue-50 p-4">
                           <div className="flex items-start gap-3">
@@ -1912,9 +2205,9 @@ const AccountList: React.FC = () => {
                           <div className="flex items-start gap-3">
                             <Chrome className="mt-0.5 h-5 w-5 text-yellow-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">从日常 Chrome 主动导入</h4>
-                              <p className="mt-1 text-sm leading-6 text-gray-600">
-                                扩展只在你点击时读取当前 Cookie Store，并只发送到本机 127.0.0.1；不参与后台自动续期。
+	                              <h4 className="font-bold text-gray-900">从你的 Chrome 导入</h4>
+	                              <p className="mt-1 text-sm leading-6 text-gray-600">
+	                                扩展只在你点击时读取当前闲鱼登录状态，并使用五分钟一次性配对发送到监控台。
                               </p>
                             </div>
                           </div>
@@ -1924,7 +2217,7 @@ const AccountList: React.FC = () => {
                           <a
                             href="/static/downloads/xianyu-cookie-importer.zip"
                             download
-                            className="inline-flex items-center gap-2 rounded-full bg-gray-100 px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-200"
+                            className="inline-flex min-h-11 items-center gap-2 rounded-full bg-gray-100 px-4 py-2 text-sm font-bold text-gray-700 hover:bg-gray-200"
                           >
                             <Upload className="h-4 w-4" />
                             下载扩展 ZIP
@@ -1933,24 +2226,21 @@ const AccountList: React.FC = () => {
                             type="button"
                             onClick={handleCreateExtensionPairing}
                             disabled={extensionBusy}
-                            className="inline-flex items-center gap-2 rounded-full bg-[#FFE815] px-4 py-2 text-sm font-bold text-gray-900 hover:bg-yellow-300 disabled:opacity-60"
+                            className="inline-flex min-h-11 items-center gap-2 rounded-full bg-[#FFE815] px-4 py-2 text-sm font-bold text-gray-900 hover:bg-yellow-300 disabled:opacity-60"
                           >
                             {extensionBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Key className="h-4 w-4" />}
                             创建一次性配对
                           </button>
                         </div>
 
-                        {extensionPairing?.pairing_code && (
+	                        {(extensionPairing?.pairing_token || extensionPairing?.pairing_code) && (
                           <div className="space-y-2">
                             <label className="block text-sm font-bold text-gray-700">复制到扩展的配对信息</label>
                             <div className="flex gap-2">
                               <textarea
                                 readOnly
                                 rows={3}
-                                value={JSON.stringify({
-                                  pairing_id: extensionPairing.pairing_id,
-                                  pairing_code: extensionPairing.pairing_code,
-                                })}
+	                                value={JSON.stringify(buildExtensionPairingBundle(extensionPairing))}
                                 className="min-w-0 flex-1 resize-none rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 font-mono text-xs"
                                 aria-label="扩展配对信息"
                               />
@@ -1980,7 +2270,7 @@ const AccountList: React.FC = () => {
 
                         <ol className="list-decimal space-y-1 pl-5 text-xs leading-5 text-gray-500">
                           <li>解压 ZIP，在 chrome://extensions 开启开发者模式并加载已解压扩展。</li>
-                          <li>在本机 Chrome 登录闲鱼官网，并保持官方页面为当前标签页。</li>
+                          <li>在你的 Chrome 登录闲鱼官网，并保持官方页面为当前标签页。</li>
                           <li>创建配对、复制到扩展，然后点击“导入到咸鱼监控台”。</li>
                         </ol>
                       </div>
@@ -2027,17 +2317,19 @@ const AccountList: React.FC = () => {
                             密码会使用独立密钥加密保存，仅在官方登录态失效时用于自动续期。
                           </p>
                         </div>
-                        <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
-                          <div>
-                            <div className="font-bold text-gray-900">登录时显示浏览器</div>
-                            <div className="text-xs text-gray-500">需要安全验证时，打开浏览器更容易完成操作。</div>
+                        {canUseServerBrowser && (
+                          <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
+                            <div>
+                              <div className="font-bold text-gray-900">登录时显示浏览器</div>
+                              <div className="text-xs text-gray-500">需要安全验证时，可直接在服务器窗口完成操作。</div>
+                            </div>
+                            <ToggleControl
+                              checked={passwordForm.show_browser}
+                              onChange={(checked) => setPasswordForm({ ...passwordForm, show_browser: checked })}
+                              label="登录时显示浏览器"
+                            />
                           </div>
-                          <ToggleControl
-                            checked={passwordForm.show_browser}
-                            onChange={(checked) => setPasswordForm({ ...passwordForm, show_browser: checked })}
-                            label="登录时显示浏览器"
-                          />
-                        </div>
+                        )}
                         {passwordMessage && (
                           <div className={`text-sm font-bold rounded-2xl px-4 py-3 ${
                             passwordStatus === 'failed' ? 'bg-red-50 text-red-600' :
@@ -2061,14 +2353,16 @@ const AccountList: React.FC = () => {
                         )}
                         {(passwordStatus === 'processing' || passwordStatus === 'verification_required') && (
                           <div className="flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => void handleShowOfficialBrowser()}
-                              className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-700"
-                            >
-                              <ExternalLink className="h-4 w-4" />
-                              本机打开官方窗口
-                            </button>
+                            {canUseServerBrowser && (
+                              <button
+                                type="button"
+                                onClick={() => void handleShowOfficialBrowser()}
+                                className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-bold text-gray-700"
+                              >
+                                <ExternalLink className="h-4 w-4" />
+                                本机打开官方窗口
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => void handleCancelOfficialLogin()}

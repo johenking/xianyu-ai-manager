@@ -10,6 +10,7 @@ import httpx
 from loguru import logger
 
 from utils.qr_login import QRLoginManager, QRLoginSession
+from utils.xianyu_session_probe import SessionProbeResult
 
 
 class FakeVerificationBrowser:
@@ -115,6 +116,111 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(session.session_id, manager.sessions)
             manager.cleanup_expired_sessions(now=terminal_at + 301)
             self.assertNotIn(session.session_id, manager.sessions)
+
+    async def test_verification_probe_starts_renderer_and_propagates_action_state(self):
+        validator = AsyncMock(return_value=SessionProbeResult(
+            status="verification_required",
+            cookies={"unb": "account-1", "cookie2": "session"},
+            verification_url="https://passport.goofish.com/verify",
+            error_code="human_verification_required",
+        ))
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=validator,
+        )
+        session = QRLoginSession("verification-session")
+        session.cookies = {"unb": "account-1", "cookie2": "session"}
+        session.unb = "account-1"
+        manager.sessions[session.session_id] = session
+        manager._ensure_verification_browser = Mock()
+
+        validated = await manager._validate_candidate_session(session)
+
+        self.assertFalse(validated)
+        self.assertEqual(session.status, "verification_required")
+        self.assertEqual(session.required_action, "render_verification")
+        manager._ensure_verification_browser.assert_called_once_with(session.session_id)
+
+        pending = asyncio.create_task(asyncio.sleep(60))
+        session.verification_task = pending
+        manager._apply_verification_browser_update(session.session_id, {
+            "verification_browser_status": "waiting",
+            "verification_screenshot_path": "/static/uploads/images/verification.png",
+            "verification_kind": "interactive",
+            "required_action": "use_local_chrome",
+        })
+        status = manager.get_session_status(session.session_id)
+        self.assertEqual(status["verification_kind"], "interactive")
+        self.assertEqual(status["required_action"], "use_local_chrome")
+        self.assertTrue(status["browser_active"])
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_success_status_without_access_token_is_not_accepted(self):
+        validator = AsyncMock(return_value=SessionProbeResult(
+            status="success",
+            cookies={"unb": "account-1", "cookie2": "session"},
+        ))
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=validator,
+        )
+        session = QRLoginSession("tokenless-session")
+        session.cookies = {"unb": "account-1", "cookie2": "session"}
+        session.unb = "account-1"
+        manager.sessions[session.session_id] = session
+
+        validated = await manager._validate_candidate_session(session)
+
+        self.assertFalse(validated)
+        self.assertFalse(session.validated)
+        self.assertEqual(session.status, "error")
+        self.assertEqual(session.ended_by, "validation_failed")
+
+    async def test_switching_to_extension_ends_qr_session_explicitly(self):
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=AsyncMock(),
+        )
+        session = QRLoginSession("switch-session")
+        session.status = "verification_required"
+        session.verification_url = "https://passport.goofish.com/verify"
+        manager.sessions[session.session_id] = session
+
+        status = manager.cancel_session(
+            session.session_id,
+            ended_by="switched_to_extension",
+        )
+
+        self.assertEqual(status["status"], "cancelled")
+        self.assertEqual(status["ended_by"], "switched_to_extension")
+        self.assertFalse(status["browser_active"])
+
+    async def test_cancelled_renderer_removes_its_late_screenshot(self):
+        class CancelledVerificationBrowser(FakeVerificationBrowser):
+            def run(self, *_args, **_kwargs):
+                return {
+                    "status": "cancelled",
+                    "screenshot_path": "/static/uploads/images/late-cancelled.png",
+                }
+
+        manager = QRLoginManager(
+            verification_browser=CancelledVerificationBrowser(),
+            session_validator=AsyncMock(),
+        )
+        session = QRLoginSession("cancelled-renderer-session")
+        session.status = "verification_required"
+        session.verification_url = "https://passport.goofish.com/verify"
+        manager.sessions[session.session_id] = session
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            screenshot = Path(temp_dir) / "late-cancelled.png"
+            screenshot.write_bytes(b"late private screenshot")
+            with patch("utils.qr_verification_browser.UPLOAD_DIR", temp_dir):
+                await manager._run_verification_browser(session.session_id)
+
+            self.assertFalse(screenshot.exists())
+            self.assertEqual(session.verification_browser_status, "cancelled")
 
 
 if __name__ == "__main__":

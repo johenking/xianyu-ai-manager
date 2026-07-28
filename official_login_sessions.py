@@ -37,6 +37,9 @@ class OfficialLoginSessionRecord:
     message: str = "正在打开闲鱼官方登录页"
     error_code: str = ""
     image_path: str = ""
+    verification_kind: str = ""
+    required_action: str = ""
+    ended_by: str = ""
     account_id: str = ""
     is_new_account: bool = False
     created_at: float = field(default_factory=time.time)
@@ -152,6 +155,7 @@ class OfficialLoginSessionCoordinator:
                 "expired",
                 "闲鱼官方登录会话已过期",
                 error_code="session_expired",
+                ended_by="expired",
             )
             await asyncio.to_thread(record.worker.close_browser)
         except asyncio.CancelledError:
@@ -236,7 +240,12 @@ class OfficialLoginSessionCoordinator:
                 metadata = metadata or {}
                 record.account_id = str(metadata.get("account_id") or result.unb)
                 record.is_new_account = bool(metadata.get("is_new_account"))
-                self._set_state(record, "success", "闲鱼官方登录成功")
+                self._set_state(
+                    record,
+                    "success",
+                    "闲鱼官方登录成功",
+                    ended_by="validated_and_persisted",
+                )
                 return
 
             state = result.status
@@ -307,6 +316,16 @@ class OfficialLoginSessionCoordinator:
             result.message,
             error_code=result.error_code,
             image_path=result.verification_image_path,
+            verification_kind=(
+                result.verification_kind
+                or ("mobile_scan" if state == "waiting_user" and record.mode == "qr" else "")
+                or ("interactive" if state == "verification_required" else "")
+            ),
+            required_action=(
+                result.required_action
+                or ("scan_image" if state == "waiting_user" and record.mode == "qr" else "")
+                or ("use_local_chrome" if state == "verification_required" else "")
+            ),
         )
 
     def _set_state(
@@ -317,6 +336,9 @@ class OfficialLoginSessionCoordinator:
         *,
         error_code: str = "",
         image_path: str = "",
+        verification_kind: str = "",
+        required_action: str = "",
+        ended_by: str = "",
     ) -> None:
         previous_image = record.image_path
         record.state = state
@@ -325,12 +347,23 @@ class OfficialLoginSessionCoordinator:
         record.updated_at = time.time()
         if image_path:
             record.image_path = image_path
+        if verification_kind:
+            record.verification_kind = verification_kind
+        if required_action:
+            record.required_action = required_action
         if previous_image and previous_image != record.image_path:
             remove_verification_image(previous_image)
         if state in TERMINAL_STATES and record.image_path:
             remove_verification_image(record.image_path)
             record.image_path = ""
         if state in TERMINAL_STATES:
+            record.ended_by = ended_by or record.ended_by or {
+                "success": "validated_and_persisted",
+                "expired": "expired",
+                "failed": "validation_failed",
+                "cancelled": "user_cancelled",
+                "interrupted": "service_restart",
+            }.get(state, "")
             if record.expiry_task and record.expiry_task is not asyncio.current_task():
                 record.expiry_task.cancel()
             if record.cleanup_task is None:
@@ -405,7 +438,13 @@ class OfficialLoginSessionCoordinator:
         if record.state not in TERMINAL_STATES:
             self._set_state(record, "restarting_listener", "正在恢复账号监听")
 
-    async def cancel(self, session_id: str, owner_user_id: int) -> bool:
+    async def cancel(
+        self,
+        session_id: str,
+        owner_user_id: int,
+        *,
+        ended_by: str = "user_cancelled",
+    ) -> bool:
         record = self._sessions.get(session_id)
         if (
             record is None
@@ -413,7 +452,13 @@ class OfficialLoginSessionCoordinator:
             or record.state not in CANCELLABLE_STATES
         ):
             return False
-        self._set_state(record, "cancelled", "登录会话已取消", error_code="cancelled")
+        self._set_state(
+            record,
+            "cancelled",
+            "登录会话已取消",
+            error_code="cancelled",
+            ended_by=ended_by,
+        )
         await asyncio.to_thread(record.worker.close_browser)
         if record.task and record.task is not asyncio.current_task():
             await asyncio.wait({record.task}, timeout=2.0)
@@ -428,6 +473,13 @@ class OfficialLoginSessionCoordinator:
 
     def _safe_status(self, record: OfficialLoginSessionRecord) -> dict[str, Any]:
         image_url = self._public_image_path(record.image_path)
+        browser_active = False
+        active = getattr(record.worker, "browser_active", None)
+        if record.state not in TERMINAL_STATES and callable(active):
+            try:
+                browser_active = bool(active())
+            except Exception:
+                browser_active = False
         return {
             "session_id": record.session_id,
             "mode": record.mode,
@@ -436,6 +488,10 @@ class OfficialLoginSessionCoordinator:
             "error_code": record.error_code,
             "qr_image_url": image_url if record.state == "waiting_user" else "",
             "verification_image_url": image_url if record.state == "verification_required" else "",
+            "verification_kind": record.verification_kind,
+            "required_action": record.required_action,
+            "browser_active": browser_active,
+            "ended_by": record.ended_by,
             "account_id": record.account_id,
             "is_new_account": record.is_new_account,
             "created_at": record.created_at,
