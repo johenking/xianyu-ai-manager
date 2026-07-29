@@ -94,7 +94,9 @@ class AIReplyEngine:
             logger.info("创建新的AI兼容客户端实例")
             client = OpenAI(
                 api_key=settings['api_key'],
-                base_url=settings['base_url']
+                base_url=settings['base_url'],
+                timeout=30.0,
+                max_retries=1,
             )
             logger.info("AI兼容客户端实例创建成功")
             return client
