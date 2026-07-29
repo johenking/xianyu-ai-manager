@@ -56,6 +56,8 @@ class OfficialLoginResult:
     verification_image_path: str = ""
     verification_url: str = field(default="", repr=False)
     requires_manual_action: bool = False
+    verification_kind: str = ""
+    required_action: str = ""
     used_password: bool = False
     browser_user_agent: str = ""
     access_token: str = field(default="", repr=False)

@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   ALLOWED_SUFFIXES,
   buildImportPayload,
+  isAllowedImportUrl,
   isAllowedCookie,
   parsePairingBundle,
   selectCookieStore,
@@ -48,7 +49,7 @@ test('serializes structured cookie metadata including partition key', () => {
 
 test('filters non-allowlisted cookie domains from an import payload', () => {
   const payload = buildImportPayload(
-    { pairingId: 'pairing-id', pairingCode: 'ABCD1234' },
+    { protocolVersion: 2, pairingId: 'pairing-id', pairingToken: 'T'.repeat(43) },
     [
       { name: 'unb', value: '123', domain: '.goofish.com', path: '/' },
       { name: 'private', value: 'other-site', domain: '.example.com', path: '/' },
@@ -59,15 +60,29 @@ test('filters non-allowlisted cookie domains from an import payload', () => {
   assert.equal(payload.cookies[0].name, 'unb');
 });
 
-test('parses JSON and compact pairing formats without persistence', () => {
+test('parses a versioned HTTPS pairing bundle without persistence', () => {
   assert.deepEqual(
-    parsePairingBundle('{"pairing_id":"one","pairing_code":"TWO"}'),
-    { pairingId: 'one', pairingCode: 'TWO' },
+    parsePairingBundle(JSON.stringify({
+      protocol_version: 2,
+      pairing_id: 'one',
+      pairing_token: 'T'.repeat(43),
+      import_url: 'https://xianyu.cxywjx.top/api/browser-extension/import',
+      console_origin: 'https://xianyu.cxywjx.top',
+      expires_at: 2_000_000_000,
+    })),
+    {
+      protocolVersion: 2,
+      pairingId: 'one',
+      pairingToken: 'T'.repeat(43),
+      importUrl: 'https://xianyu.cxywjx.top/api/browser-extension/import',
+      consoleOrigin: 'https://xianyu.cxywjx.top',
+      expiresAt: 2_000_000_000,
+    },
   );
-  assert.deepEqual(parsePairingBundle('one:TWO'), {
-    pairingId: 'one',
-    pairingCode: 'TWO',
-  });
+  assert.equal(isAllowedImportUrl('https://xianyu.cxywjx.top/api/browser-extension/import'), true);
+  assert.equal(isAllowedImportUrl('http://xianyu.cxywjx.top/api/browser-extension/import'), false);
+  assert.equal(isAllowedImportUrl('https://example.com/api/browser-extension/import'), false);
+  assert.equal(isAllowedImportUrl('https://xianyu.cxywjx.top/other'), false);
 });
 
 test('manifest permissions stay within the approved allowlist', async () => {
@@ -86,9 +101,10 @@ test('manifest permissions stay within the approved allowlist', async () => {
     );
   }
   assert.equal(
-    manifest.host_permissions.some((entry) => entry === 'http://127.0.0.1:8091/*'),
+    manifest.host_permissions.some((entry) => entry === 'https://xianyu.cxywjx.top/*'),
     true,
   );
+  assert.equal(manifest.host_permissions.some((entry) => entry.startsWith('http://')), false);
 });
 
 test('popup code never writes sensitive values to extension storage', async () => {

@@ -9,6 +9,20 @@ import AuthenticatedImage from './AuthenticatedImage';
 
 describe('AuthenticatedImage', () => {
   beforeEach(() => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: vi.fn((key: string) => values.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => values.set(key, String(value))),
+      removeItem: vi.fn((key: string) => values.delete(key)),
+      clear: vi.fn(() => values.clear()),
+      key: vi.fn((index: number) => Array.from(values.keys())[index] ?? null),
+      get length() { return values.size; },
+    };
+    vi.stubGlobal('localStorage', storage);
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: storage,
+    });
     localStorage.setItem('auth_token', 'synthetic-token');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
       new Blob(['synthetic-image'], { type: 'image/png' }),
@@ -26,9 +40,9 @@ describe('AuthenticatedImage', () => {
 
   afterEach(() => {
     cleanup();
+    localStorage.clear();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    localStorage.clear();
   });
 
   it('loads protected images with the bearer token and revokes the object URL', async () => {

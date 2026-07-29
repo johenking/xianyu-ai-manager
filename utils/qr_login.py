@@ -80,10 +80,13 @@ class QRLoginSession:
         self.verification_browser_status = None  # starting, waiting, success, failed, timeout
         self.verification_error = None
         self.verification_task = None
+        self.verification_kind = ""
+        self.required_action = ""
         self.error_code = None
         self.message = None
         self.validated = False
         self.terminal_at = None
+        self.ended_by = ""
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -139,10 +142,19 @@ class QRLoginManager:
         message: Optional[str] = None,
         *,
         now: Optional[float] = None,
+        ended_by: Optional[str] = None,
     ) -> None:
         session.status = status
         if message is not None:
             session.message = message
+        if ended_by is not None:
+            session.ended_by = ended_by
+        elif not session.ended_by:
+            session.ended_by = {
+                "expired": "expired",
+                "cancelled": "user_cancelled",
+                "error": "validation_failed",
+            }.get(status, "")
         if session.terminal_at is None:
             session.terminal_at = time.time() if now is None else now
 
@@ -375,9 +387,13 @@ class QRLoginManager:
         """Validate a candidate Cookie through the real message-token API."""
         claimed_unb = str(session.unb or session.cookies.get("unb") or "").strip()
         if not claimed_unb or not has_core_session_cookies(session.cookies):
-            session.status = "error"
+            self._mark_terminal(
+                session,
+                "error",
+                "扫码结果缺少账号身份或核心会话字段，请重新扫码",
+                ended_by="validation_failed",
+            )
             session.error_code = "core_cookies_missing"
-            session.message = "扫码结果缺少账号身份或核心会话字段，请重新扫码"
             session.validated = False
             return False
 
@@ -387,19 +403,24 @@ class QRLoginManager:
         )
         result_unb = str((result.cookies or {}).get("unb") or "").strip()
         if result_unb and result_unb != claimed_unb:
-            session.status = "error"
+            self._mark_terminal(
+                session,
+                "error",
+                "平台返回的账号身份与扫码会话不一致，已停止保存",
+                ended_by="validation_failed",
+            )
             session.error_code = "account_mismatch"
-            session.message = "平台返回的账号身份与扫码会话不一致，已停止保存"
             session.validated = False
             return False
 
-        if result.status == PROBE_SUCCESS:
+        if result.succeeded:
             session.cookies.update(result.cookies or {})
             session.unb = claimed_unb
             session.status = "success"
             session.error_code = None
             session.message = "扫码登录成功"
             session.validated = True
+            session.ended_by = "session_validated"
             return True
 
         if result.status == PROBE_VERIFICATION_REQUIRED:
@@ -408,12 +429,22 @@ class QRLoginManager:
             session.status = "verification_required"
             session.verification_browser_status = None
             session.verification_error = None
+            session.verification_kind = "" if session.verification_url else "unknown"
+            session.required_action = (
+                "render_verification" if session.verification_url else "use_local_chrome"
+            )
             session.error_code = result.error_code
-            session.message = "闲鱼要求完成安全验证，请点击“本机打开官方窗口”"
+            session.message = "闲鱼要求完成安全验证，正在识别验证方式"
             session.validated = False
+            if session.verification_url:
+                self._ensure_verification_browser(session.session_id)
             return False
 
-        session.status = "error"
+        self._mark_terminal(
+            session,
+            "error",
+            ended_by="validation_failed",
+        )
         session.error_code = result.error_code or (
             "session_expired" if result.status == PROBE_EXPIRED else "session_probe_retryable"
         )
@@ -472,10 +503,13 @@ class QRLoginManager:
                             session.verification_url = iframe_url
                             session.verification_browser_status = None if iframe_url else 'failed'
                             session.verification_error = None if iframe_url else '未获取到安全验证链接'
-                            session.message = (
-                                '闲鱼要求完成安全验证，请点击“本机打开官方窗口”'
-                                if iframe_url else '未获取到安全验证链接，请重新扫码'
+                            session.verification_kind = "" if iframe_url else "unknown"
+                            session.required_action = (
+                                "render_verification" if iframe_url else "use_local_chrome"
                             )
+                            session.message = '闲鱼要求完成安全验证，正在识别验证方式'
+                            if iframe_url:
+                                self._ensure_verification_browser(session_id)
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, 已保存验证链接")
                             break
                         else:
@@ -578,7 +612,7 @@ class QRLoginManager:
     def _apply_verification_browser_update(self, session_id: str, update: Dict[str, str]):
         """接收浏览器线程回传的安全验证页面状态。"""
         session = self.sessions.get(session_id)
-        if not session:
+        if not session or session.status in {'success', 'expired', 'cancelled', 'error'}:
             return
 
         screenshot_path = update.get('verification_screenshot_path')
@@ -589,6 +623,14 @@ class QRLoginManager:
         browser_status = update.get('verification_browser_status')
         if browser_status:
             session.verification_browser_status = browser_status
+
+        verification_kind = update.get('verification_kind')
+        if verification_kind in {'mobile_scan', 'interactive', 'unknown'}:
+            session.verification_kind = verification_kind
+
+        required_action = update.get('required_action')
+        if required_action in {'scan_image', 'use_local_chrome'}:
+            session.required_action = required_action
 
     def _should_stop_verification_browser(self, session_id: str) -> bool:
         session = self.sessions.get(session_id)
@@ -669,6 +711,7 @@ class QRLoginManager:
             remove_verification_screenshot(session.verification_screenshot_path)
             session.verification_screenshot_path = None
         elif status == 'cancelled':
+            remove_verification_screenshot(result.get('screenshot_path'))
             session.verification_browser_status = 'cancelled'
         else:
             session.status = 'verification_required'
@@ -679,13 +722,12 @@ class QRLoginManager:
     def _cleanup_verification_artifacts(self, session: QRLoginSession):
         remove_verification_screenshot(session.verification_screenshot_path)
         session.verification_screenshot_path = None
-        self.verification_browser.discard_profile(session.session_id)
         task = session.verification_task
-        if task and not task.done():
-            task.cancel()
+        if not task or task.done():
+            self.verification_browser.discard_profile(session.session_id)
 
     def continue_after_verification(self, session_id: str) -> Dict[str, Any]:
-        """用户明确请求后启动本机官方验证窗口。"""
+        """Compatibility entry that ensures the verification renderer is running."""
         session = self.sessions.get(session_id)
         if not session:
             return {'status': 'not_found', 'message': '二维码会话不存在或已过期'}
@@ -704,6 +746,38 @@ class QRLoginManager:
 
         self._ensure_verification_browser(session_id)
         return self.get_session_status(session_id)
+
+    def cancel_session(
+        self,
+        session_id: str,
+        *,
+        ended_by: str = "user_cancelled",
+    ) -> Dict[str, Any]:
+        session = self.sessions.get(session_id)
+        if not session:
+            return {'status': 'not_found', 'message': '二维码会话不存在或已过期'}
+        if session.status in {'success', 'expired', 'cancelled', 'error'}:
+            return self.get_session_status(session_id)
+        message = (
+            '已切换到你的 Chrome，原二维码会话已结束'
+            if ended_by == 'switched_to_extension'
+            else '扫码登录已取消'
+        )
+        self._mark_terminal(
+            session,
+            'cancelled',
+            message,
+            ended_by=ended_by,
+        )
+        session.error_code = 'cancelled'
+        session.verification_browser_status = 'cancelled'
+        self._cleanup_verification_artifacts(session)
+        return self.get_session_status(session_id)
+
+    def mark_persisted(self, session_id: str) -> None:
+        session = self.sessions.get(session_id)
+        if session and session.status == 'success' and session.validated:
+            session.ended_by = 'validated_and_persisted'
 
     def get_session_status(self, session_id: str) -> Dict[str, Any]:
         """获取会话状态"""
@@ -731,7 +805,13 @@ class QRLoginManager:
         public_status = 'processing' if session.status == 'verification_checking' else session.status
         result = {
             'status': public_status,
-            'session_id': session_id
+            'session_id': session_id,
+            'verification_kind': session.verification_kind,
+            'required_action': session.required_action,
+            'browser_active': bool(
+                session.verification_task and not session.verification_task.done()
+            ),
+            'ended_by': session.ended_by,
         }
         logger.info(f"获取二维码会话状态: status={public_status}")
 
@@ -745,11 +825,13 @@ class QRLoginManager:
             if session.verification_browser_status == 'failed':
                 result['message'] = session.verification_error or '安全验证浏览器处理失败，请重新生成二维码'
             elif session.verification_browser_status == 'starting':
-                result['message'] = '正在打开本机闲鱼官方窗口，请稍候'
-            elif session.verification_screenshot_path:
+                result['message'] = '正在识别闲鱼安全验证方式，请稍候'
+            elif session.required_action == 'use_local_chrome':
+                result['message'] = '此验证需要滑块、人脸或页面交互，请改用你的 Chrome'
+            elif session.required_action == 'scan_image' and session.verification_screenshot_path:
                 result['message'] = '请用手机版闲鱼扫描图中的身份验证二维码，完成后系统会自动检测'
             else:
-                result['message'] = session.message or '闲鱼要求完成安全验证，请点击“本机打开官方窗口”'
+                result['message'] = session.message or '正在识别闲鱼安全验证方式'
 
         if session.status in {'error', 'expired', 'cancelled'} and session.message:
             result['message'] = session.message

@@ -1,15 +1,15 @@
 {
   "manifest_version": 3,
   "name": "咸鱼监控台登录态导入",
-  "version": "1.0.0",
-  "description": "由用户主动把本机 Chrome 中已登录的闲鱼状态导入本机咸鱼监控台。",
+  "version": "1.1.0",
+  "description": "由用户主动把自己的 Chrome 闲鱼登录状态通过一次性配对导入咸鱼监控台。",
   "permissions": ["cookies", "activeTab"],
   "host_permissions": [
     "https://goofish.com/*",
     "https://*.goofish.com/*",
     "https://taobao.com/*",
     "https://*.taobao.com/*",
-    "http://127.0.0.1:8091/*"
+    "https://xianyu.cxywjx.top/*"
   ],
   "action": {
     "default_title": "导入闲鱼登录态",

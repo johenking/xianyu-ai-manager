@@ -113,8 +113,12 @@ from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLogin
 from browser_extension_pairing import (
     MAX_COOKIE_COUNT,
     MAX_USER_AGENT_LENGTH,
+    PAIRING_PROTOCOL_VERSION,
+    PUBLIC_CONSOLE_ORIGIN,
+    PUBLIC_IMPORT_URL,
     PairingError,
     browser_extension_pairings,
+    is_loopback_host,
     normalize_structured_cookies,
 )
 from utils.xianyu_session_probe import (
@@ -458,6 +462,30 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
     if current_user['username'] != 'admin':
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current_user
+
+
+def _is_loopback_console_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    host_header = str(request.headers.get("host") or "").strip()
+    try:
+        console_host = urlsplit(f"//{host_header}").hostname or ""
+    except ValueError:
+        return False
+    return is_loopback_host(client_host) and is_loopback_host(console_host)
+
+
+def _require_server_browser_access(
+    request: Request,
+    current_user: Dict[str, Any],
+) -> None:
+    is_admin = bool(current_user.get("is_admin")) or (
+        str(current_user.get("username") or "") == ADMIN_USERNAME
+    )
+    if not is_admin or not _is_loopback_console_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="服务器 Chrome 仅允许管理员从本机监控台操作",
+        )
 
 
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
@@ -1581,10 +1609,20 @@ class BrowserExtensionCookieIn(BaseModel):
 
 
 class BrowserExtensionImportIn(BaseModel):
+    protocol_version: int = 1
     pairing_id: str = Field(..., min_length=8, max_length=80)
-    pairing_code: str = Field(..., min_length=6, max_length=32)
+    pairing_code: Optional[str] = Field(None, min_length=6, max_length=128)
+    pairing_token: Optional[str] = Field(None, min_length=32, max_length=128)
     cookies: List[BrowserExtensionCookieIn]
     user_agent: str = Field(..., min_length=1, max_length=MAX_USER_AGENT_LENGTH)
+
+
+class QRLoginCancelIn(BaseModel):
+    ended_by: Literal[
+        "user_cancelled",
+        "switched_method",
+        "switched_to_extension",
+    ] = "user_cancelled"
 
 
 class CookieStatusIn(BaseModel):
@@ -1832,16 +1870,20 @@ def add_cookie(item: CookieIn, current_user: Dict[str, Any] = Depends(get_curren
 def create_browser_extension_pairing(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create a five-minute, owner-bound, single-use local pairing."""
+    """Create a five-minute, owner-bound, single-use browser pairing."""
     try:
-        status_info, pairing_code = browser_extension_pairings.create(current_user['user_id'])
+        status_info, pairing_token = browser_extension_pairings.create(current_user['user_id'])
     except PairingError as exc:
         raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
     return {
         "success": True,
         "data": {
             **status_info,
-            "pairing_code": pairing_code,
+            "pairing_token": pairing_token,
+            # One release of loopback-only clients still reads this alias.
+            "pairing_code": pairing_token,
+            "import_url": PUBLIC_IMPORT_URL,
+            "console_origin": PUBLIC_CONSOLE_ORIGIN,
             "local_import_url": "http://127.0.0.1:8091/api/browser-extension/import",
         },
     }
@@ -1866,7 +1908,7 @@ async def import_browser_extension_cookies(
     payload: BrowserExtensionImportIn,
     request: Request,
 ):
-    """Validate one loopback-only import without echoing sensitive material."""
+    """Validate one single-use browser import without echoing sensitive material."""
     content_length = request.headers.get("content-length", "")
     try:
         parsed_content_length = int(content_length) if content_length else 0
@@ -1880,9 +1922,28 @@ async def import_browser_extension_cookies(
     remote_host = request.client.host if request.client else ""
     consumed = False
     try:
+        protocol_version = int(payload.protocol_version or 1)
+        if protocol_version == 1 and not _is_loopback_console_request(request):
+            raise PairingError(
+                "旧版扩展导入仅接受本机回环请求",
+                error_code="non_loopback_request",
+                http_status=403,
+            )
+        pairing_secret = (
+            payload.pairing_token
+            if protocol_version == PAIRING_PROTOCOL_VERSION
+            else payload.pairing_code
+        )
+        if not pairing_secret:
+            raise PairingError(
+                "配对凭据缺失",
+                error_code="pairing_credential_missing",
+                http_status=400,
+            )
         record = browser_extension_pairings.consume(
             payload.pairing_id,
-            payload.pairing_code,
+            pairing_secret,
+            protocol_version=protocol_version,
             remote_host=remote_host,
         )
         consumed = True
@@ -1940,6 +2001,7 @@ async def import_browser_extension_cookies(
             "success": True,
             "status": safe_status['status'],
             "message": safe_status['message'],
+            "data": safe_status,
         }
     except PairingError as exc:
         if consumed:
@@ -2414,10 +2476,14 @@ def _expected_owned_unb(user_id: int, account: str) -> str:
 @accounts_router.post("/api/official-login/sessions")
 async def create_official_login_session(
     request: Dict[str, Any],
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     mode = str(request.get("mode") or "qr").strip().lower()
     account = str(request.get("account") or "").strip()
+    show_browser = bool(request.get("show_browser", False))
+    if mode in {"qr", "sms"} or show_browser:
+        _require_server_browser_access(http_request, current_user)
     try:
         session = await official_login_coordinator.start(
             owner_user_id=current_user["user_id"],
@@ -2429,7 +2495,7 @@ async def create_official_login_session(
                 else ""
             ),
             password=str(request.get("password") or ""),
-            show_browser=bool(request.get("show_browser", False)),
+            show_browser=show_browser,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2478,8 +2544,10 @@ async def get_official_login_session_image(
 @accounts_router.post("/api/official-login/sessions/{session_id}/show-browser")
 async def show_official_login_browser(
     session_id: str,
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    _require_server_browser_access(http_request, current_user)
     shown = await official_login_coordinator.show_browser(session_id, current_user["user_id"])
     if not shown:
         raise HTTPException(status_code=404, detail="登录会话不存在、已结束或不属于当前用户")
@@ -2500,9 +2568,11 @@ async def cancel_official_login_session(
 @accounts_router.post("/official-window-login")
 async def official_window_login(
     payload: OfficialWindowLoginIn,
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """Open installed Chrome and wait for SMS login on the official page."""
+    _require_server_browser_access(http_request, current_user)
     account = str(payload.account or "").strip()
     try:
         session = await official_login_coordinator.start(
@@ -2572,6 +2642,7 @@ async def cancel_official_window_login(
 @accounts_router.post("/password-login")
 async def password_login(
     request: Dict[str, Any],
+    http_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """兼容旧客户端的账号密码登录入口。"""
@@ -2579,6 +2650,9 @@ async def password_login(
         account = request.get('account')
         password = request.get('password')
         show_browser = request.get('show_browser', False)
+
+        if show_browser:
+            _require_server_browser_access(http_request, current_user)
 
         if not account or not password:
             return {'success': False, 'message': '登录账号和密码不能为空'}
@@ -2796,6 +2870,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                     },
                 )
                 status_info['account_info'] = account_info
+                qr_login_manager.mark_persisted(session_id)
+                status_info['ended_by'] = 'validated_and_persisted'
                 qr_check_processed[session_id] = {
                     'processed': True,
                     'timestamp': now,
@@ -2823,6 +2899,31 @@ async def continue_qr_code_after_verification(session_id: str, current_user: Dic
     _require_owned_qr_session(session_id, current_user)
     qr_login_manager.continue_after_verification(session_id)
     return await check_qr_code_status(session_id, current_user)
+
+
+@accounts_router.post("/qr-login/cancel/{session_id}")
+async def cancel_qr_login_session(
+    session_id: str,
+    payload: QRLoginCancelIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    registry = get_session_registry()
+    persisted = registry.get(session_id)
+    if persisted and persisted.get('owner_user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+    status_info = qr_login_manager.cancel_session(
+        session_id,
+        ended_by=payload.ended_by,
+    )
+    if status_info.get('status') == 'not_found':
+        raise HTTPException(status_code=404, detail='二维码会话不存在或已过期')
+    registry.update(
+        session_id,
+        status=status_info.get('status') or 'cancelled',
+        error_code='cancelled',
+        error_message=status_info.get('message') or '扫码登录已取消',
+    )
+    return status_info
 
 
 async def process_qr_login_cookies(
@@ -4950,7 +5051,7 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @admin_router.post("/backup/import")
-def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+async def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入用户备份"""
     try:
         # 验证文件类型
@@ -4969,14 +5070,21 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
         success = db_manager.import_backup(backup_data, user_id)
 
         if success:
-            # 备份导入成功后，刷新 CookieManager 的内存缓存
             import cookie_manager
-            if cookie_manager.manager:
-                try:
-                    cookie_manager.manager.reload_from_db()
-                    logger.info("备份导入后已刷新 CookieManager 缓存")
-                except Exception as e:
-                    logger.error(f"刷新 CookieManager 缓存失败: {e}")
+
+            manager = cookie_manager.manager
+            if manager is not None:
+                reconcile = await manager.reconcile_from_db()
+                if not reconcile.get("success"):
+                    logger.error(
+                        "备份导入后运行态对账未完成: "
+                        f"failed={reconcile.get('failed', 0)}"
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="备份已写入，但运行态对账未完成，请人工检查",
+                    )
+                logger.info("备份导入后已完成 CookieManager 运行态对账")
 
             return {"message": "备份导入成功"}
         else:
@@ -6581,8 +6689,10 @@ def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] 
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh/show-browser")
 def show_account_session_refresh_browser(
     cookie_id: str,
+    request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    _require_server_browser_access(request, current_user)
     _require_owned_cookie(cookie_id, current_user['user_id'])
     if not active_refresh_registry.show_browser(cookie_id):
         raise HTTPException(status_code=404, detail="没有正在等待人工操作的官方浏览器会话")
@@ -8967,7 +9077,7 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @admin_router.delete('/admin/users/{user_id}')
-def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
+async def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
     """删除用户（管理员专用）"""
     from db_manager import db_manager
     try:
@@ -8987,6 +9097,20 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
         success = db_manager.delete_user_and_data(user_id)
 
         if success:
+            import cookie_manager
+
+            manager = cookie_manager.manager
+            if manager is not None:
+                reconcile = await manager.reconcile_from_db()
+                if not reconcile.get("success"):
+                    logger.error(
+                        "用户删除后运行态对账未完成: "
+                        f"user_id={user_id}, failed={reconcile.get('failed', 0)}"
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="用户数据已删除，但运行态对账未完成，请人工检查",
+                    )
             log_with_user('info', f"用户删除成功: {user_to_delete['username']} (ID: {user_id})", admin_user)
             return {"message": f"用户 {user_to_delete['username']} 删除成功"}
         else:
@@ -9802,114 +9926,14 @@ def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)
         raise HTTPException(status_code=500, detail=str(e))
 
 @admin_router.post('/admin/backup/upload')
-async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin),
-                                backup_file: UploadFile = File(...)):
-    """上传并恢复数据库备份文件（管理员专用）"""
-    import os
-    import shutil
-    import sqlite3
-    from datetime import datetime
-
-    try:
-        log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
-
-        # 验证文件类型
-        if not backup_file.filename.endswith('.db'):
-            log_with_user('warning', f"无效的备份文件类型: {backup_file.filename}", admin_user)
-            raise HTTPException(status_code=400, detail="只支持.db格式的数据库文件")
-
-        # 验证文件大小（限制100MB）
-        content = await backup_file.read()
-        if len(content) > 100 * 1024 * 1024:  # 100MB
-            log_with_user('warning', f"备份文件过大: {len(content)} bytes", admin_user)
-            raise HTTPException(status_code=400, detail="备份文件大小不能超过100MB")
-
-        # 验证是否为有效的SQLite数据库文件
-        temp_file_path = f"temp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-
-        try:
-            # 保存临时文件
-            with open(temp_file_path, 'wb') as temp_file:
-                temp_file.write(content)
-
-            # 验证数据库文件完整性
-            conn = sqlite3.connect(temp_file_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            conn.close()
-
-            # 检查是否包含必要的表
-            table_names = [table[0] for table in tables]
-            required_tables = ['users', 'cookies']  # 最基本的表
-
-            missing_tables = [table for table in required_tables if table not in table_names]
-            if missing_tables:
-                log_with_user('warning', f"备份文件缺少必要的表: {missing_tables}", admin_user)
-                raise HTTPException(status_code=400, detail=f"备份文件不完整，缺少表: {', '.join(missing_tables)}")
-
-            log_with_user('info', f"备份文件验证通过，包含 {len(table_names)} 个表", admin_user)
-
-        except sqlite3.Error as e:
-            log_with_user('error', f"备份文件验证失败: {str(e)}", admin_user)
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            raise HTTPException(status_code=400, detail="无效的数据库文件")
-
-        # 备份当前数据库
-        from db_manager import db_manager
-        current_db_path = db_manager.db_path
-
-        # 生成备份文件路径（与原数据库在同一目录）
-        db_dir = os.path.dirname(current_db_path)
-        backup_filename = f"xianyu_data_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        backup_current_path = os.path.join(db_dir, backup_filename)
-
-        if os.path.exists(current_db_path):
-            shutil.copy2(current_db_path, backup_current_path)
-            log_with_user('info', f"当前数据库已备份为: {backup_current_path}", admin_user)
-
-        # 关闭当前数据库连接
-        if hasattr(db_manager, 'conn') and db_manager.conn:
-            db_manager.conn.close()
-            log_with_user('info', "已关闭当前数据库连接", admin_user)
-
-        # 替换数据库文件
-        shutil.move(temp_file_path, current_db_path)
-        log_with_user('info', f"数据库文件已替换: {current_db_path}", admin_user)
-
-        # 重新初始化数据库连接（使用原有的db_path）
-        db_manager.__init__(db_manager.db_path)
-        log_with_user('info', "数据库连接已重新初始化", admin_user)
-
-        # 验证新数据库
-        try:
-            test_users = db_manager.get_all_users()
-            log_with_user('info', f"数据库恢复成功，包含 {len(test_users)} 个用户", admin_user)
-        except Exception as e:
-            log_with_user('error', f"数据库恢复后验证失败: {str(e)}", admin_user)
-            # 如果验证失败，尝试恢复原数据库
-            if os.path.exists(backup_current_path):
-                shutil.copy2(backup_current_path, current_db_path)
-                db_manager.__init__()
-                log_with_user('info', "已恢复原数据库", admin_user)
-            raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库")
-
-        return {
-            "success": True,
-            "message": "数据库恢复成功",
-            "backup_file": backup_current_path,
-            "user_count": len(test_users)
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"上传数据库备份失败: {str(e)}", admin_user)
-        # 清理临时文件
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
+async def upload_database_backup(
+    admin_user: Dict[str, Any] = Depends(require_admin),
+):
+    """在线替换生产 SQLite 已永久关闭；停服回滚走运维 runbook。"""
+    raise HTTPException(
+        status_code=409,
+        detail="在线数据库恢复已关闭，请按停服回滚流程执行",
+    )
 
 @admin_router.get('/admin/backup/list')
 def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):

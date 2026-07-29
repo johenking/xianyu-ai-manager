@@ -31,6 +31,27 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 - Keep automatic delivery fail-closed on a verified direct API `pending_ship` result; DOM status guesses and missing platform responses are never accepted as payment confirmation.
 
+## [1.9.1] - 2026-07-28
+
+### Added
+
+- Add an owner-scoped QR cancellation endpoint with explicit `user_cancelled`, `switched_method`, and `switched_to_extension` terminal reasons.
+
+### Changed
+
+- Route slider, face, and unknown interactive risk control to a five-minute, single-use protocol-v2 Chrome extension pairing on the user's own browser; keep only mobile scan verification as a scannable image.
+- Keep login polling alive when the account modal is hidden, and close the flow only after the returned platform identity is visible in the persisted account list.
+
+### Fixed
+
+- Require a real message `accessToken` and completed account persistence before treating QR, password, official-window, or extension login as successful.
+- Prevent a scanned QR, page success text, Cookie presence, or a closed modal from being mistaken for a completed account login.
+
+### Security
+
+- Restrict server-side Chrome, SMS, and browser-display actions to administrators using the loopback console, while remote users use web QR and the fixed HTTPS extension handoff.
+- Replace the short extension pairing code with a high-entropy protocol-v2 Token without persisting pairing credentials or imported Cookies.
+
 ## [1.9.0] - 2026-07-27
 
 ### Added

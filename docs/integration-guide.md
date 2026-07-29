@@ -290,10 +290,10 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- Local Chrome QR (recommended when operating the service Mac): create `{"mode":"qr","show_browser":true}` through `/api/official-login/sessions`. The window opens on the Mac running the service.
+- Local Chrome QR (administrator loopback console only): create `{"mode":"qr","show_browser":true}` through `/api/official-login/sessions`. The window opens on the Mac running the service.
 - Web QR (recommended for remote access): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The QR image is rendered locally from the official `codeContent`; it is not a browser screenshot.
-- Visible official window: create explicit `sms` or `password` sessions through `/api/official-login/sessions`. SMS codes are entered only on the official page.
-- Local Chrome extension: create a five-minute, owner-bound, single-use pairing through `/api/browser-extension/pairings`, then import from the local extension.
+- Visible official window: create explicit `sms` or visible `password` sessions through `/api/official-login/sessions` from an administrator loopback console. SMS codes are entered only on the official page.
+- User Chrome extension: create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings`, then import from the user's Chrome to the fixed production HTTPS endpoint.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
 Start a local headed Chrome QR session:
@@ -314,7 +314,7 @@ curl -sS -X POST "$BASE_URL/qr-login/generate" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. If the response becomes `verification_required`, show the user the safe verification image when present and call `POST /qr-login/continue/{session_id}` only after an explicit local-user action. An expired QR remains queryable for at least five minutes and repeatedly returns `status='expired'` with “二维码已过期，请重新扫码” before becoming `not_found`.
+Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. A `mobile_scan` verification remains a scannable image; `interactive` and `unknown` verification require the user's Chrome extension and the QR session ends with `switched_to_extension`. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
 
 Start a visible SMS session without collecting the code in the application:
 

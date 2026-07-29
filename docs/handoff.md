@@ -2,9 +2,10 @@
 
 ## v1.10.0 Candidate On 2026-07-28
 
-The current `codex/order-sync-analytics-hardening` worktree is an uncommitted,
-unreleased candidate. It has not been pushed, merged, tagged, or deployed, and
-production remains on the v1.9.0 schema until release gates say otherwise.
+The current `codex/order-sync-analytics-hardening` branch is an unreleased
+candidate built on the v1.9.1 mainline. It has not been pushed, merged, tagged,
+or deployed, and production remains on the v1.9.1 schema until release gates
+say otherwise.
 
 Candidate contract:
 
@@ -23,6 +24,54 @@ Candidate contract:
 - Order timing uses the saved platform order-time snapshot and its source. It is
   not described as a guaranteed payment, settlement, shipment, or completion
   timestamp.
+
+## v1.9.1 Login Risk-Control Relay Production Release On 2026-07-29
+
+The login risk-control relay was deployed production-first from commit
+`8e9f056d6c8937f4a8a97d80b93b2b84b8dc6a1d`. It keeps interactive slider,
+face, and unknown verification inside a user-controlled Chrome window, retains
+mobile QR verification as an image flow, and does not report success until a
+real platform Token has been validated and the account identity has been
+persisted. The browser-extension import protocol is version 2, owner-bound,
+five-minute, and single-use; protocol version 1 remains loopback-only.
+
+Deployment evidence:
+
+- The release gate passed Ruff, Python compilation, 484 backend tests, 136
+  frontend tests, 34 focused AccountList tests, 6 extension tests, TypeScript,
+  npm audit with zero vulnerabilities, the 231-method OpenAPI snapshot,
+  Gitleaks with zero findings, and `git diff --check`.
+- Two isolated frontend and extension builds were byte-identical. Production
+  serves entry `assets/index-D6rsP8-n.js`; the disk, local, and public HTML
+  SHA-256 is `531b0f5f...`, the entry SHA-256 is `b0bf7c82...`, and the extension
+  ZIP SHA-256 is `e344821e...`. Both retained asset generations contain 35
+  references, with 69 unique files, zero missing files, and zero orphaned
+  files; all 69 assets matched disk, local HTTP, and public HTTPS byte-for-byte.
+- The mode-`0700` rollback unit is
+  `v1.9.1-pre-deploy-20260729-001005` outside the repository. Its final
+  2,129-entry SHA-256 manifest covers the integrity-checked SQLite backup,
+  three local keys, browser profiles, uploads, prior source/static/extension,
+  LaunchAgent, and verified old and candidate Git bundles.
+- The production checkout fast-forwarded from `6975deb` to the release commit
+  through the verified local bundle. The LaunchAgent restarted as the only
+  worker with PID `67698`; local and public readiness each passed all 13 samples
+  across 62 seconds with migration `2026072609`, zero active runtime sessions,
+  and SQLite integrity `ok`. The deploy log slice contained no application
+  error, traceback, HTTP 5xx, Cookie value, authorization value, pairing Token,
+  verification URL, or password value.
+- The live OpenAPI document reports version `1.9.1`, 231 methods, and
+  `POST /qr-login/cancel/{session_id}`. Unauthenticated local and public cancel
+  probes both returned 401. The current page, both asset generations, and the
+  extension ZIP were verified through the public host after restart.
+
+The operator explicitly waived the registered ordinary-user live canary before
+GitHub publication. A roughly nine-minute observation window recorded zero
+browser-extension pairing or import requests and no ordinary-user account
+transition to `chrome_extension`; therefore real slider/face/mobile-scan relay,
+live single-use Token replay, modal-hide polling, and the ordinary-user public
+server-Chrome denial remain unobserved in production. Those behaviors are
+covered by the release tests, including the expected `pairing_already_used`
+replay failure, but test coverage is not recorded as live-account evidence.
 
 ## v1.9.0 Production Release On 2026-07-27
 

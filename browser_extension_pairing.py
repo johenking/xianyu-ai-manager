@@ -14,11 +14,14 @@ from typing import Any, Iterable, Mapping, Optional
 PAIRING_TTL_SECONDS = 300
 PAIRING_MAX_ATTEMPTS = 5
 PAIRING_CREATE_LIMIT_PER_MINUTE = 10
+PAIRING_PROTOCOL_VERSION = 2
 MAX_COOKIE_COUNT = 200
 MAX_COOKIE_NAME_LENGTH = 256
 MAX_COOKIE_VALUE_LENGTH = 8192
 MAX_USER_AGENT_LENGTH = 512
 ALLOWED_COOKIE_SUFFIXES = ("goofish.com", "taobao.com")
+PUBLIC_CONSOLE_ORIGIN = "https://xianyu.cxywjx.top"
+PUBLIC_IMPORT_URL = f"{PUBLIC_CONSOLE_ORIGIN}/api/browser-extension/import"
 
 
 class PairingError(ValueError):
@@ -33,6 +36,7 @@ class PairingRecord:
     pairing_id: str
     owner_user_id: int
     code_digest: str = field(repr=False)
+    protocol_version: int = PAIRING_PROTOCOL_VERSION
     status: str = "waiting"
     message: str = "等待 Chrome 扩展导入"
     error_code: str = ""
@@ -41,6 +45,7 @@ class PairingRecord:
     created_at: float = field(default_factory=time.time)
     expires_at: float = field(default_factory=lambda: time.time() + PAIRING_TTL_SECONDS)
     consumed_at: Optional[float] = None
+    ended_by: str = ""
 
 
 def _digest_code(code: str) -> str:
@@ -138,12 +143,13 @@ class BrowserExtensionPairingManager:
 
     def create(self, owner_user_id: int) -> tuple[dict[str, Any], str]:
         pairing_id = secrets.token_urlsafe(18)
-        pairing_code = secrets.token_hex(4).upper()
+        pairing_token = secrets.token_urlsafe(32)
         now = time.time()
         record = PairingRecord(
             pairing_id=pairing_id,
             owner_user_id=int(owner_user_id),
-            code_digest=_digest_code(pairing_code),
+            code_digest=_digest_code(pairing_token),
+            protocol_version=PAIRING_PROTOCOL_VERSION,
             created_at=now,
             expires_at=now + self.ttl_seconds,
         )
@@ -163,7 +169,7 @@ class BrowserExtensionPairingManager:
             recent.append(now)
             self._creation_times[int(owner_user_id)] = recent
             self._records[pairing_id] = record
-        return self._safe_status(record), pairing_code
+        return self._safe_status(record), pairing_token
 
     def get(self, pairing_id: str, owner_user_id: int) -> dict[str, Any]:
         with self._lock:
@@ -178,11 +184,19 @@ class BrowserExtensionPairingManager:
         pairing_id: str,
         pairing_code: str,
         *,
+        protocol_version: int = 1,
         remote_host: str,
     ) -> PairingRecord:
-        if not is_loopback_host(remote_host):
+        requested_version = int(protocol_version or 1)
+        if requested_version not in {1, PAIRING_PROTOCOL_VERSION}:
             raise PairingError(
-                "扩展导入仅接受本机回环请求",
+                "配对协议版本不受支持",
+                error_code="pairing_protocol_unsupported",
+                http_status=400,
+            )
+        if requested_version == 1 and not is_loopback_host(remote_host):
+            raise PairingError(
+                "旧版扩展导入仅接受本机回环请求",
                 error_code="non_loopback_request",
                 http_status=403,
             )
@@ -204,7 +218,7 @@ class BrowserExtensionPairingManager:
                 raise PairingError("配对码错误", error_code="pairing_code_invalid", http_status=403)
 
             record.status = "received"
-            record.message = "已收到本机 Chrome 登录状态"
+            record.message = "已收到你的 Chrome 登录状态"
             record.consumed_at = time.time()
             record.code_digest = ""
             return record
@@ -225,6 +239,7 @@ class BrowserExtensionPairingManager:
             record.message = "Chrome 登录状态已导入"
             record.error_code = ""
             record.account_id = str(account_id or "")
+            record.ended_by = "validated_and_persisted"
             return self._safe_status(record)
 
     def fail(self, pairing_id: str, *, message: str, error_code: str) -> dict[str, Any]:
@@ -233,6 +248,7 @@ class BrowserExtensionPairingManager:
             record.status = "failed"
             record.message = str(message or "导入失败")[:200]
             record.error_code = str(error_code or "import_failed")[:80]
+            record.ended_by = "validation_failed"
             return self._safe_status(record)
 
     def clear(self) -> None:
@@ -252,6 +268,7 @@ class BrowserExtensionPairingManager:
             record.message = "配对已过期"
             record.error_code = "pairing_expired"
             record.code_digest = ""
+            record.ended_by = "expired"
 
     def _cleanup_locked(self, now: float) -> None:
         retention = self.ttl_seconds * 2
@@ -267,11 +284,13 @@ class BrowserExtensionPairingManager:
     def _safe_status(record: PairingRecord) -> dict[str, Any]:
         return {
             "pairing_id": record.pairing_id,
+            "protocol_version": record.protocol_version,
             "status": record.status,
             "message": record.message,
             "error_code": record.error_code,
             "account_id": record.account_id,
             "expires_at": record.expires_at,
+            "ended_by": record.ended_by,
         }
 
 

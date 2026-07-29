@@ -1,7 +1,25 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
+from starlette.requests import Request
+
 import reply_server
+
+
+def _request(*, client_host: str, host: str) -> Request:
+    return Request({
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http" if host.startswith(("127.", "localhost")) else "https",
+        "path": "/api/official-login/sessions",
+        "raw_path": b"/api/official-login/sessions",
+        "query_string": b"",
+        "headers": [(b"host", host.encode("ascii"))],
+        "client": (client_host, 45678),
+        "server": (host.split(":", 1)[0], 8091),
+    })
 
 
 class FakeCoordinator:
@@ -15,6 +33,10 @@ class FakeCoordinator:
             "error_code": "",
             "qr_image_url": "/static/uploads/images/login.png",
             "verification_image_url": "",
+            "verification_kind": "mobile_scan",
+            "required_action": "scan_image",
+            "browser_active": True,
+            "ended_by": "",
             "account_id": "",
             "is_new_account": False,
             "expires_at": 999,
@@ -46,12 +68,19 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.coordinator = FakeCoordinator()
         self.user = {"user_id": 7, "username": "operator"}
+        self.admin = {"user_id": 7, "username": "admin", "is_admin": True}
+        self.local_request = _request(client_host="127.0.0.1", host="127.0.0.1:8091")
+        self.public_request = _request(
+            client_host="127.0.0.1",
+            host="xianyu.cxywjx.top",
+        )
 
     async def test_unified_session_routes_return_only_safe_state(self):
         with patch.object(reply_server, "official_login_coordinator", self.coordinator):
             created = await reply_server.create_official_login_session(
                 {"mode": "qr"},
-                current_user=self.user,
+                http_request=self.local_request,
+                current_user=self.admin,
             )
             status = await reply_server.get_official_login_session(
                 "session-1",
@@ -59,7 +88,8 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
             )
             shown = await reply_server.show_official_login_browser(
                 "session-1",
-                current_user=self.user,
+                http_request=self.local_request,
+                current_user=self.admin,
             )
             cancelled = await reply_server.cancel_official_login_session(
                 "session-1",
@@ -98,8 +128,9 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "account": "seller@example.com",
                     "password": "secret",
-                    "show_browser": True,
+                    "show_browser": False,
                 },
+                http_request=self.public_request,
                 current_user=self.user,
             )
             qr = await reply_server.generate_qr_code(current_user=self.user)
@@ -136,7 +167,8 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
                     mode="sms",
                     account="13800138000",
                 ),
-                current_user=self.user,
+                http_request=self.local_request,
+                current_user=self.admin,
             )
 
         self.assertTrue(result["success"])
@@ -144,3 +176,28 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
             self.coordinator.start_calls[-1]["expected_unb"],
             "stable-unb",
         )
+
+    async def test_server_chrome_entry_requires_admin_and_loopback_console(self):
+        with patch.object(reply_server, "official_login_coordinator", self.coordinator):
+            with self.assertRaises(HTTPException) as public_admin:
+                await reply_server.create_official_login_session(
+                    {"mode": "qr", "show_browser": True},
+                    http_request=self.public_request,
+                    current_user=self.admin,
+                )
+            with self.assertRaises(HTTPException) as local_user:
+                await reply_server.create_official_login_session(
+                    {"mode": "qr", "show_browser": True},
+                    http_request=self.local_request,
+                    current_user=self.user,
+                )
+            with self.assertRaises(HTTPException) as public_show:
+                await reply_server.show_official_login_browser(
+                    "session-1",
+                    http_request=self.public_request,
+                    current_user=self.admin,
+                )
+
+        self.assertEqual(public_admin.exception.status_code, 403)
+        self.assertEqual(local_user.exception.status_code, 403)
+        self.assertEqual(public_show.exception.status_code, 403)
