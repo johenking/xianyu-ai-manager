@@ -1074,6 +1074,323 @@ def _order_snapshot_source_repair_v1(
             )
 
 
+def _item_metric_snapshots_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Verified seller counters, tenant scoped and hour-bucket deduplicated."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS item_metric_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            observed_hour INTEGER NOT NULL,
+            observed_at REAL NOT NULL,
+            exposure_count INTEGER CHECK (exposure_count IS NULL OR exposure_count >= 0),
+            view_count INTEGER CHECK (view_count IS NULL OR view_count >= 0),
+            want_count INTEGER CHECK (want_count IS NULL OR want_count >= 0),
+            exposure_delta INTEGER CHECK (exposure_delta IS NULL OR exposure_delta >= 0),
+            view_delta INTEGER CHECK (view_delta IS NULL OR view_delta >= 0),
+            want_delta INTEGER CHECK (want_delta IS NULL OR want_delta >= 0),
+            counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
+            source TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            UNIQUE(cookie_id, item_id, observed_hour, source),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_metrics_tenant_time "
+        "ON item_metric_snapshots(user_id, observed_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_metrics_item_time "
+        "ON item_metric_snapshots(cookie_id, item_id, observed_at)"
+    )
+def _item_metric_collection_states_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Per-account canary state; one tenant can never enable another account."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS item_metric_collection_states (
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            canary_success_count INTEGER NOT NULL DEFAULT 0
+                CHECK (canary_success_count BETWEEN 0 AND 3),
+            enabled INTEGER NOT NULL DEFAULT 0
+                CHECK (
+                    enabled IN (0, 1)
+                    AND (enabled = 0 OR canary_success_count >= 3)
+                ),
+            last_attempt_at REAL,
+            last_success_at REAL,
+            last_canary_observed_at REAL,
+            last_error_code TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            PRIMARY KEY(user_id, cookie_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_metric_collection_enabled "
+        "ON item_metric_collection_states(enabled, user_id, cookie_id)"
+    )
+    has_system_settings = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'system_settings'"
+    ).fetchone()
+    if has_system_settings:
+        cursor.execute(
+            "DELETE FROM system_settings WHERE key IN (?, ?, ?)",
+            (
+                "item_metric_collection_enabled",
+                "item_metric_canary_success_count",
+                "item_metric_schedule_hours",
+            ),
+        )
+
+
+def _item_metric_tenant_ownership_v2(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Bind metric rows to account owners and add durable fulfillment state."""
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "cookies" not in tables:
+        return
+
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_id_user "
+        "ON cookies(id, user_id)"
+    )
+    if "cards" in tables:
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_id_user "
+            "ON cards(id, user_id)"
+        )
+
+    if "item_metric_snapshots" in tables:
+        cursor.execute(
+            """
+            CREATE TABLE item_metric_snapshots_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                cookie_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                observed_hour INTEGER NOT NULL,
+                observed_at REAL NOT NULL,
+                exposure_count INTEGER CHECK (exposure_count IS NULL OR exposure_count >= 0),
+                view_count INTEGER CHECK (view_count IS NULL OR view_count >= 0),
+                want_count INTEGER CHECK (want_count IS NULL OR want_count >= 0),
+                exposure_delta INTEGER CHECK (exposure_delta IS NULL OR exposure_delta >= 0),
+                view_delta INTEGER CHECK (view_delta IS NULL OR view_delta >= 0),
+                want_delta INTEGER CHECK (want_delta IS NULL OR want_delta >= 0),
+                counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
+                source TEXT NOT NULL,
+                created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+                UNIQUE(cookie_id, item_id, observed_hour, source),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(cookie_id, user_id)
+                    REFERENCES cookies(id, user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO item_metric_snapshots_v2 (
+                id, user_id, cookie_id, item_id, observed_hour, observed_at,
+                exposure_count, view_count, want_count,
+                exposure_delta, view_delta, want_delta,
+                counter_reset, source, created_at
+            )
+            SELECT
+                s.id, s.user_id, s.cookie_id, s.item_id, s.observed_hour,
+                s.observed_at, s.exposure_count, s.view_count, s.want_count,
+                s.exposure_delta, s.view_delta, s.want_delta,
+                s.counter_reset, s.source, s.created_at
+            FROM item_metric_snapshots AS s
+            JOIN cookies AS c
+              ON c.id = s.cookie_id AND c.user_id = s.user_id
+            """
+        )
+        cursor.execute("DROP TABLE item_metric_snapshots")
+        cursor.execute(
+            "ALTER TABLE item_metric_snapshots_v2 RENAME TO item_metric_snapshots"
+        )
+        cursor.execute(
+            "CREATE INDEX idx_item_metrics_tenant_time "
+            "ON item_metric_snapshots(user_id, observed_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX idx_item_metrics_item_time "
+            "ON item_metric_snapshots(cookie_id, item_id, observed_at)"
+        )
+
+    if "item_metric_collection_states" in tables:
+        state_columns = _columns(cursor, "item_metric_collection_states")
+        last_canary_observed_at_expr = (
+            "s.last_canary_observed_at"
+            if "last_canary_observed_at" in state_columns
+            else "NULL"
+        )
+        cursor.execute(
+            """
+            CREATE TABLE item_metric_collection_states_v2 (
+                user_id INTEGER NOT NULL,
+                cookie_id TEXT NOT NULL,
+                canary_success_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (canary_success_count BETWEEN 0 AND 3),
+                enabled INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        enabled IN (0, 1)
+                        AND (enabled = 0 OR canary_success_count >= 3)
+                    ),
+                last_attempt_at REAL,
+                last_success_at REAL,
+                last_canary_observed_at REAL,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+                PRIMARY KEY(user_id, cookie_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(cookie_id, user_id)
+                    REFERENCES cookies(id, user_id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            f"""
+            INSERT INTO item_metric_collection_states_v2 (
+                user_id, cookie_id, canary_success_count, enabled,
+                last_attempt_at, last_success_at, last_canary_observed_at,
+                last_error_code, updated_at
+            )
+            SELECT
+                s.user_id, s.cookie_id, s.canary_success_count,
+                CASE
+                    WHEN s.enabled = 1 AND s.canary_success_count >= 3 THEN 1
+                    ELSE 0
+                END,
+                s.last_attempt_at, s.last_success_at,
+                {last_canary_observed_at_expr}, s.last_error_code, s.updated_at
+            FROM item_metric_collection_states AS s
+            JOIN cookies AS c
+              ON c.id = s.cookie_id AND c.user_id = s.user_id
+            """
+        )
+        cursor.execute("DROP TABLE item_metric_collection_states")
+        cursor.execute(
+            "ALTER TABLE item_metric_collection_states_v2 "
+            "RENAME TO item_metric_collection_states"
+        )
+        cursor.execute(
+            "CREATE INDEX idx_item_metric_collection_enabled "
+            "ON item_metric_collection_states(enabled, user_id, cookie_id)"
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fulfillment_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            expected_quantity INTEGER NOT NULL
+                CHECK (expected_quantity BETWEEN 1 AND 100),
+            state TEXT NOT NULL DEFAULT 'prepared'
+                CHECK (state IN (
+                    'prepared', 'sending', 'committed', 'released', 'manual_review'
+                )),
+            owner_token TEXT NOT NULL DEFAULT '',
+            lease_expires_at REAL NOT NULL DEFAULT 0,
+            reason_code TEXT NOT NULL DEFAULT '',
+            sent_count INTEGER NOT NULL DEFAULT 0
+                CHECK (sent_count >= 0 AND sent_count <= expected_quantity),
+            delivered_count INTEGER NOT NULL DEFAULT 0
+                CHECK (delivered_count >= 0 AND delivered_count <= expected_quantity),
+            attempt_count INTEGER NOT NULL DEFAULT 1 CHECK (attempt_count >= 1),
+            sending_at REAL,
+            completed_at REAL,
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            UNIQUE(cookie_id, order_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_attempt_id_user "
+        "ON fulfillment_attempts(id, user_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fulfillment_attempt_state "
+        "ON fulfillment_attempts(state, updated_at)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fulfillment_card_reservations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            card_id INTEGER,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            value TEXT NOT NULL CHECK (value <> ''),
+            state TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (state IN ('reserved', 'committed', 'released', 'manual_review')),
+            created_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
+            UNIQUE(attempt_id, ordinal),
+            FOREIGN KEY(attempt_id, user_id)
+                REFERENCES fulfillment_attempts(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fulfillment_reservation_card_state "
+        "ON fulfillment_card_reservations(card_id, state)"
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_fulfillment_reservation_card_owner_insert
+        BEFORE INSERT ON fulfillment_card_reservations
+        WHEN NEW.card_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM cards
+            WHERE id = NEW.card_id AND user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'fulfillment reservation card owner mismatch');
+        END
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_fulfillment_reservation_card_owner_update
+        BEFORE UPDATE OF card_id, user_id ON fulfillment_card_reservations
+        WHEN NEW.card_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM cards
+            WHERE id = NEW.card_id AND user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'fulfillment reservation card owner mismatch');
+        END
+        """
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1151,6 +1468,21 @@ MIGRATIONS: Sequence[Migration] = (
         "order_snapshot_source_repair_v1",
         _order_snapshot_source_repair_v1,
     ),
+    Migration(
+        "2026072701",
+        "item_metric_snapshots_v1",
+        _item_metric_snapshots_v1,
+    ),
+    Migration(
+        "2026072702",
+        "item_metric_collection_states_v1",
+        _item_metric_collection_states_v1,
+    ),
+    Migration(
+        "2026072703",
+        "item_metric_tenant_ownership_v2",
+        _item_metric_tenant_ownership_v2,
+    ),
 )
 
 
@@ -1163,6 +1495,9 @@ class MigrationRunner:
         backup_enabled: bool = True,
     ):
         self.connection = connection
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        if self.connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("SQLite 外键约束未启用")
         self.db_path = str(db_path)
         self.migrations = tuple(migrations or MIGRATIONS)
         self.backup_enabled = backup_enabled
@@ -1187,6 +1522,7 @@ class MigrationRunner:
         backup_db = backup_dir / db_path.name
         backup_connection = sqlite3.connect(str(backup_db))
         try:
+            backup_connection.execute("PRAGMA foreign_keys = ON")
             self.connection.backup(backup_connection)
         finally:
             backup_connection.close()

@@ -16,7 +16,11 @@ import qrcode
 import qrcode.constants
 from loguru import logger
 import hashlib
-from utils.qr_verification_browser import QRVerificationBrowser, remove_public_screenshot
+from utils.qr_verification_browser import (
+    QRVerificationBrowser,
+    remove_verification_screenshot,
+)
+from utils.verification_images import resolve_private_verification_image
 from utils.xianyu_session_probe import (
     PROBE_EXPIRED,
     PROBE_RETRYABLE_ERROR,
@@ -613,7 +617,7 @@ class QRLoginManager:
 
         screenshot_path = update.get('verification_screenshot_path')
         if screenshot_path and screenshot_path != session.verification_screenshot_path:
-            remove_public_screenshot(session.verification_screenshot_path)
+            remove_verification_screenshot(session.verification_screenshot_path)
             session.verification_screenshot_path = screenshot_path
 
         browser_status = update.get('verification_browser_status')
@@ -654,7 +658,7 @@ class QRLoginManager:
 
         session = self.sessions.get(session_id)
         if not session:
-            remove_public_screenshot(result.get('screenshot_path'))
+            remove_verification_screenshot(result.get('screenshot_path'))
             return
 
         status = result.get('status')
@@ -680,7 +684,7 @@ class QRLoginManager:
                         return
                     session.verification_browser_status = 'success'
                     session.verification_error = None
-                    remove_public_screenshot(session.verification_screenshot_path)
+                    remove_verification_screenshot(session.verification_screenshot_path)
                     session.verification_screenshot_path = None
                     logger.info(
                         f"扫码二次验证登录成功: {session_id}, "
@@ -704,10 +708,10 @@ class QRLoginManager:
             )
             session.verification_browser_status = 'timeout'
             session.verification_error = '等待安全验证超时'
-            remove_public_screenshot(session.verification_screenshot_path)
+            remove_verification_screenshot(session.verification_screenshot_path)
             session.verification_screenshot_path = None
         elif status == 'cancelled':
-            remove_public_screenshot(result.get('screenshot_path'))
+            remove_verification_screenshot(result.get('screenshot_path'))
             session.verification_browser_status = 'cancelled'
         else:
             session.status = 'verification_required'
@@ -716,7 +720,7 @@ class QRLoginManager:
             logger.warning(f"扫码二次验证浏览器处理失败: {session_id}, 状态: {status}")
 
     def _cleanup_verification_artifacts(self, session: QRLoginSession):
-        remove_public_screenshot(session.verification_screenshot_path)
+        remove_verification_screenshot(session.verification_screenshot_path)
         session.verification_screenshot_path = None
         task = session.verification_task
         if not task or task.done():
@@ -809,10 +813,14 @@ class QRLoginManager:
             ),
             'ended_by': session.ended_by,
         }
-        logger.info(f"获取会话状态: {result}")
+        logger.info(f"获取二维码会话状态: status={public_status}")
 
         if session.status in ['verification_required', 'verification_checking'] and session.verification_url:
-            result['verification_screenshot_path'] = session.verification_screenshot_path
+            result['verification_screenshot_path'] = (
+                f"/qr-login/verification-image/{session_id}"
+                if session.verification_screenshot_path
+                else None
+            )
             result['verification_browser_status'] = session.verification_browser_status
             if session.verification_browser_status == 'failed':
                 result['message'] = session.verification_error or '安全验证浏览器处理失败，请重新生成二维码'
@@ -836,6 +844,18 @@ class QRLoginManager:
             result['unb'] = session.unb
 
         return result
+
+    def get_verification_image_path(self, session_id: str) -> Optional[str]:
+        session = self.sessions.get(session_id)
+        if session is None or session.status not in {
+            'verification_required',
+            'verification_checking',
+        }:
+            return None
+        resolved = resolve_private_verification_image(
+            session.verification_screenshot_path
+        )
+        return str(resolved) if resolved is not None else None
 
     def cleanup_expired_sessions(self, *, now: Optional[float] = None):
         """Retain an explicit expired result before deleting terminal state."""

@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Set
 from loguru import logger
 
 from db_manager import db_manager
+from search_limits import SEARCH_GLOBAL_CONCURRENCY
 from skill_monitor_features import skill_monitor_feature_enabled
 
 
@@ -22,12 +23,18 @@ class SkillMonitorScheduler:
         poll_interval_seconds: int = 30,
         *,
         task_executor: Optional[SkillMonitorTaskExecutor] = None,
+        max_concurrent_tasks: int = SEARCH_GLOBAL_CONCURRENCY,
     ):
         self.poll_interval_seconds = poll_interval_seconds
         self.task_executor = task_executor
+        self.max_concurrent_tasks = max(
+            1,
+            min(int(max_concurrent_tasks), SEARCH_GLOBAL_CONCURRENCY),
+        )
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self._running_task_ids: Set[int] = set()
+        self._running_account_ids: Set[str] = set()
         self._execution_tasks: Set[asyncio.Task] = set()
 
     @property
@@ -67,6 +74,7 @@ class SkillMonitorScheduler:
             await asyncio.gather(*execution_tasks, return_exceptions=True)
         self._execution_tasks.clear()
         self._running_task_ids.clear()
+        self._running_account_ids.clear()
         logger.info("技能中心定时监控调度器已停止")
 
     async def _run(self) -> None:
@@ -88,12 +96,24 @@ class SkillMonitorScheduler:
         if not due_tasks:
             return 0
 
+        available_slots = max(
+            0,
+            self.max_concurrent_tasks - len(self._execution_tasks),
+        )
+        if available_slots == 0:
+            return 0
         started = 0
         for task in due_tasks:
+            if started >= available_slots:
+                break
             task_id = int(task["id"])
             if task_id in self._running_task_ids:
                 continue
+            account_id = str(task.get("account_id") or f"task:{task_id}")
+            if account_id in self._running_account_ids:
+                continue
             self._running_task_ids.add(task_id)
+            self._running_account_ids.add(account_id)
             execution_task = asyncio.create_task(
                 self._execute(task),
                 name=f"skill-monitor-task:{task_id}",
@@ -105,6 +125,7 @@ class SkillMonitorScheduler:
 
     async def _execute(self, task: dict) -> None:
         task_id = int(task["id"])
+        account_id = str(task.get("account_id") or f"task:{task_id}")
         try:
             executor = self.task_executor
             if executor is None:
@@ -118,6 +139,7 @@ class SkillMonitorScheduler:
             )
         finally:
             self._running_task_ids.discard(task_id)
+            self._running_account_ids.discard(account_id)
 
 
 skill_monitor_scheduler = SkillMonitorScheduler()

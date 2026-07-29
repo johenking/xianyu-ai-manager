@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import time
@@ -21,6 +22,26 @@ _SECRET_PATTERN = re.compile(
     r"access[_ -]?token|token|password|authorization|api[_ -]?key"
     r")[\"']?)\s*[:=]\s*(?:[\"']?bearer\s+)?[\"']?[^\"'\s,;}\]]+[\"']?"
 )
+_BRACKETED_ACCOUNT_PATTERN = re.compile(r"【([A-Za-z0-9._-]{6,})】")
+_INLINE_ACCOUNT_PATTERN = re.compile(
+    r"(?P<prefix>用户ID:\s*|更新账号\s+|已更新Cookie到数据库:\s*|"
+    r"Cookie保存成功:\s*|Cookie保存验证:\s*)"
+    r"(?P<account>[A-Za-z0-9._-]{6,})"
+)
+_STRUCTURED_ACCOUNT_PATTERN = re.compile(
+    r"(?P<prefix>['\"]?cookie_id['\"]?\s*[:=]\s*['\"]?)"
+    r"(?P<account>[A-Za-z0-9._-]{6,})(?P<suffix>['\"]?)"
+)
+_STRUCTURED_IDENTIFIER_PATTERN = re.compile(
+    r"(?P<prefix>['\"]?(?:order_id|buyer_id|chat_id|session_id|send_user_id)"
+    r"['\"]?\s*[:=]\s*['\"]?)"
+    r"(?P<identifier>[A-Za-z0-9._-]{6,})(?P<suffix>['\"]?)",
+    re.IGNORECASE,
+)
+_NATURAL_IDENTIFIER_PATTERN = re.compile(
+    r"(?P<prefix>(?:订单(?:ID)?|买家(?:ID)?|会话(?:ID)?|聊天(?:ID)?)"
+    r"\s*[:：]?\s*)(?P<identifier>\d{5,})"
+)
 
 
 def sanitize_runtime_error(value: Any) -> str:
@@ -35,6 +56,45 @@ def sanitize_runtime_error(value: Any) -> str:
         text,
     )
     return text[:500]
+
+
+def sanitize_log_record(record: Dict[str, Any]) -> None:
+    """Redact secrets and stable business identifiers without hiding metrics."""
+
+    def reference(prefix: str, value: str) -> str:
+        if re.fullmatch(rf"{prefix}_[0-9a-f]{{10}}", value):
+            return value
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+        return f"{prefix}_{digest}"
+
+    def replace_bracketed(match: re.Match) -> str:
+        value = match.group(1)
+        if re.fullmatch(r"(?:account|user|ref)_[0-9a-f]{10}", value):
+            return f"【{value}】"
+        return f"【{reference('account', value)}】"
+
+    def replace_inline_account(match: re.Match) -> str:
+        return f"{match.group('prefix')}{reference('account', match.group('account'))}"
+
+    def replace_structured_account(match: re.Match) -> str:
+        return (
+            f"{match.group('prefix')}{reference('account', match.group('account'))}"
+            f"{match.group('suffix')}"
+        )
+
+    def replace_identifier(match: re.Match) -> str:
+        return (
+            f"{match.group('prefix')}{reference('ref', match.group('identifier'))}"
+            f"{match.groupdict().get('suffix') or ''}"
+        )
+
+    message = str(record.get("message") or "")
+    message = _BRACKETED_ACCOUNT_PATTERN.sub(replace_bracketed, message)
+    message = _INLINE_ACCOUNT_PATTERN.sub(replace_inline_account, message)
+    message = _STRUCTURED_ACCOUNT_PATTERN.sub(replace_structured_account, message)
+    message = _STRUCTURED_IDENTIFIER_PATTERN.sub(replace_identifier, message)
+    message = _NATURAL_IDENTIFIER_PATTERN.sub(replace_identifier, message)
+    record["message"] = sanitize_runtime_error(message)
 
 
 class SessionRegistry:

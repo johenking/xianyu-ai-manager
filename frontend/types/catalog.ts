@@ -112,18 +112,40 @@ export interface DashboardSummary {
   item_names: Record<string, string>;
 }
 
-// 经营驾驶舱：时段流量分析（按真实成交时间 ordered_at_utc 分东八区小时/星期）
+export interface AnalyticsCoverage {
+  total_orders: number;
+  coverage_rate: number;
+}
+
+export interface AmountCoverage extends AnalyticsCoverage {
+  with_amount: number;
+}
+
+// 经营驾驶舱：订单时段分析（按已保存的平台订单时间分东八区小时/星期）
 export interface TrafficAnalytics {
-  // 覆盖率：窗口内有效订单里有多少笔带成交时间，用于标注时段分布的可信度
+  // 覆盖率：窗口内有效订单里有多少笔带订单时间，用于标注时段分布的可信度
   coverage: {
     total_orders: number;
     with_ordered_at: number;
     coverage_rate: number;
   };
+  time_coverage: {
+    total_orders: number;
+    with_ordered_at: number;
+    coverage_rate: number;
+  };
+  amount_coverage: AmountCoverage;
+  metric_source: 'order_transactions';
+  time_source: 'order_snapshot_ordered_at';
+  time_semantics: 'platform_order_recorded_at';
   // hour 为东八区 0-23；后端仅返回有数据的小时，缺口由前端补零
   hourly: Array<{ hour: number; order_count: number; amount: number }>;
   // weekday 为 strftime('%w') 字符串，'0'=周日 ... '6'=周六
   weekday: Array<{ weekday: string; order_count: number; amount: number }>;
+  sufficient_data: boolean;
+  data_requirement: { minimum_orders: number; minimum_time_coverage: number };
+  insufficient_reason: string;
+  recommendation: null | { type: 'transaction_timing'; hour: number; message: string };
 }
 
 // 经营驾驶舱：买家行为分析（仅订单可直接得出的行为量，不刻画客户画像）
@@ -142,4 +164,112 @@ export interface BuyerBehaviorAnalytics {
     order_count: number;
     total_amount: number;
   }>;
+  amount_coverage: AmountCoverage;
+  metric_source: 'order_transactions';
+}
+
+export interface ItemPerformanceAnalytics {
+  metric_source: 'order_transactions';
+  amount_coverage: AmountCoverage;
+  items: Array<{
+    item_id: string;
+    item_title: string;
+    order_count: number;
+    total_amount: number;
+    avg_amount: number;
+    orders_with_amount: number;
+  }>;
+}
+
+export interface ItemTrafficAnalytics {
+  metric_source: 'seller_backend_verified_snapshots';
+  aggregation_semantics: 'counter_delta_between_consecutive_snapshots';
+  time_precision: 'observation_window';
+  timezone: 'Asia/Shanghai';
+  schedule_interval_hours: number;
+  snapshot_count: number;
+  valid_snapshot_count: number;
+  valid_observation_window_count: number;
+  recommendation_window_count: number;
+  recommendation_distinct_days: number;
+  irregular_window_count: number;
+  distinct_days: number;
+  reset_count: number;
+  totals: {
+    exposure_delta: number;
+    view_delta: number;
+    want_delta: number;
+  };
+  observation_windows: Array<{
+    start_hour: number;
+    end_hour: number;
+    day_span: number;
+    crosses_midnight: boolean;
+    window_count: number;
+    average_duration_hours: number;
+    minimum_duration_hours: number;
+    maximum_duration_hours: number;
+    exposure_delta: number;
+    view_delta: number;
+    want_delta: number;
+  }>;
+  hourly: Array<{
+    hour: number;
+    window_start_hour: number;
+    window_end_hour: number;
+    day_span: number;
+    crosses_midnight: boolean;
+    window_count: number;
+    average_duration_hours: number;
+    exposure_delta: number;
+    view_delta: number;
+    want_delta: number;
+  }>;
+  hourly_semantics: 'legacy_observation_window_end_hour';
+  items: Array<{
+    item_id: string;
+    snapshot_count: number;
+    observation_window_count: number;
+    exposure_delta: number;
+    view_delta: number;
+    want_delta: number;
+  }>;
+  sufficient_data: boolean;
+  data_requirement: {
+    minimum_days: number;
+    minimum_snapshots: number;
+    minimum_observation_windows: number;
+    minimum_window_hours: number;
+    maximum_window_hours: number;
+  };
+  insufficient_reason: string;
+  recommendation: null | {
+    type: 'timing';
+    semantics: 'observation_window';
+    hour: number;
+    start_hour: number;
+    end_hour: number;
+    crosses_midnight: boolean;
+    average_duration_hours: number;
+    precision: 'approximate_observation_window';
+    message: string;
+  };
+}
+
+export interface ItemMetricCollectionState {
+  cookie_id: string;
+  canary_success_count: number;
+  enabled: boolean;
+  collection_enabled: boolean;
+  adapter_available: boolean;
+  last_attempt_at: number | null;
+  last_success_at: number | null;
+  last_error_code: string;
+  updated_at: number | null;
+}
+
+export interface ItemMetricStatus {
+  adapter_available: boolean;
+  enabled_accounts: number;
+  accounts: ItemMetricCollectionState[];
 }

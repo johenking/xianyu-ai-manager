@@ -1,8 +1,10 @@
 import os
 import uuid
 import hashlib
+from pathlib import Path
 from PIL import Image
 from typing import Optional, Tuple
+from urllib.parse import urlsplit
 from loguru import logger
 
 class ImageManager:
@@ -22,6 +24,93 @@ class ImageManager:
 
         # 确保上传目录存在
         self._ensure_upload_dir()
+
+    @property
+    def upload_root(self) -> Path:
+        """Return the canonical root for user-managed images."""
+        return Path(self.upload_dir).resolve()
+
+    def resolve_image_path(
+        self,
+        image_path: str,
+        *,
+        require_exists: bool = True,
+    ) -> Optional[Path]:
+        """Resolve a stored image reference without escaping the upload root.
+
+        Database fields are user-controlled through imports, so a textual
+        ``static/uploads`` prefix is not a sufficient boundary. Symlinks and
+        non-regular files are rejected even when their lexical path is beneath
+        the managed directory.
+        """
+        value = str(image_path or "").strip().replace("\\", "/")
+        if not value or "\x00" in value:
+            return None
+        if value.startswith("/static/uploads/images/"):
+            value = value[1:]
+
+        configured_prefix = Path(self.upload_dir).as_posix().rstrip("/") + "/"
+        standard_prefix = "static/uploads/images/"
+        if Path(value).is_absolute():
+            candidate = Path(value)
+        elif not Path(self.upload_dir).is_absolute() and value.startswith(
+            configured_prefix
+        ):
+            relative_value = value[len(configured_prefix):]
+            candidate = self.upload_root / relative_value
+        elif value.startswith(standard_prefix):
+            relative_value = value[len(standard_prefix):]
+            candidate = self.upload_root / relative_value
+        else:
+            return None
+        if candidate == self.upload_root:
+            return None
+        try:
+            resolved = candidate.resolve(strict=require_exists)
+            resolved.relative_to(self.upload_root)
+            lexical_relative = candidate.relative_to(self.upload_root)
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+        if require_exists:
+            try:
+                current = self.upload_root
+                for part in lexical_relative.parts:
+                    if part in {"", ".", ".."}:
+                        return None
+                    current = current / part
+                    if current.is_symlink():
+                        return None
+                if not resolved.is_file():
+                    return None
+            except OSError:
+                return None
+        return resolved
+
+    def normalize_image_reference(self, image_reference: object) -> str:
+        """Keep HTTPS references or canonical existing managed image paths."""
+        value = str(image_reference or "").strip()
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme or parsed.netloc:
+            if (
+                parsed.scheme.lower() == "https"
+                and parsed.hostname
+                and parsed.username is None
+                and parsed.password is None
+            ):
+                return value
+            return ""
+
+        resolved = self.resolve_image_path(value)
+        if resolved is None:
+            return ""
+        relative = resolved.relative_to(self.upload_root).as_posix()
+        return f"static/uploads/images/{relative}"
 
     def _ensure_upload_dir(self):
         """确保上传目录存在"""
@@ -184,14 +273,9 @@ class ImageManager:
             删除成功返回True，失败返回False
         """
         try:
-            # 构建完整路径
-            if not image_path.startswith(self.upload_dir):
-                full_path = os.path.join(os.getcwd(), image_path)
-            else:
-                full_path = image_path
-
-            if os.path.exists(full_path):
-                os.remove(full_path)
+            full_path = self.resolve_image_path(image_path)
+            if full_path is not None:
+                full_path.unlink()
                 logger.info(f"图片删除成功: {image_path}")
                 return True
             else:
@@ -212,13 +296,8 @@ class ImageManager:
             图片信息字典或None
         """
         try:
-            # 构建完整路径
-            if not image_path.startswith(self.upload_dir):
-                full_path = os.path.join(os.getcwd(), image_path)
-            else:
-                full_path = image_path
-
-            if not os.path.exists(full_path):
+            full_path = self.resolve_image_path(image_path)
+            if full_path is None:
                 return None
 
             with Image.open(full_path) as img:
@@ -227,7 +306,7 @@ class ImageManager:
                     'height': img.height,
                     'format': img.format,
                     'mode': img.mode,
-                    'size': os.path.getsize(full_path)
+                    'size': full_path.stat().st_size
                 }
 
         except Exception as e:

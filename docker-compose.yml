@@ -9,7 +9,7 @@ services:
     # 使用root用户避免权限问题
     user: "0:0"
     ports:
-      - "${WEB_PORT:-8080}:8080"
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
     volumes:
       # 数据持久化
       - ./data:/app/data:rw

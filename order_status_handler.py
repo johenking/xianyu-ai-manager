@@ -6,9 +6,7 @@
 import re
 import json
 import time
-import uuid
 import threading
-import asyncio
 from loguru import logger
 from typing import Optional, Dict, Any
 
@@ -111,35 +109,34 @@ class OrderStatusHandler:
         try:
             order_id = None
 
-            # 先查看消息的完整结构
-            logger.info(f"🔍 完整消息结构: {message}")
+            logger.debug("订单状态事件解析开始: payload_type={}", type(message).__name__)
 
             # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
             message_1 = message.get('1', {})
             content_json_str = ''
 
             if isinstance(message_1, dict):
-                logger.info(f"🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
+                logger.debug("订单状态事件字段 1 的类型为 dict")
 
                 # 检查message['1']['6']的结构
                 message_1_6 = message_1.get('6', {})
                 if isinstance(message_1_6, dict):
-                    logger.info(f"🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
+                    logger.debug("订单状态事件嵌套字段的类型为 dict")
                     # 方法1: 从button的targetUrl中提取orderId
                     content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
                 else:
-                    logger.info(f"🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
+                    logger.debug("订单状态事件嵌套字段类型不匹配: {}", type(message_1_6).__name__)
 
             elif isinstance(message_1, list):
-                logger.info(f"🔍 message['1'] 是列表，长度: {len(message_1)}")
+                logger.debug("订单状态事件字段 1 的类型为 list")
                 # 如果message['1']是列表，跳过这种提取方式
 
             elif isinstance(message_1, str):
-                logger.info(f"🔍 message['1'] 是字符串，长度: {len(message_1)}")
+                logger.debug("订单状态事件字段 1 的类型为 str")
                 # 如果message['1']是字符串，跳过这种提取方式
 
             else:
-                logger.info(f"🔍 message['1'] 未知类型: {type(message_1)}")
+                logger.debug("订单状态事件字段 1 的类型不受支持: {}", type(message_1).__name__)
                 # 其他类型，跳过这种提取方式
 
             if content_json_str:
@@ -197,7 +194,7 @@ class OrderStatusHandler:
                             if item_match and peer_match:
                                 item_id = item_match.group(1)
                                 buyer_id = peer_match.group(1)
-                                logger.info(f'🔍 从tip消息提取到: itemId={item_id}, buyerId={buyer_id}')
+                                logger.info("从 tip 消息取得订单关联标识")
 
                                 # 通过itemId和买家ID查询最近的订单
                                 try:
@@ -207,7 +204,7 @@ class OrderStatusHandler:
                                     if recent_order:
                                         order_id = recent_order.get('order_id')
                                         if order_id:
-                                            logger.info(f'✅ 从数据库查询到关联订单ID: {order_id}')
+                                            logger.info("订单状态事件已关联到已有订单")
                                 except Exception as db_e:
                                     logger.warning(f'从数据库查询订单失败: {db_e}')
                 except Exception as tip_e:
@@ -810,7 +807,10 @@ class OrderStatusHandler:
 
                 # 如果新状态的优先级低于当前状态，且不是特殊状态（退款、取消），则忽略
                 if new_priority < current_priority and new_status not in ['refunding', 'cancelled']:
-                    logger.warning(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 当前状态为 {current_status}，忽略回退到 {new_status}')
+                    logger.warning(
+                        f'[{msg_time}] 【{cookie_id}】订单 {order_id} 当前状态为 '
+                        f'{current_status}，忽略回退到 {new_status}'
+                    )
                     return True  # 返回True表示已处理，但实际上是忽略
 
             # 更新订单状态
@@ -823,9 +823,9 @@ class OrderStatusHandler:
 
             if success:
                 status_text = self.status_mapping.get(new_status, new_status)
-                logger.info(f'[{msg_time}] 【{cookie_id}】{send_message}，订单 {order_id} 状态已更新为{status_text}')
+                logger.info(f'[{msg_time}] 【{cookie_id}】订单 {order_id} 状态已更新为{status_text}')
             else:
-                logger.error(f'[{msg_time}] 【{cookie_id}】{send_message}，但订单 {order_id} 状态更新失败')
+                logger.error(f'[{msg_time}] 【{cookie_id}】订单 {order_id} 状态更新失败')
 
             return True
 
@@ -851,58 +851,32 @@ class OrderStatusHandler:
             if red_reminder != '交易关闭':
                 return False
 
-            # 提取订单ID
-            order_id = self.extract_order_id(message)
-            if not order_id:
-                # 如果无法提取订单ID，根据配置决定是否添加到待处理队列
-                if self.config.get('use_pending_queue', True):
-                    logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，暂时无法提取订单ID，添加到待处理队列')
-                else:
-                    logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，无法提取订单ID且未启用待处理队列，跳过处理')
+            identity = extract_order_event_identity(message)
+            order_id = self.extract_order_id(message) or identity["order_id"]
+            if not any((order_id, identity["item_id"], identity["buyer_id"], identity["chat_id"])):
+                logger.warning("交易关闭事件缺少可验证关联标识，已丢弃")
                 return False
-
-                # 创建一个临时的订单ID占位符，用于标识这个待处理的状态更新
-                temp_order_id = f"temp_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-
-                # 添加到待处理队列，使用特殊标记
-                self._add_to_pending_updates(
-                    order_id=temp_order_id,
-                    new_status='cancelled',
-                    cookie_id=cookie_id,
-                    context=f"交易关闭 - 用户{user_id} - {msg_time} - 等待订单ID提取"
-                )
-
-                # 添加到待处理的红色提醒消息队列
-                if cookie_id not in self._pending_red_reminder_messages:
-                    self._pending_red_reminder_messages[cookie_id] = []
-
-                self._pending_red_reminder_messages[cookie_id].append({
-                    'message': message,
-                    'red_reminder': red_reminder,
-                    'user_id': user_id,
-                    'cookie_id': cookie_id,
-                    'msg_time': msg_time,
-                    'new_status': 'cancelled',
-                    'temp_order_id': temp_order_id,
-                    'message_hash': hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message)),  # 添加消息哈希用于匹配
-                    'timestamp': time.time()  # 添加时间戳用于清理
-                })
-
-                return True
-
-            # 更新订单状态为已关闭
-            success = self.update_order_status(
-                order_id=order_id,
-                new_status='cancelled',
+            from db_manager import db_manager
+            db_manager.record_order_status_event(
                 cookie_id=cookie_id,
-                context=f"交易关闭 - 用户{user_id} - {msg_time}"
+                normalized_status='cancelled',
+                raw_status=red_reminder,
+                order_id=order_id,
+                item_id=identity["item_id"],
+                buyer_id=identity["buyer_id"],
+                chat_id=identity["chat_id"],
+                source="red_reminder",
+                occurred_at=time.time(),
             )
-
-            if success:
-                logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭，订单 {order_id} 状态已更新为已关闭')
-            else:
-                logger.error(f'[{msg_time}] 【{cookie_id}】交易关闭，但订单 {order_id} 状态更新失败')
-
+            if order_id:
+                db_manager.reconcile_order_status_events(
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=identity["item_id"],
+                    buyer_id=identity["buyer_id"],
+                    chat_id=identity["chat_id"],
+                )
+            logger.info(f'[{msg_time}] 【{cookie_id}】交易关闭状态事件已持久化')
             return True
 
         except Exception as e:
@@ -1044,118 +1018,7 @@ class OrderStatusHandler:
         )
         if matched:
             logger.info(f"订单 {order_id} 已关联 {len(matched)} 条持久化状态事件")
-        return
-
-        with self._lock:
-            # 检查是否启用待处理队列
-            if not self.config.get('use_pending_queue', True):
-                logger.info(f"⏭️ 订单 {order_id} ID已提取，但未启用待处理队列，跳过处理")
-                return
-
-            logger.info(f"✅ 待处理队列已启用，检查账号 {cookie_id} 的待处理系统消息")
-
-            # 处理待处理的系统消息队列
-            if cookie_id in self._pending_system_messages and self._pending_system_messages[cookie_id]:
-                logger.info(f"📝 账号 {cookie_id} 有 {len(self._pending_system_messages[cookie_id])} 个待处理的系统消息")
-                pending_msg = None
-
-                # 如果提供了消息，尝试匹配
-                if message:
-                    logger.info(f"🔍 尝试通过消息哈希匹配待处理的系统消息")
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
-                    # 从后往前遍历，避免pop时索引变化问题
-                    for i in range(len(self._pending_system_messages[cookie_id]) - 1, -1, -1):
-                        msg = self._pending_system_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
-                            pending_msg = self._pending_system_messages[cookie_id].pop(i)
-                            logger.info(f"✅ 通过消息哈希匹配到待处理的系统消息: {pending_msg['send_message']}")
-                            break
-
-                # 如果没有匹配到，使用FIFO原则
-                if not pending_msg and self._pending_system_messages[cookie_id]:
-                    pending_msg = self._pending_system_messages[cookie_id].pop(0)
-                    logger.info(f"✅ 使用FIFO原则处理待处理的系统消息: {pending_msg['send_message']}")
-
-                if pending_msg:
-                    logger.info(f"🔄 开始处理待处理的系统消息: {pending_msg['send_message']}")
-
-                    # 更新订单状态
-                    success = self.update_order_status(
-                        order_id=order_id,
-                        new_status=pending_msg['new_status'],
-                        cookie_id=cookie_id,
-                        context=f"{pending_msg['send_message']} - {pending_msg['msg_time']} - 延迟处理"
-                    )
-
-                    if success:
-                        status_text = self.status_mapping.get(pending_msg['new_status'], pending_msg['new_status'])
-                        logger.info(f'✅ [{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["send_message"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
-                    else:
-                        logger.error(f'❌ [{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["send_message"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
-
-                    # 清理临时订单ID的待处理更新
-                    temp_order_id = pending_msg['temp_order_id']
-                    if temp_order_id in self.pending_updates:
-                        del self.pending_updates[temp_order_id]
-                        logger.info(f"🗑️ 清理临时订单ID {temp_order_id} 的待处理更新")
-
-                    # 如果队列为空，删除该账号的队列
-                    if not self._pending_system_messages[cookie_id]:
-                        del self._pending_system_messages[cookie_id]
-                        logger.info(f"🗑️ 账号 {cookie_id} 的待处理系统消息队列已清空")
-                else:
-                    logger.info(f"ℹ️ 订单 {order_id} ID已提取，但没有找到对应的待处理系统消息")
-            else:
-                logger.info(f"ℹ️ 账号 {cookie_id} 没有待处理的系统消息")
-
-            # 处理待处理的红色提醒消息队列
-            if cookie_id in self._pending_red_reminder_messages and self._pending_red_reminder_messages[cookie_id]:
-                pending_msg = None
-
-                # 如果提供了消息，尝试匹配
-                if message:
-                    message_hash = hash(str(sorted(message.items()))) if isinstance(message, dict) else hash(str(message))
-                    # 从后往前遍历，避免pop时索引变化问题
-                    for i in range(len(self._pending_red_reminder_messages[cookie_id]) - 1, -1, -1):
-                        msg = self._pending_red_reminder_messages[cookie_id][i]
-                        if msg.get('message_hash') == message_hash:
-                            pending_msg = self._pending_red_reminder_messages[cookie_id].pop(i)
-                            logger.info(f"通过消息哈希匹配到待处理的红色提醒消息: {pending_msg['red_reminder']}")
-                            break
-
-                # 如果没有匹配到，使用FIFO原则
-                if not pending_msg and self._pending_red_reminder_messages[cookie_id]:
-                    pending_msg = self._pending_red_reminder_messages[cookie_id].pop(0)
-                    logger.info(f"使用FIFO原则处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
-
-                if pending_msg:
-                    logger.info(f"检测到订单 {order_id} ID已提取，开始处理待处理的红色提醒消息: {pending_msg['red_reminder']}")
-
-                    # 更新订单状态
-                    success = self.update_order_status(
-                        order_id=order_id,
-                        new_status=pending_msg['new_status'],
-                        cookie_id=cookie_id,
-                        context=f"{pending_msg['red_reminder']} - 用户{pending_msg['user_id']} - {pending_msg['msg_time']} - 延迟处理"
-                    )
-
-                    if success:
-                        status_text = self.status_mapping.get(pending_msg['new_status'], pending_msg['new_status'])
-                        logger.info(f'[{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["red_reminder"]}，订单 {order_id} 状态已更新为{status_text} (延迟处理)')
-                    else:
-                        logger.error(f'[{pending_msg["msg_time"]}] 【{cookie_id}】{pending_msg["red_reminder"]}，但订单 {order_id} 状态更新失败 (延迟处理)')
-
-                    # 清理临时订单ID的待处理更新
-                    temp_order_id = pending_msg['temp_order_id']
-                    if temp_order_id in self.pending_updates:
-                        del self.pending_updates[temp_order_id]
-                        logger.info(f"清理临时订单ID {temp_order_id} 的待处理更新")
-
-                    # 如果队列为空，删除该账号的队列
-                    if not self._pending_red_reminder_messages[cookie_id]:
-                        del self._pending_red_reminder_messages[cookie_id]
-                else:
-                    logger.error(f"订单 {order_id} ID已提取，但没有找到对应的待处理红色提醒消息")
+        return matched
 
 
 # 创建全局实例

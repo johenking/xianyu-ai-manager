@@ -110,7 +110,8 @@ AUTO_REPLY = config.get('AUTO_REPLY', {
     'default_message': '亲爱的"{send_user_name}" 老板你好！所有宝贝都可以拍，秒发货的哈~不满意的话可以直接申请退款哈~',
     'api': {
         'enabled': False,
-        'url': 'http://localhost:8080/xianyu/reply',
+        'host': '0.0.0.0',
+        'port': 8080,
         'timeout': 10
     }
 })

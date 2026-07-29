@@ -17,6 +17,10 @@ from security_utils import (
     verify_user_password_hash,
 )
 
+_DUMMY_PASSWORD_HASH = (
+    "$2b$12$jOacWiy3WM5oLtfiyb5eMeHNDeAvfRFBZfd93wRn8O27NldQnA8ii"
+)
+
 
 class AuthService:
     def __init__(
@@ -33,10 +37,19 @@ class AuthService:
         connection = self.users.connection
         with self.lock:
             user = self.users.get_by_identifier(username)
+            password_hash_v2 = (
+                user["password_hash_v2"]
+                if user and user["is_active"] and user["password_hash_v2"]
+                else _DUMMY_PASSWORD_HASH
+            )
+            password_matches = verify_user_password_hash(
+                password,
+                password_hash_v2,
+            )
             if not user or not user["is_active"]:
                 return False
             if user["password_hash_v2"]:
-                return verify_user_password_hash(password, user["password_hash_v2"])
+                return password_matches
             legacy_hash = user["password_hash"]
             if not verify_legacy_sha256(password, legacy_hash):
                 return False

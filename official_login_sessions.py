@@ -19,6 +19,7 @@ from utils.xianyu_official_login import (
     OfficialLoginWorker,
     XianyuOfficialLoginService,
 )
+from utils.verification_images import resolve_private_verification_image
 
 
 TERMINAL_STATES = {"success", "expired", "failed", "cancelled", "interrupted"}
@@ -394,6 +395,21 @@ class OfficialLoginSessionCoordinator:
             return None
         return self._safe_status(record)
 
+    async def get_image_path(
+        self,
+        session_id: str,
+        owner_user_id: int,
+    ) -> Optional[str]:
+        record = self._sessions.get(session_id)
+        if (
+            record is None
+            or record.owner_user_id != owner_user_id
+            or record.state not in {"waiting_user", "verification_required"}
+        ):
+            return None
+        resolved = resolve_private_verification_image(record.image_path)
+        return str(resolved) if resolved is not None else None
+
     async def wait_until_ready(
         self,
         session_id: str,
@@ -464,15 +480,12 @@ class OfficialLoginSessionCoordinator:
             await asyncio.wait({record.task}, timeout=2.0)
         return True
 
-    @staticmethod
-    def _public_image_path(path: str) -> str:
-        normalized = str(path or "").lstrip("/")
-        if normalized.startswith("static/uploads/images/"):
-            return f"/{normalized}"
-        return ""
-
     def _safe_status(self, record: OfficialLoginSessionRecord) -> dict[str, Any]:
-        image_url = self._public_image_path(record.image_path)
+        image_url = (
+            f"/api/official-login/sessions/{record.session_id}/image"
+            if record.image_path
+            else ""
+        )
         browser_active = False
         active = getattr(record.worker, "browser_active", None)
         if record.state not in TERMINAL_STATES and callable(active):

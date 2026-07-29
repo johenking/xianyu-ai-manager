@@ -1858,7 +1858,7 @@ class XianyuApis:
                 self.clear_duplicate_cookies()
                 return True
             else:
-                logger.warning(f"Login失败: {res_json}")
+                logger.warning("Login失败: platform_response_rejected")
                 time.sleep(0.5)
                 return self.hasLogin(retry_count + 1)
 
@@ -1934,7 +1934,7 @@ class XianyuApis:
                     logger.info("Token获取成功")
                     return res_json
             else:
-                logger.error(f"Token API返回格式异常: {res_json}")
+                logger.error("Token API返回格式异常")
                 return self.get_token(device_id, retry_count + 1)
 
         except Exception as e:
@@ -1998,7 +1998,7 @@ class XianyuApis:
                     logger.debug(f"商品信息获取成功: {item_id}")
                     return res_json
             else:
-                logger.error(f"商品信息API返回格式异常: {res_json}")
+                logger.error("商品信息API返回格式异常")
                 return self.get_item_info(item_id, retry_count + 1)
 
         except Exception as e:
@@ -2030,7 +2030,7 @@ class XianyuLive:
                  logger.info("Token刷新成功")
                  return new_token
              else:
-                 logger.error(f"Token刷新失败: {token_result}")
+                 logger.error("Token刷新失败: invalid_response_schema")
                  return None
 
          except Exception as e:

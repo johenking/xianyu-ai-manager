@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 from fastapi.testclient import TestClient
@@ -191,6 +191,67 @@ class OrderApiContractTests(unittest.TestCase):
             if reply_server.get_orders_db not in dependencies:
                 missing_dependency.append(route.path)
         self.assertEqual(missing_dependency, [])
+
+    def test_single_refresh_reports_unknown_status_as_partial_failure(self):
+        headers = self.headers_for(self.user_one)
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE cookies SET browser_user_agent = ? WHERE id = ?",
+                ("OrderSync-UA-Test", "acct-one"),
+            )
+            self.db.conn.commit()
+        discovery = {
+            "success": True,
+            "orders": [{
+                "order_id": "order-1",
+                "item_id": "item-1",
+                "buyer_id": "buyer-1",
+                "amount": "12.50",
+                "order_status": "unknown",
+            }],
+        }
+
+        with patch.object(
+            reply_server.XianyuOrderListClient,
+            "discover",
+            new=AsyncMock(return_value=discovery),
+        ) as discover:
+            response = self.client.post(
+                "/api/orders/order-1/refresh",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["error_code"], "status_unconfirmed")
+        self.assertFalse(payload["requires_login"])
+        self.assertNotEqual(payload["message"], "订单刷新成功")
+        self.assertEqual(self.db.get_order_by_id("order-1")["order_status"], "pending_ship")
+        self.assertEqual(discover.await_args.kwargs["user_agent"], "OrderSync-UA-Test")
+
+    def test_put_order_never_triggers_platform_refresh(self):
+        headers = self.headers_for(self.user_one)
+        with patch.object(
+            reply_server.XianyuOrderListClient,
+            "discover",
+            new=AsyncMock(),
+        ) as discover:
+            response = self.client.put(
+                "/api/orders/order-1",
+                json={"spec_value": "人工修正规格"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        self.assertFalse(response.json()["refreshed"])
+        self.assertEqual(
+            self.db.get_order_by_id("order-1")["spec_value"],
+            "人工修正规格",
+        )
+        discover.assert_not_awaited()
 
     def test_list_hides_receiver_privacy_and_serves_snapshot_display(self):
         response = self.client.get("/api/orders", headers=self.headers_for(self.user_one))
@@ -764,6 +825,105 @@ class OrderApiContractTests(unittest.TestCase):
         )
         self.assertEqual(manual.status_code, 200)
         self.assertEqual(manual.json()["results"][0]["message"], "订单不存在或无权访问")
+
+    def _manual_delivery_live(self, *, quantity=2, send_side_effect=None):
+        from XianyuAutoAsync import XianyuLive
+
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "acct-one"
+        live.ws = Mock()
+        live.ws.closed = False
+        live.confirmed_orders = {}
+        live._verify_paid_order_for_delivery = AsyncMock(return_value={
+            "allowed": True,
+            "quantity": quantity,
+        })
+        live._auto_delivery = AsyncMock(
+            side_effect=[f"card-{index}" for index in range(quantity)]
+        )
+        live.auto_confirm = AsyncMock(return_value={"success": True})
+        live.auto_freeshipping = AsyncMock(return_value={"success": True})
+        live.send_msg = AsyncMock(side_effect=send_side_effect)
+        live.send_image_msg = AsyncMock()
+        live.mark_delivery_sent = Mock()
+        return live
+
+    def test_manual_full_delivery_commits_only_after_every_message_is_acknowledged(self):
+        headers = self.headers_for(self.user_one)
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE orders SET chat_id = ? WHERE order_id = ? AND cookie_id = ?",
+                ("chat-1", "order-1", "acct-one"),
+            )
+            self.db.conn.commit()
+        live = self._manual_delivery_live(quantity=2)
+
+        with patch(
+            "XianyuAutoAsync.XianyuLive.get_instance",
+            return_value=live,
+        ), patch.object(
+            self.db,
+            "get_item_multi_quantity_delivery_status",
+            return_value=True,
+        ), patch("XianyuAutoAsync.asyncio.sleep", new=AsyncMock()):
+            response = self.client.post(
+                "/api/orders/manual-ship",
+                json={"order_ids": ["order-1"], "ship_mode": "full_delivery"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["results"][0]
+        self.assertTrue(result["success"])
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["sent_count"], 2)
+        self.assertEqual(result["expected_count"], 2)
+        committed_order = self.db.get_order_by_id("order-1")
+        self.assertTrue(committed_order["system_shipped"])
+        self.assertEqual(committed_order["order_status"], "shipped")
+        self.assertEqual(live.send_msg.await_count, 2)
+        live.mark_delivery_sent.assert_called_once_with("order-1")
+
+    def test_manual_full_delivery_partial_send_enters_manual_review_without_shipped(self):
+        headers = self.headers_for(self.user_one)
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE orders SET chat_id = ? WHERE order_id = ? AND cookie_id = ?",
+                ("chat-1", "order-1", "acct-one"),
+            )
+            self.db.conn.commit()
+        live = self._manual_delivery_live(
+            quantity=2,
+            send_side_effect=[None, RuntimeError("second message failed")],
+        )
+
+        with patch(
+            "XianyuAutoAsync.XianyuLive.get_instance",
+            return_value=live,
+        ), patch.object(
+            self.db,
+            "get_item_multi_quantity_delivery_status",
+            return_value=True,
+        ), patch("XianyuAutoAsync.asyncio.sleep", new=AsyncMock()):
+            response = self.client.post(
+                "/api/orders/manual-ship",
+                json={"order_ids": ["order-1"], "ship_mode": "full_delivery"},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["results"][0]
+        self.assertFalse(result["success"])
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["manual_review"])
+        self.assertEqual(result["error_code"], "buyer_message_failed")
+        self.assertEqual(result["sent_count"], 1)
+        pending_order = self.db.get_order_by_id("order-1")
+        self.assertFalse(pending_order["system_shipped"])
+        self.assertEqual(pending_order["order_status"], "pending_ship")
+        attempt = self.db.get_fulfillment_attempt(result["attempt_id"])
+        self.assertEqual(attempt["state"], "manual_review")
+        live.mark_delivery_sent.assert_not_called()
 
 
 if __name__ == "__main__":

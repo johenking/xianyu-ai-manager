@@ -17,6 +17,10 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
+from utils.verification_images import (
+    ensure_private_verification_root,
+    remove_private_verification_image,
+)
 from utils.xianyu_session_probe import (
     SessionProbeResult,
     detect_default_browser_user_agent,
@@ -28,25 +32,8 @@ BrowserUpdateCallback = Callable[[Dict[str, str]], None]
 StopCallback = Callable[[], bool]
 
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UPLOAD_DIR = os.path.join(PROJECT_ROOT, "static", "uploads", "images")
-
-
-def remove_public_screenshot(public_path: Optional[str]) -> None:
-    """删除由浏览器验证流程生成的公开截图。"""
-    if not public_path or not public_path.startswith("/static/uploads/images/"):
-        return
-
-    filename = os.path.basename(public_path)
-    full_path = os.path.join(UPLOAD_DIR, filename)
-    try:
-        if os.path.exists(full_path):
-            os.remove(full_path)
-            logger.info(f"已删除扫码二次验证截图: {filename}")
-    except Exception as exc:
-        logger.warning(
-            f"删除扫码二次验证截图失败: {filename}, 错误类型: {type(exc).__name__}"
-        )
+def remove_verification_screenshot(path: Optional[str]) -> None:
+    remove_private_verification_image(path)
 
 
 class QRVerificationBrowser:
@@ -55,6 +42,7 @@ class QRVerificationBrowser:
     def __init__(
         self,
         profile_root: Path | str = "browser_data",
+        verification_root: Path | str | None = None,
         *,
         playwright_factory: Optional[Callable[[], Any]] = None,
         session_validator: Optional[
@@ -62,9 +50,9 @@ class QRVerificationBrowser:
         ] = probe_message_session_sync,
     ):
         self.profile_root = Path(profile_root)
+        self.verification_root = ensure_private_verification_root(verification_root)
         self.playwright_factory = playwright_factory or self._default_playwright_factory
         self.session_validator = session_validator
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     @staticmethod
     def _default_playwright_factory():
@@ -490,7 +478,7 @@ class QRVerificationBrowser:
         safe_session_id = session_id.replace("-", "")[:12]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"qr_verify_{safe_session_id}_{timestamp}.png"
-        full_path = os.path.join(UPLOAD_DIR, filename)
+        full_path = self.verification_root / filename
 
         try:
             target = None
@@ -510,12 +498,12 @@ class QRVerificationBrowser:
                         continue
 
             if target:
-                target.screenshot(path=full_path)
+                target.screenshot(path=str(full_path))
             else:
-                page.screenshot(path=full_path, full_page=False)
+                page.screenshot(path=str(full_path), full_page=False)
 
             logger.info(f"扫码二次验证截图已保存: {filename}")
-            return f"/static/uploads/images/{filename}"
+            return str(full_path)
         except Exception as exc:
             logger.warning(
                 f"扫码二次验证截图失败: session={session_id}, "

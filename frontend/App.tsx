@@ -180,7 +180,7 @@ const App: React.FC = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard />;
       case 'accounts': return <AccountList isAdmin={isAdmin} />;
-      case 'orders': return <OrderList />;
+      case 'orders': return <OrderList onNavigateAccounts={() => setActiveTab('accounts')} />;
       case 'cards': return <CardList />;
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;

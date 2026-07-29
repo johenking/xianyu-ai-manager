@@ -1,13 +1,170 @@
 import asyncio
+import io
 import unittest
+from unittest.mock import Mock, patch
 
 import httpx
+from loguru import logger
 
 from app_factory import create_app
 from cookie_manager import CookieManager
 
 
 class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _runtime_database(state):
+        database = Mock()
+        database.get_all_cookies.side_effect = lambda: dict(state["cookies"])
+        database.get_all_keywords.side_effect = lambda: {
+            cookie_id: list(values)
+            for cookie_id, values in state.get("keywords", {}).items()
+        }
+        database.get_all_cookie_status.side_effect = lambda: dict(
+            state.get("statuses", {})
+        )
+        database.get_auto_confirm.side_effect = lambda cookie_id: bool(
+            state.get("auto_confirm", {}).get(cookie_id, True)
+        )
+        database.get_cookie_details.side_effect = lambda cookie_id: {
+            "user_id": state.get("owners", {}).get(cookie_id),
+            "auto_confirm": bool(
+                state.get("auto_confirm", {}).get(cookie_id, True)
+            ),
+        }
+        return database
+
+    async def test_runtime_reconcile_stops_listener_removed_from_database(self):
+        loop = asyncio.get_running_loop()
+        state = {
+            "cookies": {"account-removed": "unb=removed; cookie2=old"},
+            "statuses": {"account-removed": True},
+            "owners": {"account-removed": 7},
+        }
+        database = self._runtime_database(state)
+
+        with patch("cookie_manager.db_manager", database):
+            manager = CookieManager(loop)
+            listener_stopped = asyncio.Event()
+
+            async def old_listener():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    listener_stopped.set()
+                    raise
+
+            manager.tasks["account-removed"] = loop.create_task(old_listener())
+            await asyncio.sleep(0)
+            state["cookies"] = {}
+            state["statuses"] = {}
+            state["owners"] = {}
+
+            self.assertTrue(
+                hasattr(manager, "reconcile_from_db"),
+                "CookieManager must reconcile database changes with listener tasks",
+            )
+            result = await manager.reconcile_from_db(shutdown_timeout=0.2)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["removed"], 1)
+        self.assertTrue(listener_stopped.is_set())
+        self.assertNotIn("account-removed", manager.tasks)
+        self.assertNotIn("account-removed", manager.cookies)
+
+    async def test_runtime_reconcile_restarts_changed_listener_and_starts_new_one(self):
+        loop = asyncio.get_running_loop()
+        state = {
+            "cookies": {"account-changed": "unb=changed; cookie2=old"},
+            "statuses": {"account-changed": True},
+            "owners": {"account-changed": 7},
+        }
+        database = self._runtime_database(state)
+
+        with patch("cookie_manager.db_manager", database):
+            manager = CookieManager(loop)
+            old_listener_stopped = asyncio.Event()
+            started = []
+
+            async def old_listener():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    old_listener_stopped.set()
+                    raise
+
+            async def replacement_listener(cookie_id, cookie_value, user_id, **kwargs):
+                del kwargs
+                started.append((cookie_id, cookie_value, user_id))
+                await asyncio.Event().wait()
+
+            old_task = loop.create_task(old_listener())
+            manager.tasks["account-changed"] = old_task
+            manager._run_xianyu = replacement_listener
+            await asyncio.sleep(0)
+            state["cookies"] = {
+                "account-changed": "unb=changed; cookie2=new",
+                "account-added": "unb=added; cookie2=new",
+            }
+            state["statuses"] = {
+                "account-changed": True,
+                "account-added": True,
+            }
+            state["owners"] = {"account-changed": 7, "account-added": 7}
+
+            self.assertTrue(
+                hasattr(manager, "reconcile_from_db"),
+                "CookieManager must reconcile database changes with listener tasks",
+            )
+            result = await manager.reconcile_from_db(shutdown_timeout=0.2)
+            await asyncio.sleep(0)
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["restarted"], 1)
+            self.assertEqual(result["started"], 1)
+            self.assertTrue(old_listener_stopped.is_set())
+            self.assertEqual(
+                set(started),
+                {
+                    ("account-changed", "unb=changed; cookie2=new", 7),
+                    ("account-added", "unb=added; cookie2=new", 7),
+                },
+            )
+            self.assertIsNot(manager.tasks["account-changed"], old_task)
+            await manager.shutdown()
+
+    async def test_listener_failure_logs_only_masked_account_and_error_type(self):
+        raw_account_id = "seller-private-987654321"
+        private_error = "cookie2=private-cookie-value"
+
+        class FakeLive:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                raise RuntimeError(private_error)
+
+        manager = object.__new__(CookieManager)
+        manager.task_status = {}
+        output = io.StringIO()
+        sink_id = logger.add(output, level="DEBUG", format="{message}")
+        try:
+            with patch("XianyuAutoAsync.XianyuLive", FakeLive):
+                await manager._run_xianyu(
+                    raw_account_id,
+                    "unb=private; cookie2=private-cookie-value",
+                    7,
+                )
+        finally:
+            logger.remove(sink_id)
+
+        logs = output.getvalue()
+        self.assertNotIn(raw_account_id, logs)
+        self.assertNotIn(private_error, logs)
+        self.assertNotIn("Traceback", logs)
+        self.assertIn("error_type=RuntimeError", logs)
+        self.assertEqual(
+            manager.task_status[raw_account_id]["last_error"],
+            "runtime_error:RuntimeError",
+        )
+
     async def test_replace_cookie_waits_for_old_task_outside_account_lock(self):
         loop = asyncio.get_running_loop()
         manager = CookieManager(loop)
@@ -83,7 +240,7 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await replacement_task
 
-    async def test_stubborn_old_listener_cannot_block_replacement_past_timeout(self):
+    async def test_stubborn_old_listener_blocks_replacement_after_shutdown_timeout(self):
         loop = asyncio.get_running_loop()
         manager = CookieManager(loop)
         account_id = "account-1"
@@ -99,8 +256,11 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
                 except asyncio.CancelledError:
                     continue
 
+        replacement_started = asyncio.Event()
+
         async def replacement_listener(cookie_id, cookie_value, user_id, **kwargs):
             del cookie_id, cookie_value, user_id, kwargs
+            replacement_started.set()
             await asyncio.Event().wait()
 
         old_task = loop.create_task(stubborn_old_listener())
@@ -133,10 +293,10 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(completed_in_time)
         self.assertEqual(health_response.status_code, 200)
         self.assertEqual(health_response.json()["status"], "alive")
-        self.assertEqual(result["status"], "restarted")
+        self.assertEqual(result["status"], "shutdown_timeout")
+        self.assertFalse(replacement_started.is_set())
+        self.assertIs(manager.tasks[account_id], old_task)
+        self.assertEqual(manager.cookies[account_id], "unb=account-1; cookie2=old")
         release_old_listener.set()
         await old_task
-        replacement_task = manager.tasks.pop(account_id)
-        replacement_task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await replacement_task
+        manager.tasks.pop(account_id, None)

@@ -1,7 +1,9 @@
 """Shared order discovery, status normalization and sync coordination."""
 
+import asyncio
 import json
 import inspect
+import random
 import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -9,6 +11,14 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tup
 from zoneinfo import ZoneInfo
 
 import aiohttp
+
+
+_ACCOUNT_SYNC_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def get_order_sync_lock(cookie_id: Any) -> asyncio.Lock:
+    """Return the process-local MTOP synchronization lock for one account."""
+    return _ACCOUNT_SYNC_LOCKS.setdefault(str(cookie_id or ""), asyncio.Lock())
 
 
 DEFAULT_ORDER_USER_AGENT = (
@@ -89,10 +99,10 @@ def normalize_order_status(raw_status: Any, status_text: str = "") -> str:
         return "refunded"
     if any(value in text for value in ("退款中", "申请退款", "退款申请", "退货中", "退款协商")):
         return "refunding"
-    if any(value in text for value in ("确认收货", "已签收", "交易成功", "交易完成", "订单完成")):
-        return "completed"
     if any(value in text for value in ("待买家确认收货", "卖家已发货", "已发货")):
         return "shipped"
+    if any(value in text for value in ("确认收货", "已签收", "交易成功", "交易完成", "订单完成")):
+        return "completed"
     if any(value in text for value in ("待发货", "等待卖家发货", "买家已付款")):
         return "pending_ship"
     if any(value in text for value in ("交易关闭", "订单已关闭", "取消了订单", "订单取消", "超时关闭")):
@@ -145,21 +155,123 @@ def classify_platform_error(ret_values: Iterable[Any] | Any) -> Dict[str, Any]:
             "code": "session_expired",
             "message": "闲鱼登录状态已过期，请先更新登录状态",
             "requires_login": True,
+            "retryable": False,
+        }
+    permission_markers = (
+        "permission_exception",
+        "permission denied",
+        "access denied",
+        "no permission",
+        "无权限",
+        "权限不足",
+        "拒绝访问",
+    )
+    if any(marker in lowered for marker in permission_markers):
+        return {
+            "code": "platform_permission_denied",
+            "message": "闲鱼订单接口拒绝访问，请在平台确认卖家订单权限",
+            "requires_login": False,
+            "retryable": False,
+        }
+    if any(marker in lowered for marker in ("http_429", "too many requests", "rate limit", "限流", "请求频繁")):
+        return {
+            "code": "rate_limited",
+            "message": "闲鱼订单接口请求过于频繁，请稍后重试",
+            "requires_login": False,
+            "retryable": True,
+        }
+    if (
+        "network_error" in lowered
+        or any(f"http_{status}" in lowered for status in range(500, 600))
+        or any(marker in lowered for marker in ("service unavailable", "网关", "服务繁忙"))
+    ):
+        return {
+            "code": "platform_unavailable",
+            "message": "闲鱼订单接口暂时不可用，请稍后重试",
+            "requires_login": False,
+            "retryable": True,
         }
     return {
         "code": "platform_error",
         "message": message or "闲鱼订单接口返回未知错误",
         "requires_login": False,
+        "retryable": False,
     }
+
+
+SYNC_COVERAGE_FIELDS: Tuple[str, ...] = (
+    "status",
+    "item_image",
+    "buyer_nickname",
+    "buyer_avatar",
+    "amount",
+    "time",
+)
+
+
+def new_order_sync_summary() -> Dict[str, Any]:
+    return {
+        "total_seen": 0,
+        "discovered": 0,
+        "status_updated": 0,
+        "details_updated": 0,
+        "unchanged": 0,
+        "failed": 0,
+        "status_unconfirmed": 0,
+        "field_coverage": {
+            field: {"covered": 0, "total": 0, "rate": 0.0}
+            for field in SYNC_COVERAGE_FIELDS
+        },
+    }
+
+
+def finalize_order_sync_summary(
+    db: Any,
+    summary: Dict[str, Any],
+    order_ids: Iterable[str],
+    unconfirmed_order_ids: Iterable[str],
+) -> Dict[str, Any]:
+    unique_order_ids = list(dict.fromkeys(str(value) for value in order_ids if value))
+    unconfirmed = {str(value) for value in unconfirmed_order_ids if value}
+    summary["status_unconfirmed"] = len(unconfirmed)
+    summary["failed"] += len(unconfirmed)
+
+    covered = {field: 0 for field in SYNC_COVERAGE_FIELDS}
+    for order_id in unique_order_ids:
+        row = db.get_order_by_id(order_id) or {}
+        if normalize_order_status(row.get("order_status") or row.get("status")) != "unknown":
+            covered["status"] += 1
+        if str(row.get("item_image") or "").strip():
+            covered["item_image"] += 1
+        if str(row.get("buyer_nickname") or "").strip():
+            covered["buyer_nickname"] += 1
+        if str(row.get("buyer_avatar_url") or "").strip():
+            covered["buyer_avatar"] += 1
+        if row.get("paid_amount_fen") is not None:
+            covered["amount"] += 1
+        if row.get("ordered_at_utc") is not None:
+            covered["time"] += 1
+
+    total = len(unique_order_ids)
+    summary["field_coverage"] = {
+        field: {
+            "covered": covered[field],
+            "total": total,
+            "rate": round(covered[field] / total, 4) if total else 0.0,
+        }
+        for field in SYNC_COVERAGE_FIELDS
+    }
+    return summary
 
 
 def parse_order_api_payload(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {
             "success": False,
-            "error_code": "invalid_response",
+            "error_code": "invalid_response_schema",
             "error": "闲鱼订单接口返回了无法解析的数据",
             "requires_login": False,
+            "retryable": False,
         }
     ret_values = payload.get("ret") or []
     if ret_values and not str(ret_values[0]).startswith("SUCCESS"):
@@ -169,28 +281,43 @@ def parse_order_api_payload(payload: Any) -> Dict[str, Any]:
             "error_code": error["code"],
             "error": error["message"],
             "requires_login": error["requires_login"],
+            "retryable": bool(error.get("retryable")),
         }
-    return {"success": True, "data": payload.get("data") or {}}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {
+            "success": False,
+            "error_code": "invalid_response_schema",
+            "error": "闲鱼订单接口响应缺少订单数据结构",
+            "requires_login": False,
+            "retryable": False,
+        }
+    return {"success": True, "data": data}
 
 
-def extract_order_list(payload: Any) -> List[Dict[str, Any]]:
-    parsed = parse_order_api_payload(payload)
-    if not parsed.get("success"):
-        return []
-    data = parsed.get("data") or {}
+def _find_order_list(data: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
     module = data.get("module") if isinstance(data.get("module"), dict) else {}
-    candidates = [
+    candidates = (
         module.get("items"),
         data.get("orders"),
         data.get("orderList"),
         data.get("order_list"),
         data.get("list"),
         data.get("cardList"),
-    ]
+    )
     for candidate in candidates:
         if isinstance(candidate, list):
-            return [row for row in candidate if isinstance(row, dict)]
-    return []
+            if any(not isinstance(row, dict) for row in candidate):
+                return False, []
+            return True, candidate
+    return False, []
+
+
+def extract_order_list(payload: Any) -> List[Dict[str, Any]]:
+    parsed = parse_order_api_payload(payload)
+    if not parsed.get("success"):
+        return []
+    return _find_order_list(parsed.get("data") or {})[1]
 
 
 def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any]:
@@ -202,19 +329,33 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
     status_text = common_data.get("orderStatus") or raw.get("status_text") or raw.get("statusText") or raw.get("status_desc") or raw.get("statusDesc") or ""
     if str(common_data.get("inRefund") or raw.get("inRefund") or "").lower() == "true":
         status_text = status_text if "退款" in str(status_text) else f"退款中 {status_text}".strip()
-    raw_amount = raw.get("amount") or raw.get("payAmount") or raw.get("actualFee") or raw.get("price") or price_info.get("totalPrice") or price_info.get("confirmFee") or price_info.get("auctionPrice") or ""
+    raw_amount = next(
+        (
+            value
+            for value in (
+                raw.get("amount"),
+                raw.get("payAmount"),
+                raw.get("actualFee"),
+                raw.get("price"),
+                price_info.get("totalPrice"),
+                price_info.get("confirmFee"),
+                price_info.get("auctionPrice"),
+            )
+            if value is not None and (not isinstance(value, str) or value.strip())
+        ),
+        "",
+    )
     amount = str(raw_amount).replace("¥", "").replace("￥", "").replace(",", "").strip()
     return {
         "order_id": str(order_id or ""),
         "item_id": str(common_data.get("itemId") or raw.get("item_id") or raw.get("itemId") or raw.get("auctionId") or ""),
         "buyer_id": str(buyer_info.get("buyerId") or raw.get("buyer_id") or raw.get("buyerId") or raw.get("buyerUserId") or ""),
         "item_title": str(common_data.get("itemTitle") or raw.get("title") or raw.get("itemTitle") or raw.get("subject") or ""),
-        # 买家昵称/头像候选链：以 probe_order_buyer_fields.py 对真实响应的探测结果定稿；
-        # 全部落空时留空串，写入守卫对空值免疫，不会产生垃圾快照
-        "buyer_nickname": str(buyer_info.get("nick") or buyer_info.get("buyerNick") or buyer_info.get("userNick") or raw.get("buyerNick") or ""),
-        "buyer_avatar_url": str(buyer_info.get("avatar") or buyer_info.get("headPicUrl") or buyer_info.get("portraitUrl") or buyer_info.get("headPic") or ""),
+        # 昵称和头像字段尚未通过真实账号响应验收；宁可留空，也不猜字段语义。
+        "buyer_nickname": "",
+        "buyer_avatar_url": "",
         "amount": amount,
-        "quantity": str(price_info.get("buyNum") or raw.get("quantity") or raw.get("itemNum") or "1"),
+        "quantity": str(price_info.get("buyNum") or raw.get("quantity") or raw.get("itemNum") or ""),
         "order_status": normalize_order_status(raw_status, status_text),
         "platform_status_code": str(raw_status or ""),
         "platform_status_text": str(status_text or ""),
@@ -251,6 +392,17 @@ def parse_amount_fen(value: Any) -> Optional[int]:
     if amount < 0 or amount > Decimal("10000000"):
         return None
     return int((amount * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def parse_trusted_order_quantity(value: Any) -> Optional[int]:
+    """Accept only bounded positive integer quantities from verified order data."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or not text.isascii() or not text.isdigit():
+        return None
+    quantity = int(text)
+    return quantity if 1 <= quantity <= 100 else None
 
 
 def parse_order_time_utc(
@@ -291,24 +443,7 @@ def parse_order_time_utc(
 
 
 def _parse_order_timestamp(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number / 1000 if number > 10_000_000_000 else number
-    text = str(value).strip()
-    if text.isdigit():
-        number = float(text)
-        return number / 1000 if number > 10_000_000_000 else number
-    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S"):
-        try:
-            return datetime.strptime(text, pattern).timestamp()
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
+    return parse_order_time_utc(value)[0]
 
 
 async def fetch_xianyu_order_list_page(
@@ -405,12 +540,29 @@ class XianyuOrderListClient:
         page_loader: Callable[..., Awaitable[Dict[str, Any]]] = fetch_xianyu_order_list_page,
         now_fn: Callable[[], float] = time.time,
         page_size: int = 20,
-        max_pages: int = 50,
+        max_pages: int = 20,
+        max_orders: int = 400,
+        request_interval: Optional[float] = None,
+        max_retries: int = 2,
+        sleep_fn: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        jitter_fn: Callable[[float, float], float] = random.uniform,
     ):
         self.page_loader = page_loader
         self.now_fn = now_fn
         self.page_size = max(1, min(int(page_size), 100))
         self.max_pages = max(1, min(int(max_pages), 100))
+        self.max_orders = max(1, min(int(max_orders), 2000))
+        self.request_interval = max(
+            0.0,
+            float(
+                0.8
+                if request_interval is None and page_loader is fetch_xianyu_order_list_page
+                else request_interval or 0.0
+            ),
+        )
+        self.max_retries = max(0, min(int(max_retries), 4))
+        self.sleep_fn = sleep_fn
+        self.jitter_fn = jitter_fn
 
     @staticmethod
     def _merge_cookie_updates(cookie_string: str, updates: Dict[str, Any]) -> str:
@@ -435,6 +587,7 @@ class XianyuOrderListClient:
         cookie_string: str,
         days: int = 90,
         user_agent: str = "",
+        target_order_id: str = "",
     ) -> Dict[str, Any]:
         try:
             from utils.xianyu_utils import trans_cookies
@@ -456,8 +609,11 @@ class XianyuOrderListClient:
         pages_scanned = 0
         current_cookie_string = cookie_string
         cookie_changed = False
+        has_next_page = False
 
         for page_number in range(1, self.max_pages + 1):
+            if page_number > 1 and self.request_interval:
+                await self.sleep_fn(self.request_interval)
             retry_count = 0
             while True:
                 payload = await self.page_loader(
@@ -498,6 +654,12 @@ class XianyuOrderListClient:
                 if parsed.get("requires_login") and cookie_updates and retry_count == 0:
                     retry_count += 1
                     continue
+                if parsed.get("retryable") and retry_count < self.max_retries:
+                    delay = min(8.0, 0.75 * (2 ** retry_count))
+                    delay += max(0.0, float(self.jitter_fn(0.0, 0.35)))
+                    retry_count += 1
+                    await self.sleep_fn(delay)
+                    continue
                 return {
                     "success": False,
                     "error_code": parsed.get("error_code") or "platform_error",
@@ -508,8 +670,17 @@ class XianyuOrderListClient:
                 }
 
             pages_scanned += 1
-            raw_orders = extract_order_list(payload)
             response_data = parsed.get("data") or {}
+            list_found, raw_orders = _find_order_list(response_data)
+            if not list_found:
+                return {
+                    "success": False,
+                    "error_code": "invalid_response_schema",
+                    "error": "闲鱼订单接口响应缺少订单列表结构",
+                    "requires_login": False,
+                    "orders": orders,
+                    "pages_scanned": pages_scanned,
+                }
             response_module = response_data.get("module") if isinstance(response_data.get("module"), dict) else {}
             next_page_value = response_module.get("nextPage")
             has_next_page = (
@@ -517,20 +688,34 @@ class XianyuOrderListClient:
                 if next_page_value is not None
                 else len(raw_orders) >= self.page_size
             )
-            reached_cutoff = False
+            page_timestamps: List[Optional[float]] = []
             for raw_order in raw_orders:
                 order = normalize_order_record(raw_order, cookie_id)
                 created_timestamp = _parse_order_timestamp(order.get("created_at"))
+                page_timestamps.append(created_timestamp)
                 if created_timestamp is not None and created_timestamp < cutoff:
-                    reached_cutoff = True
                     continue
                 order_id = order.get("order_id")
                 if not order_id or order_id in seen_order_ids:
                     continue
                 seen_order_ids.add(order_id)
                 orders.append(order)
+                if target_order_id and order_id == target_order_id:
+                    break
+                if len(orders) >= self.max_orders:
+                    break
 
-            if reached_cutoff or not has_next_page or not raw_orders:
+            page_entirely_before_cutoff = bool(page_timestamps) and all(
+                timestamp is not None and timestamp < cutoff
+                for timestamp in page_timestamps
+            )
+            if (
+                (target_order_id and target_order_id in seen_order_ids)
+                or len(orders) >= self.max_orders
+                or page_entirely_before_cutoff
+                or not has_next_page
+                or not raw_orders
+            ):
                 break
 
         result = {
@@ -538,6 +723,11 @@ class XianyuOrderListClient:
             "requires_login": False,
             "orders": orders,
             "pages_scanned": pages_scanned,
+            "truncated": bool(
+                has_next_page
+                and not (target_order_id and target_order_id in seen_order_ids)
+                and (pages_scanned >= self.max_pages or len(orders) >= self.max_orders)
+            ),
         }
         if cookie_changed:
             result["updated_cookie_string"] = current_cookie_string
@@ -564,14 +754,26 @@ class OrderSyncCoordinator:
         days: int = 90,
         user_agent: str = "",
     ) -> Dict[str, Any]:
-        summary = {
-            "total_seen": 0,
-            "discovered": 0,
-            "status_updated": 0,
-            "details_updated": 0,
-            "unchanged": 0,
-            "failed": 0,
-        }
+        lock = get_order_sync_lock(cookie_id)
+        async with lock:
+            return await self._sync_account_unlocked(
+                cookie_id=cookie_id,
+                cookie_string=cookie_string,
+                days=days,
+                user_agent=user_agent,
+            )
+
+    async def _sync_account_unlocked(
+        self,
+        cookie_id: str,
+        cookie_string: str,
+        days: int = 90,
+        user_agent: str = "",
+    ) -> Dict[str, Any]:
+        summary = new_order_sync_summary()
+        touched_order_ids: List[str] = []
+        unconfirmed_order_ids: set[str] = set()
+        obtained_fields: set[str] = set()
         discovery = await self.discoverer(
             cookie_id=cookie_id,
             cookie_string=cookie_string,
@@ -611,6 +813,9 @@ class OrderSyncCoordinator:
             cookie_string = updated_cookie_string
 
         errors = []
+        sync_limit_reached = bool(discovery.get("truncated"))
+        if sync_limit_reached:
+            errors.append("订单同步达到本轮请求上限，请缩短时间范围后重试")
         # 成交时从商品目录快照主图，避免商品后续下架导致订单图片失联
         try:
             catalog_lookup = self.db.get_item_catalog_lookup([cookie_id])
@@ -623,7 +828,17 @@ class OrderSyncCoordinator:
                 summary["failed"] += 1
                 errors.append("订单列表包含缺少订单号的记录")
                 continue
+            touched_order_ids.append(order_id)
             summary["total_seen"] += 1
+            incoming_list_status = normalize_order_status(
+                order.get("order_status"),
+                order.get("platform_status_text") or "",
+            )
+            if incoming_list_status == "unknown":
+                unconfirmed_order_ids.add(order_id)
+            else:
+                unconfirmed_order_ids.discard(order_id)
+                obtained_fields.add("status")
             # 用成交商品 ID 关联当前目录主图，取不到则留空（不覆盖已有快照）
             catalog_item = catalog_lookup.get((str(cookie_id), str(order.get("item_id") or "")))
             catalog_image = (catalog_item or {}).get("item_image") or None
@@ -660,6 +875,10 @@ class OrderSyncCoordinator:
                 }
             buyer_nickname = str(order.get("buyer_nickname") or "").strip()
             buyer_avatar = str(order.get("buyer_avatar_url") or "").strip()
+            if buyer_nickname:
+                obtained_fields.add("buyer_nickname")
+            if buyer_avatar:
+                obtained_fields.add("buyer_avatar")
             buyer_snapshot = None
             if buyer_nickname or buyer_avatar:
                 buyer_snapshot = {
@@ -668,6 +887,11 @@ class OrderSyncCoordinator:
                     "source": "order_list",
                 }
             ordered_at = parse_order_time_utc(order.get("created_at"))
+            if ordered_at[0] is not None:
+                obtained_fields.add("time")
+            paid_amount_fen = parse_amount_fen(order.get("amount"))
+            if paid_amount_fen is not None:
+                obtained_fields.add("amount")
             update_result = self.db.apply_order_sync_update(
                 order_id=order_id,
                 cookie_id=cookie_id,
@@ -675,10 +899,15 @@ class OrderSyncCoordinator:
                 platform_status_code=order.get("platform_status_code") or "",
                 platform_status_text=order.get("platform_status_text") or "",
                 status_source="order_list",
+                sync_error=(
+                    "无法确认平台订单状态"
+                    if incoming_list_status == "unknown"
+                    else ""
+                ),
                 item_snapshot=item_snapshot,
                 buyer_snapshot=buyer_snapshot,
                 ordered_at=ordered_at,
-                paid_amount_fen=parse_amount_fen(order.get("amount")),
+                paid_amount_fen=paid_amount_fen,
                 item_id=order.get("item_id"),
                 buyer_id=order.get("buyer_id"),
                 quantity=order.get("quantity"),
@@ -713,17 +942,28 @@ class OrderSyncCoordinator:
             cutoff = self.now_fn() - max(1, min(int(days or 90), 365)) * 86400
             detail_order_ids = []
             for order in self.db.get_orders_by_cookie(cookie_id, limit=5000):
-                status = normalize_order_status(order.get("status"))
-                if status == "refunded":
-                    continue
-                if status == "cancelled" and order.get("status_source") == "order_detail" and not order.get("last_sync_error"):
-                    continue
+                status = normalize_order_status(
+                    order.get("order_status") or order.get("status")
+                )
                 created_timestamp = _parse_order_timestamp(order.get("created_at"))
                 if created_timestamp is not None and created_timestamp < cutoff:
+                    continue
+                needs_detail = any((
+                    status == "unknown",
+                    bool(str(order.get("last_sync_error") or "").strip()),
+                    not str(order.get("item_image") or "").strip(),
+                    not str(order.get("buyer_nickname") or "").strip(),
+                    not str(order.get("buyer_avatar_url") or "").strip(),
+                    order.get("paid_amount_fen") is None,
+                    order.get("ordered_at_utc") is None,
+                ))
+                if not needs_detail:
                     continue
                 order_id = str(order.get("order_id") or "")
                 if order_id:
                     detail_order_ids.append(order_id)
+                if len(detail_order_ids) >= 20:
+                    break
 
             if detail_order_ids:
                 detail_results = await self.detail_fetcher(
@@ -740,13 +980,24 @@ class OrderSyncCoordinator:
                             "requires_login": True,
                             "error_code": "session_expired",
                             "message": detail.get("error") or "闲鱼登录状态已过期，请先更新登录状态",
-                            "summary": summary,
+                            "summary": finalize_order_sync_summary(
+                                self.db,
+                                summary,
+                                touched_order_ids,
+                                unconfirmed_order_ids,
+                            ),
+                            "fields_obtained": [
+                                field
+                                for field in SYNC_COVERAGE_FIELDS
+                                if field in obtained_fields
+                            ],
                             "errors": errors + [detail.get("error") or "闲鱼登录状态已过期"],
                         }
                     if not order_id:
                         summary["failed"] += 1
                         errors.append(detail.get("error") or "订单详情缺少订单号")
                         continue
+                    touched_order_ids.append(order_id)
                     if detail.get("error"):
                         summary["failed"] += 1
                         errors.append(f"订单 {order_id}：{detail['error']}")
@@ -763,10 +1014,17 @@ class OrderSyncCoordinator:
                         detail.get("order_status"),
                         detail.get("status_text") or "",
                     )
+                    if incoming_status == "unknown":
+                        unconfirmed_order_ids.add(order_id)
+                    else:
+                        unconfirmed_order_ids.discard(order_id)
+                        obtained_fields.add("status")
                     # 详情为最高级快照来源：报文里带什么就升级什么，缺省字段自动跳过
                     detail_item_snapshot = None
                     detail_title = str(detail.get("item_title") or "").strip()
                     detail_image = str(detail.get("item_image") or detail.get("item_pic") or "").strip()
+                    if detail_image:
+                        obtained_fields.add("item_image")
                     if detail_title or detail_image:
                         detail_item_snapshot = {
                             "item_title": detail_title,
@@ -775,6 +1033,10 @@ class OrderSyncCoordinator:
                         }
                     detail_nickname = str(detail.get("buyer_nickname") or detail.get("buyer_nick") or "").strip()
                     detail_avatar = str(detail.get("buyer_avatar_url") or detail.get("buyer_avatar") or "").strip()
+                    if detail_nickname:
+                        obtained_fields.add("buyer_nickname")
+                    if detail_avatar:
+                        obtained_fields.add("buyer_avatar")
                     detail_buyer_snapshot = None
                     if detail_nickname or detail_avatar:
                         detail_buyer_snapshot = {
@@ -783,6 +1045,11 @@ class OrderSyncCoordinator:
                             "source": "order_detail",
                         }
                     detail_ordered_at = parse_order_time_utc(detail.get("order_time"))
+                    if detail_ordered_at[0] is not None:
+                        obtained_fields.add("time")
+                    detail_amount_fen = parse_amount_fen(detail.get("amount"))
+                    if detail_amount_fen is not None:
+                        obtained_fields.add("amount")
                     update_result = self.db.apply_order_sync_update(
                         order_id=order_id,
                         cookie_id=cookie_id,
@@ -794,7 +1061,7 @@ class OrderSyncCoordinator:
                         item_snapshot=detail_item_snapshot,
                         buyer_snapshot=detail_buyer_snapshot,
                         ordered_at=detail_ordered_at,
-                        paid_amount_fen=parse_amount_fen(detail.get("amount")),
+                        paid_amount_fen=detail_amount_fen,
                         item_id=detail.get("item_id"),
                         buyer_id=detail.get("buyer_id"),
                         spec_name=detail.get("spec_name"),
@@ -832,11 +1099,28 @@ class OrderSyncCoordinator:
                         chat_id=str(detail.get("chat_id") or ""),
                     )
 
+        finalize_order_sync_summary(
+            self.db,
+            summary,
+            touched_order_ids,
+            unconfirmed_order_ids,
+        )
+        success = summary["failed"] == 0 and not sync_limit_reached
+        partial = not success and bool(touched_order_ids)
         return {
-            "success": summary["failed"] == 0,
-            "partial": summary["failed"] > 0 and summary["total_seen"] > summary["failed"],
+            "success": success,
+            "partial": partial,
             "requires_login": False,
-            "message": "订单同步完成" if summary["failed"] == 0 else "订单同步部分完成",
+            "error_code": "status_unconfirmed"
+            if summary["status_unconfirmed"]
+            else "sync_limit_reached" if sync_limit_reached
+            else "sync_partial_failure" if not success else "",
+            "message": "订单同步完成" if success else "订单同步部分完成",
             "summary": summary,
+            "fields_obtained": [
+                field
+                for field in SYNC_COVERAGE_FIELDS
+                if field in obtained_fields
+            ],
             "errors": errors,
         }

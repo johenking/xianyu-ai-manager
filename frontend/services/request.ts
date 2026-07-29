@@ -126,3 +126,34 @@ export const patch = <T>(path: string, body?: unknown) =>
 
 export const del = <T>(path: string) =>
   request<T>('DELETE', path);
+
+export const fetchAuthenticatedBlob = async (
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> => {
+  const token = localStorage.getItem('auth_token');
+  const headers: HeadersInit = { Accept: 'image/*' };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  const response = await fetch(path, {
+    method: 'GET',
+    headers,
+    signal,
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    if (response.status === 401) {
+      localStorage.removeItem('auth_token');
+      window.dispatchEvent(new Event('auth:logout'));
+    }
+    throw new ApiRequestError('验证图片加载失败', { status: response.status });
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().startsWith('image/')) {
+    throw new ApiRequestError('验证图片响应格式无效', { status: response.status });
+  }
+  return response.blob();
+};

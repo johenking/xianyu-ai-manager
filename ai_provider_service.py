@@ -8,9 +8,10 @@ import secrets
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
-import requests
 from cryptography.fernet import Fernet, InvalidToken
+from utils.outbound_http import request_public_http_sync
 
 
 PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
@@ -57,6 +58,8 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
         "default_model": "",
     },
 }
+PROVIDER_MODEL_MAX_COUNT = 500
+PROVIDER_MODEL_NAME_MAX_LENGTH = 200
 
 
 def _local_encryption_secret() -> str:
@@ -110,11 +113,16 @@ def mask_provider_key(value: str) -> str:
 
 
 def extract_openai_models(payload: Dict[str, Any]) -> List[str]:
-    models = {
-        str(item.get("id") or "").strip()
-        for item in payload.get("data", [])
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    }
+    models = set()
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("id") or "").strip()
+        if not name or len(name) > PROVIDER_MODEL_NAME_MAX_LENGTH:
+            continue
+        models.add(name)
+        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
+            break
     return sorted(models, key=str.lower)
 
 
@@ -129,8 +137,10 @@ def extract_gemini_models(payload: Dict[str, Any]) -> List[str]:
         name = str(item.get("name") or "").strip()
         if name.startswith("models/"):
             name = name[7:]
-        if name:
+        if name and len(name) <= PROVIDER_MODEL_NAME_MAX_LENGTH:
             models.add(name)
+        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
+            break
     return sorted(models, key=str.lower)
 
 
@@ -140,7 +150,7 @@ def _openai_endpoint(base_url: str, suffix: str) -> str:
 
 def discover_provider_models(
     profile: Dict[str, Any],
-    get: Callable[..., Any] = requests.get,
+    get: Optional[Callable[..., Any]] = None,
     timeout: int = 20,
 ) -> List[str]:
     api_key = str(profile.get("api_key") or "")
@@ -151,15 +161,35 @@ def discover_provider_models(
         raise ValueError("请先配置 API 地址")
 
     if profile.get("provider_type") == "gemini":
-        response = get(f"{base_url}/models", params={"key": api_key}, timeout=timeout)
+        if get is not None:
+            response = get(f"{base_url}/models", params={"key": api_key}, timeout=timeout)
+        else:
+            response = request_public_http_sync(
+                "GET",
+                f"{base_url}/models",
+                params={"key": api_key},
+                timeout_seconds=timeout,
+                allowed_methods=("GET",),
+                require_https=True,
+            )
         response.raise_for_status()
         return extract_gemini_models(response.json())
 
-    response = get(
-        _openai_endpoint(base_url, "models"),
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=timeout,
-    )
+    if get is not None:
+        response = get(
+            _openai_endpoint(base_url, "models"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+    else:
+        response = request_public_http_sync(
+            "GET",
+            _openai_endpoint(base_url, "models"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout_seconds=timeout,
+            allowed_methods=("GET",),
+            require_https=True,
+        )
     response.raise_for_status()
     return extract_openai_models(response.json())
 
@@ -167,7 +197,7 @@ def discover_provider_models(
 def test_provider_reply(
     profile: Dict[str, Any],
     model_name: str,
-    post: Callable[..., Any] = requests.post,
+    post: Optional[Callable[..., Any]] = None,
     timeout: int = 30,
 ) -> str:
     model_name = str(model_name or "").strip()
@@ -182,16 +212,33 @@ def test_provider_reply(
 
     prompt = "请只回复：连接成功"
     if profile.get("provider_type") == "gemini":
-        response = post(
-            f"{base_url}/models/{model_name}:generateContent",
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 32},
-            },
-            timeout=timeout,
+        url = (
+            f"{base_url}/models/"
+            f"{quote(model_name, safe='-._')}:generateContent"
         )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 32},
+        }
+        if post is not None:
+            response = post(
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+        else:
+            response = request_public_http_sync(
+                "POST",
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json_body=payload,
+                timeout_seconds=timeout,
+                allowed_methods=("POST",),
+                require_https=True,
+            )
         response.raise_for_status()
         payload = response.json()
         try:
@@ -207,12 +254,23 @@ def test_provider_reply(
     }
     if profile.get("preset") == "deepseek" or "deepseek" in base_url.lower():
         body["thinking"] = {"type": "disabled"}
-    response = post(
-        _openai_endpoint(base_url, "chat/completions"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body,
-        timeout=timeout,
-    )
+    if post is not None:
+        response = post(
+            _openai_endpoint(base_url, "chat/completions"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=timeout,
+        )
+    else:
+        response = request_public_http_sync(
+            "POST",
+            _openai_endpoint(base_url, "chat/completions"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json_body=body,
+            timeout_seconds=timeout,
+            allowed_methods=("POST",),
+            require_https=True,
+        )
     response.raise_for_status()
     payload = response.json()
     try:
@@ -224,8 +282,16 @@ def test_provider_reply(
 class ProviderTestTokenStore:
     """Short-lived, one-time proof that a provider/model generated a reply."""
 
-    def __init__(self, ttl_seconds: int = 600):
+    def __init__(
+        self,
+        ttl_seconds: int = 600,
+        *,
+        max_entries: int = 512,
+        max_entries_per_user: int = 16,
+    ):
         self.ttl_seconds = ttl_seconds
+        self.max_entries = max(1, int(max_entries))
+        self.max_entries_per_user = max(1, int(max_entries_per_user))
         self._tokens: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -233,6 +299,16 @@ class ProviderTestTokenStore:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._cleanup()
+            matching_user_tokens = [
+                existing_token
+                for existing_token, record in self._tokens.items()
+                if record["user_id"] == int(user_id)
+            ]
+            overflow = len(matching_user_tokens) - self.max_entries_per_user + 1
+            for existing_token in matching_user_tokens[:max(0, overflow)]:
+                self._tokens.pop(existing_token, None)
+            while len(self._tokens) >= self.max_entries:
+                self._tokens.pop(next(iter(self._tokens)), None)
             self._tokens[token] = {
                 "user_id": int(user_id),
                 "profile_id": int(profile_id),

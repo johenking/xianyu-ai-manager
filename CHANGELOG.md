@@ -4,6 +4,39 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-07-29
+
+### Added
+
+- Add structured order-sync results with partial/error states, field coverage, account-scoped synchronization locks, bounded seller-order pagination, transient retry/backoff, and single-order early stopping.
+- Add order-derived item performance, verified seller-backend metric snapshots, account-scoped three-canary state, item-traffic analytics, and a default-off four-hour serial collector. Real collection remains unavailable until an adapter passes live account canaries.
+- Add `GET /analytics/items/metrics/status` so the frontend can distinguish unavailable adapters, pending canaries, and enabled accounts without exposing credentials.
+- Add migration `2026072703` for metric/account ownership constraints plus durable fulfillment attempts and card reservations.
+- Close the existing 20-item security ledger without rescanning: tenant-scoped
+  item replies, atomic password/session revocation, bounded AI and Chromium
+  work, bounded Geetest state, managed image paths, streaming upload limits and
+  redirect-safe outbound handling. See `docs/security-v1.10-closeout.md`.
+
+### Changed
+
+- Rename the cockpit's transaction-timing panel to order-timing analysis and expose the saved order-time source instead of describing `createTime` and historical snapshots as strict completion time.
+- Attribute seller counter deltas to the complete interval between consecutive snapshots. Four-hour collection now produces approximate observation-window guidance, never a fabricated one-hour traffic recommendation.
+- Make manual order `PUT` updates local-only; platform refreshes use the direct MTOP order-list path and never launch a hidden browser.
+- Load cockpit sections independently so optional item-traffic failures do not remove order timing, item performance, or buyer behavior.
+
+### Fixed
+
+- Prefer "waiting for buyer confirmation" over the shorter "confirm receipt" phrase, reject successful responses without a recognized order-list schema, and keep unknown status as a truthful partial failure.
+- Make metric batches transactional, reject out-of-order or oversized batches, enforce adapter timeouts, and prevent one tenant's canary successes from enabling other accounts.
+- Persist fulfillment as `prepared`, `sending`, `committed`, `released`, or `manual_review`; uncertain or partial external delivery is retained for manual review instead of releasing inventory or reporting a completed shipment.
+- Serialize account-listener replacement and reject a replacement when the old listener misses its shutdown deadline, preventing two listeners for one account.
+- Keep existing Loguru handlers intact when the platform runtime module loads, while retaining redaction and a dedicated private file sink.
+- Remove unreachable Playwright order-refresh code and sensitive message, receiver, phone, address, and full-result logging.
+
+### Security
+
+- Keep automatic delivery fail-closed on a verified direct API `pending_ship` result; DOM status guesses and missing platform responses are never accepted as payment confirmation.
+
 ## [1.9.1] - 2026-07-28
 
 ### Added
@@ -29,7 +62,7 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ### Added
 
-- Add the operations cockpit on the dashboard: hourly traffic analysis (order timestamps normalized to East-8) and buyer behavior analysis at the behavioral, quantifiable level only, with a fail-closed tenant guard on every analytics query.
+- Add the operations cockpit on the dashboard: hourly order-time analysis (platform order-time snapshots normalized to East-8) and buyer behavior analysis at the behavioral, quantifiable level only, with a fail-closed tenant guard on every analytics query.
 - Add order status distribution and regional distribution charts, and a product hot-sellers board that identifies period-over-period growth, served from the `/analytics/orders` and `/analytics/orders/valid` endpoints.
 - Add inline account identification and a settled-date range filter to the order list.
 

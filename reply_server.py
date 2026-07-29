@@ -1,10 +1,16 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Awaitable, Callable, List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlsplit
@@ -24,10 +30,9 @@ import asyncio
 import importlib.util
 import sqlite3
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
-import requests
-
 import cookie_manager
 from db_manager import AccountIdentityMismatchError, db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
@@ -65,12 +70,26 @@ from account_session_refresh import (
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.outbound_http import (
+    OutboundRequestError,
+    parse_public_http_url,
+    request_public_http_sync,
+)
+from utils.verification_images import (
+    latest_private_verification_image,
+    list_private_verification_images,
+    resolve_private_verification_image,
+)
 from order_sync_service import (
     OrderSyncCoordinator,
+    SYNC_COVERAGE_FIELDS,
+    VALID_ORDER_STATUSES,
     XianyuOrderListClient,
+    new_order_sync_summary,
     normalize_order_status,
     parse_amount_fen,
     parse_order_time_utc,
+    parse_trusted_order_quantity,
 )
 from api_routers import (
     accounts_router,
@@ -85,7 +104,18 @@ from api_routers import (
     skills_router,
     system_router,
 )
-from session_registry import get_session_registry, sanitize_runtime_error
+from session_registry import (
+    get_session_registry,
+    sanitize_log_record,
+    sanitize_runtime_error,
+)
+from search_limits import (
+    SEARCH_ACCOUNT_ID_MAX_CHARS,
+    SEARCH_KEYWORD_MAX_CHARS,
+    SEARCH_PAGE_MAX,
+    SEARCH_PAGE_SIZE_MAX,
+    SEARCH_TOTAL_PAGES_MAX,
+)
 from official_login_sessions import OfficialLoginSessionCoordinator, OfficialLoginSessionRecord
 from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLoginService
 from browser_extension_pairing import (
@@ -125,27 +155,151 @@ from auth_email_service import (
 
 from loguru import logger
 
-# 刮刮乐远程控制路由
-try:
-    from api_captcha_remote import router as captcha_router
-    CAPTCHA_ROUTER_AVAILABLE = True
-except ImportError:
-    logger.warning("⚠️ api_captcha_remote 未找到，刮刮乐远程控制功能不可用")
-    CAPTCHA_ROUTER_AVAILABLE = False
-
-# 关键字文件路径
-KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
+logger.configure(patcher=sanitize_log_record)
 
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float, 'expires_at': float}}
 TOKEN_EXPIRE_TIME = 30 * 24 * 60 * 60  # token过期时间：30天
+USER_BACKUP_MAX_BYTES = 25 * 1024 * 1024
+IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_upload_with_limit(
+    upload: UploadFile,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    """Read an upload incrementally and reject at the first over-limit byte."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(
+            min(UPLOAD_READ_CHUNK_BYTES, max_bytes + 1 - total)
+        )
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{label}超过{max_bytes // (1024 * 1024)}MB",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
 
-ai_reply_lab_sessions = {}  # {session_id: {'cookie_id': str, 'user_id': int, 'history': list, 'timestamp': float}}
+AI_MODEL_NAME_MAX_LENGTH = 200
+AI_MESSAGE_MAX_LENGTH = 4000
+AI_ITEM_ID_MAX_LENGTH = 160
+AI_ITEM_TITLE_MAX_LENGTH = 500
+AI_ITEM_DESCRIPTION_MAX_LENGTH = 8000
+AI_PROMPT_OVERRIDE_MAX_LENGTH = 8000
+AI_SESSION_ID_MAX_LENGTH = 128
+AI_TRAINING_RULE_MAX_COUNT = 50
+AI_TRAINING_RULE_MAX_LENGTH = 2000
+AI_TRAINING_RULE_SERIALIZED_MAX_BYTES = 4096
+AI_LAB_MAX_SESSIONS_PER_USER = 8
+AI_LAB_MAX_SESSIONS_GLOBAL = 128
+AI_LAB_SESSION_TTL_SECONDS = 6 * 3600
+AI_INTERACTIVE_GLOBAL_LIMIT = 4
+AI_INTERACTIVE_PER_USER_LIMIT = 2
+AI_INTERACTIVE_TIMEOUT_SECONDS = 45.0
+
+ai_reply_lab_sessions: Dict[str, Dict[str, Any]] = {}
+_ai_lab_sessions_lock = threading.Lock()
+_ai_interactive_executor = ThreadPoolExecutor(
+    max_workers=AI_INTERACTIVE_GLOBAL_LIMIT,
+    thread_name_prefix="ai-interactive",
+)
+_ai_interactive_global_slots = threading.BoundedSemaphore(
+    AI_INTERACTIVE_GLOBAL_LIMIT
+)
+_ai_interactive_user_slots: Dict[int, threading.BoundedSemaphore] = {}
+_ai_interactive_user_slots_lock = threading.Lock()
+
+
+def _ai_log_reference(value: Any, label: str) -> str:
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:10]
+    return f"{label}_{digest}"
+
+
+def _get_ai_user_slot(user_id: int) -> threading.BoundedSemaphore:
+    normalized_user_id = int(user_id)
+    with _ai_interactive_user_slots_lock:
+        return _ai_interactive_user_slots.setdefault(
+            normalized_user_id,
+            threading.BoundedSemaphore(AI_INTERACTIVE_PER_USER_LIMIT),
+        )
+
+
+def _run_bounded_ai_call(
+    user_id: int,
+    work: Callable[[], Any],
+) -> Any:
+    """Run expensive interactive AI work behind bounded global/user slots."""
+    if not _ai_interactive_global_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="AI 请求繁忙，请稍后重试")
+    user_slot = _get_ai_user_slot(user_id)
+    if not user_slot.acquire(blocking=False):
+        _ai_interactive_global_slots.release()
+        raise HTTPException(status_code=429, detail="当前用户 AI 请求繁忙，请稍后重试")
+    try:
+        future = _ai_interactive_executor.submit(work)
+    except Exception:
+        user_slot.release()
+        _ai_interactive_global_slots.release()
+        raise
+
+    def release_slots(_future: Any) -> None:
+        user_slot.release()
+        _ai_interactive_global_slots.release()
+
+    future.add_done_callback(release_slots)
+    try:
+        return future.result(timeout=AI_INTERACTIVE_TIMEOUT_SECONDS)
+    except FuturesTimeoutError as exc:
+        raise HTTPException(status_code=504, detail="AI 请求超时，请稍后重试") from exc
+
+
+def _prune_ai_lab_sessions(current_time: float, *, user_id: int) -> None:
+    """Bound process-local training sessions by expiry, user and total size."""
+    normalized_user_id = int(user_id)
+    with _ai_lab_sessions_lock:
+        expired = [
+            session_id
+            for session_id, session in ai_reply_lab_sessions.items()
+            if current_time - float(session.get("timestamp") or 0)
+            > AI_LAB_SESSION_TTL_SECONDS
+        ]
+        for session_id in expired:
+            ai_reply_lab_sessions.pop(session_id, None)
+
+        owned = sorted(
+            (
+                (session_id, float(session.get("timestamp") or 0))
+                for session_id, session in ai_reply_lab_sessions.items()
+                if int(session.get("user_id") or -1) == normalized_user_id
+            ),
+            key=lambda row: row[1],
+        )
+        for session_id, _timestamp in owned[:-AI_LAB_MAX_SESSIONS_PER_USER]:
+            ai_reply_lab_sessions.pop(session_id, None)
+
+        all_sessions = sorted(
+            (
+                (session_id, float(session.get("timestamp") or 0))
+                for session_id, session in ai_reply_lab_sessions.items()
+            ),
+            key=lambda row: row[1],
+        )
+        for session_id, _timestamp in all_sessions[:-AI_LAB_MAX_SESSIONS_GLOBAL]:
+            ai_reply_lab_sessions.pop(session_id, None)
 
 # Direct API QR sessions are owner-scoped and persisted at most once.
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
@@ -162,39 +316,6 @@ def cleanup_qr_check_records() -> None:
             continue
         qr_check_processed.pop(session_id, None)
         qr_check_locks.pop(session_id, None)
-
-
-def load_keywords() -> List[Tuple[str, str]]:
-    """读取关键字→回复映射表
-
-    文件格式支持：
-        关键字<空格/制表符/冒号>回复内容
-    忽略空行和以 # 开头的注释行
-    """
-    mapping: List[Tuple[str, str]] = []
-    if not KEYWORDS_FILE.exists():
-        return mapping
-
-    with KEYWORDS_FILE.open('r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            # 尝试用\t、空格、冒号分隔
-            if '\t' in line:
-                key, reply = line.split('\t', 1)
-            elif ' ' in line:
-                key, reply = line.split(' ', 1)
-            elif ':' in line:
-                key, reply = line.split(':', 1)
-            else:
-                # 无法解析的行，跳过
-                continue
-            mapping.append((key.strip(), reply.strip()))
-    return mapping
-
-
-KEYWORDS_MAPPING = load_keywords()
 
 
 # 认证相关模型
@@ -223,6 +344,10 @@ class ChangePasswordRequest(BaseModel):
 class OrderSyncRequest(BaseModel):
     cookie_id: Optional[str] = None
     days: int = Field(90, ge=1, le=365)
+
+
+class ItemMetricSyncRequest(BaseModel):
+    cookie_id: str = Field(min_length=1, max_length=128)
 
 
 class RegisterRequest(BaseModel):
@@ -466,7 +591,9 @@ def get_current_user_optional(user_info: Optional[Dict[str, Any]] = Depends(veri
 def get_user_log_prefix(user_info: Dict[str, Any] = None) -> str:
     """获取用户日志前缀"""
     if user_info:
-        return f"【{user_info['username']}#{user_info['user_id']}】"
+        stable_id = str(user_info.get('user_id') or 'unknown')
+        digest = hashlib.sha256(stable_id.encode('utf-8')).hexdigest()[:10]
+        return f"【user_{digest}】"
     return "【系统】"
 
 
@@ -518,54 +645,9 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
         logger.info(full_message)
 
 
-def match_reply(cookie_id: str, message: str) -> Optional[str]:
-    """根据 cookie_id 及消息内容匹配回复
-    只有启用的账号才会匹配关键字回复
-    """
-    mgr = cookie_manager.manager
-    if mgr is None:
-        return None
-
-    # 检查账号是否启用
-    if not mgr.get_cookie_status(cookie_id):
-        return None  # 禁用的账号不参与自动回复
-
-    # 优先账号级关键字
-    if mgr.get_keywords(cookie_id):
-        for k, r in mgr.get_keywords(cookie_id):
-            if k in message:
-                return r
-
-    # 全局关键字
-    for k, r in KEYWORDS_MAPPING:
-        if k in message:
-            return r
-    return None
-
-
-class RequestModel(BaseModel):
-    cookie_id: str
-    msg_time: str
-    user_url: str
-    send_user_id: str
-    send_user_name: str
-    item_id: str
-    send_message: str
-    chat_id: str
-
-
-class ResponseData(BaseModel):
-    send_msg: str
-
-
-class ResponseModel(BaseModel):
-    code: int
-    data: ResponseData
-
-
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.9.1",
+    version="1.10.0",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -587,13 +669,6 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有HTTP方法
     allow_headers=["*"],  # 允许所有请求头
 )
-
-# 注册刮刮乐远程控制路由
-if CAPTCHA_ROUTER_AVAILABLE:
-    app.include_router(captcha_router)
-    logger.info("✅ 已注册刮刮乐远程控制路由: /api/captcha")
-else:
-    logger.warning("⚠️ 刮刮乐远程控制路由未注册")
 
 # 初始化文件日志收集器
 setup_file_logging()
@@ -912,17 +987,19 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
 # 修改管理员密码接口
 @auth_router.post('/change-admin-password')
 async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
-    from db_manager import db_manager
-
     try:
         # 验证当前密码（使用用户表验证）
         if not db_manager.verify_user_password('admin', request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
-        # 更新密码（使用用户表更新）
-        success = db_manager.update_user_password('admin', request.new_password)
+        # 密码与全部持久化会话在同一事务内更新
+        changed_user_id = db_manager.update_user_password_and_revoke_sessions(
+            'admin',
+            request.new_password,
+        )
 
-        if success:
+        if changed_user_id is not None:
+            _drop_user_sessions_from_memory(changed_user_id)
             logger.info(f"【admin#{admin_user['user_id']}】管理员密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:
@@ -936,8 +1013,6 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
 # 普通用户修改密码接口
 @auth_router.post('/change-password')
 async def change_user_password(request: ChangePasswordRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    from db_manager import db_manager
-
     try:
         username = current_user.get('username')
         user_id = current_user.get('user_id')
@@ -949,10 +1024,14 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
         if not db_manager.verify_user_password(username, request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
-        # 更新密码
-        success = db_manager.update_user_password(username, request.new_password)
+        # 密码与全部持久化会话在同一事务内更新
+        changed_user_id = db_manager.update_user_password_and_revoke_sessions(
+            username,
+            request.new_password,
+        )
 
-        if success:
+        if changed_user_id is not None:
+            _drop_user_sessions_from_memory(changed_user_id)
             logger.info(f"【{username}#{user_id}】用户密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:
@@ -1060,8 +1139,14 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 
 # ==================== 极验滑动验证码 ====================
 
-# 极验验证状态存储: {challenge: {"status": int, "expires_at": float}}
-geetest_status_store: dict = {}
+# 极验验证状态只用于短期幂等响应。公开接口必须同时限制单键大小和
+# 进程内条目数量，避免攻击者用任意 challenge 扩大常驻内存。
+GEETEST_CHALLENGE_MAX_LENGTH = 64
+GEETEST_PROOF_MAX_LENGTH = 2048
+GEETEST_STATUS_MAX_ENTRIES = 2048
+GEETEST_STATUS_TTL_SECONDS = 300
+geetest_status_store: OrderedDict[str, Dict[str, float | int]] = OrderedDict()
+_geetest_status_lock = threading.Lock()
 
 # Lightweight, process-local diagnostics caches. They deliberately avoid account
 # browser profiles and never call the Xianyu website.
@@ -1074,29 +1159,55 @@ _browser_probe_cache: Dict[str, Any] = {}
 _browser_probe_checking = False
 
 
-def cleanup_expired_geetest_status():
-    """清理过期的极验验证状态"""
+def _cleanup_expired_geetest_status_locked(current_time: float) -> None:
+    """Remove expired rows while the caller holds ``_geetest_status_lock``."""
+    expired_keys = [
+        key
+        for key, value in geetest_status_store.items()
+        if float(value["expires_at"]) < current_time
+    ]
+    for key in expired_keys:
+        geetest_status_store.pop(key, None)
+
+
+def cleanup_expired_geetest_status() -> None:
+    """清理过期的极验验证状态。"""
     current_time = time.time()
-    expired_keys = [k for k, v in geetest_status_store.items() if v["expires_at"] < current_time]
-    for k in expired_keys:
-        del geetest_status_store[k]
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
 
 
-def set_geetest_status(challenge: str, status: int):
-    """设置极验验证状态"""
-    cleanup_expired_geetest_status()
-    geetest_status_store[challenge] = {
-        "status": status,
-        "expires_at": time.time() + 300  # 5分钟有效
-    }
+def set_geetest_status(challenge: str, status: int) -> bool:
+    """设置有界的极验验证状态；非法或过长键不会进入内存。"""
+    normalized = str(challenge or "").strip()
+    if not normalized or len(normalized) > GEETEST_CHALLENGE_MAX_LENGTH:
+        return False
+    if status not in {0, 1}:
+        return False
+    current_time = time.time()
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
+        geetest_status_store[normalized] = {
+            "status": status,
+            "expires_at": current_time + GEETEST_STATUS_TTL_SECONDS,
+        }
+        geetest_status_store.move_to_end(normalized)
+        while len(geetest_status_store) > GEETEST_STATUS_MAX_ENTRIES:
+            geetest_status_store.popitem(last=False)
+    return True
 
 
 def get_geetest_status(challenge: str) -> int:
     """获取极验验证状态，返回0表示未验证或已过期"""
-    cleanup_expired_geetest_status()
-    stored = geetest_status_store.get(challenge)
-    if stored and stored["expires_at"] > time.time():
-        return stored["status"]
+    normalized = str(challenge or "").strip()
+    if not normalized or len(normalized) > GEETEST_CHALLENGE_MAX_LENGTH:
+        return 0
+    current_time = time.time()
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
+        stored = geetest_status_store.get(normalized)
+        if stored and float(stored["expires_at"]) > current_time:
+            return int(stored["status"])
     return 0
 
 
@@ -1110,9 +1221,18 @@ class GeetestRegisterResponse(BaseModel):
 
 class GeetestValidateRequest(BaseModel):
     """极验二次验证请求"""
-    challenge: str
-    validate_str: str = Field(..., alias='validate')
-    seccode: str
+    challenge: str = Field(
+        ...,
+        min_length=1,
+        max_length=GEETEST_CHALLENGE_MAX_LENGTH,
+    )
+    validate_str: str = Field(
+        ...,
+        alias='validate',
+        min_length=1,
+        max_length=GEETEST_PROOF_MAX_LENGTH,
+    )
+    seccode: str = Field(..., min_length=1, max_length=GEETEST_PROOF_MAX_LENGTH)
 
     model_config = {'populate_by_name': True}
 
@@ -1138,7 +1258,10 @@ async def geetest_register():
         result = await gt_lib.register()
 
         data = result.to_dict()
-        logger.info(f"极验初始化结果: status={result.status}, data={data}")
+        logger.info(
+            f"极验初始化结果: status={result.status}, "
+            f"fields={sorted(str(key) for key in data.keys())}"
+        )
 
         # 记录初始状态
         challenge = data.get("challenge", "")
@@ -1623,7 +1746,10 @@ async def send_message_api(request: SendMessageRequest):
             cleaned_message
         )
 
-        logger.info(f"API成功发送消息: {cleaned_cookie_id} -> {cleaned_to_user_id}, 内容: {cleaned_message[:50]}{'...' if len(cleaned_message) > 50 else ''}")
+        logger.info(
+            f"API消息发送成功: account={cleaned_cookie_id}, "
+            f"message_length={len(cleaned_message)}"
+        )
 
         return SendMessageResponse(
             success=True,
@@ -1634,56 +1760,15 @@ async def send_message_api(request: SendMessageRequest):
         # 使用清理后的参数记录日志
         cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
         to_user_id_for_log = clean_param(request.to_user_id) if 'clean_param' in locals() else request.to_user_id
-        logger.error(f"API发送消息异常: {cookie_id_for_log} -> {to_user_id_for_log}, 错误: {str(e)}")
+        logger.error(
+            f"API发送消息异常: account={cookie_id_for_log}, "
+            f"error_type={type(e).__name__}"
+        )
         return SendMessageResponse(
             success=False,
-            message=f"发送消息失败: {str(e)}"
+            message="发送消息失败，请稍后重试"
         )
 
-
-@system_router.post("/xianyu/reply", response_model=ResponseModel)
-async def xianyu_reply(req: RequestModel):
-    msg_template = match_reply(req.cookie_id, req.send_message)
-    is_default_reply = False
-
-    if not msg_template:
-        # 从数据库获取默认回复
-        from db_manager import db_manager
-        default_reply_settings = db_manager.get_default_reply(req.cookie_id)
-
-        if default_reply_settings and default_reply_settings.get('enabled', False):
-            # 检查是否开启了"只回复一次"功能
-            if default_reply_settings.get('reply_once', False):
-                # 检查是否已经回复过这个chat_id
-                if db_manager.has_default_reply_record(req.cookie_id, req.chat_id):
-                    raise HTTPException(status_code=404, detail="该对话已使用默认回复，不再重复回复")
-
-            msg_template = default_reply_settings.get('reply_content', '')
-            is_default_reply = True
-
-        # 如果数据库中没有设置或为空，返回错误
-        if not msg_template:
-            raise HTTPException(status_code=404, detail="未找到匹配的回复规则且未设置默认回复")
-
-    # 按占位符格式化
-    try:
-        send_msg = msg_template.format(
-            send_user_id=req.send_user_id,
-            send_user_name=req.send_user_name,
-            send_message=req.send_message,
-        )
-    except Exception:
-        # 如果格式化失败，返回原始内容
-        send_msg = msg_template
-
-    # 如果是默认回复且开启了"只回复一次"，记录回复记录
-    if is_default_reply:
-        from db_manager import db_manager
-        default_reply_settings = db_manager.get_default_reply(req.cookie_id)
-        if default_reply_settings and default_reply_settings.get('reply_once', False):
-            db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
-
-    return {"code": 200, "data": {"send_msg": send_msg}}
 
 # ------------------------- 账号 / 关键字管理接口 -------------------------
 
@@ -2547,6 +2632,20 @@ official_login_coordinator = OfficialLoginSessionCoordinator(
 )
 
 
+def _private_verification_image_response(path: str) -> FileResponse:
+    resolved = resolve_private_verification_image(path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
+    return FileResponse(
+        str(resolved),
+        headers={
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 def _expected_owned_unb(user_id: int, account: str) -> str:
     value = str(account or "").strip()
     if not value:
@@ -2610,6 +2709,24 @@ async def get_official_login_session(
             "error_code": persisted.get("error_code") or "interrupted",
         }
     raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+
+
+@accounts_router.get("/api/official-login/sessions/{session_id}/image")
+async def get_official_login_session_image(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    image_path = await official_login_coordinator.get_image_path(
+        session_id,
+        current_user["user_id"],
+    )
+    if image_path:
+        return _private_verification_image_response(image_path)
+
+    persisted = get_session_registry().get(session_id)
+    if persisted and persisted.get("owner_user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="无权限访问该登录会话")
+    raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
 
 
 @accounts_router.post("/api/official-login/sessions/{session_id}/show-browser")
@@ -2790,76 +2907,12 @@ async def get_account_face_verification_screenshot(
     account_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """获取指定账号的人脸验证截图"""
-    try:
-        import glob
-        from datetime import datetime
-
-        # 检查账号是否属于当前用户
-        user_id = current_user['user_id']
-        username = current_user['username']
-
-        # 如果是管理员，允许访问所有账号
-        is_admin = username == 'admin'
-
-        if not is_admin:
-            cookie_info = db_manager.get_cookie_details(account_id)
-            if not cookie_info:
-                log_with_user('warning', f"账号 {account_id} 不存在", current_user)
-                return {
-                    'success': False,
-                    'message': '账号不存在'
-                }
-
-            cookie_user_id = cookie_info.get('user_id')
-            if cookie_user_id != user_id:
-                log_with_user('warning', f"用户 {user_id} 尝试访问账号 {account_id}（归属用户: {cookie_user_id}）", current_user)
-                return {
-                    'success': False,
-                    'message': '无权访问该账号'
-                }
-
-        # 获取该账号的验证截图
-        screenshots_dir = os.path.join(static_dir, 'uploads', 'images')
-        pattern = os.path.join(screenshots_dir, f'face_verify_{account_id}_*.jpg')
-        screenshot_files = glob.glob(pattern)
-
-        log_with_user('debug', f"查找截图: {pattern}, 找到 {len(screenshot_files)} 个文件", current_user)
-
-        if not screenshot_files:
-            log_with_user('warning', f"账号 {account_id} 没有找到验证截图", current_user)
-            return {
-                'success': False,
-                'message': '未找到验证截图'
-            }
-
-        # 获取最新的截图
-        latest_file = max(screenshot_files, key=os.path.getmtime)
-        filename = os.path.basename(latest_file)
-        stat = os.stat(latest_file)
-
-        screenshot_info = {
-            'filename': filename,
-            'account_id': account_id,
-            'path': f'/static/uploads/images/{filename}',
-            'size': stat.st_size,
-            'created_time': stat.st_ctime,
-            'created_time_str': datetime.fromtimestamp(stat.st_ctime).strftime('%Y-%m-%d %H:%M:%S')
-        }
-
-        log_with_user('info', f"获取账号 {account_id} 的验证截图", current_user)
-
-        return {
-            'success': True,
-            'screenshot': screenshot_info
-        }
-
-    except Exception as e:
-        log_with_user('error', f"获取验证截图失败: {str(e)}", current_user)
-        return {
-            'success': False,
-            'message': str(e)
-        }
+    """Return the newest private verification image for one owned account."""
+    _require_owned_cookie(account_id, current_user['user_id'])
+    image_path = _latest_account_verification_image(account_id)
+    if image_path is None:
+        raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
+    return _private_verification_image_response(str(image_path))
 
 
 @accounts_router.delete("/face-verification/screenshot/{account_id}")
@@ -2867,49 +2920,37 @@ async def delete_account_face_verification_screenshot(
     account_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """删除指定账号的人脸验证截图"""
-    try:
-        import glob
-
-        # 检查账号是否属于当前用户
-        user_id = current_user['user_id']
-        cookie_info = db_manager.get_cookie_details(account_id)
-        if not cookie_info or cookie_info.get('user_id') != user_id:
-            return {
-                'success': False,
-                'message': '无权访问该账号'
-            }
-
-        # 删除该账号的所有验证截图
-        screenshots_dir = os.path.join(static_dir, 'uploads', 'images')
-        pattern = os.path.join(screenshots_dir, f'face_verify_{account_id}_*.jpg')
-        screenshot_files = glob.glob(pattern)
-
-        deleted_count = 0
-        for file_path in screenshot_files:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    deleted_count += 1
-                    log_with_user('info', f"删除账号 {account_id} 的验证截图: {os.path.basename(file_path)}", current_user)
-            except Exception as e:
-                log_with_user('error', f"删除截图失败 {file_path}: {str(e)}", current_user)
-
-        return {
-            'success': True,
-            'message': f'已删除 {deleted_count} 个验证截图',
-            'deleted_count': deleted_count
-        }
-
-    except Exception as e:
-        log_with_user('error', f"删除验证截图失败: {str(e)}", current_user)
-        return {
-            'success': False,
-            'message': str(e)
-        }
+    """Delete private verification images for one owned account."""
+    _require_owned_cookie(account_id, current_user['user_id'])
+    image_paths = _account_verification_images(account_id)
+    for image_path in image_paths:
+        remove_verification_image(str(image_path))
+    return {
+        'success': True,
+        'message': f'已删除 {len(image_paths)} 个验证截图',
+        'deleted_count': len(image_paths),
+    }
 
 
 # ========================= 扫码登录相关接口 =========================
+
+
+def _require_owned_qr_session(
+    session_id: str,
+    current_user: Dict[str, Any],
+) -> tuple[Any, Dict[str, Any]]:
+    registry = get_session_registry()
+    registry.cleanup()
+    persisted = registry.get(session_id)
+    if not persisted or (
+        persisted.get('expires_at')
+        and float(persisted['expires_at']) <= time.time()
+    ):
+        raise HTTPException(status_code=404, detail='扫码会话不存在或已过期')
+    if persisted.get('owner_user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+    return registry, persisted
+
 
 @accounts_router.post("/qr-login/generate")
 async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -2926,7 +2967,7 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
                 ttl_seconds=900,
                 transient=qr_login_manager.sessions.get(session_id),
             )
-            log_with_user('info', f"接口二维码生成成功: {session_id}", current_user)
+            log_with_user('info', "接口二维码生成成功", current_user)
         return result
     except Exception as exc:
         logger.error(f"生成接口二维码失败: {type(exc).__name__}")
@@ -2936,16 +2977,24 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
         }
 
 
+@accounts_router.get("/qr-login/verification-image/{session_id}")
+async def get_qr_login_verification_image(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_owned_qr_session(session_id, current_user)
+    image_path = qr_login_manager.get_verification_image_path(session_id)
+    if not image_path:
+        raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
+    return _private_verification_image_response(image_path)
+
+
 @accounts_router.get("/qr-login/check/{session_id}")
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Poll one owner-scoped API QR session and persist it once after validation."""
     try:
-        registry = get_session_registry()
-        registry.cleanup()
-        persisted = registry.get(session_id)
-        if persisted and persisted.get('owner_user_id') != current_user['user_id']:
-            raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
-        if persisted and persisted.get('status') == 'interrupted':
+        registry, persisted = _require_owned_qr_session(session_id, current_user)
+        if persisted.get('status') == 'interrupted':
             return {
                 'status': 'interrupted',
                 'message': persisted.get('error_message') or '服务已重启，请重新生成二维码',
@@ -3034,10 +3083,8 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
 @accounts_router.post("/qr-login/continue/{session_id}")
 async def continue_qr_code_after_verification(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Compatibility entry that ensures the verification renderer is active."""
-    persisted = get_session_registry().get(session_id)
-    if persisted and persisted.get('owner_user_id') != current_user['user_id']:
-        raise HTTPException(status_code=403, detail='无权限访问该扫码会话')
+    """Start the dedicated Chrome window only after an explicit user action."""
+    _require_owned_qr_session(session_id, current_user)
     qr_login_manager.continue_after_verification(session_id)
     return await check_qr_code_status(session_id, current_user)
 
@@ -3244,7 +3291,6 @@ def clear_default_reply_records_compat(cid: str, current_user: Dict[str, Any] = 
 @content_router.get('/notification-channels')
 def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有通知渠道"""
-    from db_manager import db_manager
     try:
         user_id = current_user['user_id']
         return db_manager.get_notification_channels(user_id)
@@ -3255,7 +3301,6 @@ def get_notification_channels(current_user: Dict[str, Any] = Depends(get_current
 @content_router.post('/notification-channels')
 def create_notification_channel(channel_data: NotificationChannelIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建通知渠道"""
-    from db_manager import db_manager
     try:
         user_id = current_user['user_id']
         channel_id = db_manager.create_notification_channel(
@@ -3270,11 +3315,16 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
 
 
 @content_router.get('/notification-channels/{channel_id}')
-def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
+def get_notification_channel(
+    channel_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """获取指定通知渠道"""
-    from db_manager import db_manager
     try:
-        channel = db_manager.get_notification_channel(channel_id)
+        channel = db_manager.get_notification_channel(
+            channel_id,
+            current_user['user_id'],
+        )
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
         return channel
@@ -3285,15 +3335,19 @@ def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
 
 
 @content_router.put('/notification-channels/{channel_id}')
-def update_notification_channel(channel_id: int, channel_data: NotificationChannelUpdate, _: None = Depends(require_auth)):
+def update_notification_channel(
+    channel_id: int,
+    channel_data: NotificationChannelUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """更新通知渠道"""
-    from db_manager import db_manager
     try:
         success = db_manager.update_notification_channel(
             channel_id,
             channel_data.name,
             channel_data.config,
-            channel_data.enabled
+            channel_data.enabled,
+            current_user['user_id'],
         )
         if success:
             return {'msg': 'notification channel updated'}
@@ -3306,11 +3360,16 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
 
 
 @content_router.delete('/notification-channels/{channel_id}')
-def delete_notification_channel(channel_id: int, _: None = Depends(require_auth)):
+def delete_notification_channel(
+    channel_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """删除通知渠道"""
-    from db_manager import db_manager
     try:
-        success = db_manager.delete_notification_channel(channel_id)
+        success = db_manager.delete_notification_channel(
+            channel_id,
+            current_user['user_id'],
+        )
         if success:
             return {'msg': 'notification channel deleted'}
         else:
@@ -3326,7 +3385,6 @@ def delete_notification_channel(channel_id: int, _: None = Depends(require_auth)
 @content_router.get('/message-notifications')
 def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户所有账号的消息通知配置"""
-    from db_manager import db_manager
     try:
         # 只返回当前用户的消息通知配置
         user_id = current_user['user_id']
@@ -3343,7 +3401,6 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
 @content_router.get('/message-notifications/{cid}')
 def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的消息通知配置"""
-    from db_manager import db_manager
     try:
         # 检查cookie是否属于当前用户
         user_id = current_user['user_id']
@@ -3362,7 +3419,6 @@ def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(g
 @content_router.post('/message-notifications/{cid}')
 def set_message_notification(cid: str, notification_data: MessageNotificationIn, current_user: Dict[str, Any] = Depends(get_current_user)):
     """设置账号的消息通知"""
-    from db_manager import db_manager
     try:
         # 检查cookie是否属于当前用户
         user_id = current_user['user_id']
@@ -3372,11 +3428,19 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         # 检查通知渠道是否存在
-        channel = db_manager.get_notification_channel(notification_data.channel_id)
+        channel = db_manager.get_notification_channel(
+            notification_data.channel_id,
+            user_id,
+        )
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
 
-        success = db_manager.set_message_notification(cid, notification_data.channel_id, notification_data.enabled)
+        success = db_manager.set_message_notification(
+            cid,
+            notification_data.channel_id,
+            notification_data.enabled,
+            user_id,
+        )
         if success:
             return {'msg': 'message notification set'}
         else:
@@ -3388,11 +3452,16 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
 
 
 @content_router.delete('/message-notifications/account/{cid}')
-def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
+def delete_account_notifications(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """删除账号的所有消息通知配置"""
-    from db_manager import db_manager
     try:
-        success = db_manager.delete_account_notifications(cid)
+        success = db_manager.delete_account_notifications(
+            cid,
+            current_user['user_id'],
+        )
         if success:
             return {'msg': 'account notifications deleted'}
         else:
@@ -3404,11 +3473,16 @@ def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
 
 
 @content_router.delete('/message-notifications/{notification_id}')
-def delete_message_notification(notification_id: int, _: None = Depends(require_auth)):
+def delete_message_notification(
+    notification_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """删除消息通知配置"""
-    from db_manager import db_manager
     try:
-        success = db_manager.delete_message_notification(notification_id)
+        success = db_manager.delete_message_notification(
+            notification_id,
+            current_user['user_id'],
+        )
         if success:
             return {'msg': 'message notification deleted'}
         else:
@@ -3484,8 +3558,22 @@ def _prepare_settings_section(section: str, request: SystemSettingsSectionIn) ->
     elif section == 'ai':
         api_url = str(values.get('ai_api_url', raw.get('ai_api_url', '')) or '').strip()
         model = str(values.get('ai_model', raw.get('ai_model', '')) or '').strip()
-        if not api_url.startswith(('http://', 'https://')):
-            raise HTTPException(status_code=400, detail='AI API地址必须以 http:// 或 https:// 开头')
+        try:
+            scheme, host, _port = parse_public_http_url(api_url)
+        except OutboundRequestError as exc:
+            raise HTTPException(status_code=400, detail='AI API地址格式无效') from exc
+        if scheme != 'https':
+            raise HTTPException(status_code=400, detail='AI API地址必须使用 HTTPS')
+        if urlsplit(api_url).query:
+            raise HTTPException(status_code=400, detail='AI API基础地址不能包含查询参数')
+        if host == 'localhost' or host.endswith('.localhost'):
+            raise HTTPException(status_code=400, detail='AI API地址必须使用公网主机')
+        try:
+            literal_host = ipaddress.ip_address(host)
+        except ValueError:
+            literal_host = None
+        if literal_host is not None and not literal_host.is_global:
+            raise HTTPException(status_code=400, detail='AI API地址必须使用公网主机')
         if not model:
             raise HTTPException(status_code=400, detail='AI模型不能为空')
     elif section == 'smtp':
@@ -3624,20 +3712,38 @@ def verify_settings_section(section: str, request: SystemSettingsVerifyIn,
     effective = {**raw, **values}
     try:
         if section == 'ai':
-            from openai import OpenAI
             api_key = effective.get('ai_api_key') or ''
             if not api_key:
                 raise ValueError('AI API Key未配置')
-            client = OpenAI(api_key=api_key, base_url=effective.get('ai_api_url'))
-            kwargs = {
+            base_url = str(effective.get('ai_api_url') or '').rstrip('/')
+            body = {
                 'model': effective.get('ai_model'),
                 'messages': [{'role': 'user', 'content': '回复OK'}],
                 'max_tokens': 8,
                 'temperature': 0,
             }
-            if 'deepseek' in str(effective.get('ai_model', '')).lower() or 'deepseek' in str(effective.get('ai_api_url', '')).lower():
-                kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
-            client.chat.completions.create(**kwargs)
+            if (
+                'deepseek' in str(effective.get('ai_model', '')).lower()
+                or 'deepseek' in base_url.lower()
+            ):
+                body['thinking'] = {'type': 'disabled'}
+            response = request_public_http_sync(
+                'POST',
+                f"{base_url}/chat/completions",
+                headers={
+                    'Authorization': f"Bearer {api_key}",
+                    'Content-Type': 'application/json',
+                },
+                json_body=body,
+                timeout_seconds=30,
+                allowed_methods=('POST',),
+                require_https=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            choices = payload.get('choices') if isinstance(payload, dict) else None
+            if not isinstance(choices, list) or not choices:
+                raise ValueError('AI平台返回了无法识别的响应')
             return {'success': True, 'state': 'ready', 'message': 'AI连接可用'}
         recipient = normalize_email(
             str(effective.get('support_email') or '')
@@ -4649,8 +4755,12 @@ async def add_image_keyword(
             logger.warning(f"无效的图片文件类型: {image.content_type}")
             raise HTTPException(status_code=400, detail="请上传图片文件")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4709,8 +4819,12 @@ async def upload_image(
             logger.warning(f"无效的图片文件类型: {image.content_type}")
             raise HTTPException(status_code=400, detail="请上传图片文件")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4942,6 +5056,15 @@ async def update_card_with_image(
     try:
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
 
+        # 必须先验证资源所有权，再读取 multipart 文件体。
+        from db_manager import db_manager
+        existing_card = db_manager.get_card_by_id(
+            card_id,
+            current_user["user_id"],
+        )
+        if not existing_card:
+            raise HTTPException(status_code=404, detail="卡券不存在")
+
         # 验证图片文件
         if not image.content_type or not image.content_type.startswith('image/'):
             logger.warning(f"无效的图片文件类型: {image.content_type}")
@@ -4952,8 +5075,12 @@ async def update_card_with_image(
             if not spec_name or not spec_value:
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4965,7 +5092,6 @@ async def update_card_with_image(
         logger.info(f"图片保存成功: {image_url}")
 
         # 更新卡券
-        from db_manager import db_manager
         success = db_manager.update_card(
             card_id=card_id,
             name=name,
@@ -5133,15 +5259,17 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @admin_router.post("/backup/import")
-def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
+async def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = Depends(get_current_user)):
     """导入用户备份"""
     try:
         # 验证文件类型
-        if not file.filename.endswith('.json'):
+        if not str(file.filename or '').lower().endswith('.json'):
             raise HTTPException(status_code=400, detail="只支持JSON格式的备份文件")
 
-        # 读取文件内容
-        content = file.file.read()
+        # 有界读取，避免在解析前把任意大上传全部载入内存。
+        content = file.file.read(USER_BACKUP_MAX_BYTES + 1)
+        if len(content) > USER_BACKUP_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="备份文件超过25MB")
         backup_data = json.loads(content.decode('utf-8'))
 
         # 导入备份到当前用户
@@ -5150,27 +5278,37 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
         success = db_manager.import_backup(backup_data, user_id)
 
         if success:
-            # 备份导入成功后，刷新 CookieManager 的内存缓存
             import cookie_manager
-            if cookie_manager.manager:
-                try:
-                    cookie_manager.manager.reload_from_db()
-                    logger.info("备份导入后已刷新 CookieManager 缓存")
-                except Exception as e:
-                    logger.error(f"刷新 CookieManager 缓存失败: {e}")
+
+            manager = cookie_manager.manager
+            if manager is not None:
+                reconcile = await manager.reconcile_from_db()
+                if not reconcile.get("success"):
+                    logger.error(
+                        "备份导入后运行态对账未完成: "
+                        f"failed={reconcile.get('failed', 0)}"
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="备份已写入，但运行态对账未完成，请人工检查",
+                    )
+                logger.info("备份导入后已完成 CookieManager 运行态对账")
 
             return {"message": "备份导入成功"}
         else:
             raise HTTPException(status_code=400, detail="备份导入失败")
 
-    except json.JSONDecodeError:
+    except HTTPException:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError):
         raise HTTPException(status_code=400, detail="备份文件格式无效")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导入备份失败: {str(e)}")
+        logger.error(f"导入备份失败: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="导入备份失败") from e
 
 
 @admin_router.post("/system/reload-cache")
-def reload_cache(_: None = Depends(require_auth)):
+def reload_cache(_: Dict[str, Any] = Depends(require_admin)):
     """重新加载系统缓存（用于手动刷新数据）"""
     try:
         import cookie_manager
@@ -5209,16 +5347,23 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 # ==================== 商品搜索 API ====================
 
+def _public_item_search_error_code(result: Dict[str, Any]) -> str:
+    raw_code = str(result.get("error_code") or "").strip().lower()
+    if raw_code and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", raw_code):
+        return raw_code
+    return "search_failed"
+
+
 class ItemSearchRequest(BaseModel):
-    keyword: str
-    account_id: str
-    page: int = 1
-    page_size: int = 20
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
+    account_id: str = Field(min_length=1, max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
+    page: int = Field(default=1, ge=1, le=SEARCH_PAGE_MAX)
+    page_size: int = Field(default=20, ge=1, le=SEARCH_PAGE_SIZE_MAX)
 
 class ItemSearchMultipleRequest(BaseModel):
-    keyword: str
-    account_id: str
-    total_pages: int = 1
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
+    account_id: str = Field(min_length=1, max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
+    total_pages: int = Field(default=1, ge=1, le=SEARCH_TOTAL_PAGES_MAX)
 
 @content_router.post("/items/search")
 async def search_items(
@@ -5226,10 +5371,17 @@ async def search_items(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索闲鱼商品"""
-    user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
+    user_info = get_user_log_prefix(current_user)
 
     try:
-        logger.info(f"{user_info} 开始单页搜索: 关键词='{search_request.keyword}', 页码={search_request.page}, 每页={search_request.page_size}")
+        _require_skill_monitor_account_ready(
+            current_user['user_id'],
+            search_request.account_id,
+        )
+        logger.info(
+            f"{user_info} 开始单页搜索: keyword_length={len(search_request.keyword)}, "
+            f"页码={search_request.page}, 每页={search_request.page_size}"
+        )
 
         from utils.item_search import search_xianyu_items
 
@@ -5243,14 +5395,17 @@ async def search_items(
         )
 
         # 检查是否有错误
-        has_error = result.get("error")
+        has_error = bool(result.get("error"))
+        error_code = _public_item_search_error_code(result) if has_error else ""
         items_count = len(result.get("items", []))
 
-        logger.info(f"{user_info} 单页搜索完成: 获取到 {items_count} 条数据" +
-                   (f", 错误: {has_error}" if has_error else ""))
+        logger.info(
+            f"{user_info} 单页搜索完成: 获取到 {items_count} 条数据, "
+            f"error_code={error_code or 'none'}"
+        )
 
         response_data = {
-            "success": True,
+            "success": not has_error,
             "data": result.get("items", []),
             "total": result.get("total", 0),
             "page": search_request.page,
@@ -5260,16 +5415,17 @@ async def search_items(
             "source": result.get("source", "unknown")
         }
 
-        # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = "商品搜索暂时不可用"
+            response_data["error_code"] = error_code
 
         return response_data
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"{user_info} 商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"商品搜索失败: {error_msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"{user_info} 商品搜索失败: type={type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="商品搜索暂时不可用") from exc
 
 
 @accounts_router.get("/cookies/check")
@@ -5326,10 +5482,17 @@ async def search_multiple_pages(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索多页闲鱼商品"""
-    user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
+    user_info = get_user_log_prefix(current_user)
 
     try:
-        logger.info(f"{user_info} 开始多页搜索: 关键词='{search_request.keyword}', 页数={search_request.total_pages}")
+        _require_skill_monitor_account_ready(
+            current_user['user_id'],
+            search_request.account_id,
+        )
+        logger.info(
+            f"{user_info} 开始多页搜索: keyword_length={len(search_request.keyword)}, "
+            f"页数={search_request.total_pages}"
+        )
 
         from utils.item_search import search_multiple_pages_xianyu
 
@@ -5342,14 +5505,17 @@ async def search_multiple_pages(
         )
 
         # 检查是否有错误
-        has_error = result.get("error")
+        has_error = bool(result.get("error"))
+        error_code = _public_item_search_error_code(result) if has_error else ""
         items_count = len(result.get("items", []))
 
-        logger.info(f"{user_info} 多页搜索完成: 获取到 {items_count} 条数据" +
-                   (f", 错误: {has_error}" if has_error else ""))
+        logger.info(
+            f"{user_info} 多页搜索完成: 获取到 {items_count} 条数据, "
+            f"error_code={error_code or 'none'}"
+        )
 
         response_data = {
-            "success": True,
+            "success": not has_error,
             "data": result.get("items", []),
             "total": result.get("total", 0),
             "total_pages": search_request.total_pages,
@@ -5359,16 +5525,17 @@ async def search_multiple_pages(
             "source": result.get("source", "unknown")
         }
 
-        # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = "商品搜索暂时不可用"
+            response_data["error_code"] = error_code
 
         return response_data
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"多页商品搜索失败: {error_msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"{user_info} 多页商品搜索失败: type={type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="商品搜索暂时不可用") from exc
 
 
 
@@ -5493,44 +5660,110 @@ class AIReplySettings(BaseModel):
 
 
 class AIProviderProfileCreate(BaseModel):
-    name: str
-    provider_type: str = "openai_compatible"
-    preset: str = "custom"
-    base_url: str = ""
-    api_key: str = ""
-    default_model: str = ""
+    name: str = Field(..., min_length=1, max_length=100)
+    provider_type: str = Field(default="openai_compatible", max_length=50)
+    preset: str = Field(default="custom", max_length=50)
+    base_url: str = Field(default="", max_length=2048)
+    api_key: str = Field(default="", max_length=8192)
+    default_model: str = Field(default="", max_length=AI_MODEL_NAME_MAX_LENGTH)
     is_default: bool = False
 
 
 class AIProviderProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    provider_type: Optional[str] = None
-    preset: Optional[str] = None
-    base_url: Optional[str] = None
-    api_key: str = ""
-    api_key_action: str = "keep"
-    default_model: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    provider_type: Optional[str] = Field(default=None, max_length=50)
+    preset: Optional[str] = Field(default=None, max_length=50)
+    base_url: Optional[str] = Field(default=None, max_length=2048)
+    api_key: str = Field(default="", max_length=8192)
+    api_key_action: str = Field(default="keep", max_length=20)
+    default_model: Optional[str] = Field(
+        default=None,
+        max_length=AI_MODEL_NAME_MAX_LENGTH,
+    )
     is_default: Optional[bool] = None
 
 
 class AIProviderTestRequest(BaseModel):
-    model_name: str
+    model_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=AI_MODEL_NAME_MAX_LENGTH,
+    )
+
+
+class AIReplyTestRequest(BaseModel):
+    message: str = Field(default="你好", max_length=AI_MESSAGE_MAX_LENGTH)
+    item_title: str = Field(
+        default="测试商品",
+        max_length=AI_ITEM_TITLE_MAX_LENGTH,
+    )
+    item_price: float = Field(default=100, ge=0, le=1_000_000_000)
+    item_desc: str = Field(
+        default="这是一个测试商品",
+        max_length=AI_ITEM_DESCRIPTION_MAX_LENGTH,
+    )
 
 
 class AIReplyLabRequest(BaseModel):
-    session_id: Optional[str] = None
-    message: str
-    item_id: Optional[str] = None
-    item_title: str = "测试商品"
-    item_price: Any = 100
-    item_desc: str = "这是一个测试商品"
-    training_rules: List[Any] = Field(default_factory=list)
-    prompt_override: str = ""
+    session_id: Optional[str] = Field(
+        default=None,
+        max_length=AI_SESSION_ID_MAX_LENGTH,
+    )
+    message: str = Field(..., min_length=1, max_length=AI_MESSAGE_MAX_LENGTH)
+    item_id: Optional[str] = Field(
+        default=None,
+        max_length=AI_ITEM_ID_MAX_LENGTH,
+    )
+    item_title: str = Field(
+        default="测试商品",
+        max_length=AI_ITEM_TITLE_MAX_LENGTH,
+    )
+    item_price: float = Field(default=100, ge=0, le=1_000_000_000)
+    item_desc: str = Field(
+        default="这是一个测试商品",
+        max_length=AI_ITEM_DESCRIPTION_MAX_LENGTH,
+    )
+    training_rules: List[Any] = Field(
+        default_factory=list,
+        max_length=AI_TRAINING_RULE_MAX_COUNT,
+    )
+    prompt_override: str = Field(
+        default="",
+        max_length=AI_PROMPT_OVERRIDE_MAX_LENGTH,
+    )
+
+    @field_validator("training_rules")
+    @classmethod
+    def validate_training_rules(cls, rules: List[Any]) -> List[Any]:
+        for rule in rules:
+            text = rule.get("text") if isinstance(rule, dict) else rule
+            if len(str(text or "")) > AI_TRAINING_RULE_MAX_LENGTH:
+                raise ValueError("训练规则过长")
+            try:
+                serialized = json.dumps(
+                    rule,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("训练规则格式无效") from exc
+            if len(serialized) > AI_TRAINING_RULE_SERIALIZED_MAX_BYTES:
+                raise ValueError("训练规则负载过大")
+        return rules
 
 
 class AIReplyLabSaveRequest(BaseModel):
-    item_id: str = ""
-    training_rules: List[Any] = Field(default_factory=list)
+    item_id: str = Field(default="", max_length=AI_ITEM_ID_MAX_LENGTH)
+    training_rules: List[Any] = Field(
+        default_factory=list,
+        max_length=AI_TRAINING_RULE_MAX_COUNT,
+    )
+
+    @field_validator("training_rules")
+    @classmethod
+    def validate_training_rules(cls, rules: List[Any]) -> List[Any]:
+        return AIReplyLabRequest.validate_training_rules(rules)
 
 
 class AITrainingRuleStatusRequest(BaseModel):
@@ -5552,34 +5785,49 @@ class AIItemKnowledgeCopyRequest(BaseModel):
 
 
 class SkillMonitorTaskIn(BaseModel):
-    name: str = ""
-    keyword: str
+    name: str = Field(default="", max_length=128)
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    region: str = ""
-    published_within_hours: int = 24
-    ai_filter: str = ""
+    region: str = Field(default="", max_length=64)
+    published_within_hours: int = Field(default=24, ge=1, le=24 * 365)
+    ai_filter: str = Field(default="", max_length=2000)
     notify_enabled: bool = False
-    account_id: str = ""
+    account_id: str = Field(default="", max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
     enabled: bool = True
     schedule_enabled: bool = False
-    schedule_interval_minutes: int = 60
+    schedule_interval_minutes: int = Field(default=60, ge=1, le=10080)
     next_run_at: Optional[str] = None
 
 
 class SkillMonitorTaskUpdate(BaseModel):
-    name: Optional[str] = None
-    keyword: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=128)
+    keyword: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=SEARCH_KEYWORD_MAX_CHARS,
+    )
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    region: Optional[str] = None
-    published_within_hours: Optional[int] = None
-    ai_filter: Optional[str] = None
+    region: Optional[str] = Field(default=None, max_length=64)
+    published_within_hours: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=24 * 365,
+    )
+    ai_filter: Optional[str] = Field(default=None, max_length=2000)
     notify_enabled: Optional[bool] = None
-    account_id: Optional[str] = None
+    account_id: Optional[str] = Field(
+        default=None,
+        max_length=SEARCH_ACCOUNT_ID_MAX_CHARS,
+    )
     enabled: Optional[bool] = None
     schedule_enabled: Optional[bool] = None
-    schedule_interval_minutes: Optional[int] = None
+    schedule_interval_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10080,
+    )
     next_run_at: Optional[str] = None
 
 
@@ -5608,15 +5856,34 @@ def _mask_secret(value: str) -> str:
 @content_router.delete("/items/batch")
 def batch_delete_items(
     request: BatchDeleteRequest,
-    _: None = Depends(require_auth)
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """批量删除商品信息"""
     try:
         if not request.items:
             raise HTTPException(status_code=400, detail="删除列表不能为空")
+        if len(request.items) > 500:
+            raise HTTPException(status_code=400, detail="单次最多删除500个商品")
 
-        success_count = db_manager.batch_delete_item_info(request.items)
-        total_count = len(request.items)
+        normalized_items = []
+        for item in request.items:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail="删除项格式无效")
+            cookie_id = str(item.get('cookie_id') or '').strip()
+            item_id = str(item.get('item_id') or '').strip()
+            if not cookie_id or not item_id:
+                raise HTTPException(status_code=400, detail="删除项缺少账号或商品ID")
+            normalized_items.append({'cookie_id': cookie_id, 'item_id': item_id})
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if any(item['cookie_id'] not in user_cookies for item in normalized_items):
+            raise HTTPException(status_code=403, detail="无权限删除其他账号的商品")
+
+        success_count = db_manager.batch_delete_item_info(
+            normalized_items,
+            current_user['user_id'],
+        )
+        total_count = len(normalized_items)
 
         return {
             "message": f"批量删除完成",
@@ -5624,9 +5891,11 @@ def batch_delete_items(
             "total_count": total_count,
             "failed_count": total_count - success_count
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"批量删除商品信息异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"批量删除商品信息异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="批量删除商品失败")
 
 
 # ==================== AI回复管理API ====================
@@ -5664,14 +5933,18 @@ def _dedupe_rules(rules: List[str]) -> List[str]:
 def _normalize_scoped_rules(rules: List[Any], default_scope: str = 'item') -> List[Dict[str, str]]:
     seen = set()
     cleaned = []
-    for rule in rules or []:
+    for rule in (rules or [])[:AI_TRAINING_RULE_MAX_COUNT]:
         if isinstance(rule, dict):
             scope = str(rule.get('scope') or default_scope).strip().lower()
             text = str(rule.get('text') or '').strip()
         else:
             scope = default_scope
             text = str(rule or '').strip()
-        if scope not in {'global', 'item'} or not text:
+        if (
+            scope not in {'global', 'item'}
+            or not text
+            or len(text) > AI_TRAINING_RULE_MAX_LENGTH
+        ):
             continue
         key = (scope, text)
         if key in seen:
@@ -5778,6 +6051,8 @@ def _item_knowledge_payload(cookie_id: str, item_id: str, item: Dict[str, Any]) 
 
 def _normalize_provider_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     preset = str(data.get('preset') or 'custom').strip().lower()
+    if preset not in PROVIDER_PRESETS:
+        preset = 'custom'
     preset_data = PROVIDER_PRESETS.get(preset, PROVIDER_PRESETS['custom'])
     provider_type = str(data.get('provider_type') or preset_data['provider_type']).strip()
     if provider_type not in {'openai_compatible', 'gemini'}:
@@ -5789,8 +6064,14 @@ def _normalize_provider_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail='平台名称不能为空')
     if not base_url:
         raise HTTPException(status_code=400, detail='API 地址不能为空')
-    if not re.match(r'^https?://', base_url, re.IGNORECASE):
-        raise HTTPException(status_code=400, detail='API 地址必须以 http:// 或 https:// 开头')
+    try:
+        scheme, _host, _port = parse_public_http_url(base_url)
+    except OutboundRequestError as exc:
+        raise HTTPException(status_code=400, detail='API 地址格式无效') from exc
+    if scheme != 'https':
+        raise HTTPException(status_code=400, detail='AI 平台 API 地址必须使用 HTTPS')
+    if urlsplit(base_url).query:
+        raise HTTPException(status_code=400, detail='AI 平台 API 基础地址不能包含查询参数')
     return {**data, 'name': name, 'preset': preset, 'provider_type': provider_type,
             'base_url': base_url, 'default_model': default_model}
 
@@ -5861,9 +6142,14 @@ def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = D
     if not profile:
         raise HTTPException(status_code=404, detail='平台配置不存在')
     try:
-        models = discover_provider_models(profile)
+        models = _run_bounded_ai_call(
+            user_id,
+            lambda: discover_provider_models(profile),
+        )
         db_manager.update_ai_provider_models(profile_id, user_id, models)
         return {'models': models, 'cached_at': time.time()}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f'平台模型列表刷新失败 profile={profile_id}: {type(e).__name__}')
         raise HTTPException(status_code=400, detail='模型列表读取失败，可手动填写模型 ID 后测试')
@@ -5878,7 +6164,10 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
         raise HTTPException(status_code=404, detail='平台配置不存在')
     model_name = payload.model_name.strip()
     try:
-        reply = test_provider_reply(profile, model_name)
+        reply = _run_bounded_ai_call(
+            user_id,
+            lambda: test_provider_reply(profile, model_name),
+        )
         if not reply:
             raise ValueError('模型返回空内容')
         db_manager.update_ai_provider_verification(profile_id, user_id, 'verified', '测试回复生成成功')
@@ -5889,6 +6178,8 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
             'test_token': token,
             'model_name': model_name,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         db_manager.update_ai_provider_verification(profile_id, user_id, 'failed', '测试回复生成失败')
         logger.warning(f'AI平台测试失败 profile={profile_id} model={model_name}: {type(e).__name__}')
@@ -6067,8 +6358,8 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"获取AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取AI回复设置失败")
 
 
 @ai_router.put("/ai-reply-settings/{cookie_id}")
@@ -6125,9 +6416,13 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
 
             # 如果启用了AI回复，记录日志
             if settings.ai_enabled:
-                logger.info(f"账号 {cookie_id} 启用AI回复")
+                logger.info(
+                    f"{_ai_log_reference(cookie_id, 'account')} 启用AI回复"
+                )
             else:
-                logger.info(f"账号 {cookie_id} 禁用AI回复")
+                logger.info(
+                    f"{_ai_log_reference(cookie_id, 'account')} 禁用AI回复"
+                )
 
             return {"message": "AI回复设置更新成功"}
         else:
@@ -6135,8 +6430,8 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"更新AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="更新AI回复设置失败")
 
 
 @ai_router.get("/ai-reply-settings")
@@ -6170,14 +6465,14 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
             user_settings[cid] = settings
         return user_settings
     except Exception as e:
-        logger.error(f"获取所有AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"获取所有AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取AI回复设置失败")
 
 
 @ai_router.post("/ai-reply-test/{cookie_id}")
 def test_ai_reply(
     cookie_id: str,
-    test_data: dict,
+    test_data: AIReplyTestRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """测试AI回复功能"""
@@ -6202,22 +6497,25 @@ def test_ai_reply(
             raise HTTPException(status_code=400, detail='未配置API地址，请先在AI设置中配置API地址')
 
         # 构造测试数据
-        test_message = test_data.get('message', '你好')
+        test_message = test_data.message
         test_item_info = {
-            'title': test_data.get('item_title', '测试商品'),
-            'price': test_data.get('item_price', 100),
-            'desc': test_data.get('item_desc', '这是一个测试商品')
+            'title': test_data.item_title,
+            'price': test_data.item_price,
+            'desc': test_data.item_desc,
         }
 
         # 生成测试回复（跳过等待时间）
-        reply = ai_reply_engine.generate_reply(
-            message=test_message,
-            item_info=test_item_info,
-            chat_id=f"test_{int(time.time())}",
-            cookie_id=cookie_id,
-            user_id="test_user",
-            item_id="test_item",
-            skip_wait=True  # 测试时跳过10秒等待
+        reply = _run_bounded_ai_call(
+            current_user['user_id'],
+            lambda: ai_reply_engine.generate_reply(
+                message=test_message,
+                item_info=test_item_info,
+                chat_id=f"test_{int(time.time())}",
+                cookie_id=cookie_id,
+                user_id="test_user",
+                item_id="test_item",
+                skip_wait=True,
+            ),
         )
 
         if reply:
@@ -6228,10 +6526,8 @@ def test_ai_reply(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"测试AI回复异常: {e}")
-        import traceback
-        logger.error(f"详细错误: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"测试AI回复异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="测试AI回复失败")
 
 
 @ai_router.post("/ai-reply-lab/reply/{cookie_id}")
@@ -6265,31 +6561,37 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             item_desc = db_item.get('item_detail') or db_item.get('item_description') or item_desc
 
         current_time = time.time()
-        expired_sessions = [
-            sid for sid, session in ai_reply_lab_sessions.items()
-            if current_time - session.get('timestamp', 0) > 6 * 3600
-        ]
-        for sid in expired_sessions:
-            ai_reply_lab_sessions.pop(sid, None)
+        _prune_ai_lab_sessions(
+            current_time,
+            user_id=current_user['user_id'],
+        )
 
         session_id = request.session_id or secrets.token_urlsafe(16)
         registry = get_session_registry()
         persisted = registry.get(session_id)
         if persisted and persisted.get('owner_user_id') != current_user['user_id']:
             raise HTTPException(status_code=403, detail='无权限访问该训练会话')
-        session = ai_reply_lab_sessions.get(session_id)
         normalized_item_id = str(request.item_id or '')
-        if (not session or session.get('cookie_id') != cookie_id
-                or session.get('user_id') != current_user['user_id']
-                or session.get('item_id') != normalized_item_id):
-            session = {
-                'cookie_id': cookie_id,
-                'user_id': current_user['user_id'],
-                'item_id': normalized_item_id,
-                'history': [],
-                'timestamp': current_time,
-            }
-            ai_reply_lab_sessions[session_id] = session
+        with _ai_lab_sessions_lock:
+            session = ai_reply_lab_sessions.get(session_id)
+            if (not session or session.get('cookie_id') != cookie_id
+                    or session.get('user_id') != current_user['user_id']
+                    or session.get('item_id') != normalized_item_id):
+                session = {
+                    'cookie_id': cookie_id,
+                    'user_id': current_user['user_id'],
+                    'item_id': normalized_item_id,
+                    'history': [],
+                    'timestamp': current_time,
+                }
+                ai_reply_lab_sessions[session_id] = session
+            history = list(session.get('history', []))
+        _prune_ai_lab_sessions(
+            current_time,
+            user_id=current_user['user_id'],
+        )
+
+        if not persisted and not registry.get(session_id):
             registry.register(
                 session_id,
                 "ai_training",
@@ -6302,20 +6604,22 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
         else:
             registry.update(session_id, status="processing", ttl_seconds=6 * 3600)
 
-        history = session.get('history', [])
-        reply_result = ai_reply_engine.generate_lab_reply(
-            message=message,
-            item_info={
-                'title': item_title,
-                'price': item_price,
-                'desc': item_desc,
-            },
-            cookie_id=cookie_id,
-            context=history,
-            training_rules=_normalize_scoped_rules(request.training_rules),
-            item_id=normalized_item_id,
-            prompt_override=request.prompt_override,
-            return_metadata=True,
+        reply_result = _run_bounded_ai_call(
+            current_user['user_id'],
+            lambda: ai_reply_engine.generate_lab_reply(
+                message=message,
+                item_info={
+                    'title': item_title,
+                    'price': item_price,
+                    'desc': item_desc,
+                },
+                cookie_id=cookie_id,
+                context=history,
+                training_rules=_normalize_scoped_rules(request.training_rules),
+                item_id=normalized_item_id,
+                prompt_override=request.prompt_override,
+                return_metadata=True,
+            ),
         )
 
         if not reply_result or not reply_result.get('reply'):
@@ -6326,15 +6630,17 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             {'role': 'user', 'content': message},
             {'role': 'assistant', 'content': reply},
         ])
-        session['history'] = history[-24:]
-        session['timestamp'] = current_time
+        with _ai_lab_sessions_lock:
+            session['history'] = history[-24:]
+            session['timestamp'] = current_time
+            response_history = list(session['history'])
         registry.update(session_id, status="success", ttl_seconds=6 * 3600)
 
         return {
             "session_id": session_id,
             "reply": reply,
             "warnings": _detect_ai_reply_warnings(reply),
-            "history": session['history'],
+            "history": response_history,
             "rule_context": reply_result.get('rule_context', {}),
             "rule_audit": reply_result.get('audit', {}),
             "regenerated": bool(reply_result.get('regenerated')),
@@ -6348,8 +6654,8 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"AI训练实验室回复异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"AI训练实验室回复异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="AI训练实验室回复失败")
 
 
 @ai_router.post("/ai-reply-lab/save/{cookie_id}")
@@ -6370,8 +6676,8 @@ def save_ai_reply_lab_rules(cookie_id: str, request: AIReplyLabSaveRequest, curr
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"保存AI训练规则异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"保存AI训练规则异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="保存AI训练规则失败")
 
 
 @ai_router.get("/ai-training-rules/{cookie_id}")
@@ -6449,7 +6755,11 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"生成商品知识草稿失败 {cookie_id}/{item_id}: {e}")
+        logger.error(
+            f"生成商品知识草稿失败 "
+            f"{_ai_log_reference(cookie_id, 'account')}/"
+            f"{_ai_log_reference(item_id, 'item')}: {type(e).__name__}"
+        )
         raise HTTPException(status_code=500, detail='AI草稿生成失败，请检查AI配置')
 
 
@@ -6530,13 +6840,38 @@ def _require_owned_cookie(cookie_id: str, user_id: int) -> None:
         raise HTTPException(status_code=403, detail="无权限访问该闲鱼账号")
 
 
+def _account_verification_identities(cookie_id: str) -> list[str]:
+    details = db_manager.get_cookie_details(cookie_id) or {}
+    values = [
+        str(cookie_id or '').strip(),
+        str(details.get('xianyu_unb') or '').strip(),
+    ]
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _account_verification_images(cookie_id: str) -> list[Path]:
+    return list_private_verification_images(
+        _account_verification_identities(cookie_id)
+    )
+
+
+def _latest_account_verification_image(cookie_id: str) -> Optional[Path]:
+    return latest_private_verification_image(
+        _account_verification_identities(cookie_id)
+    )
+
+
+def _remove_account_verification_images(cookie_id: str) -> None:
+    for image_path in _account_verification_images(cookie_id):
+        remove_verification_image(str(image_path))
+
+
 def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
     refresh_status = db_manager.get_account_session_refresh(cookie_id)
     state = refresh_status.get('state')
     registry_active = active_refresh_registry.is_active(cookie_id)
     if state in {'refreshing', 'verification_required'} and not registry_active:
-        image_path = (refresh_status.get('verification_image_url') or '').lstrip('/')
-        remove_verification_image(image_path)
+        _remove_account_verification_images(cookie_id)
         db_manager.update_account_session_refresh(
             cookie_id,
             state='action_required',
@@ -6553,8 +6888,7 @@ def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
         and time.time() > float(refresh_status['expires_at'])
     ):
         active_refresh_registry.cancel(cookie_id)
-        image_path = (refresh_status.get('verification_image_url') or '').lstrip('/')
-        remove_verification_image(image_path)
+        _remove_account_verification_images(cookie_id)
         db_manager.update_account_session_refresh(
             cookie_id,
             state='timeout',
@@ -6564,6 +6898,12 @@ def _current_session_refresh_status(cookie_id: str) -> Dict[str, Any]:
         )
         refresh_status = db_manager.get_account_session_refresh(cookie_id)
     refresh_status['browser_active'] = active_refresh_registry.browser_active(cookie_id)
+    refresh_status['verification_image_url'] = (
+        f"/face-verification/screenshot/{cookie_id}"
+        if refresh_status.get('state') == 'verification_required'
+        and _latest_account_verification_image(cookie_id) is not None
+        else ''
+    )
     return refresh_status
 
 
@@ -6680,11 +7020,10 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
 def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
     status_info = _current_session_refresh_status(cookie_id)
-    image_path = (status_info.get('verification_image_url') or '').lstrip('/')
     cancelled = active_refresh_registry.cancel(cookie_id)
     if not cancelled:
         raise HTTPException(status_code=409, detail="当前没有正在运行的刷新任务")
-    remove_verification_image(image_path)
+    _remove_account_verification_images(cookie_id)
     db_manager.update_account_session_refresh(
         cookie_id, state='cancelled', trigger=status_info.get('trigger') or 'manual',
         message='Cookie 刷新已取消', error_code='cancelled',
@@ -7259,7 +7598,14 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             payload = {'title': title, 'text': message, 'message': message, 'item_url': result_payload.get('item_url')}
         if channel_type == 'webhook' and idempotency_key:
             payload.setdefault('idempotency_key', idempotency_key)
-        response = requests.post(url, json=payload, timeout=timeout, **request_kwargs)
+        response = request_public_http_sync(
+            'POST',
+            url,
+            json_body=payload,
+            timeout_seconds=timeout,
+            require_https=True,
+            **request_kwargs,
+        )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
         return
@@ -7271,11 +7617,13 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
             key = config.get('key') or config.get('device_key')
             if not key:
                 raise ValueError("Bark通知缺少url或device_key")
-            url = f"{server}/{key}/{quote(title)}/{quote(message)}"
-        response = requests.get(
+            url = f"{server}/{quote(str(key), safe='')}/{quote(title)}/{quote(message)}"
+        response = request_public_http_sync(
+            'GET',
             url,
-            timeout=timeout,
+            timeout_seconds=timeout,
             headers=idempotency_headers or None,
+            require_https=True,
         )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
@@ -7287,11 +7635,14 @@ def _send_skill_notification_to_channel(channel: Dict[str, Any], task: Dict[str,
         api_base = (config.get('api_base_url') or 'https://api.telegram.org').rstrip('/')
         if not token or not chat_id:
             raise ValueError("Telegram通知缺少bot_token或chat_id")
-        response = requests.post(
-            f"{api_base}/bot{token}/sendMessage",
-            json={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': False},
-            timeout=timeout,
+        safe_token = quote(str(token), safe=':')
+        response = request_public_http_sync(
+            'POST',
+            f"{api_base}/bot{safe_token}/sendMessage",
+            json_body={'chat_id': chat_id, 'text': message, 'disable_web_page_preview': False},
+            timeout_seconds=timeout,
             headers=idempotency_headers or None,
+            require_https=True,
         )
         response.raise_for_status()
         _raise_skill_notification_api_error(response, channel_type)
@@ -8448,7 +8799,7 @@ def test_skill_agent_reply(test_data: SkillAgentTestIn, current_user: Dict[str, 
                 'cookie_id': cookie_id,
                 'model_name': settings.get('model_name'),
                 'base_url': settings.get('base_url'),
-                'message_preview': test_data.message[:40],
+                'message_length': len(test_data.message),
             }
         )
         return {
@@ -8465,8 +8816,8 @@ def test_skill_agent_reply(test_data: SkillAgentTestIn, current_user: Dict[str, 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"测试技能AI专家回复异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"测试技能AI专家回复异常: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="AI专家回复测试失败")
 
 
 @skills_router.get("/api/skills/ops/health")
@@ -8718,7 +9069,8 @@ def get_skill_delivery_diagnostics(current_user: Dict[str, Any] = Depends(get_cu
 # ==================== 日志管理API ====================
 
 @admin_router.get("/logs")
-async def get_logs(lines: int = 200, level: str = None, source: str = None, _: None = Depends(require_auth)):
+async def get_logs(lines: int = 200, level: str = None, source: str = None,
+                   _: Dict[str, Any] = Depends(require_admin)):
     """获取实时系统日志"""
     try:
         # 获取文件日志收集器
@@ -8792,7 +9144,7 @@ async def delete_risk_control_log(
 
 
 @admin_router.get("/logs/stats")
-async def get_log_stats(_: None = Depends(require_auth)):
+async def get_log_stats(_: Dict[str, Any] = Depends(require_admin)):
     """获取日志统计信息"""
     try:
         collector = get_file_log_collector()
@@ -8805,7 +9157,7 @@ async def get_log_stats(_: None = Depends(require_auth)):
 
 
 @admin_router.post("/logs/clear")
-async def clear_logs(_: None = Depends(require_auth)):
+async def clear_logs(_: Dict[str, Any] = Depends(require_admin)):
     """清空日志"""
     try:
         collector = get_file_log_collector()
@@ -8898,8 +9250,12 @@ async def get_all_items_from_account(
 
 
 @content_router.post("/items/get-by-page")
-async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
+async def get_items_by_page(
+    request: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """从指定账号按页获取商品信息"""
+    xianyu_instance = None
     try:
         # 验证参数
         cookie_id = request.get('cookie_id')
@@ -8922,12 +9278,12 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
         if page_size < 1 or page_size > 100:
             return {"success": False, "message": "每页数量必须在1-100之间"}
 
-        # 获取账号信息
-        account = db_manager.get_cookie_by_id(cookie_id)
-        if not account:
-            return {"success": False, "message": "账号不存在"}
+        # 先按当前租户读取 Cookie，禁止使用其他租户的平台会话。
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权操作此账号")
 
-        cookies_str = account['cookies_str']
+        cookies_str = user_cookies[cookie_id]
         if not cookies_str:
             return {"success": False, "message": "账号cookies为空"}
 
@@ -8936,29 +9292,56 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
         xianyu_instance = XianyuLive(cookies_str, cookie_id)
 
         # 调用获取指定页商品信息的方法
-        logger.info(f"开始获取账号 {cookie_id} 第{page_number}页商品信息（每页{page_size}条）")
+        logger.info(
+            "开始按页获取商品: account={}, page={}, page_size={}",
+            _masked_identifier(cookie_id),
+            page_number,
+            page_size,
+        )
         result = await xianyu_instance.get_item_list_info(page_number, page_size)
 
-        # 关闭session
-        await xianyu_instance.close_session()
-
         if result.get('error'):
-            logger.error(f"获取商品信息失败: {result['error']}")
-            return {"success": False, "message": result['error']}
-        else:
-            current_count = result.get('current_count', 0)
-            logger.info(f"成功获取账号 {cookie_id} 第{page_number}页 {current_count} 个商品")
-            return {
-                "success": True,
-                "message": f"成功获取第{page_number}页 {current_count} 个商品，详细信息已打印到控制台",
-                "page_number": page_number,
-                "page_size": page_size,
-                "current_count": current_count
-            }
+            logger.warning(
+                "按页获取商品失败: account={}, page={}",
+                _masked_identifier(cookie_id),
+                page_number,
+            )
+            return {"success": False, "message": "获取商品信息失败"}
 
-    except Exception as e:
-        logger.error(f"获取账号商品信息异常: {str(e)}")
-        return {"success": False, "message": f"获取商品信息异常: {str(e)}"}
+        current_count = result.get('current_count', 0)
+        logger.info(
+            "按页获取商品完成: account={}, page={}, count={}",
+            _masked_identifier(cookie_id),
+            page_number,
+            current_count,
+        )
+        return {
+            "success": True,
+            "message": f"成功获取第{page_number}页 {current_count} 个商品",
+            "page_number": page_number,
+            "page_size": page_size,
+            "current_count": current_count,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "按页获取商品异常: account={}, error_type={}",
+            _masked_identifier(request.get('cookie_id')),
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=500, detail="获取商品信息失败")
+    finally:
+        if xianyu_instance is not None:
+            try:
+                await xianyu_instance.close_session()
+            except Exception as exc:
+                logger.warning(
+                    "关闭商品同步会话失败: account={}, error_type={}",
+                    _masked_identifier(request.get('cookie_id')),
+                    type(exc).__name__,
+                )
 
 
 # ------------------------- 用户设置接口 -------------------------
@@ -9045,7 +9428,7 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @admin_router.delete('/admin/users/{user_id}')
-def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
+async def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
     """删除用户（管理员专用）"""
     from db_manager import db_manager
     try:
@@ -9065,6 +9448,20 @@ def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin
         success = db_manager.delete_user_and_data(user_id)
 
         if success:
+            import cookie_manager
+
+            manager = cookie_manager.manager
+            if manager is not None:
+                reconcile = await manager.reconcile_from_db()
+                if not reconcile.get("success"):
+                    logger.error(
+                        "用户删除后运行态对账未完成: "
+                        f"user_id={user_id}, failed={reconcile.get('failed', 0)}"
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="用户数据已删除，但运行态对账未完成，请人工检查",
+                    )
             log_with_user('info', f"用户删除成功: {user_to_delete['username']} (ID: {user_id})", admin_user)
             return {"message": f"用户 {user_to_delete['username']} 删除成功"}
         else:
@@ -9411,7 +9808,7 @@ def get_dashboard_summary(
     period = _dashboard_period(range_key, start_date, end_date)
     # 仪表盘一律只统计当前登录用户自己的数据，admin 也不例外（不再提供全局视图）
     scoped_user_id = current_user['user_id']
-    valid_statuses = ['pending_ship', 'shipped', 'completed']
+    valid_statuses = list(VALID_ORDER_STATUSES)
     current = db_manager.get_order_analytics(
         start_date=period['start_date'],
         end_date=period['end_date'],
@@ -9463,7 +9860,7 @@ def get_order_analytics(
         user_id = current_user['user_id']
 
         # 定义有效订单状态（只统计这几种状态）
-        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        valid_statuses = list(VALID_ORDER_STATUSES)
 
         # 调用数据库分析函数，传入包含状态
         analytics_data = db_manager.get_order_analytics(
@@ -9507,7 +9904,7 @@ def get_valid_orders(
         user_id = current_user['user_id']
 
         # 定义有效订单状态
-        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        valid_statuses = list(VALID_ORDER_STATUSES)
 
         # 调用数据库函数获取有效订单
         orders = db_manager.get_orders_for_analytics(
@@ -9531,9 +9928,9 @@ def get_traffic_analytics(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
-    时段流量分析（经营驾驶舱）
+    订单时段分析（经营驾驶舱）
 
-    按真实成交时间 ordered_at_utc 分桶到东八区小时/星期，回报覆盖率。
+    按平台订单时间快照分桶到东八区小时/星期，回报覆盖率。
     只统计当前登录用户自己名下有效订单（租户隔离）。
 
     Args:
@@ -9541,9 +9938,9 @@ def get_traffic_analytics(
         end_date: 结束日期 (格式: YYYY-MM-DD)
     """
     try:
-        log_with_user('info', f"查询时段流量分析: {start_date} - {end_date}", current_user)
+        log_with_user('info', f"查询订单时段分析: {start_date} - {end_date}", current_user)
         user_id = current_user['user_id']
-        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        valid_statuses = list(VALID_ORDER_STATUSES)
         data = db_manager.get_traffic_analytics(
             start_date=start_date,
             end_date=end_date,
@@ -9551,14 +9948,14 @@ def get_traffic_analytics(
             include_statuses=valid_statuses
         )
         if 'error' in data:
-            log_with_user('error', f"获取时段流量分析失败: {data['error']}", current_user)
+            log_with_user('error', f"获取订单时段分析失败: {data['error']}", current_user)
             raise HTTPException(status_code=500, detail=data['error'])
-        log_with_user('info', "时段流量分析查询成功", current_user)
+        log_with_user('info', "订单时段分析查询成功", current_user)
         return data
     except HTTPException:
         raise
     except Exception as e:
-        log_with_user('error', f"获取时段流量分析失败: {str(e)}", current_user)
+        log_with_user('error', f"获取订单时段分析失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
 
 @orders_router.get('/analytics/buyers')
@@ -9581,7 +9978,7 @@ def get_buyer_behavior_analytics(
     try:
         log_with_user('info', f"查询买家行为分析: {start_date} - {end_date}", current_user)
         user_id = current_user['user_id']
-        valid_statuses = ['pending_ship', 'shipped', 'completed']
+        valid_statuses = list(VALID_ORDER_STATUSES)
         data = db_manager.get_buyer_behavior_analytics(
             start_date=start_date,
             end_date=end_date,
@@ -9598,6 +9995,98 @@ def get_buyer_behavior_analytics(
     except Exception as e:
         log_with_user('error', f"获取买家行为分析失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@orders_router.get('/analytics/items/performance')
+def get_item_performance_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """成交商品表现；来源是订单，不把成交趋势命名为流量。"""
+    data = db_manager.get_item_performance_analytics(
+        user_id=current_user['user_id'],
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if 'error' in data:
+        raise HTTPException(status_code=500, detail=data['error'])
+    return data
+
+
+@orders_router.get('/analytics/items/traffic')
+def get_item_traffic_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    cookie_id: Optional[str] = None,
+    item_id: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Verified seller-backend exposure/view/want deltas with sufficiency gates."""
+    try:
+        return db_manager.get_item_traffic_analytics(
+            user_id=current_user['user_id'],
+            start_date=start_date,
+            end_date=end_date,
+            cookie_id=cookie_id,
+            item_id=item_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@orders_router.get('/analytics/items/metrics/status')
+def get_item_metric_status(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Return account-scoped canary state without exposing account credentials."""
+    from item_metric_service import item_metric_collection_status
+
+    user_id = int(current_user['user_id'])
+    accounts = [
+        item_metric_collection_status(
+            db_manager,
+            user_id=user_id,
+            cookie_id=cookie_id,
+        )
+        for cookie_id in db_manager.get_all_cookies(user_id)
+    ]
+    return {
+        "adapter_available": any(
+            bool(account.get("adapter_available")) for account in accounts
+        ),
+        "enabled_accounts": sum(
+            int(bool(account.get("collection_enabled"))) for account in accounts
+        ),
+        "accounts": accounts,
+    }
+
+
+@orders_router.post('/analytics/items/metrics/sync')
+async def sync_item_metrics(
+    request: ItemMetricSyncRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Run one visible-account canary through the registered verified adapter."""
+    from item_metric_scheduler import item_metric_scheduler
+    from item_metric_service import collect_item_metrics_once
+
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if request.cookie_id not in user_cookies:
+        raise HTTPException(status_code=404, detail="账号不存在或无权访问")
+    result = await collect_item_metrics_once(
+        db_manager,
+        user_id=current_user['user_id'],
+        cookie_id=request.cookie_id,
+        cookie_string=user_cookies[request.cookie_id],
+        canary=True,
+    )
+    if result.get("collection_enabled"):
+        await item_metric_scheduler.start()
+    status_code = 200 if result.get("success") else 409
+    return JSONResponse(status_code=status_code, content=result)
 
 # ------------------------- 指定商品回复接口 -------------------------
 
@@ -9734,10 +10223,7 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
-        # 获取指定商品回复
-        item_replies = db_manager.get_itemReplays_by_cookie(cookie_id)
-        # 找对应item_id的回复
-        item_reply = next((r for r in item_replies if r['item_id'] == item_id), None)
+        item_reply = db_manager.get_item_reply(cookie_id, item_id)
 
         if item_reply is None:
             raise HTTPException(status_code=404, detail="商品回复不存在")
@@ -9747,7 +10233,8 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取商品回复失败: {str(e)}")
+        logger.error(f"获取商品回复失败: error_type={type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取商品回复失败")
 
 
 # ------------------------- 数据库备份和恢复接口 -------------------------
@@ -9790,114 +10277,14 @@ def download_database_backup(admin_user: Dict[str, Any] = Depends(require_admin)
         raise HTTPException(status_code=500, detail=str(e))
 
 @admin_router.post('/admin/backup/upload')
-async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_admin),
-                                backup_file: UploadFile = File(...)):
-    """上传并恢复数据库备份文件（管理员专用）"""
-    import os
-    import shutil
-    import sqlite3
-    from datetime import datetime
-
-    try:
-        log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
-
-        # 验证文件类型
-        if not backup_file.filename.endswith('.db'):
-            log_with_user('warning', f"无效的备份文件类型: {backup_file.filename}", admin_user)
-            raise HTTPException(status_code=400, detail="只支持.db格式的数据库文件")
-
-        # 验证文件大小（限制100MB）
-        content = await backup_file.read()
-        if len(content) > 100 * 1024 * 1024:  # 100MB
-            log_with_user('warning', f"备份文件过大: {len(content)} bytes", admin_user)
-            raise HTTPException(status_code=400, detail="备份文件大小不能超过100MB")
-
-        # 验证是否为有效的SQLite数据库文件
-        temp_file_path = f"temp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-
-        try:
-            # 保存临时文件
-            with open(temp_file_path, 'wb') as temp_file:
-                temp_file.write(content)
-
-            # 验证数据库文件完整性
-            conn = sqlite3.connect(temp_file_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            conn.close()
-
-            # 检查是否包含必要的表
-            table_names = [table[0] for table in tables]
-            required_tables = ['users', 'cookies']  # 最基本的表
-
-            missing_tables = [table for table in required_tables if table not in table_names]
-            if missing_tables:
-                log_with_user('warning', f"备份文件缺少必要的表: {missing_tables}", admin_user)
-                raise HTTPException(status_code=400, detail=f"备份文件不完整，缺少表: {', '.join(missing_tables)}")
-
-            log_with_user('info', f"备份文件验证通过，包含 {len(table_names)} 个表", admin_user)
-
-        except sqlite3.Error as e:
-            log_with_user('error', f"备份文件验证失败: {str(e)}", admin_user)
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            raise HTTPException(status_code=400, detail="无效的数据库文件")
-
-        # 备份当前数据库
-        from db_manager import db_manager
-        current_db_path = db_manager.db_path
-
-        # 生成备份文件路径（与原数据库在同一目录）
-        db_dir = os.path.dirname(current_db_path)
-        backup_filename = f"xianyu_data_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        backup_current_path = os.path.join(db_dir, backup_filename)
-
-        if os.path.exists(current_db_path):
-            shutil.copy2(current_db_path, backup_current_path)
-            log_with_user('info', f"当前数据库已备份为: {backup_current_path}", admin_user)
-
-        # 关闭当前数据库连接
-        if hasattr(db_manager, 'conn') and db_manager.conn:
-            db_manager.conn.close()
-            log_with_user('info', "已关闭当前数据库连接", admin_user)
-
-        # 替换数据库文件
-        shutil.move(temp_file_path, current_db_path)
-        log_with_user('info', f"数据库文件已替换: {current_db_path}", admin_user)
-
-        # 重新初始化数据库连接（使用原有的db_path）
-        db_manager.__init__(db_manager.db_path)
-        log_with_user('info', "数据库连接已重新初始化", admin_user)
-
-        # 验证新数据库
-        try:
-            test_users = db_manager.get_all_users()
-            log_with_user('info', f"数据库恢复成功，包含 {len(test_users)} 个用户", admin_user)
-        except Exception as e:
-            log_with_user('error', f"数据库恢复后验证失败: {str(e)}", admin_user)
-            # 如果验证失败，尝试恢复原数据库
-            if os.path.exists(backup_current_path):
-                shutil.copy2(backup_current_path, current_db_path)
-                db_manager.__init__()
-                log_with_user('info', "已恢复原数据库", admin_user)
-            raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库")
-
-        return {
-            "success": True,
-            "message": "数据库恢复成功",
-            "backup_file": backup_current_path,
-            "user_count": len(test_users)
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"上传数据库备份失败: {str(e)}", admin_user)
-        # 清理临时文件
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        raise HTTPException(status_code=500, detail=str(e))
+async def upload_database_backup(
+    admin_user: Dict[str, Any] = Depends(require_admin),
+):
+    """在线替换生产 SQLite 已永久关闭；停服回滚走运维 runbook。"""
+    raise HTTPException(
+        status_code=409,
+        detail="在线数据库恢复已关闭，请按停服回滚流程执行",
+    )
 
 @admin_router.get('/admin/backup/list')
 def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
@@ -10155,21 +10542,6 @@ def get_orders_db() -> Any:
     return db_manager
 
 
-async def _fetch_order_details_for_sync(**kwargs):
-    from utils.order_fetcher_optimized import process_orders_batch
-
-    return await process_orders_batch(
-        order_ids=kwargs["order_ids"],
-        cookie_id=kwargs["cookie_id"],
-        cookie_string=kwargs["cookie_string"],
-        max_concurrent=3,
-        timeout=30,
-        headless=True,
-        use_pool=True,
-        force_refresh=True,
-    )
-
-
 async def _persist_order_sync_cookie(
     cookie_id: str,
     cookie_string: str,
@@ -10214,20 +10586,21 @@ async def _sync_recent_orders(
     coordinator = OrderSyncCoordinator(
         orders_db,
         discoverer=client.discover,
-        detail_fetcher=_fetch_order_details_for_sync,
         cookie_updater=persist_cookie,
     )
     account_results = []
-    total_summary = {
-        "total_seen": 0,
-        "discovered": 0,
-        "status_updated": 0,
-        "details_updated": 0,
-        "unchanged": 0,
-        "failed": 0,
-    }
+    total_summary = new_order_sync_summary()
+    scalar_summary_keys = (
+        "total_seen",
+        "discovered",
+        "status_updated",
+        "details_updated",
+        "unchanged",
+        "failed",
+        "status_unconfirmed",
+    )
     for account_id, cookie_string in user_cookies.items():
-        account_details = orders_db.get_cookie_by_id(account_id) or {}
+        account_details = orders_db.get_cookie_details(account_id) or {}
         result = await coordinator.sync_account(
             cookie_id=account_id,
             cookie_string=cookie_string,
@@ -10235,12 +10608,28 @@ async def _sync_recent_orders(
             user_agent=str(account_details.get('browser_user_agent') or ''),
         )
         account_results.append({"cookie_id": account_id, **result})
-        for key in total_summary:
+        for key in scalar_summary_keys:
             total_summary[key] += int((result.get("summary") or {}).get(key) or 0)
+        account_coverage = (result.get("summary") or {}).get("field_coverage") or {}
+        for field in SYNC_COVERAGE_FIELDS:
+            target = total_summary["field_coverage"][field]
+            source = account_coverage.get(field) or {}
+            target["covered"] += int(source.get("covered") or 0)
+            target["total"] += int(source.get("total") or 0)
+
+    for field in SYNC_COVERAGE_FIELDS:
+        coverage = total_summary["field_coverage"][field]
+        coverage["rate"] = round(
+            coverage["covered"] / coverage["total"], 4
+        ) if coverage["total"] else 0.0
 
     requires_login = [row["cookie_id"] for row in account_results if row.get("requires_login")]
     successful = sum(1 for row in account_results if row.get("success"))
     partial = any(row.get("partial") for row in account_results) or (successful > 0 and successful < len(account_results))
+    permission_denied = any(
+        row.get("error_code") == "platform_permission_denied"
+        for row in account_results
+    )
     payload = {
         "success": successful == len(account_results),
         "partial": partial,
@@ -10249,6 +10638,8 @@ async def _sync_recent_orders(
             if successful == len(account_results)
             else "登录状态已过期，请先在账号管理更新登录状态"
             if requires_login and successful == 0
+            else "平台拒绝订单访问，请检查卖家订单权限"
+            if permission_denied and successful == 0
             else "订单同步部分完成"
         ),
         "days": days,
@@ -10805,10 +11196,8 @@ async def refresh_single_order(
     current_user: Dict[str, Any] = Depends(get_current_user),
     orders_db: Any = Depends(get_orders_db),
 ):
-    """刷新单条订单状态"""
+    """用卖家订单列表刷新单条订单；详情直连适配器验真前不启动浏览器。"""
     try:
-        from utils.order_fetcher_optimized import process_orders_batch
-
         user_id = current_user['user_id']
         log_with_user('info', f"刷新单条订单: {order_id}", current_user)
 
@@ -10828,131 +11217,91 @@ async def refresh_single_order(
         if not cookies_str:
             raise HTTPException(status_code=400, detail="Cookie无效")
 
-        # 调用批量刷新函数处理单条订单
-        batch_results = await process_orders_batch(
-            order_ids=[order_id],
+        client = XianyuOrderListClient()
+        target_observed = False
+
+        async def discover_target(**kwargs):
+            nonlocal target_observed
+            discovery = await client.discover(
+                target_order_id=order_id,
+                **kwargs,
+            )
+            if not discovery.get("success"):
+                return discovery
+            matching = [
+                row for row in discovery.get("orders") or []
+                if str(row.get("order_id") or "") == order_id
+            ]
+            target_observed = bool(matching)
+            return {**discovery, "orders": matching}
+
+        async def persist_cookie(account_id: str, cookie_string: str) -> bool:
+            return await _persist_order_sync_cookie(
+                account_id,
+                cookie_string,
+                orders_db,
+            )
+
+        account_details = orders_db.get_cookie_details(cookie_id) or {}
+        result = await OrderSyncCoordinator(
+            orders_db,
+            discoverer=discover_target,
+            cookie_updater=persist_cookie,
+        ).sync_account(
             cookie_id=cookie_id,
             cookie_string=cookies_str,
-            max_concurrent=1,
-            timeout=30,
-            headless=True,
-            use_pool=True,
-            force_refresh=True
+            days=365,
+            user_agent=str(account_details.get('browser_user_agent') or ''),
         )
 
-        if not batch_results or len(batch_results) == 0:
-            raise HTTPException(status_code=500, detail="刷新失败")
-
-        result = batch_results[0]
-        if result.get('error'):
-            status_code = 409 if result.get('requires_login') or result.get('error_code') == 'session_expired' else 502
-            raise HTTPException(
-                status_code=status_code,
-                detail={
-                    "code": result.get('error_code') or 'order_refresh_failed',
-                    "message": result.get('error'),
-                    "requires_login": status_code == 409,
-                },
-            )
-
-        order_status = normalize_order_status(
-            result.get('order_status', 'unknown'),
-            result.get('status_text', ''),
-        )
-        # 详情为最高级快照来源：报文携带的商品/买家身份随状态一并落库
-        refresh_item_snapshot = None
-        refresh_title = str(result.get('item_title') or '').strip()
-        refresh_image = str(result.get('item_image') or result.get('item_pic') or '').strip()
-        if refresh_title or refresh_image:
-            refresh_item_snapshot = {
-                'item_title': refresh_title,
-                'item_image': refresh_image,
-                'source': 'order_detail',
+        requires_login = bool(result.get("requires_login"))
+        if not target_observed and result.get("success"):
+            result = {
+                **result,
+                "success": False,
+                "partial": False,
+                "error_code": "order_not_observed",
+                "message": "本轮订单列表未返回该订单，已保留原状态",
             }
-        refresh_nickname = str(result.get('buyer_nickname') or result.get('buyer_nick') or '').strip()
-        refresh_avatar = str(result.get('buyer_avatar_url') or result.get('buyer_avatar') or '').strip()
-        refresh_buyer_snapshot = None
-        if refresh_nickname or refresh_avatar:
-            refresh_buyer_snapshot = {
-                'buyer_nickname': refresh_nickname,
-                'buyer_avatar_url': refresh_avatar,
-                'source': 'order_detail',
-            }
-        update_result = orders_db.apply_order_sync_update(
-            order_id=order_id,
-            cookie_id=cookie_id,
-            incoming_status=order_status,
-            platform_status_code=str(result.get('api_status') or result.get('order_status') or ''),
-            platform_status_text=str(result.get('status_text') or ''),
-            status_source='order_detail',
-            sync_error='' if order_status != 'unknown' else '无法确认平台订单状态',
-            item_snapshot=refresh_item_snapshot,
-            buyer_snapshot=refresh_buyer_snapshot,
-            ordered_at=parse_order_time_utc(result.get('order_time')),
-            paid_amount_fen=parse_amount_fen(result.get('amount')),
-            item_id=result.get('item_id') or None,
-            buyer_id=result.get('buyer_id') or None,
-            spec_name=result.get('spec_name') or None,
-            spec_value=result.get('spec_value') or None,
-            quantity=result.get('quantity') or None,
-            amount=result.get('amount') or None,
-            created_at=result.get('order_time') or None,
-            receiver_name=result.get('receiver_name') or None,
-            receiver_phone=result.get('receiver_phone') or None,
-            receiver_address=result.get('receiver_address') or None,
-            receiver_city=result.get('receiver_city') or None,
-        )
-        refresh_buyer_id = str(result.get('buyer_id') or order.get('buyer_id') or '').strip()
-        if refresh_buyer_id and (refresh_nickname or refresh_avatar):
-            refreshed_at = parse_order_time_utc(result.get('order_time'))[0]
-            orders_db.upsert_customer_observation(
-                cookie_id=cookie_id,
-                buyer_id=refresh_buyer_id,
-                display_name=refresh_nickname,
-                avatar_url=refresh_avatar,
-                source='order_detail',
-                observed_at=refreshed_at,
-            )
 
-        log_with_user('info', f"订单刷新成功: {order_id}, 新状态: {order_status}", current_user)
-        return JSONResponse({
-            "success": True,
-            "message": "订单刷新成功",
+        refreshed = orders_db.get_order_by_id(order_id) or order
+        error_code = str(result.get("error_code") or "")
+        if error_code == "status_unconfirmed":
+            message = "订单已获取部分字段，但平台状态仍待确认"
+        else:
+            message = result.get("message") or (
+                "订单状态已刷新" if result.get("success") else "订单刷新未完成"
+            )
+        payload = {
+            "success": bool(result.get("success")),
+            "partial": bool(result.get("partial")),
+            "error_code": error_code,
+            "requires_login": requires_login,
+            "message": message,
+            "summary": result.get("summary") or new_order_sync_summary(),
+            "fields_obtained": result.get("fields_obtained") or [],
             "data": {
                 "order_id": order_id,
-                "order_status": update_result.get('new_status', order_status),
-                "status_changed": bool(update_result.get('status_changed')),
-                "details_changed": bool(update_result.get('details_changed')),
-            }
-        })
+                "order_status": refreshed.get("order_status") or refreshed.get("status") or "unknown",
+                "status_changed": bool((result.get("summary") or {}).get("status_updated")),
+                "details_changed": bool((result.get("summary") or {}).get("details_updated")),
+            },
+        }
+        log_with_user(
+            'info',
+            f"订单刷新结束: success={payload['success']}, partial={payload['partial']}, code={error_code or 'none'}",
+            current_user,
+        )
+        return JSONResponse(
+            status_code=409 if requires_login else 200,
+            content=payload,
+        )
 
     except HTTPException:
         raise
     except Exception as e:
         log_with_user('error', f"刷新订单失败: {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=f"刷新订单失败: {str(e)}")
-
-
-def check_order_data_completeness(order: Dict[str, Any]) -> bool:
-    """
-    检查订单数据是否完整
-
-    Args:
-        order: 订单数据字典
-
-    Returns:
-        True表示数据完整，False表示需要刷新
-    """
-    # 检查关键字段是否为空或为'unknown'
-    incomplete_conditions = [
-        not order.get('receiver_name') or order.get('receiver_name') == 'unknown',
-        not order.get('receiver_phone') or order.get('receiver_phone') == 'unknown',
-        not order.get('receiver_address') or order.get('receiver_address') == 'unknown',
-        order.get('order_status') == 'unknown',
-        not order.get('buyer_id') or order.get('buyer_id') == 'unknown',
-    ]
-
-    return not any(incomplete_conditions)
 
 
 @orders_router.put('/api/orders/{order_id}')
@@ -10962,134 +11311,42 @@ async def update_order(
     current_user: Dict[str, Any] = Depends(get_current_user),
     orders_db: Any = Depends(get_orders_db),
 ):
-    """
-    更新订单信息
-    自动检查订单数据完整性，如数据不完整则通过 Playwright 从订单详情页获取最新完整数据
-    获取完整信息包括：订单ID、商品ID、买家ID、规格、数量、金额、订单状态、收货人信息
-    """
+    """Update explicitly supplied local fields without hidden platform requests."""
     try:
-        from utils.order_fetcher_optimized import fetch_order_complete
-
         user_id = current_user['user_id']
-        log_with_user('info', f"更新订单: {order_id}, 数据: {update_data}", current_user)
+        log_with_user(
+            'info',
+            f"更新订单: {order_id}, 字段数: {len(update_data or {})}",
+            current_user,
+        )
 
-        # 获取用户的所有Cookie
         user_cookies = orders_db.get_all_cookies(user_id)
-
-        # 验证订单属于当前用户
         order = orders_db.get_order_by_id(order_id)
         if not order:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
-
         if order.get('cookie_id') not in user_cookies:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
-        # 检查订单数据完整性
-        is_complete = check_order_data_completeness(order)
-
-        if not is_complete:
-            log_with_user('info', f"订单 {order_id} 数据不完整，开始使用Playwright获取完整数据", current_user)
-
-            # 获取该订单对应的Cookie字符串
-            cookie_id = order.get('cookie_id')
-            cookie_string = user_cookies.get(cookie_id)
-
-            if cookie_string:
-
-                try:
-                    # 使用优化后的合并函数：一次浏览器访问获取所有数据
-                    log_with_user('info', f"使用优化方法获取订单 {order_id} 的完整数据", current_user)
-
-                    complete_result = await fetch_order_complete(
-                        order_id=order_id,
-                        cookie_id=cookie_id,
-                        cookie_string=cookie_string,
-                        timeout=30,
-                        headless=True,
-                        use_pool=True  # 使用浏览器池
-                    )
-
-                    if complete_result:
-                        log_with_user('info', f"成功获取订单 {order_id} 的完整数据（一次浏览器调用）", current_user)
-
-                        # 状态码映射（如果需要转换）
-                        order_status = complete_result.get('order_status', 'unknown')
-                        if order_status and isinstance(order_status, str) and order_status.isdigit():
-                            status_mapping = {
-                                '1': 'processing',
-                                '2': 'pending_ship',
-                                '3': 'shipped',
-                                '4': 'completed',
-                                '5': 'refunding',
-                                '6': 'cancelled',
-                                '7': 'refunding',
-                                '8': 'cancelled',
-                                '9': 'refunding',
-                                '10': 'cancelled',
-                            }
-                            order_status = status_mapping.get(order_status, order_status)
-
-                        # 构建要更新的完整数据
-                        refresh_data = {
-                            'order_id': order_id,
-                            'item_id': complete_result.get('item_id') or order.get('item_id'),
-                            'buyer_id': complete_result.get('buyer_id') or order.get('buyer_id'),
-                            'order_status': order_status or order.get('order_status'),
-                            'spec_name': complete_result.get('spec_name') or None,
-                            'spec_value': complete_result.get('spec_value') or None,
-                            'quantity': complete_result.get('quantity') or None,
-                            'amount': complete_result.get('amount') or None,
-                            'created_at': complete_result.get('order_time') or None,
-                            'receiver_name': complete_result.get('receiver_name') or None,
-                            'receiver_phone': complete_result.get('receiver_phone') or None,
-                            'receiver_address': complete_result.get('receiver_address') or None
-                        }
-
-                        # 更新数据库
-                        orders_db.insert_or_update_order(**refresh_data)
-                        log_with_user('info', f"订单 {order_id} 完整数据已更新到数据库", current_user)
-                    else:
-                        log_with_user('warning', f"订单 {order_id} 详情获取失败，继续使用现有数据", current_user)
-
-                except Exception as e:
-                    log_with_user('error', f"获取订单 {order_id} 详情时出错: {str(e)}", current_user)
-                    # 继续执行，即使刷新失败也允许用户手动更新
-            else:
-                log_with_user('warning', f"订单 {order_id} 的Cookie信息不完整，无法刷新", current_user)
-
-        # 提取可更新的字段
         allowed_fields = {
             'item_id', 'buyer_id', 'spec_name', 'spec_value',
             'quantity', 'amount', 'order_status',
             'receiver_name', 'receiver_phone', 'receiver_address',
             'system_shipped', 'created_at'
         }
-
-        # 只保留允许更新的字段
-        filtered_data = {k: v for k, v in update_data.items() if k in allowed_fields}
+        filtered_data = {
+            key: value
+            for key, value in (update_data or {}).items()
+            if key in allowed_fields
+        }
 
         if not filtered_data:
-            # 如果没有用户提供的更新数据
-            if not is_complete:
-                # 数据不完整，已经进行了自动刷新，返回刷新后的订单
-                updated_order = orders_db.get_order_by_id(order_id)
-                return {
-                    "success": True,
-                    "message": "订单数据已自动刷新",
-                    "data": updated_order,
-                    "refreshed": True
-                }
-            else:
-                # 数据完整，直接返回当前订单信息
-                updated_order = orders_db.get_order_by_id(order_id)
-                return {
-                    "success": True,
-                    "message": "订单数据已是最新",
-                    "data": updated_order,
-                    "refreshed": False
-                }
+            return {
+                "success": True,
+                "message": "没有可更新字段",
+                "data": order,
+                "refreshed": False,
+            }
 
-        # 应用用户提供的更新
         success = orders_db.insert_or_update_order(
             order_id=order_id,
             **filtered_data
@@ -11097,16 +11354,14 @@ async def update_order(
 
         if success:
             log_with_user('info', f"订单更新成功: {order_id}", current_user)
-            # 返回更新后的订单
             updated_order = orders_db.get_order_by_id(order_id)
             return {
                 "success": True,
                 "message": "更新成功",
                 "data": updated_order,
-                "refreshed": not is_complete  # 标记是否进行了自动刷新
+                "refreshed": False,
             }
-        else:
-            raise HTTPException(status_code=500, detail="更新失败")
+        raise HTTPException(status_code=500, detail="更新失败")
 
     except HTTPException:
         raise
@@ -11122,12 +11377,7 @@ async def refresh_orders_status(
     current_user: Dict[str, Any] = Depends(get_current_user),
     orders_db: Any = Depends(get_orders_db),
 ):
-    """
-    智能刷新订单状态
-    1. 从数据库获取订单列表（支持筛选）
-    2. 对非'已发货'状态的订单，使用Playwright查询最新状态
-    3. 更新数据库中有变化的订单
-    """
+    """Compatibility endpoint backed by the bounded direct order-list sync."""
     # 兼容旧前端；状态筛选不再缩小核对范围，避免漏掉签收或退款变化。
     return await _sync_recent_orders(
         current_user=current_user,
@@ -11135,383 +11385,6 @@ async def refresh_orders_status(
         cookie_id=cookie_id,
         days=90,
     )
-
-    try:
-        from db_manager import db_manager
-        from utils.order_fetcher_optimized import process_orders_batch
-
-        user_id = current_user['user_id']
-        log_with_user('info', f"开始智能刷新订单状态（优化版：并发处理） (cookie_id={cookie_id}, status={status})", current_user)
-
-        # 获取用户的所有Cookie
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        # 如果指定了cookie_id，只使用该Cookie
-        if cookie_id:
-            if cookie_id not in user_cookies:
-                raise HTTPException(status_code=404, detail="Cookie不存在或无权访问")
-            user_cookies = {cookie_id: user_cookies[cookie_id]}
-
-        # 获取需要刷新的订单
-        orders_to_refresh = []
-        for cid in user_cookies.keys():
-            # 获取该Cookie的所有订单
-            orders = db_manager.get_orders_by_cookie(cid, limit=1000)
-
-            # 筛选需要刷新的订单
-            for order in orders:
-                # 如果指定了状态筛选，只刷新该状态的订单
-                if status and order.get('status') != status:
-                    continue
-
-                order_status = order.get('status', 'unknown')
-
-                # 判断是否需要刷新：只根据状态判断
-                # 稳定状态（已发货、交易成功、交易关闭）的订单不需要刷新
-                needs_refresh = order_status not in ['shipped', 'completed', 'cancelled']
-
-                if needs_refresh:
-                    orders_to_refresh.append({
-                        'order_id': order['order_id'],
-                        'cookie_id': cid,
-                        'current_status': order_status
-                    })
-
-        log_with_user('info', f"找到 {len(orders_to_refresh)} 个需要刷新的订单", current_user)
-
-        if not orders_to_refresh:
-            return JSONResponse({
-                "success": True,
-                "message": "没有需要刷新的订单",
-                "summary": {
-                    "total": 0,
-                    "updated": 0,
-                    "no_change": 0,
-                    "failed": 0
-                },
-                "results": []
-            })
-
-        # 刷新订单信息（包括状态、买家ID、金额等）
-        updated_count = 0
-        failed_count = 0
-        no_change_count = 0
-        refresh_results = []
-
-        # 按cookie_id分组订单（因为每个cookie需要单独的浏览器实例）
-        orders_by_cookie = {}
-        for order_info in orders_to_refresh:
-            cid = order_info['cookie_id']
-            if cid not in orders_by_cookie:
-                orders_by_cookie[cid] = []
-            orders_by_cookie[cid].append(order_info)
-
-        # 对每个cookie的订单进行并发批量处理
-        for cid, cookie_orders in orders_by_cookie.items():
-            cookies_str = user_cookies[cid]
-            if not cookies_str:
-                log_with_user('warning', f"Cookie {cid} 的值为空，跳过", current_user)
-                failed_count += len(cookie_orders)
-                continue
-
-            # 提取订单ID列表
-            order_ids = [o['order_id'] for o in cookie_orders]
-            log_with_user('info', f"使用并发处理Cookie {cid} 的 {len(order_ids)} 个订单", current_user)
-
-            # 并发批量处理（一次浏览器调用获取所有数据）
-            batch_results = await process_orders_batch(
-                order_ids=order_ids,
-                cookie_id=cid,
-                cookie_string=cookies_str,
-                max_concurrent=5,  # 并发5个
-                timeout=30,
-                headless=True,
-                use_pool=True,  # 使用浏览器池
-                force_refresh=True  # 强制刷新，跳过缓存检查
-            )
-
-            # 处理结果并更新数据库
-            for i, result in enumerate(batch_results):
-                order_info = cookie_orders[i]
-                order_id = order_info['order_id']
-                current_status = order_info['current_status']
-
-                if result and not result.get('error'):
-                    # 调试：打印API和DOM状态
-                    api_status = result.get('api_status', 'N/A')
-                    dom_status = result.get('dom_status', 'N/A')
-                    log_with_user('debug', f"订单 {order_id} - API状态: {api_status}, DOM状态: {dom_status}", current_user)
-
-                    # 状态码映射
-                    order_status = result.get('order_status', 'unknown')
-                    if order_status and str(order_status).isdigit():
-                        status_mapping = {
-                            '1': 'processing',
-                            '2': 'pending_ship',
-                            '3': 'shipped',
-                            '4': 'completed',
-                            '5': 'refunding',
-                            '6': 'cancelled',
-                            '7': 'refunding',
-                            '8': 'cancelled',
-                            '9': 'refunding',
-                            '10': 'cancelled',
-                            '11': 'completed',  # 交易完成
-                            '12': 'cancelled',  # 交易关闭
-                        }
-                        order_status = status_mapping.get(str(order_status), order_status)
-
-                    # 更新数据库
-                    success = db_manager.insert_or_update_order(
-                        order_id=order_id,
-                        item_id=result.get('item_id') or None,
-                        buyer_id=result.get('buyer_id') or None,
-                        spec_name=result.get('spec_name') or None,
-                        spec_value=result.get('spec_value') or None,
-                        quantity=result.get('quantity') or None,
-                        amount=result.get('amount') or None,
-                        order_status=order_status if order_status != current_status else None,
-                        cookie_id=cid,
-                        created_at=result.get('order_time') or None,
-                        receiver_name=result.get('receiver_name') or None,
-                        receiver_phone=result.get('receiver_phone') or None,
-                        receiver_address=result.get('receiver_address') or None
-                    )
-
-                    if success:
-                        # 检查是否有更新
-                        has_changes = (
-                            order_status != current_status or
-                            result.get('buyer_id') or
-                            result.get('amount')
-                        )
-
-                        if has_changes:
-                            updated_count += 1
-                            refresh_results.append({
-                                'order_id': order_id,
-                                'old_status': current_status,
-                                'new_status': order_status,
-                                'status_text': result.get('status_text', '')
-                            })
-                            log_with_user('info', f"订单 {order_id} 已更新 | {current_status} -> {order_status}", current_user)
-                        else:
-                            no_change_count += 1
-                    else:
-                        failed_count += 1
-                        log_with_user('error', f"订单 {order_id} 更新失败", current_user)
-                else:
-                    failed_count += 1
-                    error_msg = result.get('error', '未知错误') if result else '未知错误'
-                    log_with_user('warning', f"订单 {order_id} 获取失败: {error_msg}", current_user)
-
-        # 由于我们已经处理完所有订单，跳过原来的循环
-        # 下面的代码需要删除，所以我们需要找到循环结束的位置
-        if False:  # 这个if永远不会执行，只是为了保持代码结构
-            from order_status_query_playwright import OrderStatusQueryPlaywright
-            from utils.order_detail_fetcher import fetch_order_detail_simple
-
-            for order_info in orders_to_refresh:
-                order_id = order_info['order_id']
-                cookie_id = order_info['cookie_id']
-                current_status = order_info['current_status']
-
-                try:
-                    # 获取Cookie (get_all_cookies返回的是 {cookie_id: cookie_value} 格式)
-                    cookies_str = user_cookies[cookie_id]
-
-                    if not cookies_str:
-                        log_with_user('warning', f"Cookie {cookie_id} 的值为空，跳过订单 {order_id}", current_user)
-                        failed_count += 1
-                        continue
-
-                    # 使用订单详情获取器获取完整信息（包括买家ID、金额、收货人信息）
-                    # 注意：fetch_order_detail_simple 已经能获取所有需要的数据，无需再调用 OrderStatusQueryPlaywright
-                    order_detail = await fetch_order_detail_simple(order_id, cookies_str, headless=True)
-
-                    if order_detail:
-                        # 提取订单详情（从页面获取）
-                        spec_name = order_detail.get('spec_name', '')
-                        spec_value = order_detail.get('spec_value', '')
-                        quantity = order_detail.get('quantity', '')
-                        amount = order_detail.get('amount', '')
-                        receiver_name = order_detail.get('receiver_name', '')
-                        receiver_phone = order_detail.get('receiver_phone', '')
-                        receiver_address = order_detail.get('receiver_address', '')
-
-                        # 只使用状态查询获取订单状态和买家ID（因为DOM解析无法获取这些）
-                        query = OrderStatusQueryPlaywright(cookies_str, cookie_id, headless=True)
-                        status_result = await query.query_order_status(order_id)
-
-                        new_status = current_status
-                        new_status_text = ''
-                        buyer_id = ''
-                        item_id = ''
-                        is_bargain = None
-
-                        if status_result.get('success'):
-                            new_status_code = status_result.get('order_status')
-                            new_status_text = status_result.get('status_text', '')
-
-                            # 将状态码转换为数据库状态
-                            # 完整的订单状态码映射（基于闲鱼API）
-                            status_mapping = {
-                                1: 'processing',      # 处理中
-                                2: 'pending_ship',    # 待发货
-                                3: 'shipped',         # 已发货
-                                4: 'completed',       # 已完成/交易成功
-                                5: 'refunding',       # 退款中
-                                6: 'cancelled',       # 已取消/已关闭
-                                7: 'refunding',       # 退款申请中
-                                8: 'cancelled',       # 退款成功（订单关闭）
-                                9: 'refunding',       # 退款协商中
-                                10: 'cancelled',      # 退款关闭
-                            }
-                            new_status = status_mapping.get(new_status_code, 'unknown')
-
-                            # 特殊处理：根据状态文本智能识别（优先检查最终状态）
-                            if new_status == 'unknown':
-                                # 优先级1: 检查"退款成功"（最终状态）
-                                if '退款' in new_status_text and '成功' in new_status_text:
-                                    new_status = 'cancelled'  # 退款成功=订单关闭
-                                # 优先级2: 检查"关闭"或"取消"（最终状态）
-                                elif '关闭' in new_status_text or '取消' in new_status_text or '超时' in new_status_text:
-                                    new_status = 'cancelled'
-                                # 优先级3: 检查"完成"或"交易成功"（最终状态）
-                                elif '完成' in new_status_text or '交易成功' in new_status_text or '确认收货' in new_status_text:
-                                    new_status = 'completed'
-                                # 优先级4: 检查"退款"（中间状态）
-                                elif '退款' in new_status_text:
-                                    new_status = 'refunding'
-
-                            log_with_user('debug', f"订单 {order_id}: 状态码={new_status_code}, 状态文本={new_status_text}, 映射结果={new_status}", current_user)
-
-                            # 从 raw_data 中提取完整信息
-                            raw_data = status_result.get('raw_data', {})
-
-                            # 提取买家ID、商品ID、时间信息
-                            created_at = None
-                            try:
-                                # 方法1: 从根级别提取 peerUserId (买家ID)
-                                buyer_id = str(raw_data.get('peerUserId', ''))
-
-                                # 方法2: 从根级别提取 itemId (商品ID)
-                                item_id = str(raw_data.get('itemId', ''))
-
-                                # 方法3: 从 orderStatusVO 组件中提取下单时间
-                                if 'components' in raw_data:
-                                    for component in raw_data['components']:
-                                        if component.get('render') == 'orderStatusVO':
-                                            order_status_data = component.get('data', {})
-                                            # 从 orderStatusNodeList 中找到第一个时间节点（已拍下时间 = 创建时间）
-                                            node_list = order_status_data.get('orderStatusNodeList', [])
-                                            if node_list and len(node_list) > 0:
-                                                created_at = node_list[0].get('time')  # 第一个是"已拍下"时间
-                                            break
-
-                                # 方法4: 从 orderInfoVO 组件中提取是否小刀（如果有 bargainInfo）
-                                if 'components' in raw_data:
-                                    for component in raw_data['components']:
-                                        if component.get('render') == 'orderInfoVO':
-                                            data = component.get('data', {})
-                                            # 检查是否有小刀信息
-                                            if 'bargainInfo' in data:
-                                                bargain_info = data.get('bargainInfo', {})
-                                                is_bargain = bargain_info.get('bargain', False)
-                                            # 如果前面没找到商品ID，尝试从 jumpUrl 中提取
-                                            if not item_id:
-                                                item_info = data.get('itemInfo', {})
-                                                jump_url = item_info.get('jumpUrl', '')
-                                                if 'id=' in jump_url:
-                                                    item_id = jump_url.split('id=')[1].split('&')[0]
-                                            break
-
-                                if created_at:
-                                    log_with_user('debug', f"提取到订单创建时间: {created_at}", current_user)
-
-                            except Exception as e:
-                                log_with_user('warning', f"提取订单信息失败: {str(e)}", current_user)
-
-                        # 更新数据库（包含所有字段）
-                        success = db_manager.insert_or_update_order(
-                            order_id=order_id,
-                            item_id=item_id if item_id else None,
-                            buyer_id=buyer_id if buyer_id else None,
-                            spec_name=spec_name if spec_name else None,
-                            spec_value=spec_value if spec_value else None,
-                            quantity=quantity if quantity else None,
-                            amount=amount if amount else None,
-                            order_status=new_status if new_status != current_status else None,
-                            is_bargain=is_bargain if is_bargain is not None else None,
-                            cookie_id=cookie_id,
-                            created_at=created_at,  # 添加创建时间（从API提取的北京时间）
-                            receiver_name=receiver_name if receiver_name else None,
-                            receiver_phone=receiver_phone if receiver_phone else None,
-                            receiver_address=receiver_address if receiver_address else None
-                        )
-
-                        if success:
-                            # 检查是否有任何更新
-                            has_changes = (
-                                new_status != current_status or
-                                (buyer_id and buyer_id != 'unknown_user') or
-                                amount
-                            )
-
-                            if has_changes:
-                                updated_count += 1
-                                refresh_results.append({
-                                    'order_id': order_id,
-                                    'old_status': current_status,
-                                    'new_status': new_status,
-                                    'status_text': new_status_text
-                                })
-                                log_with_user('info', f"订单 {order_id} 信息已更新 | 状态: {current_status} -> {new_status} | 买家: {buyer_id} | 金额: {amount}", current_user)
-                            else:
-                                no_change_count += 1
-                                log_with_user('debug', f"订单 {order_id} 信息无变化", current_user)
-                        else:
-                            failed_count += 1
-                            log_with_user('error', f"订单 {order_id} 信息更新失败", current_user)
-                    else:
-                        failed_count += 1
-                        log_with_user('warning', f"订单 {order_id} 详情获取失败", current_user)
-
-                except Exception as e:
-                    failed_count += 1
-                    log_with_user('error', f"刷新订单 {order_id} 时发生异常: {str(e)}", current_user)
-
-        # 返回刷新结果
-        log_with_user('info', f"订单刷新完成: 更新{updated_count}个, 无变化{no_change_count}个, 失败{failed_count}个", current_user)
-
-        return JSONResponse({
-            "success": True,
-            "message": f"刷新完成: 更新{updated_count}个, 无变化{no_change_count}个, 失败{failed_count}个",
-            "summary": {
-                "total": len(orders_to_refresh),
-                "updated": updated_count,
-                "no_change": no_change_count,
-                "failed": failed_count
-            },
-            "updated_orders": refresh_results
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log_with_user('error', f"刷新订单状态失败: {str(e)}", current_user)
-        raise HTTPException(status_code=500, detail=f"刷新订单状态失败: {str(e)}")
-
-
-# 已取消：全量核对订单数据功能
-# 现在使用更新订单状态接口进行单个订单的数据核查
-# @app.post('/api/orders/verify-all')
-# async def verify_all_orders(current_user: Dict[str, Any] = Depends(get_current_user)):
-#     """
-#     全量核对所有订单数据
-#     通过 Playwright 访问每个订单的详情页，更新时间、收货人信息等
-#     """
-#     pass
 
 
 @orders_router.post('/api/orders/manual-ship')
@@ -11530,8 +11403,10 @@ async def manual_ship_orders(
     - full_delivery: 完整发货流程（匹配卡券、发送卡券给买家、标记发货状态）
     """
     try:
-        from XianyuAutoAsync import XianyuLive
-        import asyncio
+        from XianyuAutoAsync import (
+            AUTO_DELIVERY_SOURCE_PAID_NOTICE,
+            XianyuLive,
+        )
 
         user_id = current_user['user_id']
         log_with_user('info', f"开始手动发货: 订单数量={len(order_ids)}, 模式={ship_mode}", current_user)
@@ -11693,93 +11568,93 @@ async def manual_ship_orders(
                         failed_count += 1
                         continue
 
-                    # 检查多数量发货
-                    quantity_to_send = 1
-                    multi_quantity_delivery = orders_db.get_item_multi_quantity_delivery_status(cookie_id, item_id)
-                    if multi_quantity_delivery:
-                        try:
-                            order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
-                            if order_detail and isinstance(order_detail, dict):
-                                qty = order_detail.get('quantity', 1)
-                                if isinstance(qty, int) and qty > 1:
-                                    quantity_to_send = qty
-                        except Exception as e:
-                            log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
-
-                    # 调用_auto_delivery获取卡券内容（内部会调用auto_confirm）
-                    delivery_contents = []
-                    for i in range(quantity_to_send):
-                        try:
-                            delivery_content = await live_instance._auto_delivery(
-                                item_id, '', order_id, buyer_id
-                            )
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
-                        except Exception as e:
-                            log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
-
-                    if not delivery_contents:
+                    payment_check = await live_instance._verify_paid_order_for_delivery(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                    )
+                    if not payment_check.get("allowed"):
                         results.append({
                             'order_id': order_id,
                             'success': False,
-                            'message': '未匹配到发货规则或卡券获取失败'
+                            'partial': False,
+                            'error_code': payment_check.get('error_code') or 'payment_unconfirmed',
+                            'requires_login': bool(payment_check.get('requires_login')),
+                            'manual_review': False,
+                            'message': payment_check.get('reason') or '未确认订单处于待发货状态',
                         })
                         failed_count += 1
                         continue
 
-                    # 发送卡券内容给买家
-                    send_success = True
-                    for idx, content in enumerate(delivery_contents):
-                        try:
-                            if content.startswith("__IMAGE_SEND__"):
-                                image_data = content.replace("__IMAGE_SEND__", "")
-                                card_id = None
-                                if "|" in image_data:
-                                    card_id_str, image_url = image_data.split("|", 1)
-                                    try:
-                                        card_id = int(card_id_str)
-                                    except ValueError:
-                                        card_id = None
-                                else:
-                                    image_url = image_data
-                                await live_instance.send_image_msg(
-                                    live_instance.ws, chat_id, buyer_id,
-                                    image_url, card_id=card_id
-                                )
-                            else:
-                                await live_instance.send_msg(
-                                    live_instance.ws, chat_id, buyer_id, content
-                                )
+                    # 检查多数量发货；开启后只信任本轮平台查询返回的数量。
+                    quantity_to_send = 1
+                    multi_quantity_delivery = orders_db.get_item_multi_quantity_delivery_status(cookie_id, item_id)
+                    if multi_quantity_delivery:
+                        trusted_quantity = payment_check.get('quantity')
+                        if trusted_quantity is None:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'partial': False,
+                                'error_code': 'quantity_unconfirmed',
+                                'requires_login': False,
+                                'manual_review': False,
+                                'message': '平台订单列表未返回可信购买数量'
+                            })
+                            failed_count += 1
+                            continue
+                        quantity_to_send = trusted_quantity
 
-                            # 多条消息之间间隔1秒
-                            if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
-                            send_success = False
-
-                    # 更新本地数据库状态
-                    orders_db.insert_or_update_order(
+                    fulfillment = await live_instance._execute_fulfillment_attempt(
+                        websocket=live_instance.ws,
                         order_id=order_id,
-                        cookie_id=cookie_id,
-                        order_status='shipped',
-                        system_shipped=True
+                        item_id=item_id,
+                        buyer_id=buyer_id,
+                        chat_id=chat_id,
+                        expected_quantity=quantity_to_send,
+                        delivery_source=AUTO_DELIVERY_SOURCE_PAID_NOTICE,
+                        confirm_platform=True,
+                        item_title=str(order.get('item_title') or ''),
+                        database=orders_db,
                     )
-
-                    if send_success:
+                    if fulfillment.get('success'):
+                        already_completed = bool(fulfillment.get('already_completed'))
                         results.append({
                             'order_id': order_id,
                             'success': True,
-                            'message': f'完整发货成功，已发送{len(delivery_contents)}条卡券信息给买家'
+                            'partial': False,
+                            'error_code': None,
+                            'requires_login': False,
+                            'manual_review': False,
+                            'attempt_id': fulfillment.get('attempt_id'),
+                            'sent_count': fulfillment.get('sent_count', quantity_to_send),
+                            'expected_count': quantity_to_send,
+                            'message': (
+                                '订单已有已提交的完整发货记录，未重复发送'
+                                if already_completed
+                                else f'完整发货成功，已发送{quantity_to_send}条卡券信息给买家'
+                            )
                         })
                         success_count += 1
                     else:
+                        manual_review = bool(fulfillment.get('manual_review'))
                         results.append({
                             'order_id': order_id,
-                            'success': True,
-                            'message': f'发货状态已更新，但部分卡券消息发送失败（共{len(delivery_contents)}条）'
+                            'success': False,
+                            'partial': bool(fulfillment.get('partial')),
+                            'error_code': fulfillment.get('error_code') or 'fulfillment_failed',
+                            'requires_login': False,
+                            'manual_review': manual_review,
+                            'attempt_id': fulfillment.get('attempt_id'),
+                            'sent_count': int(fulfillment.get('sent_count') or 0),
+                            'expected_count': quantity_to_send,
+                            'message': (
+                                '完整发货未完成，状态不确定，已转人工复核'
+                                if manual_review
+                                else '完整发货未开始或发货内容不完整'
+                            )
                         })
-                        success_count += 1
+                        failed_count += 1
 
             except Exception as e:
                 results.append({

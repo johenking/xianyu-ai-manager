@@ -13,6 +13,15 @@ class AIProductScopingTests(unittest.TestCase):
         handle, self.db_path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
         self.db = DBManager(self.db_path)
+        admin = self.db.get_user_by_username("admin")
+        self.assertIsNotNone(admin)
+        self.assertTrue(
+            self.db.save_cookie(
+                "account-1",
+                "unb=account-1; cookie2=synthetic-session",
+                admin["id"],
+            )
+        )
         self.original_db = ai_module.db_manager
         ai_module.db_manager = self.db
         self.engine = AIReplyEngine()

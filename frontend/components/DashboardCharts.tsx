@@ -18,6 +18,7 @@ import { ShoppingCart, TrendingUp, TrendingDown } from 'lucide-react';
 import type { OrderAnalytics } from '../types';
 
 const COLORS = ['#FFE815', '#3B82F6', '#10B981', '#F59E0B', '#E11D48'];
+const CHART_INITIAL_DIMENSION = { width: 320, height: 240 } as const;
 
 // 订单状态中文标签，与订单列表/仪表盘保持一致
 const STATUS_LABELS: Record<string, string> = {
@@ -34,7 +35,7 @@ const shortName = (value: string, length: number) => (
   value.length > length ? `${value.slice(0, length)}...` : value
 );
 
-// 爆品榜单行：当期指标 + 相对上一周期的订单量环比
+// 成交爆品榜单行：当期指标 + 相对上一周期的订单量环比
 interface HotItemRow {
   itemId: string;
   name: string;
@@ -83,7 +84,7 @@ const DashboardCharts: React.FC<{
     orders: entry.order_count,
   }));
 
-  // 爆品榜：以当期商品为基准，与上一周期订单量做环比
+  // 成交爆品榜：以当期商品为基准，与上一周期订单量做环比
   // hasPrevious 用于区分"无环比数据"（首次/单周期）与"有数据但无爆品"两种空态
   const prevStats = previous?.item_stats || [];
   const hasPrevious = prevStats.length > 0;
@@ -130,7 +131,7 @@ const DashboardCharts: React.FC<{
               <p className="font-medium">暂无营收数据</p>
             </div>
           ) : (
-            <ResponsiveContainer width="100%" height="100%">
+            <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
               <AreaChart data={chartData} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}>
                 <defs>
                   <linearGradient id="dashboardRevenue" x1="0" y1="0" x2="0" y2="1">
@@ -154,7 +155,7 @@ const DashboardCharts: React.FC<{
           <h3 className="mb-5 text-lg font-bold text-gray-900">商品销量排行</h3>
           <div className="h-[280px]">
             {productSales.length === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无数据</div> : (
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                 <BarChart data={productSales} layout="vertical" margin={{ left: 10 }}>
                   <CartesianGrid strokeDasharray="3 3" horizontal vertical={false} stroke="#F3F4F6" />
                   <XAxis type="number" axisLine={false} tickLine={false} />
@@ -171,7 +172,7 @@ const DashboardCharts: React.FC<{
           <h3 className="mb-5 text-lg font-bold text-gray-900">商品下单占比</h3>
           <div className="h-[280px]">
             {orderShares.length === 0 || totalOrders === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无数据</div> : (
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                 <PieChart>
                   <Pie data={orderShares} dataKey="value" nameKey="name" innerRadius={58} outerRadius={88} paddingAngle={2}>
                     {orderShares.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
@@ -191,7 +192,7 @@ const DashboardCharts: React.FC<{
           <p className="mb-4 text-sm text-gray-400">仅统计待发货/已发货/已完成订单</p>
           <div className="h-[280px]">
             {statusShares.length === 0 || totalStatusCount === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无数据</div> : (
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                 <PieChart>
                   <Pie data={statusShares} dataKey="value" nameKey="name" innerRadius={58} outerRadius={88} paddingAngle={2}>
                     {statusShares.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
@@ -209,7 +210,7 @@ const DashboardCharts: React.FC<{
           <p className="mb-4 text-sm text-gray-400">收货城市订单量 Top 10</p>
           <div className="h-[280px]">
             {cityData.length === 0 ? <div className="flex h-full items-center justify-center text-gray-400">暂无收货城市数据</div> : (
-              <ResponsiveContainer width="100%" height="100%">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                 <BarChart data={cityData} layout="vertical" margin={{ left: 10 }}>
                   <CartesianGrid strokeDasharray="3 3" horizontal vertical={false} stroke="#F3F4F6" />
                   <XAxis type="number" axisLine={false} tickLine={false} allowDecimals={false} />
@@ -225,12 +226,12 @@ const DashboardCharts: React.FC<{
 
       <section className="ios-card rounded-2xl p-6">
         <div className="mb-4 flex items-center gap-2">
-          <h3 className="text-lg font-bold text-gray-900">🔥 爆品榜</h3>
+          <h3 className="text-lg font-bold text-gray-900">成交爆品榜</h3>
           <span className="text-sm text-gray-400">当期订单量 ≥ 2，按环比增长排序</span>
         </div>
         {hotItems.length === 0 ? (
           <div className="flex h-32 items-center justify-center text-sm text-gray-400">
-            {hasPrevious ? '暂无符合条件的爆品（当期订单量需 ≥ 2）' : '暂无环比数据，需至少两个周期'}
+            {hasPrevious ? '暂无符合条件的成交爆品（当期订单量需 ≥ 2）' : '暂无环比数据，需至少两个周期'}
           </div>
         ) : (
           <div className="overflow-x-auto">

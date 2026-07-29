@@ -1,5 +1,72 @@
 # Handoff
 
+## v1.10.0 Candidate On 2026-07-28
+
+The current `codex/order-sync-analytics-hardening` branch is an unreleased
+candidate built on the v1.9.1 mainline. It has not been pushed, merged, tagged,
+or deployed, and production remains on the v1.9.1 schema until release gates
+say otherwise.
+
+Candidate contract:
+
+- The latest schema is `2026072703`: item metric rows and canary state are bound
+  to their account owner, while `fulfillment_attempts` and
+  `fulfillment_card_reservations` persist `prepared`, `sending`, `committed`,
+  `released`, and `manual_review` outcomes across restarts. Possible external
+  side effects after `sending` never permit automatic inventory release.
+- Seller metric collection is default-off. A real adapter must be registered
+  and each account must independently pass three live canaries before the
+  four-hour serial scheduler starts. Synthetic tests do not verify a seller
+  backend response path.
+- A canary advances only when its batch inserts a new observation newer than
+  the account's previous canary observation. Duplicate, reset or out-of-order
+  snapshots cannot enable collection.
+- Traffic deltas are assigned to the complete interval between consecutive
+  snapshots. The API and dashboard expose approximate observation windows and
+  duration metadata; they do not turn a four-hour sample into one-hour traffic.
+- Order timing uses the saved platform order-time snapshot and its source. It is
+  not described as a guaranteed payment, settlement, shipment, or completion
+  timestamp.
+- The recovered 20-item pre-release security ledger is closed in
+  `docs/security-v1.10-closeout.md`; no replacement full scan was launched.
+
+Local release gates completed on 2026-07-29:
+
+- Ruff, the explicit Python compilation list, Gitleaks over the complete
+  `origin/main...HEAD` delta, the OpenAPI snapshot and `git diff --check`
+  passed. The complete backend suite passed 689 tests in 104.419 seconds with
+  an integrity-checked isolated SQLite database.
+- The frontend passed 23 files with 145 tests, TypeScript, npm audit with zero
+  vulnerabilities and two production builds. Build verification retained 36
+  assets with zero orphans and a 71.6% entry-size reduction. The locked Python
+  dependency audit reported no vulnerability.
+- The repository-outside candidate at
+  `/Users/mac/Library/Application Support/XianyuManager Candidates/v1.10.0-20260729-135100`
+  used an integrity-checked production database copy and copied all three
+  local keys into a mode-`0700` directory. After migration, every candidate
+  account was explicitly disabled before the acceptance start; no production
+  account state was modified.
+- The acceptance start used one Uvicorn process on `127.0.0.1:8092`, migration
+  `2026072703`, zero account listener tasks and zero runtime sessions. Local
+  live/readiness, SQLite integrity, version `1.10.0`, root HTML, authenticated
+  empty states and all four unauthenticated order/metric probes passed. The
+  unauthenticated probes returned 401 and the metric adapter remained
+  unavailable. The candidate was stopped and port 8092 was verified free.
+- Full-page 1440-pixel desktop and 390-pixel mobile captures of the dashboard
+  and order center are retained in the candidate `evidence` directory. The
+  automated browser recorded no page error, console error or failed request.
+
+The first candidate rehearsal was stopped immediately when two legacy accounts
+without matching post-migration status rows defaulted to enabled. The candidate
+copy was normalized only after migration and the acceptance restart then had
+zero listeners. This is why candidate rehearsals must migrate first and disable
+every copied account by joining the final `cookies` table, rather than assuming
+that historical `cookie_status` rows are complete.
+
+GitHub PR/CI, production rollback packaging, deployment, tag creation and
+branch cleanup remain release gates at this point. Real platform detail and
+seller-metric canaries also remain external gates; their adapters stay closed.
+
 ## v1.9.1 Login Risk-Control Relay Production Release On 2026-07-29
 
 The login risk-control relay was deployed production-first from commit
@@ -51,7 +118,7 @@ replay failure, but test coverage is not recorded as live-account evidence.
 ## v1.9.0 Production Release On 2026-07-27
 
 The operations cockpit and dashboard business-insights work was deployed from
-commit `6975deb352de5b5be060b3e3f599885fd97a79a2`. It adds hourly traffic and
+commit `6975deb352de5b5be060b3e3f599885fd97a79a2`. It adds hourly order-time and
 buyer-behavior analysis (behavioral and quantifiable only, no customer
 profiling), order status and regional distribution charts, a product
 hot-sellers board with period-over-period growth detection, and inline account
@@ -367,7 +434,7 @@ Run before release or deployment:
 source .venv/bin/activate
 pip install -r requirements-dev.lock
 ruff check .
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 
 cd frontend

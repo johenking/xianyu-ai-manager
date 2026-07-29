@@ -73,11 +73,11 @@ class UserDashboardAccessTests(unittest.TestCase):
                     (cookie_id, enabled),
                 )
             cursor.executemany(
-                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status, cookie_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, paid_amount_fen, "
+                "order_status, cookie_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    ("order-one", "item-one", "buyer-one", "12.50", "completed", "one-active", "2026-07-10 10:00:00"),
-                    ("order-two", "item-two", "buyer-two", "99.00", "completed", "two-active", "2026-07-10 11:00:00"),
+                    ("order-one", "item-one", "buyer-one", "12.50", 1250, "completed", "one-active", "2026-07-10 10:00:00"),
+                    ("order-two", "item-two", "buyer-two", "99.00", 9900, "completed", "two-active", "2026-07-10 11:00:00"),
                 ),
             )
             cursor.executemany(
@@ -231,9 +231,9 @@ class UserDashboardAccessTests(unittest.TestCase):
                 ("admin-active", "unb=admin-active; cookie2=session", admin["id"], "admin-active"),
             )
             cursor.execute(
-                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status, cookie_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("order-admin", "item-admin", "buyer-admin", "5.00", "completed", "admin-active", "2026-07-10 12:00:00"),
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, paid_amount_fen, "
+                "order_status, cookie_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("order-admin", "item-admin", "buyer-admin", "5.00", 500, "completed", "admin-active", "2026-07-10 12:00:00"),
             )
             cursor.execute(
                 "INSERT INTO item_info (cookie_id, item_id, item_title) VALUES (?, ?, ?)",
@@ -304,6 +304,167 @@ class UserDashboardAccessTests(unittest.TestCase):
 
         self.assertEqual(password.status_code, 403, password.text)
         self.assertEqual(qr.status_code, 403, qr.text)
+
+    def test_notification_channels_are_tenant_scoped_for_read_update_and_delete(self):
+        own_channel = self.db.create_notification_channel(
+            "channel-one", "webhook", '{"url":"https://example.test/one"}',
+            self.user_one["id"],
+        )
+        foreign_channel = self.db.create_notification_channel(
+            "channel-two", "webhook", '{"url":"https://example.test/two"}',
+            self.user_two["id"],
+        )
+        headers = self.headers_for(self.user_one)
+
+        own = self.client.get(
+            f"/notification-channels/{own_channel}", headers=headers,
+        )
+        self.assertEqual(own.status_code, 200, own.text)
+
+        foreign = self.client.get(
+            f"/notification-channels/{foreign_channel}", headers=headers,
+        )
+        self.assertEqual(foreign.status_code, 404, foreign.text)
+
+        update = self.client.put(
+            f"/notification-channels/{foreign_channel}",
+            headers=headers,
+            json={"name": "hijacked", "config": "{}", "enabled": False},
+        )
+        self.assertEqual(update.status_code, 404, update.text)
+
+        delete = self.client.delete(
+            f"/notification-channels/{foreign_channel}", headers=headers,
+        )
+        self.assertEqual(delete.status_code, 404, delete.text)
+        self.assertEqual(
+            self.db.get_notification_channel(foreign_channel, self.user_two["id"])["name"],
+            "channel-two",
+        )
+
+    def test_message_notification_mutations_reject_foreign_accounts_and_channels(self):
+        own_channel = self.db.create_notification_channel(
+            "channel-one", "webhook", '{"url":"https://example.test/one"}',
+            self.user_one["id"],
+        )
+        foreign_channel = self.db.create_notification_channel(
+            "channel-two", "webhook", '{"url":"https://example.test/two"}',
+            self.user_two["id"],
+        )
+        self.assertTrue(self.db.set_message_notification(
+            "two-active", foreign_channel, True, self.user_two["id"],
+        ))
+        with self.db.lock:
+            foreign_notification_id = self.db.conn.execute(
+                "SELECT id FROM message_notifications WHERE cookie_id = ?",
+                ("two-active",),
+            ).fetchone()[0]
+        headers = self.headers_for(self.user_one)
+
+        cross_channel = self.client.post(
+            "/message-notifications/one-active",
+            headers=headers,
+            json={"channel_id": foreign_channel, "enabled": True},
+        )
+        self.assertEqual(cross_channel.status_code, 404, cross_channel.text)
+
+        cross_account_delete = self.client.delete(
+            "/message-notifications/account/two-active", headers=headers,
+        )
+        self.assertEqual(cross_account_delete.status_code, 404, cross_account_delete.text)
+
+        cross_notification_delete = self.client.delete(
+            f"/message-notifications/{foreign_notification_id}", headers=headers,
+        )
+        self.assertEqual(cross_notification_delete.status_code, 404, cross_notification_delete.text)
+        self.assertEqual(
+            len(self.db.get_account_notifications("two-active")),
+            1,
+        )
+
+        own_link = self.client.post(
+            "/message-notifications/one-active",
+            headers=headers,
+            json={"channel_id": own_channel, "enabled": True},
+        )
+        self.assertEqual(own_link.status_code, 200, own_link.text)
+
+    def test_batch_item_delete_rejects_mixed_tenant_request_atomically(self):
+        response = self.client.request(
+            "DELETE",
+            "/items/batch",
+            headers=self.headers_for(self.user_one),
+            json={
+                "items": [
+                    {"cookie_id": "one-active", "item_id": "item-one"},
+                    {"cookie_id": "two-active", "item_id": "item-two"},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 403, response.text)
+        with self.db.lock:
+            remaining = self.db.conn.execute(
+                "SELECT cookie_id, item_id FROM item_info "
+                "WHERE (cookie_id = ? AND item_id = ?) "
+                "OR (cookie_id = ? AND item_id = ?)",
+                ("one-active", "item-one", "two-active", "item-two"),
+            ).fetchall()
+        self.assertEqual(
+            {(row[0], row[1]) for row in remaining},
+            {("one-active", "item-one"), ("two-active", "item-two")},
+        )
+
+    def test_batch_item_delete_removes_only_owned_items(self):
+        response = self.client.request(
+            "DELETE",
+            "/items/batch",
+            headers=self.headers_for(self.user_one),
+            json={
+                "items": [
+                    {"cookie_id": "one-active", "item_id": "item-one"},
+                    {"cookie_id": "one-active", "item_id": "unused-item"},
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["success_count"], 2)
+        with self.db.lock:
+            own_count = self.db.conn.execute(
+                "SELECT COUNT(*) FROM item_info WHERE cookie_id = ?",
+                ("one-active",),
+            ).fetchone()[0]
+            foreign_count = self.db.conn.execute(
+                "SELECT COUNT(*) FROM item_info WHERE cookie_id = ? AND item_id = ?",
+                ("two-active", "item-two"),
+            ).fetchone()[0]
+        self.assertEqual(own_count, 0)
+        self.assertEqual(foreign_count, 1)
+
+    def test_item_page_fetch_rejects_foreign_account_before_client_creation(self):
+        with patch("XianyuAutoAsync.XianyuLive") as live_class:
+            response = self.client.post(
+                "/items/get-by-page",
+                headers=self.headers_for(self.user_one),
+                json={"cookie_id": "two-active", "page_number": 1, "page_size": 20},
+            )
+
+        self.assertEqual(response.status_code, 403, response.text)
+        live_class.assert_not_called()
+
+    def test_operational_cache_and_log_endpoints_require_admin(self):
+        headers = self.headers_for(self.user_one)
+        responses = (
+            self.client.post("/system/reload-cache", headers=headers),
+            self.client.get("/logs", headers=headers),
+            self.client.get("/logs/stats", headers=headers),
+            self.client.post("/logs/clear", headers=headers),
+        )
+
+        for response in responses:
+            with self.subTest(path=response.request.url.path):
+                self.assertEqual(response.status_code, 403, response.text)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,13 @@ from loguru import logger
 from PIL import Image
 import io
 
+from utils.image_utils import image_manager
+
+
+IMAGE_UPLOAD_RESPONSE_MAX_BYTES = 256 * 1024
+IMAGE_UPLOAD_FILE_MAX_BYTES = 5 * 1024 * 1024
+IMAGE_UPLOAD_RESPONSE_CHUNK_BYTES = 32 * 1024
+
 
 class ImageUploader:
     """图片上传器 - 上传图片到闲鱼CDN"""
@@ -86,6 +93,11 @@ class ImageUploader:
                     file_size = os.path.getsize(temp_path)
                     logger.info(f"图片质量调整为 {quality}%，文件大小: {file_size / 1024:.1f}KB")
 
+                if file_size > max_size:
+                    logger.warning("压缩后的图片仍超过上传大小上限")
+                    os.remove(temp_path)
+                    return None
+
                 logger.info(f"图片压缩完成: {file_size / 1024:.1f}KB")
                 return temp_path
 
@@ -97,11 +109,16 @@ class ImageUploader:
         """上传图片到闲鱼CDN"""
         temp_path = None
         try:
+            managed_path = image_manager.resolve_image_path(image_path)
+            if managed_path is None:
+                logger.warning("拒绝上传受控图片目录之外的路径")
+                return None
+
             if not self.session:
                 await self.create_session()
 
             # 压缩图片
-            temp_path = self._compress_image(image_path)
+            temp_path = self._compress_image(str(managed_path))
             if not temp_path:
                 logger.error("图片压缩失败")
                 return None
@@ -109,9 +126,12 @@ class ImageUploader:
             # 读取压缩后的图片数据
             with open(temp_path, 'rb') as f:
                 image_data = f.read()
+            if len(image_data) > IMAGE_UPLOAD_FILE_MAX_BYTES:
+                logger.warning("拒绝上传超过大小上限的压缩图片")
+                return None
 
             # 构造文件名
-            filename = os.path.basename(image_path)
+            filename = managed_path.name
             if not filename.lower().endswith(('.jpg', '.jpeg')):
                 filename = os.path.splitext(filename)[0] + '.jpg'
 
@@ -136,19 +156,52 @@ class ImageUploader:
 
             # 发送上传请求
             logger.info(f"开始上传图片到闲鱼CDN: {filename}")
-            async with self.session.post(self.upload_url, data=data, headers=headers) as response:
+            async with self.session.post(
+                self.upload_url,
+                data=data,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
                 if response.status == 200:
-                    response_text = await response.text()
-                    logger.debug(f"上传响应: {response_text}")
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(content_length) if content_length else None
+                    except (TypeError, ValueError):
+                        declared_size = None
+                    if (
+                        declared_size is not None
+                        and declared_size > IMAGE_UPLOAD_RESPONSE_MAX_BYTES
+                    ):
+                        logger.error("图片上传响应超过大小上限")
+                        return None
+
+                    response_body = bytearray()
+                    async for chunk in response.content.iter_chunked(
+                        IMAGE_UPLOAD_RESPONSE_CHUNK_BYTES
+                    ):
+                        response_body.extend(chunk)
+                        if len(response_body) > IMAGE_UPLOAD_RESPONSE_MAX_BYTES:
+                            logger.error("图片上传响应超过大小上限")
+                            return None
+                    response_text = bytes(response_body).decode(
+                        response.charset or "utf-8",
+                        errors="replace",
+                    )
+                    logger.debug(
+                        f"图片上传响应已接收: body_length={len(response_text)}"
+                    )
 
                     # 解析响应获取图片URL
                     image_url = self._parse_upload_response(response_text)
                     if image_url:
-                        logger.info(f"图片上传成功: {image_url}")
+                        logger.info("图片上传成功")
                         return image_url
                     else:
                         logger.error("解析上传响应失败")
                         return None
+                elif 300 <= response.status < 400:
+                    logger.error("图片上传端点返回了未接受的重定向")
+                    return None
                 else:
                     logger.error(f"图片上传失败: HTTP {response.status}")
                     return None
@@ -178,7 +231,7 @@ class ImageUploader:
                     logger.error("   4. 复制完整的Cookie字符串，更新配置文件中的Cookie")
                     return None
                 else:
-                    logger.error(f"收到HTML响应而非JSON，可能是Cookie失效: {response_text[:500]}")
+                    logger.error("收到HTML响应而非JSON，可能是Cookie失效")
                     return None
 
             # 尝试解析JSON响应
@@ -192,7 +245,7 @@ class ImageUploader:
             if 'object' in response_data and isinstance(response_data['object'], dict):
                 obj = response_data['object']
                 if 'url' in obj:
-                    logger.info(f"从object.url提取到图片URL: {obj['url']}")
+                    logger.info("从object.url提取到图片URL")
                     return obj['url']
 
             # 方式3: 直接在根级别
@@ -211,12 +264,14 @@ class ImageUploader:
                 if 'file_url' in data:
                     return data['file_url']
 
-            logger.error(f"无法从响应中提取图片URL: {response_data}")
+            logger.error(
+                f"无法从响应中提取图片URL: response_type={type(response_data).__name__}"
+            )
             return None
 
         except json.JSONDecodeError:
             # 如果不是JSON格式，尝试其他解析方式
-            logger.error(f"响应不是有效的JSON格式，可能是Cookie失效: {response_text[:200]}...")
+            logger.error("响应不是有效的JSON格式，可能是Cookie失效")
             return None
         except Exception as e:
             logger.error(f"解析上传响应异常: {e}")

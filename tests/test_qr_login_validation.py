@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import tempfile
 import time
 import unittest
@@ -96,12 +97,13 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             screenshot = Path(temp_dir) / "verification.png"
             screenshot.write_bytes(b"private screenshot")
-            session.verification_screenshot_path = (
-                "/static/uploads/images/verification.png"
-            )
+            session.verification_screenshot_path = str(screenshot)
             manager.sessions[session.session_id] = session
 
-            with patch("utils.qr_verification_browser.UPLOAD_DIR", temp_dir):
+            with patch.dict(
+                os.environ,
+                {"XIANYU_PRIVATE_VERIFICATION_DIR": temp_dir},
+            ):
                 manager.cleanup_expired_sessions()
                 first = manager.get_session_status(session.session_id)
                 second = manager.get_session_status(session.session_id)
@@ -198,14 +200,17 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_renderer_removes_its_late_screenshot(self):
         class CancelledVerificationBrowser(FakeVerificationBrowser):
+            screenshot_path = ""
+
             def run(self, *_args, **_kwargs):
                 return {
                     "status": "cancelled",
-                    "screenshot_path": "/static/uploads/images/late-cancelled.png",
+                    "screenshot_path": self.screenshot_path,
                 }
 
+        verification_browser = CancelledVerificationBrowser()
         manager = QRLoginManager(
-            verification_browser=CancelledVerificationBrowser(),
+            verification_browser=verification_browser,
             session_validator=AsyncMock(),
         )
         session = QRLoginSession("cancelled-renderer-session")
@@ -216,7 +221,11 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             screenshot = Path(temp_dir) / "late-cancelled.png"
             screenshot.write_bytes(b"late private screenshot")
-            with patch("utils.qr_verification_browser.UPLOAD_DIR", temp_dir):
+            verification_browser.screenshot_path = str(screenshot)
+            with patch.dict(
+                os.environ,
+                {"XIANYU_PRIVATE_VERIFICATION_DIR": temp_dir},
+            ):
                 await manager._run_verification_browser(session.session_id)
 
             self.assertFalse(screenshot.exists())
