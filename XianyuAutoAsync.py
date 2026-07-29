@@ -1390,6 +1390,7 @@ class XianyuLive:
         """实时确认普通订单已付款；任何不确定状态都按未通过处理。"""
         from order_sync_service import (
             XianyuOrderListClient,
+            get_order_sync_lock,
             normalize_order_status,
             parse_trusted_order_quantity,
         )
@@ -1398,13 +1399,14 @@ class XianyuLive:
         expected_buyer_id = str(buyer_id or "").strip()
         client = XianyuOrderListClient(max_pages=20)
         try:
-            discovery = await client.discover(
-                cookie_id=self.cookie_id,
-                cookie_string=self.cookies_str,
-                days=365,
-                user_agent=self.browser_user_agent,
-                target_order_id=str(order_id),
-            )
+            async with get_order_sync_lock(self.cookie_id):
+                discovery = await client.discover(
+                    cookie_id=self.cookie_id,
+                    cookie_string=self.cookies_str,
+                    days=365,
+                    user_agent=self.browser_user_agent,
+                    target_order_id=str(order_id),
+                )
         except Exception as exc:
             reason = sanitize_runtime_error(
                 f"实时订单状态查询异常: {type(exc).__name__}"

@@ -4,7 +4,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 import order_sync_service
@@ -20,6 +20,7 @@ from order_sync_service import (
     normalize_order_record,
     parse_amount_fen,
     parse_order_api_payload,
+    fetch_xianyu_order_list_page,
 )
 from utils.browser_pool import cookie_fingerprint
 from order_status_handler import extract_order_event_identity
@@ -490,6 +491,7 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["summary"]["failed"], 1)
         self.assertEqual(self.db.get_order_by_id("order-known")["order_status"], "shipped")
         self.assertEqual(self.db.get_order_by_id("order-known")["paid_amount_fen"], 1990)
+        self.assertEqual(result["fields_obtained"], ["amount"])
 
     async def test_recent_order_client_paginates_and_stops_at_date_cutoff(self):
         requested_pages = []
@@ -700,6 +702,99 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 2)
         sleep.assert_awaited_once_with(0.75)
 
+    async def test_recent_order_client_retries_server_errors_with_backoff(self):
+        calls = 0
+        sleep = AsyncMock()
+
+        async def page_loader(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                return {"ret": ["HTTP_503::订单接口请求失败"]}
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {"module": {"items": [], "nextPage": "false"}},
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            max_retries=2,
+            sleep_fn=sleep,
+            jitter_fn=lambda _start, _end: 0.0,
+        ).discover(
+            cookie_id="account-server-retry",
+            cookie_string="unb=account-server-retry; _m_h5_tk=token_value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(calls, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [0.75, 1.5],
+        )
+
+    async def test_recent_order_client_stops_after_retry_limit(self):
+        calls = 0
+        sleep = AsyncMock()
+
+        async def page_loader(**_kwargs):
+            nonlocal calls
+            calls += 1
+            return {"ret": ["HTTP_503::订单接口请求失败"]}
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            max_retries=2,
+            sleep_fn=sleep,
+            jitter_fn=lambda _start, _end: 0.0,
+        ).discover(
+            cookie_id="account-retry-limit",
+            cookie_string="unb=account-retry-limit; _m_h5_tk=token_value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "platform_unavailable")
+        self.assertEqual(calls, 3)
+        self.assertEqual(sleep.await_count, 2)
+
+    async def test_production_transport_has_total_timeout_and_maps_timeout(self):
+        captured = {}
+
+        class TimeoutResponse:
+            async def __aenter__(self):
+                raise asyncio.TimeoutError
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        class TimeoutSession:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            def post(self, *_args, **_kwargs):
+                return TimeoutResponse()
+
+        with patch(
+            "order_sync_service.aiohttp.ClientSession",
+            TimeoutSession,
+        ), patch("utils.xianyu_utils.generate_sign", return_value="test-sign"):
+            result = await fetch_xianyu_order_list_page(
+                cookie_id="account-timeout",
+                cookie_string="unb=account-timeout; _m_h5_tk=token_suffix",
+                page_number=1,
+                page_size=20,
+                user_id="account-timeout",
+            )
+
+        self.assertEqual(result, {"ret": ["NETWORK_ERROR::TimeoutError"]})
+        self.assertEqual(captured["timeout"].total, 20)
+
     async def test_recent_order_client_stops_when_target_order_is_found(self):
         requested_pages = []
 
@@ -878,6 +973,38 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(first, second)
         self.assertEqual(max_active, 1)
+
+    async def test_account_syncs_for_different_accounts_can_run_in_parallel(self):
+        both_entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def discoverer(**_kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                both_entered.set()
+            await release.wait()
+            active -= 1
+            return {"success": True, "orders": []}
+
+        coordinator = OrderSyncCoordinator(self.db, discoverer=discoverer)
+        first = asyncio.create_task(coordinator.sync_account(
+            cookie_id="parallel-account-1",
+            cookie_string="unb=parallel-account-1; cookie2=value",
+        ))
+        second = asyncio.create_task(coordinator.sync_account(
+            cookie_id="parallel-account-2",
+            cookie_string="unb=parallel-account-2; cookie2=value",
+        ))
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+            self.assertEqual(max_active, 2)
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
 
     async def test_coordinator_persists_refreshed_cookie_without_returning_it(self):
         updates = []

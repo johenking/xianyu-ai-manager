@@ -16,6 +16,11 @@ import aiohttp
 _ACCOUNT_SYNC_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
+def get_order_sync_lock(cookie_id: Any) -> asyncio.Lock:
+    """Return the process-local MTOP synchronization lock for one account."""
+    return _ACCOUNT_SYNC_LOCKS.setdefault(str(cookie_id or ""), asyncio.Lock())
+
+
 DEFAULT_ORDER_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -749,7 +754,7 @@ class OrderSyncCoordinator:
         days: int = 90,
         user_agent: str = "",
     ) -> Dict[str, Any]:
-        lock = _ACCOUNT_SYNC_LOCKS.setdefault(str(cookie_id), asyncio.Lock())
+        lock = get_order_sync_lock(cookie_id)
         async with lock:
             return await self._sync_account_unlocked(
                 cookie_id=cookie_id,
@@ -768,6 +773,7 @@ class OrderSyncCoordinator:
         summary = new_order_sync_summary()
         touched_order_ids: List[str] = []
         unconfirmed_order_ids: set[str] = set()
+        obtained_fields: set[str] = set()
         discovery = await self.discoverer(
             cookie_id=cookie_id,
             cookie_string=cookie_string,
@@ -832,6 +838,7 @@ class OrderSyncCoordinator:
                 unconfirmed_order_ids.add(order_id)
             else:
                 unconfirmed_order_ids.discard(order_id)
+                obtained_fields.add("status")
             # 用成交商品 ID 关联当前目录主图，取不到则留空（不覆盖已有快照）
             catalog_item = catalog_lookup.get((str(cookie_id), str(order.get("item_id") or "")))
             catalog_image = (catalog_item or {}).get("item_image") or None
@@ -868,6 +875,10 @@ class OrderSyncCoordinator:
                 }
             buyer_nickname = str(order.get("buyer_nickname") or "").strip()
             buyer_avatar = str(order.get("buyer_avatar_url") or "").strip()
+            if buyer_nickname:
+                obtained_fields.add("buyer_nickname")
+            if buyer_avatar:
+                obtained_fields.add("buyer_avatar")
             buyer_snapshot = None
             if buyer_nickname or buyer_avatar:
                 buyer_snapshot = {
@@ -876,6 +887,11 @@ class OrderSyncCoordinator:
                     "source": "order_list",
                 }
             ordered_at = parse_order_time_utc(order.get("created_at"))
+            if ordered_at[0] is not None:
+                obtained_fields.add("time")
+            paid_amount_fen = parse_amount_fen(order.get("amount"))
+            if paid_amount_fen is not None:
+                obtained_fields.add("amount")
             update_result = self.db.apply_order_sync_update(
                 order_id=order_id,
                 cookie_id=cookie_id,
@@ -891,7 +907,7 @@ class OrderSyncCoordinator:
                 item_snapshot=item_snapshot,
                 buyer_snapshot=buyer_snapshot,
                 ordered_at=ordered_at,
-                paid_amount_fen=parse_amount_fen(order.get("amount")),
+                paid_amount_fen=paid_amount_fen,
                 item_id=order.get("item_id"),
                 buyer_id=order.get("buyer_id"),
                 quantity=order.get("quantity"),
@@ -970,6 +986,11 @@ class OrderSyncCoordinator:
                                 touched_order_ids,
                                 unconfirmed_order_ids,
                             ),
+                            "fields_obtained": [
+                                field
+                                for field in SYNC_COVERAGE_FIELDS
+                                if field in obtained_fields
+                            ],
                             "errors": errors + [detail.get("error") or "闲鱼登录状态已过期"],
                         }
                     if not order_id:
@@ -997,10 +1018,13 @@ class OrderSyncCoordinator:
                         unconfirmed_order_ids.add(order_id)
                     else:
                         unconfirmed_order_ids.discard(order_id)
+                        obtained_fields.add("status")
                     # 详情为最高级快照来源：报文里带什么就升级什么，缺省字段自动跳过
                     detail_item_snapshot = None
                     detail_title = str(detail.get("item_title") or "").strip()
                     detail_image = str(detail.get("item_image") or detail.get("item_pic") or "").strip()
+                    if detail_image:
+                        obtained_fields.add("item_image")
                     if detail_title or detail_image:
                         detail_item_snapshot = {
                             "item_title": detail_title,
@@ -1009,6 +1033,10 @@ class OrderSyncCoordinator:
                         }
                     detail_nickname = str(detail.get("buyer_nickname") or detail.get("buyer_nick") or "").strip()
                     detail_avatar = str(detail.get("buyer_avatar_url") or detail.get("buyer_avatar") or "").strip()
+                    if detail_nickname:
+                        obtained_fields.add("buyer_nickname")
+                    if detail_avatar:
+                        obtained_fields.add("buyer_avatar")
                     detail_buyer_snapshot = None
                     if detail_nickname or detail_avatar:
                         detail_buyer_snapshot = {
@@ -1017,6 +1045,11 @@ class OrderSyncCoordinator:
                             "source": "order_detail",
                         }
                     detail_ordered_at = parse_order_time_utc(detail.get("order_time"))
+                    if detail_ordered_at[0] is not None:
+                        obtained_fields.add("time")
+                    detail_amount_fen = parse_amount_fen(detail.get("amount"))
+                    if detail_amount_fen is not None:
+                        obtained_fields.add("amount")
                     update_result = self.db.apply_order_sync_update(
                         order_id=order_id,
                         cookie_id=cookie_id,
@@ -1028,7 +1061,7 @@ class OrderSyncCoordinator:
                         item_snapshot=detail_item_snapshot,
                         buyer_snapshot=detail_buyer_snapshot,
                         ordered_at=detail_ordered_at,
-                        paid_amount_fen=parse_amount_fen(detail.get("amount")),
+                        paid_amount_fen=detail_amount_fen,
                         item_id=detail.get("item_id"),
                         buyer_id=detail.get("buyer_id"),
                         spec_name=detail.get("spec_name"),
@@ -1086,8 +1119,8 @@ class OrderSyncCoordinator:
             "summary": summary,
             "fields_obtained": [
                 field
-                for field, coverage in summary["field_coverage"].items()
-                if coverage["covered"] > 0
+                for field in SYNC_COVERAGE_FIELDS
+                if field in obtained_fields
             ],
             "errors": errors,
         }

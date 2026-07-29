@@ -253,6 +253,66 @@ class HumanVerificationPolicyTests(unittest.TestCase):
                 self.assertFalse(result["allowed"])
                 self.assertEqual(result["status"], "identity_unconfirmed")
 
+    def test_realtime_delivery_check_shares_the_coordinator_account_lock(self):
+        async def verify():
+            from order_sync_service import OrderSyncCoordinator
+
+            account_id = "shared-lock-account"
+            coordinator_entered = asyncio.Event()
+            release_coordinator = asyncio.Event()
+
+            async def coordinator_discoverer(**_kwargs):
+                coordinator_entered.set()
+                await release_coordinator.wait()
+                return {"success": True, "orders": []}
+
+            database = Mock()
+            database.get_item_catalog_lookup.return_value = {}
+            coordinator_task = asyncio.create_task(
+                OrderSyncCoordinator(
+                    database,
+                    discoverer=coordinator_discoverer,
+                ).sync_account(
+                    cookie_id=account_id,
+                    cookie_string=f"unb={account_id}; cookie2=value",
+                )
+            )
+            await coordinator_entered.wait()
+
+            live = object.__new__(XianyuLive)
+            live.cookie_id = account_id
+            live.cookies_str = f"unb={account_id}; cookie2=value"
+            live.browser_user_agent = "test-agent"
+            client_discover = AsyncMock(return_value={
+                "success": True,
+                "orders": [{
+                    "order_id": "order-for-test",
+                    "item_id": "item-for-test",
+                    "buyer_id": "buyer-for-test",
+                    "order_status": "pending_ship",
+                }],
+            })
+
+            with patch("order_sync_service.XianyuOrderListClient") as client_class:
+                client_class.return_value.discover = client_discover
+                delivery_task = asyncio.create_task(
+                    live._verify_paid_order_for_delivery(
+                        "order-for-test",
+                        "item-for-test",
+                        "buyer-for-test",
+                    )
+                )
+                await asyncio.sleep(0)
+                client_discover.assert_not_awaited()
+                release_coordinator.set()
+                await coordinator_task
+                result = await delivery_task
+
+            self.assertTrue(result["allowed"])
+            client_discover.assert_awaited_once()
+
+        asyncio.run(verify())
+
     def test_bargain_freeshipping_runs_only_after_the_shared_payment_gate(self):
         handler_source = inspect.getsource(XianyuLive._handle_auto_delivery)
         workflow_source = inspect.getsource(XianyuLive._execute_fulfillment_attempt)
