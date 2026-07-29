@@ -4,7 +4,7 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
-## [1.10.0] - 2026-07-27
+## [1.10.0] - 2026-07-29
 
 ### Added
 
@@ -29,6 +29,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Prefer "waiting for buyer confirmation" over the shorter "confirm receipt" phrase, reject successful responses without a recognized order-list schema, and keep unknown status as a truthful partial failure.
 - Make metric batches transactional, reject out-of-order or oversized batches, enforce adapter timeouts, and prevent one tenant's canary successes from enabling other accounts.
 - Persist fulfillment as `prepared`, `sending`, `committed`, `released`, or `manual_review`; uncertain or partial external delivery is retained for manual review instead of releasing inventory or reporting a completed shipment.
+- Serialize account-listener replacement and reject a replacement when the old listener misses its shutdown deadline, preventing two listeners for one account.
+- Keep existing Loguru handlers intact when the platform runtime module loads, while retaining redaction and a dedicated private file sink.
 - Remove unreachable Playwright order-refresh code and sensitive message, receiver, phone, address, and full-result logging.
 
 ### Security
