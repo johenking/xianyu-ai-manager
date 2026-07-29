@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
+from collections.abc import Sequence
+from typing import Any, Awaitable, Callable, Dict, Optional
 from weakref import WeakKeyDictionary
 
 
-ItemMetricCollector = Callable[..., Awaitable[Iterable[Dict[str, Any]]]]
+ItemMetricCollector = Callable[..., Awaitable[Sequence[Dict[str, Any]]]]
 _collector: Optional[ItemMetricCollector] = None
 _account_locks_by_loop: WeakKeyDictionary = WeakKeyDictionary()
 ITEM_METRIC_ADAPTER_TIMEOUT_SECONDS = 30
@@ -17,6 +18,10 @@ ITEM_METRIC_MAX_ROWS = 200
 
 class ItemMetricCollectorContractError(TypeError):
     """Raised before invoking a collector that cannot be cancelled safely."""
+
+
+class ItemMetricCollectorResultError(TypeError):
+    """Raised when an adapter result cannot be proven bounded before copying."""
 
 
 def register_item_metric_collector(collector: Optional[ItemMetricCollector]) -> None:
@@ -49,7 +54,21 @@ async def _invoke_collector(
         )
 
     result = await collector(cookie_id=cookie_id, cookie_string=cookie_string)
-    return list(result or [])
+    if result is None:
+        return []
+    if isinstance(result, (str, bytes, bytearray)) or not isinstance(
+        result,
+        Sequence,
+    ):
+        raise ItemMetricCollectorResultError(
+            "商品指标适配器必须返回有界序列"
+        )
+    row_count = len(result)
+    if row_count > ITEM_METRIC_MAX_ROWS:
+        raise ItemMetricCollectorResultError(
+            "商品指标适配器单批返回行数超过上限"
+        )
+    return [result[index] for index in range(row_count)]
 
 
 def item_metric_collection_enabled(
@@ -78,7 +97,10 @@ def item_metric_collection_status(
     return {
         **state,
         "adapter_available": item_metric_collector_available(),
-        "collection_enabled": bool(state.get("enabled")),
+        "collection_enabled": bool(
+            state.get("enabled")
+            and int(state.get("canary_success_count") or 0) >= 3
+        ),
     }
 
 
@@ -112,8 +134,6 @@ async def collect_item_metrics_once(
             )
             if not rows:
                 raise ValueError("商品指标适配器没有返回已验证快照")
-            if len(rows) > ITEM_METRIC_MAX_ROWS:
-                raise ValueError("商品指标适配器单批返回行数超过上限")
             batch_result = db.record_item_metric_snapshots(
                 user_id=user_id,
                 cookie_id=cookie_id,
@@ -124,6 +144,7 @@ async def collect_item_metrics_once(
                     user_id=user_id,
                     cookie_id=cookie_id,
                     success=True,
+                    observed_at=batch_result.get("newest_inserted_observed_at"),
                 )
                 if canary
                 else db.get_item_metric_collection_state(
@@ -136,12 +157,15 @@ async def collect_item_metrics_once(
                 **batch_result,
                 "canary_successes": int(state.get("canary_success_count") or 0),
                 "collection_enabled": bool(state.get("enabled")),
+                "canary_advanced": bool(state.get("canary_advanced")),
             }
         except Exception as exc:
             if isinstance(exc, asyncio.TimeoutError):
                 error_code = "metric_adapter_timeout"
             elif isinstance(exc, ItemMetricCollectorContractError):
                 error_code = "metric_adapter_must_be_async"
+            elif isinstance(exc, ItemMetricCollectorResultError):
+                error_code = "metric_adapter_result_not_bounded"
             else:
                 error_code = "metric_collection_failed"
             if canary:

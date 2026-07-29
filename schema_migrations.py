@@ -1123,9 +1123,14 @@ def _item_metric_collection_states_v1(
             cookie_id TEXT NOT NULL,
             canary_success_count INTEGER NOT NULL DEFAULT 0
                 CHECK (canary_success_count BETWEEN 0 AND 3),
-            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            enabled INTEGER NOT NULL DEFAULT 0
+                CHECK (
+                    enabled IN (0, 1)
+                    AND (enabled = 0 OR canary_success_count >= 3)
+                ),
             last_attempt_at REAL,
             last_success_at REAL,
+            last_canary_observed_at REAL,
             last_error_code TEXT NOT NULL DEFAULT '',
             updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
             PRIMARY KEY(user_id, cookie_id),
@@ -1234,6 +1239,12 @@ def _item_metric_tenant_ownership_v2(
         )
 
     if "item_metric_collection_states" in tables:
+        state_columns = _columns(cursor, "item_metric_collection_states")
+        last_canary_observed_at_expr = (
+            "s.last_canary_observed_at"
+            if "last_canary_observed_at" in state_columns
+            else "NULL"
+        )
         cursor.execute(
             """
             CREATE TABLE item_metric_collection_states_v2 (
@@ -1241,9 +1252,14 @@ def _item_metric_tenant_ownership_v2(
                 cookie_id TEXT NOT NULL,
                 canary_success_count INTEGER NOT NULL DEFAULT 0
                     CHECK (canary_success_count BETWEEN 0 AND 3),
-                enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                enabled INTEGER NOT NULL DEFAULT 0
+                    CHECK (
+                        enabled IN (0, 1)
+                        AND (enabled = 0 OR canary_success_count >= 3)
+                    ),
                 last_attempt_at REAL,
                 last_success_at REAL,
+                last_canary_observed_at REAL,
                 last_error_code TEXT NOT NULL DEFAULT '',
                 updated_at REAL NOT NULL DEFAULT (CAST(strftime('%s','now') AS REAL)),
                 PRIMARY KEY(user_id, cookie_id),
@@ -1254,15 +1270,20 @@ def _item_metric_tenant_ownership_v2(
             """
         )
         cursor.execute(
-            """
+            f"""
             INSERT INTO item_metric_collection_states_v2 (
                 user_id, cookie_id, canary_success_count, enabled,
-                last_attempt_at, last_success_at, last_error_code, updated_at
+                last_attempt_at, last_success_at, last_canary_observed_at,
+                last_error_code, updated_at
             )
             SELECT
-                s.user_id, s.cookie_id, s.canary_success_count, s.enabled,
-                s.last_attempt_at, s.last_success_at, s.last_error_code,
-                s.updated_at
+                s.user_id, s.cookie_id, s.canary_success_count,
+                CASE
+                    WHEN s.enabled = 1 AND s.canary_success_count >= 3 THEN 1
+                    ELSE 0
+                END,
+                s.last_attempt_at, s.last_success_at,
+                {last_canary_observed_at_expr}, s.last_error_code, s.updated_at
             FROM item_metric_collection_states AS s
             JOIN cookies AS c
               ON c.id = s.cookie_id AND c.user_id = s.user_id

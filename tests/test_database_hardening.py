@@ -76,6 +76,7 @@ class DatabaseHardeningTests(unittest.TestCase):
             user_id=self.owner_a["id"],
             cookie_id="account-a",
             success=True,
+            observed_at=time.time(),
         )
         with self.db.lock:
             self.db.conn.execute(
@@ -148,11 +149,13 @@ class DatabaseHardeningTests(unittest.TestCase):
             source="seller_backend_verified",
             view_count=10,
         )
-        for _ in range(3):
+        observed_at = time.time()
+        for index in range(3):
             self.db.record_item_metric_canary_result(
                 user_id=self.owner_a["id"],
                 cookie_id="account-a",
                 success=True,
+                observed_at=observed_at + index,
             )
         backup = self.db.export_backup(self.owner_a["id"])
         self.assertIn("item_metric_snapshots", backup["data"])
