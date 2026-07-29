@@ -12,6 +12,10 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Add order-derived item performance, verified seller-backend metric snapshots, account-scoped three-canary state, item-traffic analytics, and a default-off four-hour serial collector. Real collection remains unavailable until an adapter passes live account canaries.
 - Add `GET /analytics/items/metrics/status` so the frontend can distinguish unavailable adapters, pending canaries, and enabled accounts without exposing credentials.
 - Add migration `2026072703` for metric/account ownership constraints plus durable fulfillment attempts and card reservations.
+- Close the existing 20-item security ledger without rescanning: tenant-scoped
+  item replies, atomic password/session revocation, bounded AI and Chromium
+  work, bounded Geetest state, managed image paths, streaming upload limits and
+  redirect-safe outbound handling. See `docs/security-v1.10-closeout.md`.
 
 ### Changed
 

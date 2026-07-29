@@ -18,12 +18,17 @@ Candidate contract:
   and each account must independently pass three live canaries before the
   four-hour serial scheduler starts. Synthetic tests do not verify a seller
   backend response path.
+- A canary advances only when its batch inserts a new observation newer than
+  the account's previous canary observation. Duplicate, reset or out-of-order
+  snapshots cannot enable collection.
 - Traffic deltas are assigned to the complete interval between consecutive
   snapshots. The API and dashboard expose approximate observation windows and
   duration metadata; they do not turn a four-hour sample into one-hour traffic.
 - Order timing uses the saved platform order-time snapshot and its source. It is
   not described as a guaranteed payment, settlement, shipment, or completion
   timestamp.
+- The recovered 20-item pre-release security ledger is closed in
+  `docs/security-v1.10-closeout.md`; no replacement full scan was launched.
 
 ## v1.9.1 Login Risk-Control Relay Production Release On 2026-07-29
 
