@@ -326,7 +326,6 @@ def _mask_account_ids_in_log(record):
     sanitize_log_record(record)
 
 
-logger.remove()
 logger.configure(patcher=_mask_account_ids_in_log)
 logger.add(
     log_path,
@@ -338,12 +337,6 @@ logger.add(
     encoding='utf-8',
     enqueue=True,
     opener=_secure_log_opener,
-)
-logger.add(
-    sys.stdout,
-    level=LOG_CONFIG.get('level', 'DEBUG'),
-    format=LOG_CONFIG.get('format', '<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>'),
-    enqueue=True
 )
 
 class XianyuLive:

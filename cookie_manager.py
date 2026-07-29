@@ -445,27 +445,33 @@ class CookieManager:
     ) -> dict:
         """Replace one listener without holding its account lock during shutdown."""
         account_ref = _mask_cookie_id(cookie_id)
+        action_lock = self._runtime_action_locks.setdefault(cookie_id, asyncio.Lock())
         lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
-        cookie_info = await asyncio.to_thread(db_manager.get_cookie_details, cookie_id)
-        original_user_id = user_id if user_id is not None else (
-            cookie_info.get("user_id") if cookie_info else None
-        )
-        original_keywords = list(self.keywords.get(cookie_id, []))
-        original_status = self.cookie_status.get(cookie_id, True)
+        async with action_lock:
+            cookie_info = await asyncio.to_thread(
+                db_manager.get_cookie_details,
+                cookie_id,
+            )
+            original_user_id = user_id if user_id is not None else (
+                cookie_info.get("user_id") if cookie_info else None
+            )
+            original_keywords = list(self.keywords.get(cookie_id, []))
+            original_status = self.cookie_status.get(cookie_id, True)
 
-        async with lock:
-            generation = self._task_generations.get(cookie_id, 0) + 1
-            self._task_generations[cookie_id] = generation
-            old_task = self.tasks.pop(cookie_id, None)
+            async with lock:
+                generation = self._task_generations.get(cookie_id, 0) + 1
+                self._task_generations[cookie_id] = generation
+                old_task = self.tasks.get(cookie_id)
 
-        if old_task and old_task is not asyncio.current_task():
-            logger.info(f"【{account_ref}】正在停止旧任务...")
-            old_task.cancel()
-            done, _ = await asyncio.wait({old_task}, timeout=shutdown_timeout)
-            if old_task not in done:
-                logger.warning(f"【{account_ref}】等待旧任务停止超时，继续安装最新监听")
-                old_task.add_done_callback(self._consume_task_result)
-            else:
+            if old_task and old_task is not asyncio.current_task():
+                logger.info(f"【{account_ref}】正在停止旧任务...")
+                old_task.cancel()
+                done, _ = await asyncio.wait({old_task}, timeout=shutdown_timeout)
+                if old_task not in done:
+                    logger.error(
+                        f"【{account_ref}】等待旧任务停止超时，保留旧监听并拒绝替换"
+                    )
+                    return {"status": "shutdown_timeout", "cookie_id": cookie_id}
                 try:
                     old_task.result()
                 except asyncio.CancelledError:
@@ -475,53 +481,56 @@ class CookieManager:
                         f"【{account_ref}】等待旧任务清理时出错: "
                         f"error_type={type(exc).__name__}"
                     )
+                async with lock:
+                    if self.tasks.get(cookie_id) is old_task:
+                        self.tasks.pop(cookie_id, None)
 
-        async with lock:
-            if self._task_generations.get(cookie_id) != generation:
-                return {"status": "superseded", "cookie_id": cookie_id}
-
-            if expected_cookie_revision is not None:
-                latest_cookie_info = db_manager.get_cookie_details(cookie_id)
-                if (
-                    not latest_cookie_info
-                    or int(latest_cookie_info.get("cookie_revision", -1))
-                    != int(expected_cookie_revision)
-                    or (
-                        expected_cookie_value is not None
-                        and str(latest_cookie_info.get("value") or "")
-                        != str(expected_cookie_value)
-                    )
-                ):
+            async with lock:
+                if self._task_generations.get(cookie_id) != generation:
                     return {"status": "superseded", "cookie_id": cookie_id}
 
-            if save_to_db:
-                saved = await asyncio.to_thread(
-                    db_manager.save_cookie,
-                    cookie_id,
-                    new_value,
-                    original_user_id,
-                )
-                if not saved:
-                    return {"status": "rejected", "cookie_id": cookie_id}
+                if expected_cookie_revision is not None:
+                    latest_cookie_info = db_manager.get_cookie_details(cookie_id)
+                    if (
+                        not latest_cookie_info
+                        or int(latest_cookie_info.get("cookie_revision", -1))
+                        != int(expected_cookie_revision)
+                        or (
+                            expected_cookie_value is not None
+                            and str(latest_cookie_info.get("value") or "")
+                            != str(expected_cookie_value)
+                        )
+                    ):
+                        return {"status": "superseded", "cookie_id": cookie_id}
 
-            self.cookies[cookie_id] = new_value
-            self.keywords[cookie_id] = original_keywords
-            self.cookie_status[cookie_id] = original_status
-            replacement = self.loop.create_task(
-                self._run_xianyu(
-                    cookie_id,
-                    new_value,
-                    original_user_id,
-                    runtime_state=runtime_state,
+                if save_to_db:
+                    saved = await asyncio.to_thread(
+                        db_manager.save_cookie,
+                        cookie_id,
+                        new_value,
+                        original_user_id,
+                    )
+                    if not saved:
+                        return {"status": "rejected", "cookie_id": cookie_id}
+
+                self.cookies[cookie_id] = new_value
+                self.keywords[cookie_id] = original_keywords
+                self.cookie_status[cookie_id] = original_status
+                replacement = self.loop.create_task(
+                    self._run_xianyu(
+                        cookie_id,
+                        new_value,
+                        original_user_id,
+                        runtime_state=runtime_state,
+                    )
                 )
+                self.tasks[cookie_id] = replacement
+
+            logger.info(
+                f"【{account_ref}】已更新Cookie并重启任务 "
+                f"owner_attached={original_user_id is not None}"
             )
-            self.tasks[cookie_id] = replacement
-
-        logger.info(
-            f"【{account_ref}】已更新Cookie并重启任务 "
-            f"owner_attached={original_user_id is not None}"
-        )
-        return {"status": "restarted", "cookie_id": cookie_id}
+            return {"status": "restarted", "cookie_id": cookie_id}
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task) -> None:
