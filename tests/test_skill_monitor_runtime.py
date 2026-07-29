@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -7,15 +8,17 @@ from fastapi import HTTPException
 import reply_server
 import skill_monitor_delivery_dispatcher as delivery_module
 import skill_monitor_scheduler as scheduler_module
+from utils.outbound_http import OutboundRequestError, PublicHTTPResponse
 
 
 class SkillNotificationTests(unittest.TestCase):
     @staticmethod
     def _successful_response(payload):
-        response = Mock()
-        response.json.return_value = payload
-        response.raise_for_status.return_value = None
-        return response
+        return PublicHTTPResponse(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(payload).encode("utf-8"),
+        )
 
     def test_enabled_channels_only_returns_supported_types(self):
         channels = [
@@ -57,25 +60,37 @@ class SkillNotificationTests(unittest.TestCase):
 
         for channel_type, config, response_payload, expected_payload in cases:
             with self.subTest(channel_type=channel_type), patch.object(
-                reply_server.requests,
-                "post",
+                reply_server,
+                "request_public_http_sync",
                 return_value=self._successful_response(response_payload),
-            ) as post_mock:
+            ) as request_mock:
                 reply_server._send_skill_notification_to_channel(
                     {"type": channel_type, "config": config}, task, result
                 )
 
-            self.assertEqual(post_mock.call_args.kwargs["json"], expected_payload)
+            self.assertEqual(request_mock.call_args.kwargs["json_body"], expected_payload)
+            self.assertEqual(request_mock.call_args.args[0], "POST")
 
     def test_platform_webhook_business_error_is_not_recorded_as_success(self):
         response = self._successful_response({"errcode": 40013, "errmsg": "invalid webhook"})
-        with patch.object(reply_server.requests, "post", return_value=response):
+        with patch.object(reply_server, "request_public_http_sync", return_value=response):
             with self.assertRaisesRegex(ValueError, "invalid webhook"):
                 reply_server._send_skill_notification_to_channel(
                     {"type": "wechat", "config": {"webhook_url": "https://example.test/wechat"}},
                     {"keyword": "iPhone"},
                     {"title": "iPhone 15"},
                 )
+
+    def test_private_webhook_target_is_rejected_before_network_access(self):
+        with self.assertRaisesRegex(ValueError, "non-public"):
+            reply_server._send_skill_notification_to_channel(
+                {
+                    "type": "webhook",
+                    "config": {"webhook_url": "http://127.0.0.1/internal"},
+                },
+                {"keyword": "iPhone"},
+                {"title": "iPhone 15"},
+            )
 
 
 class SkillDeliveryDispatcherTests(unittest.IsolatedAsyncioTestCase):
@@ -136,6 +151,30 @@ class SkillDeliveryDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["status"], "failed")
         self.assertNotIn(secret_url, kwargs["error_message"])
         self.assertIn("[redacted-url]", kwargs["error_message"])
+
+    async def test_network_error_is_recorded_as_unknown(self):
+        with patch.object(delivery_module, "skill_monitor_feature_enabled", return_value=True), patch.object(
+            delivery_module.db_manager,
+            "get_skill_monitor_delivery_context",
+            return_value=self._context(),
+        ), patch.object(
+            reply_server,
+            "_send_skill_notification_to_channel",
+            side_effect=OutboundRequestError("network_error", "outbound endpoint request failed"),
+        ), patch.object(
+            delivery_module.db_manager,
+            "finish_skill_monitor_delivery",
+            return_value=True,
+        ) as finish_mock:
+            await self.dispatcher_execute(delivery_module.SkillMonitorDeliveryDispatcher(), self._delivery())
+
+        kwargs = finish_mock.call_args.kwargs
+        self.assertEqual(kwargs["status"], "unknown")
+        self.assertEqual(kwargs["error_code"], "send_outcome_unknown")
+
+    @staticmethod
+    async def dispatcher_execute(dispatcher, delivery):
+        await dispatcher._execute(delivery)
 
 
 class SkillAiFilterTests(unittest.TestCase):

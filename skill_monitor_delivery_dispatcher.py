@@ -6,11 +6,11 @@ import asyncio
 import time
 from typing import Dict, Optional, Set
 
-import requests
 from loguru import logger
 
 from db_manager import db_manager
 from skill_monitor_features import skill_monitor_feature_enabled
+from utils.outbound_http import OutboundRequestError
 
 
 SKILL_MONITOR_DELIVERY_HEARTBEAT_SECONDS = 15
@@ -258,9 +258,12 @@ class SkillMonitorDeliveryDispatcher:
                 await asyncio.gather(heartbeat_task, return_exceptions=True)
             from reply_server import _safe_skill_notification_error
 
-            outcome_unknown = isinstance(
-                exc,
-                (requests.RequestException, asyncio.TimeoutError, TimeoutError),
+            outcome_unknown = (
+                isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                or (
+                    isinstance(exc, OutboundRequestError)
+                    and exc.code == "network_error"
+                )
             )
             db_manager.finish_skill_monitor_delivery(
                 delivery_id,

@@ -13,14 +13,15 @@ import os
 import json
 import time
 import sqlite3
-import requests  # 确保已导入
 import threading
 import re
 import uuid
 from typing import List, Dict, Optional, Any
+from urllib.parse import quote
 from loguru import logger
 from openai import OpenAI
 from db_manager import db_manager
+from utils.outbound_http import request_public_http_sync
 
 
 class AIReplyEngine:
@@ -84,15 +85,15 @@ class AIReplyEngine:
             return None
 
         try:
-            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
+            logger.info("创建新的AI兼容客户端实例")
             client = OpenAI(
                 api_key=settings['api_key'],
                 base_url=settings['base_url']
             )
-            logger.info(f"为账号 {cookie_id} 创建OpenAI客户端成功，实际base_url: {client.base_url}")
+            logger.info("AI兼容客户端实例创建成功")
             return client
         except Exception as e:
-            logger.error(f"创建OpenAI客户端失败 {cookie_id}: {e}")
+            logger.error(f"创建AI兼容客户端失败: {type(e).__name__}")
             return None
 
     def _is_dashscope_api(self, settings: dict) -> bool:
@@ -757,7 +758,10 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
         else:
             raise ValueError("DashScope API URL中未找到app_id")
 
-        url = f"https://dashscope.aliyuncs.com/api/v1/apps/{app_id}/completion"
+        url = (
+            "https://dashscope.aliyuncs.com/api/v1/apps/"
+            f"{quote(app_id, safe='-._')}/completion"
+        )
 
         system_content = ""
         user_content = ""
@@ -784,23 +788,29 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             "Content-Type": "application/json"
         }
 
-        logger.info(f"DashScope API请求: {url}")
-        logger.info(f"发送的prompt: {prompt[:100]}...") # 避免 prompt 过长
-        logger.debug(f"请求数据: {json.dumps(data, ensure_ascii=False)}")
+        logger.info(f"DashScope API请求: prompt_length={len(prompt)}")
 
-        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response = request_public_http_sync(
+            "POST",
+            url,
+            headers=headers,
+            json_body=data,
+            timeout_seconds=30,
+            allowed_methods=("POST",),
+            require_https=True,
+        )
 
-        if response.status_code != 200:
-            logger.error(f"DashScope API请求失败: {response.status_code} - {response.text}")
-            raise Exception(f"DashScope API请求失败: {response.status_code} - {response.text}")
+        if response.status != 200:
+            logger.error(f"DashScope API请求失败: status={response.status}")
+            raise Exception(f"DashScope API请求失败: HTTP {response.status}")
 
         result = response.json()
-        logger.debug(f"DashScope API响应: {json.dumps(result, ensure_ascii=False)}")
 
         if 'output' in result and 'text' in result['output']:
             return result['output']['text'].strip()
         else:
-            raise Exception(f"DashScope API响应格式错误: {result}")
+            logger.error("DashScope API响应格式错误")
+            raise Exception("DashScope API响应格式错误")
 
     def _call_gemini_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """
@@ -809,7 +819,10 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
         api_key = settings['api_key']
         model_name = settings['model_name']
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{quote(str(model_name), safe='-._')}:generateContent"
+        )
 
         headers = {"Content-Type": "application/json"}
 
@@ -830,7 +843,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
         user_content = "\n".join(user_content_parts)
 
         if not user_content:
-            logger.warning(f"Gemini API 调用: 未在消息中找到 'user' 角色内容。Messages: {messages}")
+            logger.warning("Gemini API调用缺少用户消息")
             raise ValueError("未在消息中找到用户内容 (user content)")
         # --- 消息格式转换结束 ---
 
@@ -852,30 +865,41 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 "parts": [{"text": system_instruction}]
             }
 
-        logger.info(f"Calling Gemini REST API: {url.split('?')[0]}")
-        logger.debug(f"Gemini Payload: {json.dumps(payload, ensure_ascii=False)}")
+        logger.info(
+            f"Calling Gemini REST API: model={model_name}, "
+            f"user_content_length={len(user_content)}"
+        )
 
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = request_public_http_sync(
+            "POST",
+            url,
+            params={"key": api_key},
+            headers=headers,
+            json_body=payload,
+            timeout_seconds=30,
+            allowed_methods=("POST",),
+            require_https=True,
+        )
 
-        if response.status_code != 200:
-            logger.error(f"Gemini API 请求失败: {response.status_code} - {response.text}")
-            raise Exception(f"Gemini API 请求失败: {response.status_code} - {response.text}")
+        if response.status != 200:
+            logger.error(f"Gemini API请求失败: status={response.status}")
+            raise Exception(f"Gemini API请求失败: HTTP {response.status}")
 
         result = response.json()
-        logger.debug(f"Gemini API 响应: {json.dumps(result, ensure_ascii=False)}")
 
         try:
             reply_text = result['candidates'][0]['content']['parts'][0]['text']
             return reply_text.strip()
         except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Gemini API 响应格式错误: {result} - {e}")
-            raise Exception(f"Gemini API 响应格式错误: {result}")
+            logger.error(f"Gemini API响应格式错误: {type(e).__name__}")
+            raise Exception("Gemini API响应格式错误")
 
     def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """调用OpenAI兼容API"""
         try:
-            logger.info(f"调用OpenAI API: model={settings['model_name']}, base_url={settings.get('base_url', 'default')}")
-            kwargs = {
+            del client
+            logger.info(f"调用AI兼容API: model={settings['model_name']}")
+            body = {
                 "model": settings['model_name'],
                 "messages": messages,
                 "max_tokens": max(max_tokens, 160),
@@ -884,23 +908,33 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             if self._is_deepseek_api(settings):
                 # DeepSeek V4 thinking mode defaults to enabled. With short customer-service
                 # budgets it can return reasoning without final content, so force non-thinking.
-                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                body["thinking"] = {"type": "disabled"}
 
-            response = client.chat.completions.create(**kwargs)
-            message = response.choices[0].message
-            content = (message.content or '').strip()
+            response = request_public_http_sync(
+                "POST",
+                f"{str(settings.get('base_url') or '').rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings['api_key']}",
+                    "Content-Type": "application/json",
+                },
+                json_body=body,
+                timeout_seconds=30,
+                allowed_methods=("POST",),
+                require_https=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            choices = payload.get('choices') if isinstance(payload, dict) else None
+            first_choice = choices[0] if isinstance(choices, list) and choices else {}
+            message = first_choice.get('message') if isinstance(first_choice, dict) else {}
+            content = str(message.get('content') or '').strip() if isinstance(message, dict) else ''
             if not content:
-                finish_reason = getattr(response.choices[0], 'finish_reason', '')
-                usage = getattr(response, 'usage', None)
-                logger.warning(f"OpenAI兼容API返回空内容: finish_reason={finish_reason}, usage={usage}")
+                finish_reason = first_choice.get('finish_reason') if isinstance(first_choice, dict) else ''
+                logger.warning(f"AI兼容API返回空内容: finish_reason={finish_reason}")
                 return ''
             return content
         except Exception as e:
-            logger.error(f"OpenAI API调用失败: {e}")
-            # 如果有详细的错误信息，打印出来
-            if hasattr(e, 'response'):
-                logger.error(f"响应状态码: {getattr(e.response, 'status_code', 'unknown')}")
-                logger.error(f"响应内容: {getattr(e.response, 'text', 'unknown')}")
+            logger.error(f"AI兼容API调用失败: error_type={type(e).__name__}")
             raise
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
@@ -931,16 +965,16 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             # 同样，你也可以通过正则表达式来匹配纯数字，比如 "100" "80"
             # 但那可能有点复杂，先加关键词是最小改动
             if any(kw in msg_lower for kw in price_keywords):
-                logger.debug(f"本地意图检测: price ({message})")
+                logger.debug("本地意图检测: price")
                 return 'price'
 
             # 技术相关关键词
             tech_keywords = ['怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动']
             if any(kw in msg_lower for kw in tech_keywords):
-                logger.debug(f"本地意图检测: tech ({message})")
+                logger.debug("本地意图检测: tech")
                 return 'tech'
 
-            logger.debug(f"本地意图检测: default ({message})")
+            logger.debug("本地意图检测: default")
             return 'default'
 
         except Exception as e:
@@ -971,11 +1005,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
 
             # 如果调用方已经实现了去抖（debounce），可以通过 skip_wait=True 跳过内部等待
             if not skip_wait:
-                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息: {message[:20]}... (时间:{message_created_at})")
+                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息")
                 # 固定等待10秒，等待可能的后续消息（在锁外延迟，避免阻塞其他消息保存）
                 time.sleep(10)
             else:
-                logger.info(f"【{cookie_id}】消息已保存（外部防抖已启用，跳过内部等待）: {message[:20]}... (时间:{message_created_at})")
+                logger.info(f"【{cookie_id}】消息已保存，外部防抖已启用")
 
             # 获取该chat_id的锁，确保同一对话的消息串行处理
             chat_lock = self._get_chat_lock(chat_id)
@@ -987,16 +1021,16 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 # 如果 skip_wait=False（内部等待），查询窗口为25秒（10秒等待 + 10秒消息间隔 + 5秒缓冲）
                 query_seconds = 6 if skip_wait else 25
                 recent_messages = self._get_recent_user_messages(chat_id, cookie_id, item_id, seconds=query_seconds)
-                logger.info(f"【{cookie_id}】最近{query_seconds}秒内的消息: {[msg['content'][:20] for msg in recent_messages]}")
+                logger.info(f"【{cookie_id}】最近{query_seconds}秒内消息数量: {len(recent_messages)}")
 
                 if recent_messages and len(recent_messages) > 0:
                     # 只处理最后一条消息（时间戳最新的）
                     latest_message = recent_messages[-1]
                     if message_created_at != latest_message['created_at']:
-                        logger.info(f"【{cookie_id}】检测到有更新的消息，跳过当前消息: {message[:20]}... (时间:{message_created_at})，最新消息: {latest_message['content'][:20]}... (时间:{latest_message['created_at']})")
+                        logger.info(f"【{cookie_id}】检测到更新消息，跳过较早消息")
                         return None
                     else:
-                        logger.info(f"【{cookie_id}】当前消息是最新消息，开始处理: {message[:20]}... (时间:{message_created_at})")
+                        logger.info(f"【{cookie_id}】当前消息为最新消息，开始处理")
 
                 # 1. 获取AI回复设置
                 settings = db_manager.get_ai_reply_settings(cookie_id)
@@ -1074,20 +1108,13 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 # 11. 保存AI回复到对话记录
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent)
 
-                # 12. 更新议价次数 (此方法已在 get_bargain_count 中通过 SQL COUNT(*) 隐式实现)
-                if intent == "price":
-                    # self.increment_bargain_count(chat_id, cookie_id) # 此行原先就没有，保持不变
-                    pass
-
                 logger.info(f"AI回复生成成功 (账号: {cookie_id}, 回复长度: {len(reply)})")
                 return reply
 
         except Exception as e:
-            logger.error(f"AI回复生成失败 {cookie_id}: {e}")
-            if hasattr(e, 'response') and hasattr(e.response, 'url'):
-                logger.error(f"请求URL: {e.response.url}")
-            if hasattr(e, 'request') and hasattr(e.request, 'url'):
-                logger.error(f"请求URL: {e.request.url}")
+            logger.error(
+                f"AI回复生成失败 {cookie_id}: error_type={type(e).__name__}"
+            )
             return None
 
     async def generate_reply_async(self, message: str, item_info: dict, chat_id: str,
@@ -1101,7 +1128,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             import asyncio as _asyncio
             return await _asyncio.to_thread(self.generate_reply, message, item_info, chat_id, cookie_id, user_id, item_id, skip_wait)
         except Exception as e:
-            logger.error(f"异步生成回复失败: {e}")
+            logger.error(f"异步生成回复失败: error_type={type(e).__name__}")
             return None
 
     def get_conversation_context(self, chat_id: str, cookie_id: str, item_id: str, limit: int = 20) -> List[Dict]:
@@ -1119,7 +1146,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 context = [{"role": row[0], "content": row[1]} for row in reversed(results)]
                 return context
         except Exception as e:
-            logger.error(f"获取对话上下文失败: {e}")
+            logger.error(f"获取对话上下文失败: error_type={type(e).__name__}")
             return []
 
     def save_conversation(self, chat_id: str, cookie_id: str, user_id: str,
@@ -1143,7 +1170,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 result = cursor.fetchone()
                 return result[0] if result else None
         except Exception as e:
-            logger.error(f"保存对话记录失败: {e}")
+            logger.error(f"保存对话记录失败: error_type={type(e).__name__}")
             return None
     def get_bargain_count(self, chat_id: str, cookie_id: str, item_id: str) -> int:
         """获取议价次数"""
@@ -1158,7 +1185,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 result = cursor.fetchone()
                 return result[0] if result else 0
         except Exception as e:
-            logger.error(f"获取议价次数失败: {e}")
+            logger.error(f"获取议价次数失败: error_type={type(e).__name__}")
             return 0
 
     def _get_recent_user_messages(self, chat_id: str, cookie_id: str, item_id: str, seconds: int = 2) -> List[Dict]:
@@ -1166,20 +1193,6 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
         try:
             with db_manager.lock:
                 cursor = db_manager.conn.cursor()
-                # 先查询所有该chat的user消息，用于调试
-                cursor.execute('''
-                SELECT content, created_at,
-                       julianday('now') - julianday(created_at) as time_diff_days,
-                       (julianday('now') - julianday(created_at)) * 86400.0 as time_diff_seconds
-                FROM ai_conversations
-                WHERE chat_id = ? AND cookie_id = ? AND item_id = ? AND role = 'user'
-                ORDER BY created_at DESC LIMIT 10
-                ''', (chat_id, cookie_id, item_id))
-
-                all_messages = cursor.fetchall()
-                logger.info(f"【调试】chat_id={chat_id} 最近10条user消息: {[(msg[0][:10], msg[1], f'{msg[3]:.2f}秒前') for msg in all_messages]}")
-
-                # 正式查询
                 cursor.execute('''
                 SELECT content, created_at FROM ai_conversations
                 WHERE chat_id = ? AND cookie_id = ? AND item_id = ? AND role = 'user'
@@ -1190,24 +1203,8 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 results = cursor.fetchall()
                 return [{"content": row[0], "created_at": row[1]} for row in results]
         except Exception as e:
-            logger.error(f"获取最近用户消息列表失败: {e}")
+            logger.error(f"获取最近用户消息列表失败: error_type={type(e).__name__}")
             return []
-
-    def increment_bargain_count(self, chat_id: str, cookie_id: str):
-        """(此方法已废弃，通过 get_bargain_count 的 SQL 查询实现)"""
-        pass
-
-    #
-    # --- 修复 P0-2: 移除所有有状态的缓存管理方法 ---
-    #
-
-    # def clear_client_cache(self, cookie_id: str = None):
-    #     """(已移除) 清理客户端缓存"""
-    #     pass
-
-    # def cleanup_unused_clients(self, max_idle_hours: int = 24):
-    #     """(已移除) 清理长时间未使用的客户端"""
-    #     pass
 
 
 # 全局AI回复引擎实例

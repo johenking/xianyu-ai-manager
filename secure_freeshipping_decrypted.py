@@ -64,9 +64,7 @@ class SecureFreeshipping:
             'data': data_val,
         }
 
-        # 打印参数信息
-        logger.info(f"【{self.cookie_id}】免拼发货请求参数: data_val = {data_val}")
-        logger.info(f"【{self.cookie_id}】参数详情 - order_id: {order_id}, item_id: {item_id}, buyer_id: {buyer_id}")
+        logger.info(f"【{self.cookie_id}】免拼发货请求已构造")
 
         # 始终从最新的cookies中获取_m_h5_tk token（刷新后cookies会被更新）
         token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
@@ -105,7 +103,10 @@ class SecureFreeshipping:
                         await self.update_config_cookies()
                         logger.debug("已更新Cookie到数据库")
 
-                logger.info(f"【{self.cookie_id}】自动免拼发货响应: {res_json}")
+                logger.info(
+                    f"【{self.cookie_id}】自动免拼发货响应已接收: "
+                    f"ret_count={len(res_json.get('ret') or [])}"
+                )
 
                 # 检查响应结果
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
@@ -119,7 +120,10 @@ class SecureFreeshipping:
 
 
         except Exception as e:
-            logger.error(f"【{self.cookie_id}】自动免拼发货API请求异常: {self._safe_str(e)}")
+            logger.error(
+                f"【{self.cookie_id}】自动免拼发货API请求异常: "
+                f"{type(e).__name__}"
+            )
             await asyncio.sleep(0.5)
 
             # 网络异常也进行重试
@@ -127,4 +131,4 @@ class SecureFreeshipping:
                 logger.info(f"【{self.cookie_id}】网络异常，准备重试...")
                 return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
 
-            return {"error": f"网络异常: {self._safe_str(e)}", "order_id": order_id}
+            return {"error": f"网络异常: {type(e).__name__}", "order_id": order_id}

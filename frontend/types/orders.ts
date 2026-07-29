@@ -62,6 +62,32 @@ export interface OrderSyncSummary {
   details_updated: number;
   unchanged: number;
   failed: number;
+  status_unconfirmed: number;
+  field_coverage: Record<OrderSyncCoverageField, OrderSyncFieldCoverage>;
+}
+
+export type OrderSyncCoverageField =
+  | 'status'
+  | 'item_image'
+  | 'buyer_nickname'
+  | 'buyer_avatar'
+  | 'amount'
+  | 'time';
+
+export interface OrderSyncFieldCoverage {
+  covered: number;
+  total: number;
+  rate: number;
+}
+
+export interface OrderSyncAccountResult {
+  cookie_id: string;
+  success: boolean;
+  partial?: boolean;
+  error_code?: string;
+  requires_login?: boolean;
+  message?: string;
+  fields_obtained?: OrderSyncCoverageField[];
 }
 
 export interface OrderSyncResponse {
@@ -71,5 +97,21 @@ export interface OrderSyncResponse {
   days: number;
   summary: OrderSyncSummary;
   requires_login: string[];
-  accounts: Array<{ cookie_id: string; success: boolean; message?: string }>;
+  accounts: OrderSyncAccountResult[];
+}
+
+export interface OrderRefreshResponse {
+  success: boolean;
+  partial: boolean;
+  error_code: string;
+  requires_login: boolean;
+  message: string;
+  summary: OrderSyncSummary;
+  fields_obtained: OrderSyncCoverageField[];
+  data?: {
+    order_id: string;
+    order_status: OrderStatus;
+    status_changed: boolean;
+    details_changed: boolean;
+  };
 }

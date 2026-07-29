@@ -3,7 +3,7 @@ import React from 'react';
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { deleteOrder, getOrderDetail, getOrders, getAccountDetails, syncOrders } from '../services/api';
+import { deleteOrder, getOrderDetail, getOrders, getAccountDetails, syncOrders, syncSingleOrder } from '../services/api';
 import OrderList from './OrderList';
 import { clearOrderItemImageCache } from './ui/OrderItemImage';
 
@@ -27,6 +27,27 @@ const pageOf = (data: any[], extra: Record<string, unknown> = {}) => ({
   page: 1,
   page_size: 20,
   total_pages: 1,
+  ...extra,
+});
+
+const syncCoverage = (total = 0) => ({
+  status: { covered: 0, total, rate: 0 },
+  item_image: { covered: 0, total, rate: 0 },
+  buyer_nickname: { covered: 0, total, rate: 0 },
+  buyer_avatar: { covered: 0, total, rate: 0 },
+  amount: { covered: 0, total, rate: 0 },
+  time: { covered: 0, total, rate: 0 },
+});
+
+const syncSummary = (extra: Record<string, unknown> = {}) => ({
+  total_seen: 0,
+  discovered: 0,
+  status_updated: 0,
+  details_updated: 0,
+  unchanged: 0,
+  failed: 0,
+  status_unconfirmed: 0,
+  field_coverage: syncCoverage(),
   ...extra,
 });
 
@@ -83,20 +104,86 @@ describe('OrderList status sync', () => {
   });
 
   it('shows login recovery guidance when recent sync requires login', async () => {
+    const onNavigateAccounts = vi.fn();
     vi.mocked(syncOrders).mockResolvedValue({
       success: false,
+      partial: false,
       message: '登录状态已过期，请先在账号管理更新登录状态',
       days: 90,
-      summary: { total_seen: 0, discovered: 0, status_updated: 0, details_updated: 0, unchanged: 0, failed: 0 },
+      summary: syncSummary(),
       requires_login: ['account-1'],
       accounts: [],
     });
-    render(<OrderList />);
+    render(<OrderList onNavigateAccounts={onNavigateAccounts} />);
 
     fireEvent.click(await screen.findByRole('button', { name: '同步近90天订单' }));
 
     expect((await screen.findAllByText(/登录状态已过期/)).length).toBeGreaterThan(0);
     expect(screen.getByText(/account-1/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '前往账号管理' }));
+    expect(onNavigateAccounts).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders partial sync, unconfirmed status and field coverage', async () => {
+    vi.mocked(syncOrders).mockResolvedValue({
+      success: false,
+      partial: true,
+      message: '订单同步部分完成',
+      days: 90,
+      summary: syncSummary({
+        total_seen: 1,
+        failed: 1,
+        status_unconfirmed: 1,
+        field_coverage: {
+          ...syncCoverage(1),
+          item_image: { covered: 1, total: 1, rate: 1 },
+          amount: { covered: 1, total: 1, rate: 1 },
+        },
+      }),
+      requires_login: [],
+      accounts: [{
+        cookie_id: 'account-1',
+        success: false,
+        partial: true,
+        error_code: 'status_unconfirmed',
+        message: '平台状态仍待确认',
+      }],
+    });
+    render(<OrderList />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '同步近90天订单' }));
+
+    expect((await screen.findAllByText('订单同步部分完成')).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('状态待确认 1')).toBeInTheDocument();
+    expect(screen.getByText('商品图片')).toBeInTheDocument();
+    expect(screen.getByText('买家昵称')).toBeInTheDocument();
+    expect(screen.getAllByText('100%').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/平台状态仍待确认/)).toBeInTheDocument();
+  });
+
+  it('treats single-order partial refresh as partial instead of success', async () => {
+    vi.mocked(syncSingleOrder).mockResolvedValue({
+      success: false,
+      partial: true,
+      error_code: 'status_unconfirmed',
+      requires_login: false,
+      message: '订单已获取部分字段，但平台状态仍待确认',
+      summary: syncSummary({ status_unconfirmed: 1, failed: 1 }),
+      fields_obtained: ['amount'],
+      data: {
+        order_id: 'refund-1',
+        order_status: 'refunded',
+        status_changed: false,
+        details_changed: true,
+      },
+    });
+    render(<OrderList />);
+
+    fireEvent.click((await screen.findAllByTitle(/查看详情/))[0]);
+    fireEvent.click(await screen.findByRole('button', { name: /同步此订单/ }));
+
+    expect(await screen.findByText('订单已获取部分字段，但平台状态仍待确认')).toBeInTheDocument();
+    expect(screen.queryByText('订单同步完成')).not.toBeInTheDocument();
   });
 });
 

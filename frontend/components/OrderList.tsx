@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, OrderSyncResponse, AccountDetail } from '../types';
 import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails } from '../services/api';
-import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload } from 'lucide-react';
+import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload, LogIn } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
 import OrderItemImage from './ui/OrderItemImage';
 import BuyerAvatar from './ui/BuyerAvatar';
@@ -14,6 +14,15 @@ const BUYER_IDENTITY_LABELS: Record<string, string> = {
 };
 
 const SEARCH_DEBOUNCE_MS = 280;
+
+const SYNC_FIELD_LABELS = {
+  status: '订单状态',
+  item_image: '商品图片',
+  buyer_nickname: '买家昵称',
+  buyer_avatar: '买家头像',
+  amount: '实付金额',
+  time: '成交时间',
+} as const;
 
 const buyerListLabel = (order: Order): string => {
   if (order.buyer_display_name?.trim()) return order.buyer_display_name.trim();
@@ -79,7 +88,7 @@ const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => {
   );
 };
 
-const OrderList: React.FC = () => {
+const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAccounts }) => {
   const [orders, setOrders] = useState<Order[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -110,6 +119,7 @@ const OrderList: React.FC = () => {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [syncResult, setSyncResult] = useState<OrderSyncResponse | null>(null);
+  const [loginRecoveryAccounts, setLoginRecoveryAccounts] = useState<string[]>([]);
   // 请求代际号：旧响应到达时直接丢弃，避免慢请求覆盖新筛选结果
   const requestGeneration = useRef(0);
   const listAbortController = useRef<AbortController | null>(null);
@@ -242,13 +252,17 @@ const OrderList: React.FC = () => {
   const handleSync = async () => {
       setLoading(true);
       setSyncResult(null);
+      setLoginRecoveryAccounts([]);
       setPageNotice({ tone: 'info', text: '正在发现并核对近 90 天订单' });
       try {
         const result = await syncOrders(undefined, 90);
         setSyncResult(result);
+        setLoginRecoveryAccounts(result.requires_login);
         await loadOrders();
         setPageNotice({
-          tone: result.requires_login.length > 0 || !result.success ? 'error' : 'success',
+          tone: result.requires_login.length > 0 || (!result.success && !result.partial)
+            ? 'error'
+            : result.partial ? 'info' : 'success',
           text: result.message || '订单同步完成',
         });
       } catch (error) {
@@ -390,14 +404,19 @@ const OrderList: React.FC = () => {
 
   const handleSyncSingle = async (orderId: string) => {
     setSyncingOrderId(orderId);
+    setLoginRecoveryAccounts([]);
     try {
       const result = await syncSingleOrder(orderId);
-      if (result.success) {
+      if (result.success || result.partial) {
         await loadOrders();
-        setPageNotice({ tone: 'success', text: result.message || '订单同步完成' });
-      } else {
-        setPageNotice({ tone: 'error', text: result.message || '同步失败' });
       }
+      if (result.requires_login && selectedOrder?.cookie_id) {
+        setLoginRecoveryAccounts([selectedOrder.cookie_id]);
+      }
+      setPageNotice({
+        tone: result.success ? 'success' : result.partial ? 'info' : 'error',
+        text: result.message || (result.partial ? '订单已获取部分字段' : '同步失败'),
+      });
     } catch (error: any) {
       console.error('同步订单失败:', error);
       setPageNotice({ tone: 'error', text: error?.message || '同步失败，请重试' });
@@ -455,7 +474,7 @@ const OrderList: React.FC = () => {
       </div>
 
       {syncResult && (
-        <div className={`border px-4 py-3 rounded-xl text-sm ${syncResult.requires_login.length ? 'bg-red-50 border-red-200 text-red-800' : 'bg-white border-gray-200 text-gray-700'}`}>
+        <div className={`border px-4 py-3 rounded-lg text-sm ${syncResult.requires_login.length ? 'bg-red-50 border-red-200 text-red-800' : syncResult.partial ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-emerald-50 border-emerald-200 text-emerald-900'}`}>
           <div className="font-bold">{syncResult.message}</div>
           <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs">
             <span>发现 {syncResult.summary.discovered}</span>
@@ -463,12 +482,49 @@ const OrderList: React.FC = () => {
             <span>详情更新 {syncResult.summary.details_updated}</span>
             <span>无变化 {syncResult.summary.unchanged}</span>
             <span>失败 {syncResult.summary.failed}</span>
+            <span>状态待确认 {syncResult.summary.status_unconfirmed}</span>
           </div>
-          {syncResult.requires_login.length > 0 && (
-            <div className="mt-2 font-medium">
-              需要更新登录状态的账号：{syncResult.requires_login.join('、')}。请前往账号管理恢复登录后再同步。
+          <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-current/10 pt-3 sm:grid-cols-3 lg:grid-cols-6">
+            {Object.entries(SYNC_FIELD_LABELS).map(([field, label]) => {
+              const coverage = syncResult.summary.field_coverage[field as keyof typeof SYNC_FIELD_LABELS];
+              return (
+                <div key={field} className="min-w-0">
+                  <div className="text-[11px] opacity-70">{label}</div>
+                  <div className="mt-0.5 font-bold tabular-nums">
+                    {coverage.total ? `${coverage.covered}/${coverage.total}` : '0/0'}
+                    <span className="ml-1 text-[11px] font-medium opacity-70">
+                      {Math.round(coverage.rate * 100)}%
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {syncResult.accounts.some((account) => !account.success) && (
+            <div className="mt-3 border-t border-current/10 pt-3 text-xs">
+              {syncResult.accounts.filter((account) => !account.success).map((account) => (
+                <div key={account.cookie_id}>
+                  {accountNames[account.cookie_id] || account.cookie_id}：{account.message || account.error_code || '同步未完成'}
+                </div>
+              ))}
             </div>
           )}
+        </div>
+      )}
+
+      {loginRecoveryAccounts.length > 0 && (
+        <div className="flex flex-col gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="font-bold">账号登录状态需要恢复</div>
+            <div className="mt-1 text-xs">{loginRecoveryAccounts.map((id) => accountNames[id] || id).join('、')}</div>
+          </div>
+          <button
+            type="button"
+            onClick={onNavigateAccounts}
+            className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white"
+          >
+            <LogIn className="h-4 w-4" />前往账号管理
+          </button>
         </div>
       )}
 

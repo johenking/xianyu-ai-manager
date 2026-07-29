@@ -140,11 +140,19 @@ class AuthLogSafetyTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         sink_id = logger.add(output, level="DEBUG", format="{message}")
         try:
-            with patch.object(
-                reply_server.qr_login_manager,
-                "get_session_status",
-                side_effect=RuntimeError(secret),
+            with (
+                patch.object(reply_server, "get_session_registry") as get_registry,
+                patch.object(
+                    reply_server.qr_login_manager,
+                    "get_session_status",
+                    side_effect=RuntimeError(secret),
+                ),
             ):
+                get_registry.return_value.get.return_value = {
+                    "session_id": "safe-session",
+                    "owner_user_id": 7,
+                    "status": "processing",
+                }
                 result = await reply_server.check_qr_code_status(
                     "safe-session",
                     current_user={"user_id": 7, "username": "operator"},

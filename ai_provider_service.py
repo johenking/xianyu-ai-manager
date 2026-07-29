@@ -8,9 +8,10 @@ import secrets
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import quote
 
-import requests
 from cryptography.fernet import Fernet, InvalidToken
+from utils.outbound_http import request_public_http_sync
 
 
 PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
@@ -140,7 +141,7 @@ def _openai_endpoint(base_url: str, suffix: str) -> str:
 
 def discover_provider_models(
     profile: Dict[str, Any],
-    get: Callable[..., Any] = requests.get,
+    get: Optional[Callable[..., Any]] = None,
     timeout: int = 20,
 ) -> List[str]:
     api_key = str(profile.get("api_key") or "")
@@ -151,15 +152,35 @@ def discover_provider_models(
         raise ValueError("请先配置 API 地址")
 
     if profile.get("provider_type") == "gemini":
-        response = get(f"{base_url}/models", params={"key": api_key}, timeout=timeout)
+        if get is not None:
+            response = get(f"{base_url}/models", params={"key": api_key}, timeout=timeout)
+        else:
+            response = request_public_http_sync(
+                "GET",
+                f"{base_url}/models",
+                params={"key": api_key},
+                timeout_seconds=timeout,
+                allowed_methods=("GET",),
+                require_https=True,
+            )
         response.raise_for_status()
         return extract_gemini_models(response.json())
 
-    response = get(
-        _openai_endpoint(base_url, "models"),
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=timeout,
-    )
+    if get is not None:
+        response = get(
+            _openai_endpoint(base_url, "models"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+    else:
+        response = request_public_http_sync(
+            "GET",
+            _openai_endpoint(base_url, "models"),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout_seconds=timeout,
+            allowed_methods=("GET",),
+            require_https=True,
+        )
     response.raise_for_status()
     return extract_openai_models(response.json())
 
@@ -167,7 +188,7 @@ def discover_provider_models(
 def test_provider_reply(
     profile: Dict[str, Any],
     model_name: str,
-    post: Callable[..., Any] = requests.post,
+    post: Optional[Callable[..., Any]] = None,
     timeout: int = 30,
 ) -> str:
     model_name = str(model_name or "").strip()
@@ -182,16 +203,33 @@ def test_provider_reply(
 
     prompt = "请只回复：连接成功"
     if profile.get("provider_type") == "gemini":
-        response = post(
-            f"{base_url}/models/{model_name}:generateContent",
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 32},
-            },
-            timeout=timeout,
+        url = (
+            f"{base_url}/models/"
+            f"{quote(model_name, safe='-._')}:generateContent"
         )
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 32},
+        }
+        if post is not None:
+            response = post(
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=timeout,
+            )
+        else:
+            response = request_public_http_sync(
+                "POST",
+                url,
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json_body=payload,
+                timeout_seconds=timeout,
+                allowed_methods=("POST",),
+                require_https=True,
+            )
         response.raise_for_status()
         payload = response.json()
         try:
@@ -207,12 +245,23 @@ def test_provider_reply(
     }
     if profile.get("preset") == "deepseek" or "deepseek" in base_url.lower():
         body["thinking"] = {"type": "disabled"}
-    response = post(
-        _openai_endpoint(base_url, "chat/completions"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body,
-        timeout=timeout,
-    )
+    if post is not None:
+        response = post(
+            _openai_endpoint(base_url, "chat/completions"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=body,
+            timeout=timeout,
+        )
+    else:
+        response = request_public_http_sync(
+            "POST",
+            _openai_endpoint(base_url, "chat/completions"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json_body=body,
+            timeout_seconds=timeout,
+            allowed_methods=("POST",),
+            require_https=True,
+        )
     response.raise_for_status()
     payload = response.json()
     try:

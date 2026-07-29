@@ -74,9 +74,15 @@ Copying knowledge chooses the source draft, or the published snapshot when no dr
 
 ## Order Synchronization
 
-`order_sync_service.py` discovers seller orders from the recent paginated platform feed and reconciles them with stored details. The default window is 90 days. Status text takes precedence over numeric codes, so signed orders become `completed`, active refunds become `refunding`, successful refunds become `refunded`, and closed refund requests become `refund_cancelled`.
+`order_sync_service.py` discovers seller orders through the direct MTOP seller feed and reconciles them with stored details. Accounts synchronize under a keyed lock; pagination is serial, bounded, delayed between pages, and retries only classified 429, network, and 5xx failures. A single-order refresh stops when the target appears. A successful envelope without a recognized list container is an invalid response, never an empty successful sync. Status text takes precedence over numeric codes, with longer phrases such as "waiting for buyer confirmation" evaluated before "confirm receipt".
 
-Unknown or failed responses never overwrite a reliable stored status. Shipped, completed, refunding, and legacy closed orders remain eligible for detail checks because completion can later move to refund. Session expiry stops that account's sync with `requires_login` instead of counting the attempt as success. Unmatched status events are persisted in `order_status_events` and reconciled when the corresponding order is later discovered.
+Unknown or failed responses never overwrite a reliable stored status. `PUT /api/orders/{order_id}` changes only explicitly supplied local fields; platform refresh uses the structured `/refresh` or `/sync` path. Automatic delivery accepts only a direct API `pending_ship` result and fails closed on unknown, missing, mismatched, or denied responses. A real order-detail adapter remains unregistered until an authenticated canary verifies its response fields; DOM status guesses are never authoritative.
+
+`orders.ordered_at_utc` is a saved platform order-time snapshot whose exact source is carried in `ordered_at_source`. It supports time-of-day analysis but is not asserted to be the payment, settlement, shipment, or completion timestamp.
+
+Migration `2026072701` stores tenant-scoped verified item metric snapshots. Migration `2026072702` stores the three-canary state per user and account. Migration `2026072703` binds metric rows and state to account ownership and adds durable fulfillment attempts plus card reservations. Adapter batches are limited, timed out, and committed atomically; counter resets never become negative traffic and out-of-order snapshots are rejected. Counter deltas belong to the full interval between consecutive snapshots. The four-hour scheduler therefore reports approximate observation windows and never attributes an interval delta to one hour. The real adapter is unregistered by default, and the scheduler remains off until an account independently passes three live canaries.
+
+Fulfillment persists `prepared` before inventory is used, moves to `sending` before the first irreversible platform or buyer-facing action, and reaches `committed` only after the complete quantity is acknowledged. A pre-send cancellation can reach `released`; any crash, partial send, or uncertain result after `sending` reaches `manual_review` and keeps its reservations out of the available inventory pool.
 
 ## AI Providers And Settings
 
@@ -99,7 +105,9 @@ Core tables:
 - `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.
 - `ai_training_rules`: global and product-scoped rules with enabled state.
 - `ai_item_knowledge_profiles`, `ai_item_knowledge_versions`: knowledge draft, published snapshot, and version history.
-- `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory, delivery, synchronized orders and deferred status events, and products.
+- `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory rules, synchronized orders and deferred status events, and products.
+- `item_metric_snapshots`, `item_metric_collection_states`: verified metric history and account-scoped, default-off collection gates.
+- `fulfillment_attempts`, `fulfillment_card_reservations`: durable delivery state and inventory reservations that survive process restarts.
 - `notification_channels`, `message_notifications`, `risk_control_logs`: notification and risk-control records.
 - `skill_monitor_tasks`, `skill_monitor_results`, `skill_agent_prompts`, `skill_run_logs`: Skill Center schedules, run state, deduplicated results, expert prompts, and audit logs.
 
@@ -116,7 +124,7 @@ Core tables:
 - AI training: `/ai-reply-lab/*`, `/ai-training-rules/*`.
 - Product knowledge: `/ai-item-knowledge/{cookie_id}/{item_id}/*`.
 - Replies and inventory: `/keywords*`, `/default-replies*`, `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`.
-- Orders and analytics: role-aware `GET /api/dashboard/summary`, `POST /api/orders/sync`, `/api/orders*`, `/analytics/orders*`.
+- Orders and analytics: role-aware `GET /api/dashboard/summary`, structured `POST /api/orders/sync`, `/api/orders*`, order timing and buyer behavior, `/analytics/items/performance`, `/analytics/items/traffic`, and account-scoped metric status/manual canaries.
 - Skill Center: `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*`.
 
 ## Skill Center Boundary

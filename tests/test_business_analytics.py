@@ -93,21 +93,24 @@ class BusinessAnalyticsTests(unittest.TestCase):
             #  a/b: buyer-x 复购，东八区 14 点；c: buyer-y 15 点；d: buyer-z 无成交时间
             rows = (
                 ("order-a", "item-1", "buyer-x", "买家X", "¥10.00", "completed",
-                 "one-active", "2026-07-10 09:00:00", _epoch_cst(2026, 7, 10, 14, 30)),
+                 "one-active", "2026-07-10 09:00:00", _epoch_cst(2026, 7, 10, 14, 30), 1000),
                 ("order-b", "item-1", "buyer-x", "买家X", "¥22.50", "completed",
-                 "one-active", "2026-07-10 09:05:00", _epoch_cst(2026, 7, 10, 14, 50)),
+                 "one-active", "2026-07-10 09:05:00", _epoch_cst(2026, 7, 10, 14, 50), 2250),
                 ("order-c", "item-2", "buyer-y", "买家Y", "¥5.00", "completed",
-                 "one-active", "2026-07-10 09:10:00", _epoch_cst(2026, 7, 10, 15, 10)),
+                 "one-active", "2026-07-10 09:10:00", _epoch_cst(2026, 7, 10, 15, 10), 500),
                 ("order-d", "item-3", "buyer-z", "买家Z", "¥8.00", "completed",
-                 "one-active", "2026-07-10 09:15:00", None),
+                 "one-active", "2026-07-10 09:15:00", None, 800),
+                # 异常货币文本不参与金额，订单本身仍计数。
+                ("order-null", "item-4", "buyer-null", "买家空额", "AUD 9.00", "completed",
+                 "one-active", "2026-07-10 09:18:00", _epoch_cst(2026, 7, 10, 16, 0), None),
                 # user_two 名下 1 单：租户隔离验证，不得泄漏到 user_one 的结果
                 ("order-e", "item-9", "buyer-w", "买家W", "¥99.00", "completed",
-                 "two-active", "2026-07-10 09:20:00", _epoch_cst(2026, 7, 10, 14, 0)),
+                 "two-active", "2026-07-10 09:20:00", _epoch_cst(2026, 7, 10, 14, 0), 9900),
             )
             cursor.executemany(
                 "INSERT INTO orders (order_id, item_id, buyer_id, buyer_nickname, amount, "
-                "order_status, cookie_id, created_at, ordered_at_utc) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "order_status, cookie_id, created_at, ordered_at_utc, paid_amount_fen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             self.db.conn.commit()
@@ -121,21 +124,100 @@ class BusinessAnalyticsTests(unittest.TestCase):
             include_statuses=["pending_ship", "shipped", "completed"],
         )
         coverage = result["coverage"]
-        # 有效订单 4 单，其中 3 单有成交时间
-        self.assertEqual(coverage["total_orders"], 4)
-        self.assertEqual(coverage["with_ordered_at"], 3)
-        self.assertAlmostEqual(coverage["coverage_rate"], 0.75, places=4)
+        # 有效订单 5 单，其中 4 单有成交时间；空金额订单不从分母移除。
+        self.assertEqual(coverage["total_orders"], 5)
+        self.assertEqual(coverage["with_ordered_at"], 4)
+        self.assertAlmostEqual(coverage["coverage_rate"], 0.8, places=4)
+        self.assertEqual(result["amount_coverage"]["with_amount"], 4)
+        self.assertEqual(result["amount_coverage"]["total_orders"], 5)
+        self.assertEqual(result["metric_source"], "order_transactions")
+        self.assertEqual(result["time_source"], "order_snapshot_ordered_at")
+        self.assertEqual(result["time_semantics"], "platform_order_recorded_at")
+        self.assertFalse(result["sufficient_data"])
+        self.assertIsNone(result["recommendation"])
+        self.assertIn("20", result["insufficient_reason"])
 
         # 东八区小时桶：14 点 2 单、15 点 1 单
         hourly = {row["hour"]: row["order_count"] for row in result["hourly"]}
         self.assertEqual(hourly.get(14), 2)
         self.assertEqual(hourly.get(15), 1)
+        self.assertEqual(hourly.get(16), 1)
         self.assertNotIn(6, hourly)  # 不得按 UTC 小时(06/07)分桶
 
         # 东八区 2026-07-10 是周五：strftime('%w') 周日=0，周五=5
         expected_dow = datetime(2026, 7, 10).strftime("%w")
         weekday = {row["weekday"]: row["order_count"] for row in result["weekday"]}
-        self.assertEqual(weekday.get(expected_dow), 3)
+        self.assertEqual(weekday.get(expected_dow), 4)
+
+    def test_transaction_timing_recommendation_requires_enough_covered_orders(self):
+        with self.db.lock:
+            self.db.conn.executemany(
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status,"
+                " cookie_id, created_at, ordered_at_utc, paid_amount_fen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        f"recommend-{index}",
+                        "item-recommend",
+                        f"buyer-{index}",
+                        "¥10.00",
+                        "completed",
+                        "one-active",
+                        "2026-07-10 10:00:00",
+                        _epoch_cst(2026, 7, 10, 20, index),
+                        1000,
+                    )
+                    for index in range(15)
+                ],
+            )
+            self.db.conn.commit()
+
+        result = self.db.get_traffic_analytics(
+            start_date="2026-07-10",
+            end_date="2026-07-10",
+            user_id=self.user_one["id"],
+            include_statuses=["pending_ship", "shipped", "completed"],
+        )
+        self.assertEqual(result["coverage"]["total_orders"], 20)
+        self.assertEqual(result["coverage"]["with_ordered_at"], 19)
+        self.assertTrue(result["sufficient_data"])
+        self.assertEqual(result["recommendation"]["hour"], 20)
+        self.assertIn("不代表真实曝光流量", result["recommendation"]["message"])
+
+    def test_transaction_timing_recommendation_rejects_low_time_coverage(self):
+        with self.db.lock:
+            self.db.conn.executemany(
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status,"
+                " cookie_id, created_at, ordered_at_utc, paid_amount_fen)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        f"low-coverage-{index}",
+                        "item-low-coverage",
+                        f"buyer-low-{index}",
+                        "¥10.00",
+                        "completed",
+                        "one-active",
+                        "2026-07-10 10:00:00",
+                        None,
+                        1000,
+                    )
+                    for index in range(15)
+                ],
+            )
+            self.db.conn.commit()
+
+        result = self.db.get_traffic_analytics(
+            start_date="2026-07-10",
+            end_date="2026-07-10",
+            user_id=self.user_one["id"],
+            include_statuses=["pending_ship", "shipped", "completed"],
+        )
+        self.assertEqual(result["coverage"]["total_orders"], 20)
+        self.assertEqual(result["coverage"]["with_ordered_at"], 4)
+        self.assertFalse(result["sufficient_data"])
+        self.assertIsNone(result["recommendation"])
+        self.assertIn("80%", result["insufficient_reason"])
 
     def test_traffic_analytics_isolated_per_user(self):
         result = self.db.get_traffic_analytics(
@@ -161,13 +243,15 @@ class BusinessAnalyticsTests(unittest.TestCase):
             include_statuses=["pending_ship", "shipped", "completed"],
         )
         summary = result["summary"]
-        self.assertEqual(summary["total_buyers"], 3)       # x, y, z
+        self.assertEqual(summary["total_buyers"], 4)       # x, y, z, null
         self.assertEqual(summary["repeat_buyers"], 1)      # 仅 x 下单≥2
-        self.assertAlmostEqual(summary["repeat_rate"], 1 / 3, places=4)
+        self.assertAlmostEqual(summary["repeat_rate"], 1 / 4, places=4)
+        self.assertEqual(result["amount_coverage"]["with_amount"], 4)
+        self.assertEqual(result["amount_coverage"]["total_orders"], 5)
 
-        # 频次分布：下 1 单的买家 2 个（y,z），下 2 单的买家 1 个（x）
+        # 频次分布：下 1 单的买家 3 个（y,z,null），下 2 单的买家 1 个（x）
         freq = {row["order_count"]: row["buyer_count"] for row in result["frequency"]}
-        self.assertEqual(freq.get(1), 2)
+        self.assertEqual(freq.get(1), 3)
         self.assertEqual(freq.get(2), 1)
 
     def test_buyer_behavior_contribution_ranking(self):
@@ -184,6 +268,8 @@ class BusinessAnalyticsTests(unittest.TestCase):
         self.assertEqual(top[0]["order_count"], 2)
         self.assertEqual([row["buyer_id"] for row in top[:3]],
                          ["buyer-x", "buyer-z", "buyer-y"])
+        null_row = next(row for row in top if row["buyer_id"] == "buyer-null")
+        self.assertEqual(null_row["total_amount"], 0)
 
     def test_buyer_behavior_isolated_per_user(self):
         result = self.db.get_buyer_behavior_analytics(
@@ -208,8 +294,8 @@ class BusinessAnalyticsTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertEqual(payload["coverage"]["total_orders"], 4)
-        self.assertEqual(payload["coverage"]["with_ordered_at"], 3)
+        self.assertEqual(payload["coverage"]["total_orders"], 5)
+        self.assertEqual(payload["coverage"]["with_ordered_at"], 4)
         hourly = {row["hour"]: row["order_count"] for row in payload["hourly"]}
         self.assertEqual(hourly.get(14), 2)
 
@@ -221,7 +307,7 @@ class BusinessAnalyticsTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
-        self.assertEqual(payload["summary"]["total_buyers"], 3)
+        self.assertEqual(payload["summary"]["total_buyers"], 4)
         self.assertEqual(payload["top_buyers"][0]["buyer_id"], "buyer-x")
 
     def test_analytics_endpoints_are_isolated_across_users(self):

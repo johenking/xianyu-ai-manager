@@ -22,6 +22,10 @@ from utils.xianyu_session_probe import (
     is_allowed_verification_url,
     probe_message_session_sync,
 )
+from utils.verification_images import (
+    ensure_private_verification_root,
+    verification_identity_key,
+)
 
 
 GOOFISH_IM_URL = "https://www.goofish.com/im"
@@ -188,7 +192,7 @@ class XianyuOfficialLoginService:
         self,
         *,
         profile_root: Path | str = "browser_data",
-        verification_root: Path | str = "static/uploads/images",
+        verification_root: Path | str | None = None,
         playwright_factory: Optional[Callable[[], Any]] = None,
         verification_timeout: float = 900.0,
         login_timeout: float = 60.0,
@@ -199,7 +203,7 @@ class XianyuOfficialLoginService:
         ] = probe_message_session_sync,
     ) -> None:
         self.profile_root = Path(profile_root)
-        self.verification_root = Path(verification_root)
+        self.verification_root = ensure_private_verification_root(verification_root)
         self.playwright_factory = playwright_factory or self._default_playwright_factory
         self.verification_timeout = verification_timeout
         self.login_timeout = login_timeout
@@ -1268,8 +1272,7 @@ class XianyuOfficialLoginService:
 
     @staticmethod
     def _safe_screenshot_key(value: str) -> str:
-        raw = str(value or "login").encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()[:12]
+        return verification_identity_key(value)
 
     @staticmethod
     def _install_official_message_listener(page: Any) -> None:

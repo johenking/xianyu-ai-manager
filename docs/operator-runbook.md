@@ -49,7 +49,7 @@ Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.syst
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -65,6 +65,12 @@ npm run verify:build
 The frontend build writes to `static/`. It keeps the current and previous successful asset generations and disables source maps unless `VITE_BUILD_SOURCEMAP=true`. A production build alone does not restart the backend.
 
 The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
+
+Migration `2026072703` is the current candidate schema. It enforces account ownership for metric rows and collection state and adds durable fulfillment attempts and card reservations. A `sending` attempt found after restart, or any partial/uncertain send, must remain `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
+
+The item-metric scheduler must remain stopped unless at least one account has independently completed three real canaries and a verified adapter is registered. `metric_adapter_unavailable` is the expected fail-closed response before that external acceptance; it is not evidence that traffic collection ran. Scheduled collection is approximately every four hours, so traffic deltas are observation-window totals between consecutive snapshots. Do not interpret the compatibility `hourly` field as one-hour traffic; use `observation_windows` and its duration metadata.
+
+Order synchronization uses the direct seller-order MTOP feed. A partial response, `sync_limit_reached`, `status_unconfirmed`, `platform_permission_denied`, or `requires_login` must not be reported as a completed refresh. Automatic delivery requires a current direct API `pending_ship` result and must not fall back to DOM text.
 
 Basic smoke tests:
 

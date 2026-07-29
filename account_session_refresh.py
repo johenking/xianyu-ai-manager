@@ -1,7 +1,8 @@
-import os
 import threading
 import time
 from typing import Any, Optional
+
+from utils.verification_images import remove_private_verification_image
 
 
 LOGIN_METHODS = {
@@ -157,17 +158,7 @@ def resolve_refresh_schedule_anchor(
 
 
 def remove_verification_image(path: Optional[str]) -> None:
-    if not path:
-        return
-    normalized = os.path.normpath(path)
-    allowed_root = os.path.normpath("static/uploads/images")
-    if normalized == allowed_root or not normalized.startswith(allowed_root + os.sep):
-        return
-    try:
-        if os.path.isfile(normalized):
-            os.remove(normalized)
-    except OSError:
-        pass
+    remove_private_verification_image(path)
 
 
 class ActiveRefreshRegistry:

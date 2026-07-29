@@ -4,8 +4,12 @@ import type {
   ApiResponse,
   BuyerBehaviorAnalytics,
   DashboardSummary,
+  ItemMetricStatus,
+  ItemPerformanceAnalytics,
+  ItemTrafficAnalytics,
   Order,
   OrderAnalytics,
+  OrderRefreshResponse,
   OrderSyncResponse,
   PaginatedResponse,
   TrafficAnalytics,
@@ -93,8 +97,24 @@ export const syncOrders = async (cookieId?: string, days: number = 90): Promise<
   return result as OrderSyncResponse;
 };
 
-export const syncSingleOrder = async (orderId: string): Promise<any> => {
-  return post(`/api/orders/${orderId}/refresh`);
+export const syncSingleOrder = async (orderId: string): Promise<OrderRefreshResponse> => {
+  const token = localStorage.getItem('auth_token');
+  const response = await fetch(`/api/orders/${orderId}/refresh`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+    },
+  });
+  const result = await response.json();
+  if (response.status === 401) {
+    localStorage.removeItem('auth_token');
+    window.dispatchEvent(new Event('auth:logout'));
+  }
+  if (!response.ok && response.status !== 409) {
+    throw new Error(result?.message || result?.detail || `订单刷新失败 (${response.status})`);
+  }
+  return result as OrderRefreshResponse;
 };
 
 export const manualShipOrder = async (orderIds: string[], shipMode: 'status_only' | 'full_delivery', content?: string): Promise<any> => {
@@ -155,7 +175,7 @@ export const getValidOrders = async (dateRange: {start_date: string; end_date: s
     return res.orders || [];
 }
 
-// 经营驾驶舱：时段流量分析。租户隔离由后端按登录用户强制执行。
+// 经营驾驶舱：订单时段分析。租户隔离由后端按登录用户强制执行。
 export const getTrafficAnalytics = async (
     dateRange: { start_date: string; end_date: string },
 ): Promise<TrafficAnalytics> => {
@@ -174,3 +194,25 @@ export const getBuyerBehaviorAnalytics = async (
         end_date: dateRange.end_date,
     });
 }
+
+export const getItemPerformanceAnalytics = async (
+    dateRange: { start_date: string; end_date: string },
+): Promise<ItemPerformanceAnalytics> => {
+    return get('/analytics/items/performance', {
+        start_date: dateRange.start_date,
+        end_date: dateRange.end_date,
+    });
+}
+
+export const getItemTrafficAnalytics = async (
+    dateRange: { start_date: string; end_date: string },
+): Promise<ItemTrafficAnalytics> => {
+    return get('/analytics/items/traffic', {
+        start_date: dateRange.start_date,
+        end_date: dateRange.end_date,
+    });
+}
+
+export const getItemMetricStatus = async (): Promise<ItemMetricStatus> => {
+    return get('/analytics/items/metrics/status');
+};

@@ -2,6 +2,7 @@ import sqlite3
 import os
 import threading
 import hashlib
+import math
 import time
 import json
 import random
@@ -14,7 +15,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
-from typing import List, Tuple, Dict, Optional, Any, Sequence
+from typing import List, Tuple, Dict, Optional, Any, Sequence, Iterable
 from zoneinfo import ZoneInfo
 from loguru import logger
 
@@ -58,6 +59,84 @@ COOKIE_REFRESH_MAX_INTERVAL_MINUTES = 10080
 SKILL_MONITOR_RUN_LEASE_SECONDS = 180
 SKILL_MONITOR_DELIVERY_LEASE_SECONDS = 60
 SKILL_MONITOR_RETENTION_SECONDS = 30 * 24 * 60 * 60
+ITEM_METRIC_MAX_FUTURE_SKEW_SECONDS = 5 * 60
+ITEM_METRIC_RECOMMENDATION_MIN_INTERVAL_SECONDS = 2 * 60 * 60
+ITEM_METRIC_RECOMMENDATION_MAX_INTERVAL_SECONDS = 6 * 60 * 60
+FULFILLMENT_ATTEMPT_LEASE_SECONDS = 6 * 60 * 60
+FULFILLMENT_MAX_QUANTITY = 100
+BACKUP_MAX_SERIALIZED_BYTES = 128 * 1024 * 1024
+BACKUP_MAX_TOTAL_ROWS = 1_000_000
+BACKUP_MAX_TABLES = 32
+
+USER_BACKUP_TABLES = (
+    "cookies",
+    "keywords",
+    "cookie_status",
+    "default_replies",
+    "message_notifications",
+    "item_info",
+    "ai_reply_settings",
+    "ai_conversations",
+    "ai_training_rules",
+    "ai_item_knowledge_profiles",
+    "ai_item_knowledge_versions",
+    "item_metric_snapshots",
+    "item_metric_collection_states",
+)
+SYSTEM_BACKUP_TABLES = (
+    "cookies",
+    "keywords",
+    "cookie_status",
+    "cards",
+    "delivery_rules",
+    "default_replies",
+    "notification_channels",
+    "message_notifications",
+    "system_settings",
+    "item_info",
+    "ai_reply_settings",
+    "ai_conversations",
+    "ai_item_cache",
+    "ai_training_rules",
+    "ai_item_knowledge_profiles",
+    "ai_item_knowledge_versions",
+    "item_metric_snapshots",
+    "item_metric_collection_states",
+    "fulfillment_attempts",
+    "fulfillment_card_reservations",
+)
+BACKUP_INSERT_ORDER = (
+    "cookies",
+    "cards",
+    "notification_channels",
+    "system_settings",
+    "keywords",
+    "cookie_status",
+    "default_replies",
+    "item_info",
+    "ai_reply_settings",
+    "ai_conversations",
+    "ai_item_cache",
+    "ai_training_rules",
+    "ai_item_knowledge_profiles",
+    "ai_item_knowledge_versions",
+    "item_metric_snapshots",
+    "item_metric_collection_states",
+    "fulfillment_attempts",
+    "fulfillment_card_reservations",
+    "delivery_rules",
+    "message_notifications",
+)
+BACKUP_AUTO_ID_TABLES = {
+    "ai_conversations",
+    "ai_training_rules",
+    "ai_item_knowledge_versions",
+    "item_info",
+    "item_metric_snapshots",
+    "fulfillment_attempts",
+    "fulfillment_card_reservations",
+    "message_notifications",
+}
 
 
 def _account_log_reference(account_id: str) -> str:
@@ -103,6 +182,16 @@ SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS = 30 * 24 * 60 * 60
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
 
+    @staticmethod
+    def _connect(db_path: str) -> sqlite3.Connection:
+        connection = sqlite3.connect(db_path, check_same_thread=False)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            connection.close()
+            raise RuntimeError("SQLite 外键约束未启用")
+        return connection
+
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
         # 支持环境变量配置数据库路径
@@ -137,6 +226,7 @@ class DBManager:
         logger.info(f"数据库路径: {self.db_path}")
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
+        self._fulfillment_owner_token = secrets.token_urlsafe(24)
 
         # SQL日志配置 - 默认启用
         self.sql_log_enabled = True  # 默认启用SQL日志
@@ -156,7 +246,7 @@ class DBManager:
     def init_db(self):
         """初始化数据库表结构"""
         try:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn = self._connect(self.db_path)
             cursor = self.conn.cursor()
 
             # 创建用户表
@@ -1660,7 +1750,7 @@ class DBManager:
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn = self._connect(self.db_path)
         return self.conn
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
@@ -1962,16 +2052,48 @@ class DBManager:
                 return False
 
 
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    def _delete_cookie_children(
+        self,
+        cursor: sqlite3.Cursor,
+        cookie_ids: Sequence[str],
+    ) -> None:
+        normalized_ids = [str(cookie_id) for cookie_id in cookie_ids if cookie_id]
+        if not normalized_ids:
+            return
+        placeholders = ",".join("?" for _ in normalized_ids)
+        tables = cursor.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        for (table_name,) in tables:
+            table_name = str(table_name)
+            if table_name == "cookies":
+                continue
+            columns = {
+                str(row[1])
+                for row in cursor.execute(
+                    f"PRAGMA table_info({self._quote_identifier(table_name)})"
+                ).fetchall()
+            }
+            if "cookie_id" not in columns:
+                continue
+            cursor.execute(
+                f"DELETE FROM {self._quote_identifier(table_name)} "
+                f"WHERE cookie_id IN ({placeholders})",
+                normalized_ids,
+            )
+
     def delete_cookie(self, cookie_id: str) -> bool:
-        """从数据库删除Cookie及其关键字"""
+        """原子删除账号及所有 cookie_id 子表数据。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                # 删除关联的关键字
-                self._execute_sql(cursor, "DELETE FROM keywords WHERE cookie_id = ?", (cookie_id,))
-                # 删除买家档案（SQLite 外键未必启用，不依赖 CASCADE）
-                self._execute_sql(cursor, "DELETE FROM customer_profiles WHERE cookie_id = ?", (cookie_id,))
-                # 删除Cookie
+                cursor.execute("BEGIN IMMEDIATE")
+                self._delete_cookie_children(cursor, [cookie_id])
                 self._execute_sql(cursor, "DELETE FROM cookies WHERE id = ?", (cookie_id,))
                 self.conn.commit()
                 logger.debug(f"Cookie删除成功: {cookie_id}")
@@ -4040,15 +4162,21 @@ class DBManager:
                 logger.error(f"获取通知渠道失败: {e}")
                 return []
 
-    def get_notification_channel(self, channel_id: int) -> Optional[Dict[str, any]]:
-        """获取指定通知渠道"""
+    def get_notification_channel(
+        self,
+        channel_id: int,
+        user_id: int,
+    ) -> Optional[Dict[str, any]]:
+        """获取当前租户的指定通知渠道。"""
+        if user_id is None:
+            raise ValueError("get_notification_channel 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT id, name, type, config, enabled, created_at, updated_at
-                FROM notification_channels WHERE id = ?
-                ''', (channel_id,))
+                FROM notification_channels WHERE id = ? AND user_id = ?
+                ''', (channel_id, int(user_id)))
 
                 row = cursor.fetchone()
                 if row:
@@ -4066,16 +4194,25 @@ class DBManager:
                 logger.error(f"获取通知渠道失败: {e}")
                 return None
 
-    def update_notification_channel(self, channel_id: int, name: str, config: str, enabled: bool = True) -> bool:
-        """更新通知渠道"""
+    def update_notification_channel(
+        self,
+        channel_id: int,
+        name: str,
+        config: str,
+        enabled: bool,
+        user_id: int,
+    ) -> bool:
+        """更新当前租户的通知渠道。"""
+        if user_id is None:
+            raise ValueError("update_notification_channel 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 UPDATE notification_channels
                 SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                ''', (name, config, enabled, channel_id))
+                WHERE id = ? AND user_id = ?
+                ''', (name, config, enabled, channel_id, int(user_id)))
                 self.conn.commit()
                 logger.debug(f"更新通知渠道: {channel_id}")
                 return cursor.rowcount > 0
@@ -4084,12 +4221,18 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
-    def delete_notification_channel(self, channel_id: int) -> bool:
-        """删除通知渠道"""
+    def delete_notification_channel(self, channel_id: int, user_id: int) -> bool:
+        """删除当前租户的通知渠道。"""
+        if user_id is None:
+            raise ValueError("delete_notification_channel 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM notification_channels WHERE id = ?", (channel_id,))
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM notification_channels WHERE id = ? AND user_id = ?",
+                    (channel_id, int(user_id)),
+                )
                 self.conn.commit()
                 logger.debug(f"删除通知渠道: {channel_id}")
                 return cursor.rowcount > 0
@@ -4099,11 +4242,27 @@ class DBManager:
                 return False
 
     # -------------------- 消息通知配置操作 --------------------
-    def set_message_notification(self, cookie_id: str, channel_id: int, enabled: bool = True) -> bool:
-        """设置账号的消息通知"""
+    def set_message_notification(
+        self,
+        cookie_id: str,
+        channel_id: int,
+        enabled: bool,
+        user_id: int,
+    ) -> bool:
+        """在同一租户内关联账号与通知渠道。"""
+        if user_id is None:
+            raise ValueError("set_message_notification 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                ownership = cursor.execute(
+                    "SELECT 1 FROM cookies AS c "
+                    "JOIN notification_channels AS nc ON nc.id = ? "
+                    "WHERE c.id = ? AND c.user_id = ? AND nc.user_id = ?",
+                    (channel_id, cookie_id, int(user_id), int(user_id)),
+                ).fetchone()
+                if not ownership:
+                    return False
                 cursor.execute('''
                 INSERT OR REPLACE INTO message_notifications (cookie_id, channel_id, enabled)
                 VALUES (?, ?, ?)
@@ -4125,6 +4284,7 @@ class DBManager:
                 SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
+                JOIN cookies c ON c.id = mn.cookie_id AND c.user_id = nc.user_id
                 WHERE mn.cookie_id = ? AND nc.enabled = 1
                 ORDER BY mn.id
                 ''', (cookie_id,))
@@ -4154,6 +4314,7 @@ class DBManager:
                 SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
+                JOIN cookies c ON c.id = mn.cookie_id AND c.user_id = nc.user_id
                 WHERE nc.enabled = 1
                 ORDER BY mn.cookie_id, mn.id
                 ''')
@@ -4178,12 +4339,19 @@ class DBManager:
                 logger.error(f"获取所有消息通知配置失败: {e}")
                 return {}
 
-    def delete_message_notification(self, notification_id: int) -> bool:
-        """删除消息通知配置"""
+    def delete_message_notification(self, notification_id: int, user_id: int) -> bool:
+        """删除当前租户的消息通知配置。"""
+        if user_id is None:
+            raise ValueError("delete_message_notification 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM message_notifications WHERE id = ?", (notification_id,))
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM message_notifications WHERE id = ? "
+                    "AND cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)",
+                    (notification_id, int(user_id)),
+                )
                 self.conn.commit()
                 logger.debug(f"删除消息通知配置: {notification_id}")
                 return cursor.rowcount > 0
@@ -4192,12 +4360,19 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
-    def delete_account_notifications(self, cookie_id: str) -> bool:
-        """删除账号的所有消息通知配置"""
+    def delete_account_notifications(self, cookie_id: str, user_id: int) -> bool:
+        """删除当前租户账号的所有消息通知配置。"""
+        if user_id is None:
+            raise ValueError("delete_account_notifications 必须提供 user_id")
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM message_notifications WHERE cookie_id = ?", (cookie_id,))
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM message_notifications WHERE cookie_id = ? "
+                    "AND cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)",
+                    (cookie_id, int(user_id)),
+                )
                 self.conn.commit()
                 logger.debug(f"删除账号通知配置: {cookie_id}")
                 return cursor.rowcount > 0
@@ -4246,9 +4421,11 @@ class DBManager:
                         }
 
                         # 备份其他相关表
-                        related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations', 'ai_training_rules',
-                                        'ai_item_knowledge_profiles', 'ai_item_knowledge_versions']
+                        related_tables = [
+                            table
+                            for table in USER_BACKUP_TABLES
+                            if table not in {"cookies", "keywords"}
+                        ]
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -4260,13 +4437,7 @@ class DBManager:
                             }
                 else:
                     # 系统级备份：备份所有数据
-                    tables = [
-                        'cookies', 'keywords', 'cookie_status', 'cards',
-                        'delivery_rules', 'default_replies', 'notification_channels',
-                        'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'ai_training_rules',
-                        'ai_item_knowledge_profiles', 'ai_item_knowledge_versions'
-                    ]
+                    tables = SYSTEM_BACKUP_TABLES
 
                     for table in tables:
                         cursor.execute(f"SELECT * FROM {table}")
@@ -4355,104 +4526,310 @@ class DBManager:
             smtp_reconfiguration_required,
         )
 
+    def _backup_table_columns(
+        self,
+        cursor: sqlite3.Cursor,
+        table_name: str,
+    ) -> List[str]:
+        rows = cursor.execute(
+            f"PRAGMA table_info({self._quote_identifier(table_name)})"
+        ).fetchall()
+        if not rows:
+            raise ValueError(f"备份表不存在: {table_name}")
+        return [str(row[1]) for row in rows]
+
+    def _prepare_backup_import(
+        self,
+        backup_data: Dict[str, Any],
+        user_id: Optional[int],
+        cursor: sqlite3.Cursor,
+    ) -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
+        if not isinstance(backup_data, dict) or not isinstance(
+            backup_data.get("data"), dict
+        ):
+            raise ValueError("备份数据格式无效")
+        try:
+            serialized_size = len(
+                json.dumps(
+                    backup_data,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("备份数据无法序列化") from exc
+        if serialized_size > BACKUP_MAX_SERIALIZED_BYTES:
+            raise ValueError("备份数据超过大小上限")
+
+        data = backup_data["data"]
+        if len(data) > BACKUP_MAX_TABLES:
+            raise ValueError("备份数据表数量超过上限")
+        allowed_tables = set(
+            USER_BACKUP_TABLES if user_id is not None else SYSTEM_BACKUP_TABLES
+        )
+        unknown_tables = set(map(str, data)) - allowed_tables
+        if unknown_tables:
+            raise ValueError("备份包含不允许导入的数据表")
+        if user_id is not None and "cookies" not in data:
+            raise ValueError("用户备份缺少账号表")
+
+        prepared: Dict[str, Dict[str, Any]] = {}
+        total_rows = 0
+        for table_name, table_data in data.items():
+            table_name = str(table_name)
+            if not isinstance(table_data, dict):
+                raise ValueError(f"备份表结构无效: {table_name}")
+            columns = table_data.get("columns")
+            rows = table_data.get("rows")
+            if not isinstance(columns, list) or not all(
+                isinstance(column, str) and column for column in columns
+            ):
+                raise ValueError(f"备份列定义无效: {table_name}")
+            if len(columns) != len(set(columns)):
+                raise ValueError(f"备份包含重复列: {table_name}")
+            if not isinstance(rows, list):
+                raise ValueError(f"备份行定义无效: {table_name}")
+
+            server_columns = self._backup_table_columns(cursor, table_name)
+            if len(columns) != len(server_columns) or set(columns) != set(
+                server_columns
+            ):
+                raise ValueError(f"备份列与当前 schema 不一致: {table_name}")
+
+            normalized_rows: List[List[Any]] = []
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) != len(columns):
+                    raise ValueError(f"备份行列数量不匹配: {table_name}")
+                row_by_column = dict(zip(columns, row))
+                normalized_rows.append(
+                    [row_by_column[column] for column in server_columns]
+                )
+            total_rows += len(normalized_rows)
+            if total_rows > BACKUP_MAX_TOTAL_ROWS:
+                raise ValueError("备份总行数超过上限")
+            prepared[table_name] = {
+                "columns": server_columns,
+                "rows": normalized_rows,
+            }
+
+        smtp_settings_imported = False
+        smtp_reconfiguration_required = False
+        if "system_settings" in prepared:
+            table = prepared["system_settings"]
+            (
+                table["rows"],
+                smtp_settings_imported,
+                smtp_reconfiguration_required,
+            ) = self._prepare_imported_system_settings(
+                table["columns"], table["rows"]
+            )
+
+        if user_id is not None:
+            cookie_table = prepared["cookies"]
+            cookie_columns = cookie_table["columns"]
+            cookie_id_index = cookie_columns.index("id")
+            cookie_user_index = cookie_columns.index("user_id")
+            imported_cookie_ids: set[str] = set()
+            for row in cookie_table["rows"]:
+                cookie_id = str(row[cookie_id_index] or "").strip()
+                if not cookie_id or cookie_id in imported_cookie_ids:
+                    raise ValueError("用户备份包含无效或重复账号")
+                imported_cookie_ids.add(cookie_id)
+                row[cookie_id_index] = cookie_id
+                row[cookie_user_index] = int(user_id)
+
+            for table_name, table in prepared.items():
+                if table_name == "cookies":
+                    continue
+                columns = table["columns"]
+                if "cookie_id" not in columns:
+                    raise ValueError(f"用户备份表缺少账号归属: {table_name}")
+                cookie_index = columns.index("cookie_id")
+                user_index = columns.index("user_id") if "user_id" in columns else None
+                id_index = (
+                    columns.index("id")
+                    if table_name in BACKUP_AUTO_ID_TABLES and "id" in columns
+                    else None
+                )
+                for row in table["rows"]:
+                    cookie_id = str(row[cookie_index] or "").strip()
+                    if cookie_id not in imported_cookie_ids:
+                        raise ValueError("用户备份包含其他账号的关联数据")
+                    row[cookie_index] = cookie_id
+                    if table_name in {
+                        "item_metric_snapshots",
+                        "item_metric_collection_states",
+                    } and user_index is not None:
+                        row[user_index] = int(user_id)
+                    if id_index is not None:
+                        row[id_index] = None
+
+        return (
+            prepared,
+            smtp_settings_imported,
+            smtp_reconfiguration_required,
+        )
+
+    def _insert_backup_rows(
+        self,
+        cursor: sqlite3.Cursor,
+        table_name: str,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+    ) -> None:
+        if not rows:
+            return
+        quoted_columns = ",".join(
+            self._quote_identifier(column) for column in columns
+        )
+        placeholders = ",".join("?" for _ in columns)
+        cursor.executemany(
+            f"INSERT INTO {self._quote_identifier(table_name)} "
+            f"({quoted_columns}) VALUES ({placeholders})",
+            rows,
+        )
+
+    def _upsert_imported_cookies(
+        self,
+        cursor: sqlite3.Cursor,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+        *,
+        user_id: Optional[int],
+    ) -> set[str]:
+        id_index = columns.index("id")
+        imported_ids = {str(row[id_index]) for row in rows}
+        if user_id is not None and imported_ids:
+            placeholders = ",".join("?" for _ in imported_ids)
+            foreign = cursor.execute(
+                f"SELECT id FROM cookies WHERE id IN ({placeholders}) "
+                "AND user_id != ? LIMIT 1",
+                [*sorted(imported_ids), int(user_id)],
+            ).fetchone()
+            if foreign:
+                raise PermissionError("备份账号已属于其他用户")
+
+        update_columns = [column for column in columns if column != "id"]
+        update_sql = ",".join(
+            f"{self._quote_identifier(column)} = ?" for column in update_columns
+        )
+        for row in rows:
+            row_map = dict(zip(columns, row))
+            cookie_id = str(row_map["id"])
+            owner_clause = " AND user_id = ?" if user_id is not None else ""
+            params = [row_map[column] for column in update_columns]
+            params.append(cookie_id)
+            if user_id is not None:
+                params.append(int(user_id))
+            cursor.execute(
+                f"UPDATE cookies SET {update_sql} WHERE id = ?{owner_clause}",
+                params,
+            )
+            if cursor.rowcount:
+                continue
+            self._insert_backup_rows(cursor, "cookies", columns, [row])
+        return imported_ids
+
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
         """导入系统备份数据（支持用户隔离）"""
         with self.lock:
+            cursor = self.conn.cursor()
             try:
-                # 验证备份数据格式
-                if not isinstance(backup_data, dict) or 'data' not in backup_data:
-                    raise ValueError("备份数据格式无效")
+                (
+                    prepared,
+                    smtp_settings_imported,
+                    smtp_reconfiguration_required,
+                ) = self._prepare_backup_import(backup_data, user_id, cursor)
 
-                # 开始事务
-                cursor = self.conn.cursor()
-                self._execute_sql(cursor, "BEGIN TRANSACTION")
-
+                cursor.execute("BEGIN IMMEDIATE")
                 if user_id is not None:
-                    # 用户级导入：只清空该用户的数据
-                    # 获取用户的cookie_id列表
-                    self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ?", (user_id,))
-                    user_cookie_ids = [row[0] for row in cursor.fetchall()]
-
-                    if user_cookie_ids:
-                        placeholders = ','.join(['?' for _ in user_cookie_ids])
-
-                        # 删除用户相关数据
-                        related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
-
-                        for table in related_tables:
-                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
-
-                        # 删除用户的cookies
-                        self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
+                    current_cookie_ids = {
+                        str(row[0])
+                        for row in cursor.execute(
+                            "SELECT id FROM cookies WHERE user_id = ?",
+                            (int(user_id),),
+                        ).fetchall()
+                    }
+                    for table_name in reversed(BACKUP_INSERT_ORDER):
+                        if table_name in {"cookies", "system_settings"}:
+                            continue
+                        if table_name not in prepared or not current_cookie_ids:
+                            continue
+                        placeholders = ",".join("?" for _ in current_cookie_ids)
+                        cursor.execute(
+                            f"DELETE FROM {self._quote_identifier(table_name)} "
+                            f"WHERE cookie_id IN ({placeholders})",
+                            sorted(current_cookie_ids),
+                        )
                 else:
-                    # 系统级导入：清空所有数据（除了用户和管理员密码）
-                    tables = [
-                        'message_notifications', 'notification_channels', 'default_replies',
-                        'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'ai_training_rules',
-                        'ai_item_knowledge_profiles', 'ai_item_knowledge_versions', 'cookies'
-                    ]
+                    for table_name in reversed(BACKUP_INSERT_ORDER):
+                        if table_name == "cookies" or table_name not in prepared:
+                            continue
+                        if table_name == "system_settings":
+                            cursor.execute(
+                                "DELETE FROM system_settings "
+                                "WHERE key != 'admin_password_hash'"
+                            )
+                        else:
+                            cursor.execute(
+                                f"DELETE FROM {self._quote_identifier(table_name)}"
+                            )
 
-                    for table in tables:
-                        cursor.execute(f"DELETE FROM {table}")
-
-                    # 清空系统设置（保留管理员密码）
-                    self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
-
-                # 导入数据
-                data = backup_data['data']
-                smtp_settings_imported = False
-                smtp_reconfiguration_required = False
-                for table_name, table_data in data.items():
-                    if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
-                                        'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'ai_training_rules',
-                                        'ai_item_knowledge_profiles', 'ai_item_knowledge_versions']:
-                        continue
-
-                    columns = table_data['columns']
-                    rows = table_data['rows']
-
-                    if not rows:
-                        continue
-
-                    if table_name == 'system_settings':
-                        (
-                            rows,
-                            imported_smtp_settings,
-                            imported_smtp_reconfiguration,
-                        ) = self._prepare_imported_system_settings(columns, rows)
-                        smtp_settings_imported |= imported_smtp_settings
-                        smtp_reconfiguration_required |= imported_smtp_reconfiguration
-
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
-                        updated_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, row))
-                            row_dict['user_id'] = user_id
-                            updated_rows.append([row_dict[col] for col in columns])
-                        rows = updated_rows
-
-                    # 构建插入语句
-                    placeholders = ','.join(['?' for _ in columns])
-
-                    if table_name == 'system_settings':
-                        # 系统设置需要特殊处理，避免覆盖管理员密码
-                        key_index = columns.index('key')
-                        for row in rows:
-                            if row[key_index] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                imported_cookie_ids: set[str] = set()
+                if "cookies" in prepared:
+                    cookie_table = prepared["cookies"]
+                    imported_cookie_ids = self._upsert_imported_cookies(
+                        cursor,
+                        cookie_table["columns"],
+                        cookie_table["rows"],
+                        user_id=user_id,
+                    )
+                    if user_id is not None:
+                        stale_ids = current_cookie_ids - imported_cookie_ids
+                        self._delete_cookie_children(cursor, sorted(stale_ids))
+                        if stale_ids:
+                            placeholders = ",".join("?" for _ in stale_ids)
+                            cursor.execute(
+                                f"DELETE FROM cookies WHERE id IN ({placeholders}) "
+                                "AND user_id = ?",
+                                [*sorted(stale_ids), int(user_id)],
+                            )
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        existing_ids = {
+                            str(row[0])
+                            for row in cursor.execute("SELECT id FROM cookies").fetchall()
+                        }
+                        stale_ids = existing_ids - imported_cookie_ids
+                        self._delete_cookie_children(cursor, sorted(stale_ids))
+                        if stale_ids:
+                            placeholders = ",".join("?" for _ in stale_ids)
+                            cursor.execute(
+                                f"DELETE FROM cookies WHERE id IN ({placeholders})",
+                                sorted(stale_ids),
+                            )
+
+                for table_name in BACKUP_INSERT_ORDER:
+                    if table_name == "cookies" or table_name not in prepared:
+                        continue
+                    table = prepared[table_name]
+                    rows = table["rows"]
+                    if table_name == "system_settings":
+                        key_index = table["columns"].index("key")
+                        rows = [
+                            row
+                            for row in rows
+                            if row[key_index] != "admin_password_hash"
+                        ]
+                    self._insert_backup_rows(
+                        cursor,
+                        table_name,
+                        table["columns"],
+                        rows,
+                    )
 
                 if smtp_settings_imported:
                     self._clear_smtp_verification(cursor)
 
-                # 提交事务
                 self.conn.commit()
                 if smtp_reconfiguration_required:
                     logger.warning(
@@ -5672,6 +6049,14 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                active_reservation = cursor.execute(
+                    "SELECT 1 FROM fulfillment_card_reservations "
+                    "WHERE card_id = ? AND state IN ('reserved', 'manual_review') "
+                    "LIMIT 1",
+                    (card_id,),
+                ).fetchone()
+                if active_reservation:
+                    return False
                 if user_id is not None:
                     self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
                 else:
@@ -5710,6 +6095,702 @@ class DBManager:
                 logger.error(f"删除发货规则失败: {e}")
                 self.conn.rollback()
                 raise
+
+    _FULFILLMENT_ATTEMPT_COLUMNS = (
+        "id",
+        "order_id",
+        "cookie_id",
+        "user_id",
+        "expected_quantity",
+        "state",
+        "owner_token",
+        "lease_expires_at",
+        "reason_code",
+        "sent_count",
+        "delivered_count",
+        "attempt_count",
+        "sending_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    )
+
+    @classmethod
+    def _decode_fulfillment_attempt(cls, row: tuple) -> Dict[str, Any]:
+        attempt = dict(zip(cls._FULFILLMENT_ATTEMPT_COLUMNS, row))
+        for key in (
+            "id",
+            "user_id",
+            "expected_quantity",
+            "sent_count",
+            "delivered_count",
+            "attempt_count",
+        ):
+            attempt[key] = int(attempt[key])
+        return attempt
+
+    def _load_fulfillment_attempt(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        attempt_id: Optional[int] = None,
+        order_id: Optional[str] = None,
+        cookie_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        columns_sql = ", ".join(self._FULFILLMENT_ATTEMPT_COLUMNS)
+        if attempt_id is not None:
+            row = cursor.execute(
+                f"SELECT {columns_sql} FROM fulfillment_attempts WHERE id = ?",
+                (int(attempt_id),),
+            ).fetchone()
+        else:
+            row = cursor.execute(
+                f"SELECT {columns_sql} FROM fulfillment_attempts "
+                "WHERE cookie_id = ? AND order_id = ?",
+                (str(cookie_id or ""), str(order_id or "")),
+            ).fetchone()
+        return self._decode_fulfillment_attempt(row) if row else None
+
+    @staticmethod
+    def _fulfillment_reservation_values(
+        cursor: sqlite3.Cursor,
+        attempt_id: int,
+        states: Sequence[str] = ("reserved",),
+    ) -> List[str]:
+        if not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        rows = cursor.execute(
+            "SELECT value FROM fulfillment_card_reservations "
+            f"WHERE attempt_id = ? AND state IN ({placeholders}) "
+            "ORDER BY ordinal, id",
+            (int(attempt_id), *states),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _public_fulfillment_attempt(
+        self,
+        cursor: sqlite3.Cursor,
+        attempt: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result = dict(attempt)
+        result.pop("owner_token", None)
+        result["attempt_id"] = int(result["id"])
+        reservation_state = {
+            "prepared": ("reserved",),
+            "sending": ("reserved",),
+            "committed": ("committed",),
+            "released": ("released",),
+            "manual_review": ("manual_review",),
+        }.get(str(attempt["state"]), ())
+        result["reservation_values"] = self._fulfillment_reservation_values(
+            cursor,
+            int(attempt["id"]),
+            reservation_state,
+        )
+        return result
+
+    @staticmethod
+    def _fulfillment_reason(reason_code: str) -> str:
+        normalized = str(reason_code or "unknown").strip()
+        return normalized[:128] or "unknown"
+
+    def begin_fulfillment_attempt(
+        self,
+        order_id: str,
+        cookie_id: str,
+        expected_quantity: int,
+    ) -> Dict[str, Any]:
+        """Acquire one durable fulfillment attempt for an order."""
+        order_id = str(order_id or "").strip()
+        cookie_id = str(cookie_id or "").strip()
+        try:
+            expected_quantity = int(expected_quantity)
+        except (TypeError, ValueError):
+            expected_quantity = 0
+        if (
+            not order_id
+            or not cookie_id
+            or expected_quantity < 1
+            or expected_quantity > FULFILLMENT_MAX_QUANTITY
+        ):
+            return {
+                "outcome": "manual_review",
+                "attempt_id": None,
+                "error_code": "invalid_fulfillment_context",
+            }
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                owner = cursor.execute(
+                    "SELECT user_id FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                ).fetchone()
+                if not owner or owner[0] is None:
+                    self.conn.rollback()
+                    return {
+                        "outcome": "manual_review",
+                        "attempt_id": None,
+                        "error_code": "account_owner_unavailable",
+                    }
+                user_id = int(owner[0])
+                order = cursor.execute(
+                    "SELECT 1 FROM orders WHERE order_id = ? AND cookie_id = ?",
+                    (order_id, cookie_id),
+                ).fetchone()
+                if not order:
+                    self.conn.rollback()
+                    return {
+                        "outcome": "manual_review",
+                        "attempt_id": None,
+                        "error_code": "order_context_unavailable",
+                    }
+                now = time.time()
+                lease_expires_at = now + FULFILLMENT_ATTEMPT_LEASE_SECONDS
+                attempt = self._load_fulfillment_attempt(
+                    cursor,
+                    order_id=order_id,
+                    cookie_id=cookie_id,
+                )
+                if attempt is None:
+                    cursor.execute(
+                        "INSERT INTO fulfillment_attempts "
+                        "(order_id, cookie_id, user_id, expected_quantity, state, "
+                        "owner_token, lease_expires_at, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, 'prepared', ?, ?, ?, ?)",
+                        (
+                            order_id,
+                            cookie_id,
+                            user_id,
+                            expected_quantity,
+                            self._fulfillment_owner_token,
+                            lease_expires_at,
+                            now,
+                            now,
+                        ),
+                    )
+                    attempt = self._load_fulfillment_attempt(
+                        cursor,
+                        attempt_id=int(cursor.lastrowid),
+                    )
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "acquired"
+                    return result
+
+                state = str(attempt["state"])
+                if state == "committed":
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "already_completed"
+                    return result
+                if state == "manual_review":
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "manual_review"
+                    return result
+                if int(attempt["expected_quantity"]) != expected_quantity:
+                    cursor.execute(
+                        "UPDATE fulfillment_attempts SET state = 'manual_review', "
+                        "reason_code = 'expected_quantity_changed', owner_token = '', "
+                        "lease_expires_at = 0, updated_at = ? WHERE id = ?",
+                        (now, int(attempt["id"])),
+                    )
+                    cursor.execute(
+                        "UPDATE fulfillment_card_reservations "
+                        "SET state = 'manual_review', updated_at = ? "
+                        "WHERE attempt_id = ? AND state = 'reserved'",
+                        (now, int(attempt["id"])),
+                    )
+                    attempt = self._load_fulfillment_attempt(
+                        cursor, attempt_id=int(attempt["id"])
+                    )
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "manual_review"
+                    return result
+
+                same_owner = attempt["owner_token"] == self._fulfillment_owner_token
+                lease_active = float(attempt["lease_expires_at"] or 0) > now
+                if state in {"prepared", "sending"} and same_owner and lease_active:
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "busy"
+                    return result
+                if state == "sending":
+                    cursor.execute(
+                        "UPDATE fulfillment_attempts SET state = 'manual_review', "
+                        "reason_code = 'interrupted_after_sending', owner_token = '', "
+                        "lease_expires_at = 0, updated_at = ? WHERE id = ?",
+                        (now, int(attempt["id"])),
+                    )
+                    cursor.execute(
+                        "UPDATE fulfillment_card_reservations "
+                        "SET state = 'manual_review', updated_at = ? "
+                        "WHERE attempt_id = ? AND state = 'reserved'",
+                        (now, int(attempt["id"])),
+                    )
+                    attempt = self._load_fulfillment_attempt(
+                        cursor, attempt_id=int(attempt["id"])
+                    )
+                    self.conn.commit()
+                    result = self._public_fulfillment_attempt(cursor, attempt)
+                    result["outcome"] = "manual_review"
+                    return result
+
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET state = 'prepared', "
+                    "owner_token = ?, lease_expires_at = ?, reason_code = '', "
+                    "sent_count = 0, delivered_count = 0, sending_at = NULL, "
+                    "completed_at = NULL, attempt_count = attempt_count + 1, "
+                    "updated_at = ? WHERE id = ? AND state IN ('prepared', 'released')",
+                    (
+                        self._fulfillment_owner_token,
+                        lease_expires_at,
+                        now,
+                        int(attempt["id"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return {
+                        "outcome": "busy",
+                        "attempt_id": int(attempt["id"]),
+                        "error_code": "attempt_state_conflict",
+                    }
+                attempt = self._load_fulfillment_attempt(
+                    cursor, attempt_id=int(attempt["id"])
+                )
+                self.conn.commit()
+                result = self._public_fulfillment_attempt(cursor, attempt)
+                result["outcome"] = "acquired"
+                return result
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(
+                    "创建履约尝试失败 type={}",
+                    type(exc).__name__,
+                )
+                return {
+                    "outcome": "manual_review",
+                    "attempt_id": None,
+                    "error_code": "fulfillment_store_error",
+                }
+
+    def reserve_batch_card_data(
+        self,
+        attempt_id: int,
+        card_id: int,
+        count: int,
+    ) -> Optional[List[str]]:
+        """Atomically reserve batch-card values without marking them delivered."""
+        try:
+            attempt_id = int(attempt_id)
+            card_id = int(card_id)
+            count = int(count)
+        except (TypeError, ValueError):
+            return None
+        if count < 1 or count > FULFILLMENT_MAX_QUANTITY:
+            return None
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(cursor, attempt_id=attempt_id)
+                if (
+                    not attempt
+                    or attempt["state"] != "prepared"
+                    or attempt["owner_token"] != self._fulfillment_owner_token
+                    or count > int(attempt["expected_quantity"])
+                ):
+                    self.conn.rollback()
+                    return None
+                existing = cursor.execute(
+                    "SELECT card_id, value FROM fulfillment_card_reservations "
+                    "WHERE attempt_id = ? AND state = 'reserved' "
+                    "ORDER BY ordinal, id",
+                    (attempt_id,),
+                ).fetchall()
+                if any(row[0] is None or int(row[0]) != card_id for row in existing):
+                    self.conn.rollback()
+                    return None
+                existing_values = [str(row[1]) for row in existing]
+                if len(existing_values) > count:
+                    self.conn.rollback()
+                    return None
+                if len(existing_values) == count:
+                    self.conn.commit()
+                    return existing_values
+
+                card = cursor.execute(
+                    "SELECT type, data_content, enabled FROM cards "
+                    "WHERE id = ? AND user_id = ?",
+                    (card_id, int(attempt["user_id"])),
+                ).fetchone()
+                if not card or str(card[0]) != "data" or not bool(card[2]):
+                    self.conn.rollback()
+                    return None
+                available = [
+                    line.strip()
+                    for line in str(card[1] or "").splitlines()
+                    if line.strip()
+                ]
+                needed = count - len(existing_values)
+                if len(available) < needed:
+                    self.conn.rollback()
+                    return None
+                selected = available[:needed]
+                remaining = available[needed:]
+                cursor.execute(
+                    "UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND user_id = ?",
+                    ("\n".join(remaining), card_id, int(attempt["user_id"])),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return None
+                ordinal_row = cursor.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) "
+                    "FROM fulfillment_card_reservations WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                next_ordinal = int(ordinal_row[0]) + 1
+                now = time.time()
+                cursor.executemany(
+                    "INSERT INTO fulfillment_card_reservations "
+                    "(attempt_id, user_id, card_id, ordinal, value, state, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)",
+                    [
+                        (
+                            attempt_id,
+                            int(attempt["user_id"]),
+                            card_id,
+                            next_ordinal + offset,
+                            value,
+                            now,
+                            now,
+                        )
+                        for offset, value in enumerate(selected)
+                    ],
+                )
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET lease_expires_at = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (now + FULFILLMENT_ATTEMPT_LEASE_SECONDS, now, attempt_id),
+                )
+                self.conn.commit()
+                return existing_values + selected
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(
+                    "预留批量卡券失败 type={}",
+                    type(exc).__name__,
+                )
+                return None
+
+    def mark_fulfillment_sending(self, attempt_id: int) -> bool:
+        """Persist the point after which automatic inventory release is unsafe."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if not attempt:
+                    self.conn.rollback()
+                    return False
+                if (
+                    attempt["state"] == "sending"
+                    and attempt["owner_token"] == self._fulfillment_owner_token
+                ):
+                    self.conn.commit()
+                    return True
+                if (
+                    attempt["state"] != "prepared"
+                    or attempt["owner_token"] != self._fulfillment_owner_token
+                ):
+                    self.conn.rollback()
+                    return False
+                now = time.time()
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET state = 'sending', "
+                    "sending_at = COALESCE(sending_at, ?), lease_expires_at = ?, "
+                    "updated_at = ? WHERE id = ? AND state = 'prepared' "
+                    "AND owner_token = ?",
+                    (
+                        now,
+                        now + FULFILLMENT_ATTEMPT_LEASE_SECONDS,
+                        now,
+                        int(attempt_id),
+                        self._fulfillment_owner_token,
+                    ),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("标记履约发送失败 type={}", type(exc).__name__)
+                return False
+
+    def commit_fulfillment_attempt(
+        self,
+        attempt_id: int,
+        delivered_count: int,
+    ) -> bool:
+        """Commit a fully acknowledged delivery and permanently consume inventory."""
+        try:
+            attempt_id = int(attempt_id)
+            delivered_count = int(delivered_count)
+        except (TypeError, ValueError):
+            return False
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(cursor, attempt_id=attempt_id)
+                if not attempt:
+                    self.conn.rollback()
+                    return False
+                if attempt["state"] == "committed":
+                    self.conn.commit()
+                    return int(attempt["delivered_count"]) == delivered_count
+                if (
+                    attempt["state"] != "sending"
+                    or attempt["owner_token"] != self._fulfillment_owner_token
+                    or delivered_count != int(attempt["expected_quantity"])
+                ):
+                    self.conn.rollback()
+                    return False
+                now = time.time()
+                cursor.execute(
+                    "UPDATE orders SET system_shipped = 1, order_status = 'shipped', "
+                    "status_source = 'system_fulfillment', "
+                    "status_synced_at = CURRENT_TIMESTAMP, last_sync_error = '', "
+                    "updated_at = CURRENT_TIMESTAMP, version = version + 1 "
+                    "WHERE order_id = ? AND cookie_id = ?",
+                    (str(attempt["order_id"]), str(attempt["cookie_id"])),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET state = 'committed', "
+                    "sent_count = ?, delivered_count = ?, reason_code = '', "
+                    "owner_token = '', lease_expires_at = 0, completed_at = ?, "
+                    "updated_at = ? WHERE id = ? AND state = 'sending' "
+                    "AND owner_token = ?",
+                    (
+                        delivered_count,
+                        delivered_count,
+                        now,
+                        now,
+                        attempt_id,
+                        self._fulfillment_owner_token,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False
+                cursor.execute(
+                    "UPDATE fulfillment_card_reservations "
+                    "SET state = 'committed', updated_at = ? "
+                    "WHERE attempt_id = ? AND state = 'reserved'",
+                    (now, attempt_id),
+                )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("提交履约失败 type={}", type(exc).__name__)
+                return False
+
+    def release_fulfillment_attempt(
+        self,
+        attempt_id: int,
+        reason_code: str,
+    ) -> bool:
+        """Release only pre-send reservations and restore batch-card inventory."""
+        try:
+            attempt_id = int(attempt_id)
+        except (TypeError, ValueError):
+            return False
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(cursor, attempt_id=attempt_id)
+                if not attempt:
+                    self.conn.rollback()
+                    return False
+                if attempt["state"] == "released":
+                    self.conn.commit()
+                    return True
+                if (
+                    attempt["state"] != "prepared"
+                    or attempt["owner_token"] != self._fulfillment_owner_token
+                ):
+                    self.conn.rollback()
+                    return False
+                reservations = cursor.execute(
+                    "SELECT card_id, value FROM fulfillment_card_reservations "
+                    "WHERE attempt_id = ? AND state = 'reserved' "
+                    "ORDER BY ordinal, id",
+                    (attempt_id,),
+                ).fetchall()
+                now = time.time()
+                if reservations:
+                    card_ids = {row[0] for row in reservations}
+                    if len(card_ids) != 1 or None in card_ids:
+                        cursor.execute(
+                            "UPDATE fulfillment_attempts SET state = 'manual_review', "
+                            "reason_code = 'reservation_card_unavailable', owner_token = '', "
+                            "lease_expires_at = 0, updated_at = ? WHERE id = ?",
+                            (now, attempt_id),
+                        )
+                        cursor.execute(
+                            "UPDATE fulfillment_card_reservations "
+                            "SET state = 'manual_review', updated_at = ? "
+                            "WHERE attempt_id = ? AND state = 'reserved'",
+                            (now, attempt_id),
+                        )
+                        self.conn.commit()
+                        return False
+                    card_id = int(next(iter(card_ids)))
+                    card = cursor.execute(
+                        "SELECT data_content FROM cards WHERE id = ? AND user_id = ?",
+                        (card_id, int(attempt["user_id"])),
+                    ).fetchone()
+                    if not card:
+                        cursor.execute(
+                            "UPDATE fulfillment_attempts SET state = 'manual_review', "
+                            "reason_code = 'reservation_card_unavailable', owner_token = '', "
+                            "lease_expires_at = 0, updated_at = ? WHERE id = ?",
+                            (now, attempt_id),
+                        )
+                        cursor.execute(
+                            "UPDATE fulfillment_card_reservations "
+                            "SET state = 'manual_review', updated_at = ? "
+                            "WHERE attempt_id = ? AND state = 'reserved'",
+                            (now, attempt_id),
+                        )
+                        self.conn.commit()
+                        return False
+                    existing = [
+                        line.strip()
+                        for line in str(card[0] or "").splitlines()
+                        if line.strip()
+                    ]
+                    restored = [str(row[1]) for row in reservations] + existing
+                    cursor.execute(
+                        "UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND user_id = ?",
+                        ("\n".join(restored), card_id, int(attempt["user_id"])),
+                    )
+                    if cursor.rowcount != 1:
+                        self.conn.rollback()
+                        return False
+                cursor.execute(
+                    "UPDATE fulfillment_card_reservations SET state = 'released', "
+                    "updated_at = ? WHERE attempt_id = ? AND state = 'reserved'",
+                    (now, attempt_id),
+                )
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET state = 'released', "
+                    "reason_code = ?, owner_token = '', lease_expires_at = 0, "
+                    "completed_at = ?, updated_at = ? WHERE id = ? AND state = 'prepared'",
+                    (
+                        self._fulfillment_reason(reason_code),
+                        now,
+                        now,
+                        attempt_id,
+                    ),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("释放履约预留失败 type={}", type(exc).__name__)
+                return False
+
+    def mark_fulfillment_manual_review(
+        self,
+        attempt_id: int,
+        reason_code: str,
+        sent_count: int = 0,
+    ) -> bool:
+        """Quarantine uncertain delivery state without returning reserved values."""
+        try:
+            attempt_id = int(attempt_id)
+            sent_count = int(sent_count)
+        except (TypeError, ValueError):
+            return False
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(cursor, attempt_id=attempt_id)
+                if not attempt or attempt["state"] in {"committed", "released"}:
+                    self.conn.rollback()
+                    return False
+                if (
+                    attempt["state"] in {"prepared", "sending"}
+                    and attempt["owner_token"] != self._fulfillment_owner_token
+                ):
+                    self.conn.rollback()
+                    return False
+                sent_count = max(
+                    int(attempt["sent_count"]),
+                    min(max(sent_count, 0), int(attempt["expected_quantity"])),
+                )
+                now = time.time()
+                cursor.execute(
+                    "UPDATE fulfillment_attempts SET state = 'manual_review', "
+                    "reason_code = ?, sent_count = ?, owner_token = '', "
+                    "lease_expires_at = 0, completed_at = ?, updated_at = ? "
+                    "WHERE id = ? AND state IN ('prepared', 'sending', 'manual_review')",
+                    (
+                        self._fulfillment_reason(reason_code),
+                        sent_count,
+                        now,
+                        now,
+                        attempt_id,
+                    ),
+                )
+                cursor.execute(
+                    "UPDATE fulfillment_card_reservations "
+                    "SET state = 'manual_review', updated_at = ? "
+                    "WHERE attempt_id = ? AND state = 'reserved'",
+                    (now, attempt_id),
+                )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("标记履约人工复核失败 type={}", type(exc).__name__)
+                return False
+
+    def get_fulfillment_attempt(
+        self,
+        attempt_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Return durable fulfillment state and its currently quarantined values."""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                attempt = self._load_fulfillment_attempt(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if not attempt:
+                    return None
+                return self._public_fulfillment_attempt(cursor, attempt)
+            except Exception as exc:
+                logger.error("读取履约状态失败 type={}", type(exc).__name__)
+                return None
 
     def consume_batch_data(self, card_id: int):
         """消费批量数据的第一条记录（线程安全）"""
@@ -6489,8 +7570,8 @@ class DBManager:
             self.conn.rollback()
             return False
 
-    def batch_delete_item_info(self, items_to_delete: list) -> int:
-        """批量删除商品信息
+    def batch_delete_item_info(self, items_to_delete: list, user_id: int) -> int:
+        """原子删除当前租户的一批商品信息。
 
         Args:
             items_to_delete: 要删除的商品列表，每个元素包含 cookie_id 和 item_id
@@ -6498,6 +7579,8 @@ class DBManager:
         Returns:
             int: 成功删除的商品数量
         """
+        if user_id is None:
+            raise ValueError("batch_delete_item_info 必须提供 user_id")
         if not items_to_delete:
             return 0
 
@@ -6505,38 +7588,28 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('BEGIN TRANSACTION')
+                cursor.execute('BEGIN IMMEDIATE')
 
                 for item_data in items_to_delete:
-                    try:
-                        cookie_id = item_data.get('cookie_id')
-                        item_id = item_data.get('item_id')
+                    cookie_id = str(item_data.get('cookie_id') or '').strip()
+                    item_id = str(item_data.get('item_id') or '').strip()
+                    if not cookie_id or not item_id:
+                        raise ValueError("批量删除商品参数不完整")
+                    cursor.execute(
+                        "DELETE FROM item_info WHERE cookie_id = ? AND item_id = ? "
+                        "AND cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)",
+                        (cookie_id, item_id, int(user_id)),
+                    )
+                    success_count += max(0, int(cursor.rowcount or 0))
 
-                        if not cookie_id or not item_id:
-                            continue
-
-                        cursor.execute('DELETE FROM item_info WHERE cookie_id = ? AND item_id = ?',
-                                     (cookie_id, item_id))
-
-                        if cursor.rowcount > 0:
-                            success_count += 1
-                            logger.debug(f"删除商品信息: {cookie_id} - {item_id}")
-
-                    except Exception as item_e:
-                        logger.warning(f"删除单个商品失败 {item_data.get('item_id', 'unknown')}: {item_e}")
-                        continue
-
-                cursor.execute('COMMIT')
+                self.conn.commit()
                 logger.info(f"批量删除商品信息完成: {success_count}/{len(items_to_delete)} 个商品")
                 return success_count
 
         except Exception as e:
             logger.error(f"批量删除商品信息失败: {e}")
-            try:
-                cursor.execute('ROLLBACK')
-            except:
-                pass
-            return success_count
+            self.conn.rollback()
+            return 0
 
     # ==================== 用户设置管理方法 ====================
 
@@ -6740,52 +7813,61 @@ class DBManager:
     def delete_user_and_data(self, user_id: int):
         """删除用户及其所有相关数据"""
         with self.lock:
+            cursor = self.conn.cursor()
             try:
-                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                cookie_ids = [
+                    str(row[0])
+                    for row in cursor.execute(
+                        "SELECT id FROM cookies WHERE user_id = ?", (int(user_id),)
+                    ).fetchall()
+                ]
+                self._delete_cookie_children(cursor, cookie_ids)
+                cursor.execute("DELETE FROM cookies WHERE user_id = ?", (int(user_id),))
 
-                # 开始事务
-                cursor.execute('BEGIN TRANSACTION')
-
-                # 删除用户相关的所有数据
-                # 1. 删除用户设置
-                cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
-
-                # 2. 删除用户的卡券
-                cursor.execute('DELETE FROM cards WHERE user_id = ?', (user_id,))
-
-                # 3. 删除用户的发货规则
-                cursor.execute('DELETE FROM delivery_rules WHERE user_id = ?', (user_id,))
-
-                # 4. 删除用户的通知渠道
-                cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
-
-                # 5. 删除用户的Cookie
-                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
-
-                # 6. 删除用户的关键字
-                cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
-                cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的AI回复设置
-                cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的消息通知
-                cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 10. 最后删除用户本身
-                cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
-
-                # 提交事务
-                cursor.execute('COMMIT')
+                # These legacy tables have historically lacked reliable ON DELETE CASCADE.
+                for table_name in (
+                    "delivery_rules",
+                    "cards",
+                    "notification_channels",
+                    "user_settings",
+                    "ai_provider_profiles",
+                    "skill_monitor_results",
+                    "skill_monitor_tasks",
+                    "skill_agent_prompts",
+                    "skill_run_logs",
+                    "auth_sessions",
+                ):
+                    columns = {
+                        str(row[1])
+                        for row in cursor.execute(
+                            f"PRAGMA table_info({self._quote_identifier(table_name)})"
+                        ).fetchall()
+                    }
+                    if "user_id" in columns:
+                        cursor.execute(
+                            f"DELETE FROM {self._quote_identifier(table_name)} "
+                            "WHERE user_id = ?",
+                            (int(user_id),),
+                        )
+                if {
+                    str(row[1])
+                    for row in cursor.execute(
+                        "PRAGMA table_info(runtime_sessions)"
+                    ).fetchall()
+                } >= {"owner_user_id"}:
+                    cursor.execute(
+                        "DELETE FROM runtime_sessions WHERE owner_user_id = ?",
+                        (int(user_id),),
+                    )
+                cursor.execute("DELETE FROM users WHERE id = ?", (int(user_id),))
+                self.conn.commit()
 
                 logger.info(f"用户及相关数据删除成功: user_id={user_id}")
                 return True
 
             except Exception as e:
-                # 回滚事务
-                cursor.execute('ROLLBACK')
+                self.conn.rollback()
                 logger.error(f"删除用户及相关数据失败: {e}")
                 return False
 
@@ -8465,22 +9547,18 @@ class DBManager:
                     placeholders = ','.join(['?' for _ in include_statuses])
                     where_conditions.append(f"o.order_status IN ({placeholders})")
                     params.extend(include_statuses)
-
-                where_conditions.extend([
-                    "o.amount IS NOT NULL",
-                    "o.amount != ''",
-                    "o.amount != 'N/A'",
-                ])
                 where_clause = f"WHERE {' AND '.join(where_conditions)}"
 
                 # 1. 总收益统计（估值，实际会扣税等）
                 cursor.execute(f"""
                     SELECT
                         COUNT(DISTINCT o.order_id) as total_orders,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount,
+                        SUM(o.paid_amount_fen) / 100.0 as total_amount,
+                        AVG(o.paid_amount_fen) / 100.0 as avg_amount,
                         COUNT(DISTINCT o.buyer_id) as unique_buyers,
-                        COUNT(DISTINCT o.item_id) as unique_items
+                        COUNT(DISTINCT o.item_id) as unique_items,
+                        COUNT(DISTINCT CASE WHEN o.paid_amount_fen IS NOT NULL THEN o.order_id END) as with_amount,
+                        COUNT(DISTINCT CASE WHEN o.ordered_at_utc IS NOT NULL THEN o.order_id END) as with_time
                     FROM {from_clause}
                     {where_clause}
                 """, params)
@@ -8491,15 +9569,33 @@ class DBManager:
                     'total_amount': round(row[1] or 0, 2),
                     'avg_amount': round(row[2] or 0, 2),
                     'unique_buyers': row[3] or 0,
-                    'unique_items': row[4] or 0
+                    'unique_items': row[4] or 0,
+                    'orders_with_amount': row[5] or 0,
+                    'amount_coverage_rate': round((row[5] or 0) / (row[0] or 1), 4)
+                    if row[0] else 0.0,
                 } if row else {}
+                total_orders = (row[0] or 0) if row else 0
+                with_amount = (row[5] or 0) if row else 0
+                with_time = (row[6] or 0) if row else 0
+                amount_coverage = {
+                    'total_orders': total_orders,
+                    'with_amount': with_amount,
+                    'coverage_rate': round(with_amount / total_orders, 4)
+                    if total_orders else 0.0,
+                }
+                time_coverage = {
+                    'total_orders': total_orders,
+                    'with_ordered_at': with_time,
+                    'coverage_rate': round(with_time / total_orders, 4)
+                    if total_orders else 0.0,
+                }
 
                 # 2. 按日期统计订单量和收益
                 cursor.execute(f"""
                     SELECT
                         DATE(o.created_at) as date,
                         COUNT(DISTINCT o.order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as daily_amount
+                        SUM(o.paid_amount_fen) / 100.0 as daily_amount
                     FROM {from_clause}
                     {where_clause}
                     GROUP BY DATE(o.created_at)
@@ -8520,7 +9616,7 @@ class DBManager:
                     SELECT
                         o.order_status,
                         COUNT(DISTINCT o.order_id) as count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as amount
+                        SUM(o.paid_amount_fen) / 100.0 as amount
                     FROM {from_clause}
                     {where_clause}
                     GROUP BY o.order_status
@@ -8540,7 +9636,7 @@ class DBManager:
                     SELECT
                         o.receiver_city,
                         COUNT(DISTINCT o.order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount
+                        SUM(o.paid_amount_fen) / 100.0 as total_amount
                     FROM {from_clause}
                     {where_clause}
                     AND o.receiver_city IS NOT NULL AND o.receiver_city != ''
@@ -8562,8 +9658,8 @@ class DBManager:
                     SELECT
                         o.item_id,
                         COUNT(DISTINCT o.order_id) as order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as total_amount,
-                        AVG(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) as avg_amount
+                        SUM(o.paid_amount_fen) / 100.0 as total_amount,
+                        AVG(o.paid_amount_fen) / 100.0 as avg_amount
                     FROM {from_clause}
                     {where_clause}
                     AND o.item_id IS NOT NULL AND o.item_id != ''
@@ -8586,7 +9682,10 @@ class DBManager:
                     'daily_stats': daily_stats,
                     'status_stats': status_stats,
                     'city_stats': city_stats,
-                    'item_stats': item_stats
+                    'item_stats': item_stats,
+                    'amount_coverage': amount_coverage,
+                    'time_coverage': time_coverage,
+                    'metric_source': 'order_transactions',
                 }
 
             except Exception as e:
@@ -8601,7 +9700,7 @@ class DBManager:
         与 get_order_analytics 口径完全一致：
         - 时间边界用 created_at（配合分析索引），左闭右开；
         - 强制 c.user_id 隔离（租户）；
-        - amount 非空、非 'N/A'，保证金额可 CAST。
+        - 订单量不依赖金额是否可解析；金额仅使用 paid_amount_fen。
 
         返回 (where_clause_str, params_list)。
         """
@@ -8621,22 +9720,17 @@ class DBManager:
             placeholders = ','.join(['?' for _ in include_statuses])
             where_conditions.append(f"{o_alias}.order_status IN ({placeholders})")
             params.extend(include_statuses)
-        where_conditions.extend([
-            f"{o_alias}.amount IS NOT NULL",
-            f"{o_alias}.amount != ''",
-            f"{o_alias}.amount != 'N/A'",
-        ])
         return f"WHERE {' AND '.join(where_conditions)}", params
 
     def get_traffic_analytics(self, start_date: str = None, end_date: str = None,
                               user_id: int = None, include_statuses: list = None):
-        """时段流量分析：按真实成交时间(ordered_at_utc)分桶到东八区小时/星期。
+        """订单时段分析：按已保存的平台订单时间分桶到东八区小时/星期。
 
         口径说明（阶段B经营驾驶舱）：
         - 时间边界沿用 created_at（与 get_order_analytics 一致），作覆盖率分母；
         - 只有 ordered_at_utc IS NOT NULL 的订单进入时段分桶，避免把订单
           全堆到同步任务运行时刻而失真；旧订单缺成交时间会被排除，用
-          coverage 字段如实回报覆盖率，供前端标注"基于 N% 有成交时间的订单"。
+          coverage 字段如实回报覆盖率，供前端标注"基于 N% 有订单时间的订单"。
         - ordered_at_utc 存 UTC 秒级 epoch，东八区分桶用 '+8 hours' 偏移。
 
         Args:
@@ -8664,17 +9758,26 @@ class DBManager:
                     SELECT
                         COUNT(DISTINCT o.order_id) AS total_orders,
                         COUNT(DISTINCT CASE WHEN o.ordered_at_utc IS NOT NULL
-                              THEN o.order_id END) AS with_ordered_at
+                              THEN o.order_id END) AS with_ordered_at,
+                        COUNT(DISTINCT CASE WHEN o.paid_amount_fen IS NOT NULL
+                              THEN o.order_id END) AS with_amount
                     FROM {from_clause}
                     {where_clause}
                 """, params)
                 row = cursor.fetchone()
                 total_orders = (row[0] or 0) if row else 0
                 with_ordered_at = (row[1] or 0) if row else 0
+                with_amount = (row[2] or 0) if row else 0
                 coverage = {
                     'total_orders': total_orders,
                     'with_ordered_at': with_ordered_at,
                     'coverage_rate': round(with_ordered_at / total_orders, 4)
+                    if total_orders else 0.0,
+                }
+                amount_coverage = {
+                    'total_orders': total_orders,
+                    'with_amount': with_amount,
+                    'coverage_rate': round(with_amount / total_orders, 4)
                     if total_orders else 0.0,
                 }
 
@@ -8685,7 +9788,7 @@ class DBManager:
                     SELECT
                         CAST(strftime('%H', o.ordered_at_utc, 'unixepoch', '+8 hours') AS INTEGER) AS hour,
                         COUNT(DISTINCT o.order_id) AS order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS amount
+                        SUM(o.paid_amount_fen) / 100.0 AS amount
                     FROM {from_clause}
                     {bucket_where}
                     GROUP BY hour
@@ -8701,7 +9804,7 @@ class DBManager:
                     SELECT
                         strftime('%w', o.ordered_at_utc, 'unixepoch', '+8 hours') AS weekday,
                         COUNT(DISTINCT o.order_id) AS order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS amount
+                        SUM(o.paid_amount_fen) / 100.0 AS amount
                     FROM {from_clause}
                     {bucket_where}
                     GROUP BY weekday
@@ -8713,10 +9816,53 @@ class DBManager:
                     'amount': round(r[2] or 0, 2),
                 } for r in cursor.fetchall()]
 
-                return {'coverage': coverage, 'hourly': hourly, 'weekday': weekday}
+                sufficient_data = (
+                    total_orders >= 20
+                    and coverage['coverage_rate'] >= 0.8
+                )
+                best_hour = max(
+                    hourly,
+                    key=lambda value: (value['order_count'], value['amount']),
+                    default=None,
+                )
+                recommendation = None
+                if sufficient_data and best_hour:
+                    start_hour = int(best_hour['hour'])
+                    recommendation = {
+                        'type': 'transaction_timing',
+                        'hour': start_hour,
+                        'message': (
+                            f"可优先在 {start_hour:02d}:00-"
+                            f"{(start_hour + 1) % 24:02d}:00 安排擦亮或超级曝光；"
+                            "建议依据订单时段，不代表真实曝光流量，也不会自动执行。"
+                        ),
+                    }
+                insufficient_reason = ''
+                if total_orders < 20:
+                    insufficient_reason = '至少需要 20 笔有效成交订单'
+                elif coverage['coverage_rate'] < 0.8:
+                    insufficient_reason = '订单时间覆盖率至少需要达到 80%'
+
+                return {
+                    'coverage': coverage,
+                    'time_coverage': coverage,
+                    'amount_coverage': amount_coverage,
+                    'metric_source': 'order_transactions',
+                    'time_source': 'order_snapshot_ordered_at',
+                    'time_semantics': 'platform_order_recorded_at',
+                    'hourly': hourly,
+                    'weekday': weekday,
+                    'sufficient_data': sufficient_data,
+                    'data_requirement': {
+                        'minimum_orders': 20,
+                        'minimum_time_coverage': 0.8,
+                    },
+                    'insufficient_reason': insufficient_reason,
+                    'recommendation': recommendation,
+                }
 
             except Exception as e:
-                logger.error(f"获取时段流量分析失败: {e}")
+                logger.error(f"获取订单时段分析失败: {e}")
                 return {'error': str(e)}
 
     def get_buyer_behavior_analytics(self, start_date: str = None, end_date: str = None,
@@ -8749,13 +9895,31 @@ class DBManager:
                 )
                 buyer_where = where_clause + " AND o.buyer_id IS NOT NULL AND o.buyer_id != ''"
 
+                cursor.execute(f"""
+                    SELECT
+                        COUNT(DISTINCT o.order_id),
+                        COUNT(DISTINCT CASE WHEN o.paid_amount_fen IS NOT NULL
+                              THEN o.order_id END)
+                    FROM {from_clause}
+                    {where_clause}
+                """, params)
+                coverage_row = cursor.fetchone()
+                coverage_total = (coverage_row[0] or 0) if coverage_row else 0
+                coverage_amount = (coverage_row[1] or 0) if coverage_row else 0
+                amount_coverage = {
+                    'total_orders': coverage_total,
+                    'with_amount': coverage_amount,
+                    'coverage_rate': round(coverage_amount / coverage_total, 4)
+                    if coverage_total else 0.0,
+                }
+
                 # 每个买家的下单次数与贡献金额（后续复用为频次分布与贡献榜的基底）
                 cursor.execute(f"""
                     SELECT
                         o.buyer_id,
                         MAX(o.buyer_nickname) AS buyer_nickname,
                         COUNT(DISTINCT o.order_id) AS order_count,
-                        SUM(CAST(REPLACE(REPLACE(o.amount, '¥', ''), ',', '') AS REAL)) AS total_amount
+                        SUM(o.paid_amount_fen) / 100.0 AS total_amount
                     FROM {from_clause}
                     {buyer_where}
                     GROUP BY o.buyer_id
@@ -8794,11 +9958,723 @@ class DBManager:
                     'summary': summary,
                     'frequency': frequency,
                     'top_buyers': top_buyers,
+                    'amount_coverage': amount_coverage,
+                    'metric_source': 'order_transactions',
                 }
 
             except Exception as e:
                 logger.error(f"获取买家行为分析失败: {e}")
                 return {'error': str(e)}
+
+    @staticmethod
+    def _prepare_item_metric_snapshot(
+        *,
+        item_id: str,
+        observed_at: float,
+        source: str,
+        exposure_count: Optional[int] = None,
+        view_count: Optional[int] = None,
+        want_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        item_id = str(item_id or "").strip()
+        source = str(source or "").strip()
+        if not item_id:
+            raise ValueError("商品指标必须提供商品")
+        if source not in {"seller_backend_verified", "seller_backend_api"}:
+            raise ValueError("商品指标来源未经验证")
+        observed_at = float(observed_at)
+        if not math.isfinite(observed_at) or observed_at <= 0:
+            raise ValueError("商品指标观测时间无效")
+        if observed_at > time.time() + ITEM_METRIC_MAX_FUTURE_SKEW_SECONDS:
+            raise ValueError("商品指标观测时间超出允许的未来偏差")
+
+        def normalized_count(value: Optional[int]) -> Optional[int]:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                raise ValueError("商品指标计数无效")
+            parsed = int(value)
+            if parsed < 0 or parsed != value:
+                raise ValueError("商品指标计数必须是非负整数")
+            return parsed
+
+        counts = {
+            "exposure": normalized_count(exposure_count),
+            "view": normalized_count(view_count),
+            "want": normalized_count(want_count),
+        }
+        if all(value is None for value in counts.values()):
+            raise ValueError("商品指标至少包含一个可信计数")
+        return {
+            "item_id": item_id,
+            "observed_at": observed_at,
+            "observed_hour": int(observed_at // 3600),
+            "source": source,
+            "counts": counts,
+        }
+
+    def _record_item_metric_snapshot_locked(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        user_id: int,
+        cookie_id: str,
+        prepared: Dict[str, Any],
+        owner_verified: bool = False,
+    ) -> Dict[str, Any]:
+        if not owner_verified:
+            owner = cursor.execute(
+                "SELECT user_id FROM cookies WHERE id = ?",
+                (cookie_id,),
+            ).fetchone()
+            if not owner or int(owner[0]) != int(user_id):
+                raise PermissionError("账号不存在或无权访问")
+
+        item_id = prepared["item_id"]
+        observed_hour = prepared["observed_hour"]
+        source = prepared["source"]
+        existing = cursor.execute(
+            "SELECT id, counter_reset, exposure_count, view_count, want_count "
+            "FROM item_metric_snapshots "
+            "WHERE cookie_id = ? AND item_id = ? AND observed_hour = ? AND source = ?",
+            (cookie_id, item_id, observed_hour, source),
+        ).fetchone()
+        if existing:
+            existing_counts = tuple(existing[2:5])
+            incoming_counts = tuple(
+                prepared["counts"][key] for key in ("exposure", "view", "want")
+            )
+            if existing_counts != incoming_counts:
+                raise ValueError("同一观测时间桶存在冲突的商品指标快照")
+            return {
+                "inserted": False,
+                "snapshot_id": int(existing[0]),
+                "counter_reset": bool(existing[1]),
+            }
+
+        latest = cursor.execute(
+            "SELECT observed_hour FROM item_metric_snapshots "
+            "WHERE cookie_id = ? AND item_id = ? AND source = ? "
+            "ORDER BY observed_hour DESC LIMIT 1",
+            (cookie_id, item_id, source),
+        ).fetchone()
+        if latest and int(latest[0]) > int(observed_hour):
+            raise ValueError("商品指标快照时间早于已保存的最新观测")
+
+        previous = cursor.execute(
+            "SELECT exposure_count, view_count, want_count "
+            "FROM item_metric_snapshots "
+            "WHERE cookie_id = ? AND item_id = ? AND source = ? "
+            "AND observed_hour < ? ORDER BY observed_hour DESC LIMIT 1",
+            (cookie_id, item_id, source, observed_hour),
+        ).fetchone()
+        previous_counts = dict(
+            zip(("exposure", "view", "want"), previous or (None, None, None))
+        )
+        counts = prepared["counts"]
+        deltas: Dict[str, Optional[int]] = {}
+        counter_reset = False
+        for key, current in counts.items():
+            prior = previous_counts[key]
+            if current is None or prior is None:
+                deltas[key] = None
+            elif current < int(prior):
+                deltas[key] = None
+                counter_reset = True
+            else:
+                deltas[key] = current - int(prior)
+
+        cursor.execute(
+            """
+            INSERT INTO item_metric_snapshots (
+                user_id, cookie_id, item_id, observed_hour, observed_at,
+                exposure_count, view_count, want_count,
+                exposure_delta, view_delta, want_delta,
+                counter_reset, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user_id), cookie_id, item_id, observed_hour,
+                prepared["observed_at"], counts["exposure"], counts["view"],
+                counts["want"], deltas["exposure"], deltas["view"],
+                deltas["want"], int(counter_reset), source,
+            ),
+        )
+        return {
+            "inserted": True,
+            "snapshot_id": int(cursor.lastrowid),
+            "counter_reset": counter_reset,
+        }
+
+    def record_item_metric_snapshot(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        item_id: str,
+        observed_at: float,
+        source: str,
+        exposure_count: Optional[int] = None,
+        view_count: Optional[int] = None,
+        want_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Store one verified snapshot, deduplicated by its observation-hour bucket."""
+        if user_id is None:
+            raise ValueError("record_item_metric_snapshot 必须提供 user_id")
+        cookie_id = str(cookie_id or "").strip()
+        if not cookie_id:
+            raise ValueError("商品指标必须提供账号")
+        prepared = self._prepare_item_metric_snapshot(
+            item_id=item_id,
+            observed_at=observed_at,
+            source=source,
+            exposure_count=exposure_count,
+            view_count=view_count,
+            want_count=want_count,
+        )
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                result = self._record_item_metric_snapshot_locked(
+                    cursor,
+                    user_id=int(user_id),
+                    cookie_id=cookie_id,
+                    prepared=prepared,
+                )
+                self.conn.commit()
+                return result
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def record_item_metric_snapshots(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        rows: Iterable[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        """Persist one adapter batch atomically; any invalid row rolls it all back."""
+        if user_id is None:
+            raise ValueError("record_item_metric_snapshots 必须提供 user_id")
+        cookie_id = str(cookie_id or "").strip()
+        if not cookie_id:
+            raise ValueError("商品指标必须提供账号")
+        normalized_rows = list(rows or [])
+        if not normalized_rows:
+            raise ValueError("商品指标适配器没有返回已验证快照")
+        if len(normalized_rows) > 200:
+            raise ValueError("商品指标单批最多保存 200 行")
+        prepared_rows = [
+            self._prepare_item_metric_snapshot(
+                item_id=str(row.get("item_id") or ""),
+                observed_at=row.get("observed_at"),
+                source=str(row.get("source") or ""),
+                exposure_count=row.get("exposure_count"),
+                view_count=row.get("view_count"),
+                want_count=row.get("want_count"),
+            )
+            for row in normalized_rows
+            if isinstance(row, dict)
+        ]
+        if len(prepared_rows) != len(normalized_rows):
+            raise ValueError("商品指标适配器返回了无法解析的数据")
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                owner = cursor.execute(
+                    "SELECT user_id FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                ).fetchone()
+                if not owner or int(owner[0]) != int(user_id):
+                    raise PermissionError("账号不存在或无权访问")
+                results = [
+                    self._record_item_metric_snapshot_locked(
+                        cursor,
+                        user_id=int(user_id),
+                        cookie_id=cookie_id,
+                        prepared=prepared,
+                        owner_verified=True,
+                    )
+                    for prepared in prepared_rows
+                ]
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return {
+            "inserted": sum(int(bool(row["inserted"])) for row in results),
+            "duplicates": sum(int(not row["inserted"]) for row in results),
+            "counter_resets": sum(int(bool(row["counter_reset"])) for row in results),
+        }
+
+    def get_item_metric_collection_state(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+    ) -> Dict[str, Any]:
+        cookie_id = str(cookie_id or "").strip()
+        with self.lock:
+            cursor = self.conn.cursor()
+            owner = cursor.execute(
+                "SELECT user_id FROM cookies WHERE id = ?",
+                (cookie_id,),
+            ).fetchone()
+            if not owner or int(owner[0]) != int(user_id):
+                raise PermissionError("账号不存在或无权访问")
+            row = cursor.execute(
+                "SELECT canary_success_count, enabled, last_attempt_at, "
+                "last_success_at, last_error_code, updated_at "
+                "FROM item_metric_collection_states "
+                "WHERE user_id = ? AND cookie_id = ?",
+                (int(user_id), cookie_id),
+            ).fetchone()
+        if not row:
+            return {
+                "cookie_id": cookie_id,
+                "canary_success_count": 0,
+                "enabled": False,
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "last_error_code": "",
+                "updated_at": None,
+            }
+        return {
+            "cookie_id": cookie_id,
+            "canary_success_count": int(row[0] or 0),
+            "enabled": bool(row[1]),
+            "last_attempt_at": row[2],
+            "last_success_at": row[3],
+            "last_error_code": str(row[4] or ""),
+            "updated_at": row[5],
+        }
+
+    def record_item_metric_canary_result(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        success: bool,
+        error_code: str = "",
+    ) -> Dict[str, Any]:
+        cookie_id = str(cookie_id or "").strip()
+        now = time.time()
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                owner = cursor.execute(
+                    "SELECT user_id FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                ).fetchone()
+                if not owner or int(owner[0]) != int(user_id):
+                    raise PermissionError("账号不存在或无权访问")
+                row = cursor.execute(
+                    "SELECT canary_success_count FROM item_metric_collection_states "
+                    "WHERE user_id = ? AND cookie_id = ?",
+                    (int(user_id), cookie_id),
+                ).fetchone()
+                current = int(row[0] or 0) if row else 0
+                updated = min(current + 1, 3) if success else 0
+                enabled = int(success and updated >= 3)
+                cursor.execute(
+                    """
+                    INSERT INTO item_metric_collection_states (
+                        user_id, cookie_id, canary_success_count, enabled,
+                        last_attempt_at, last_success_at, last_error_code, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, cookie_id) DO UPDATE SET
+                        canary_success_count = excluded.canary_success_count,
+                        enabled = excluded.enabled,
+                        last_attempt_at = excluded.last_attempt_at,
+                        last_success_at = COALESCE(
+                            excluded.last_success_at,
+                            item_metric_collection_states.last_success_at
+                        ),
+                        last_error_code = excluded.last_error_code,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        int(user_id), cookie_id, updated, enabled, now,
+                        now if success else None,
+                        "" if success else str(error_code or "metric_collection_failed"),
+                        now,
+                    ),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return self.get_item_metric_collection_state(
+            user_id=int(user_id),
+            cookie_id=cookie_id,
+        )
+
+    def has_enabled_item_metric_collection(self) -> bool:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM item_metric_collection_states AS s "
+                "JOIN cookies AS c "
+                "ON c.id = s.cookie_id AND c.user_id = s.user_id "
+                "WHERE s.enabled = 1 LIMIT 1"
+            ).fetchone()
+        return bool(row)
+
+    def get_item_traffic_analytics(
+        self,
+        *,
+        user_id: int,
+        start_date: str = None,
+        end_date: str = None,
+        cookie_id: str = None,
+        item_id: str = None,
+    ) -> Dict[str, Any]:
+        """Aggregate verified deltas by the interval between consecutive snapshots."""
+        if user_id is None:
+            raise ValueError("get_item_traffic_analytics 必须提供 user_id")
+        base_conditions = ["c.user_id = ?", "m.user_id = c.user_id"]
+        base_params: List[Any] = [int(user_id)]
+        if cookie_id:
+            base_conditions.append("m.cookie_id = ?")
+            base_params.append(str(cookie_id))
+        if item_id:
+            base_conditions.append("m.item_id = ?")
+            base_params.append(str(item_id))
+        cst = ZoneInfo("Asia/Shanghai")
+        start_timestamp: Optional[float] = None
+        end_timestamp: Optional[float] = None
+        if start_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=cst)
+            start_timestamp = start.timestamp()
+        if end_date:
+            end = (
+                datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=cst)
+                + timedelta(days=1)
+            )
+            end_timestamp = end.timestamp()
+
+        scoped_conditions = []
+        scoped_params: List[Any] = []
+        if start_timestamp is not None:
+            scoped_conditions.append("observed_at >= ?")
+            scoped_params.append(start_timestamp)
+        if end_timestamp is not None:
+            scoped_conditions.append("observed_at < ?")
+            scoped_params.append(end_timestamp)
+        scoped_where = (
+            "WHERE " + " AND ".join(scoped_conditions)
+            if scoped_conditions
+            else ""
+        )
+
+        window_conditions = [
+            "window_start_at IS NOT NULL",
+            "counter_reset = 0",
+            "(exposure_delta IS NOT NULL OR view_delta IS NOT NULL "
+            "OR want_delta IS NOT NULL)",
+        ]
+        window_params: List[Any] = []
+        if start_timestamp is not None:
+            # A delta covers the entire interval since the previous snapshot. Exclude
+            # a boundary-crossing interval instead of attributing outside traffic to
+            # the selected date range.
+            window_conditions.append("window_start_at >= ?")
+            window_params.append(start_timestamp)
+        if end_timestamp is not None:
+            window_conditions.append("observed_at < ?")
+            window_params.append(end_timestamp)
+        valid_window_where = "WHERE " + " AND ".join(window_conditions)
+        base_where = "WHERE " + " AND ".join(base_conditions)
+        metric_ctes = f"""
+            WITH ordered_metrics AS (
+                SELECT
+                    m.*,
+                    LAG(m.observed_at) OVER (
+                        PARTITION BY m.cookie_id, m.item_id, m.source
+                        ORDER BY m.observed_at, m.id
+                    ) AS window_start_at
+                FROM item_metric_snapshots AS m
+                JOIN cookies AS c ON c.id = m.cookie_id
+                {base_where}
+            ),
+            scoped_metrics AS (
+                SELECT * FROM ordered_metrics
+                {scoped_where}
+            ),
+            valid_windows AS (
+                SELECT * FROM ordered_metrics
+                {valid_window_where}
+            ),
+            recommendation_windows AS (
+                SELECT * FROM valid_windows
+                WHERE observed_at - window_start_at BETWEEN
+                    {ITEM_METRIC_RECOMMENDATION_MIN_INTERVAL_SECONDS}
+                    AND {ITEM_METRIC_RECOMMENDATION_MAX_INTERVAL_SECONDS}
+            )
+        """
+        query_params = [*base_params, *scoped_params, *window_params]
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            if cookie_id:
+                owner = cursor.execute(
+                    "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,)
+                ).fetchone()
+                if not owner or int(owner[0]) != int(user_id):
+                    raise PermissionError("账号不存在或无权访问")
+            cursor.execute(f"""{metric_ctes}
+                SELECT
+                    (SELECT COUNT(*) FROM scoped_metrics),
+                    (SELECT COUNT(*) FROM valid_windows),
+                    (SELECT COUNT(DISTINCT date(
+                        observed_at, 'unixepoch', '+8 hours'
+                    )) FROM valid_windows),
+                    (SELECT SUM(COALESCE(exposure_delta, 0)) FROM valid_windows),
+                    (SELECT SUM(COALESCE(view_delta, 0)) FROM valid_windows),
+                    (SELECT SUM(COALESCE(want_delta, 0)) FROM valid_windows),
+                    (SELECT SUM(counter_reset) FROM scoped_metrics),
+                    (SELECT COUNT(*) FROM recommendation_windows),
+                    (SELECT COUNT(DISTINCT date(
+                        observed_at, 'unixepoch', '+8 hours'
+                    )) FROM recommendation_windows)
+            """, query_params)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0, 0)
+            snapshot_count = int(row[0] or 0)
+            valid_snapshot_count = int(row[1] or 0)
+            distinct_days = int(row[2] or 0)
+            totals = {
+                "exposure_delta": int(row[3] or 0),
+                "view_delta": int(row[4] or 0),
+                "want_delta": int(row[5] or 0),
+            }
+            reset_count = int(row[6] or 0)
+            recommendation_window_count = int(row[7] or 0)
+            recommendation_distinct_days = int(row[8] or 0)
+
+            cursor.execute(f"""{metric_ctes}
+                SELECT
+                    CAST(strftime(
+                        '%H', window_start_at, 'unixepoch', '+8 hours'
+                    ) AS INTEGER),
+                    CAST(strftime(
+                        '%H', observed_at, 'unixepoch', '+8 hours'
+                    ) AS INTEGER),
+                    CAST(
+                        julianday(date(observed_at, 'unixepoch', '+8 hours'))
+                        - julianday(date(
+                            window_start_at, 'unixepoch', '+8 hours'
+                        ))
+                    AS INTEGER),
+                    COUNT(*),
+                    AVG(observed_at - window_start_at) / 3600.0,
+                    MIN(observed_at - window_start_at) / 3600.0,
+                    MAX(observed_at - window_start_at) / 3600.0,
+                    SUM(COALESCE(exposure_delta, 0)),
+                    SUM(COALESCE(view_delta, 0)),
+                    SUM(COALESCE(want_delta, 0))
+                FROM recommendation_windows
+                GROUP BY 1, 2, 3
+                ORDER BY 2, 1, 3
+            """, query_params)
+            observation_windows = [{
+                "start_hour": int(value[0]),
+                "end_hour": int(value[1]),
+                "day_span": int(value[2] or 0),
+                "crosses_midnight": int(value[2] or 0) > 0,
+                "window_count": int(value[3] or 0),
+                "average_duration_hours": round(float(value[4] or 0), 2),
+                "minimum_duration_hours": round(float(value[5] or 0), 2),
+                "maximum_duration_hours": round(float(value[6] or 0), 2),
+                "exposure_delta": int(value[7] or 0),
+                "view_delta": int(value[8] or 0),
+                "want_delta": int(value[9] or 0),
+            } for value in cursor.fetchall()]
+
+            # Compatibility alias: `hour` is the observation-window end hour,
+            # not an hourly traffic bucket. New clients use observation_windows.
+            hourly = [{
+                "hour": value["end_hour"],
+                "window_start_hour": value["start_hour"],
+                "window_end_hour": value["end_hour"],
+                "day_span": value["day_span"],
+                "crosses_midnight": value["crosses_midnight"],
+                "window_count": value["window_count"],
+                "average_duration_hours": value["average_duration_hours"],
+                "exposure_delta": value["exposure_delta"],
+                "view_delta": value["view_delta"],
+                "want_delta": value["want_delta"],
+            } for value in observation_windows]
+
+            cursor.execute(f"""{metric_ctes}
+                SELECT item_id, COUNT(*),
+                    SUM(COALESCE(exposure_delta, 0)),
+                    SUM(COALESCE(view_delta, 0)),
+                    SUM(COALESCE(want_delta, 0))
+                FROM valid_windows
+                GROUP BY item_id
+                ORDER BY SUM(COALESCE(view_delta, 0)) DESC, COUNT(*) DESC
+                LIMIT 50
+            """, query_params)
+            items = [{
+                "item_id": value[0],
+                "snapshot_count": int(value[1] or 0),
+                "observation_window_count": int(value[1] or 0),
+                "exposure_delta": int(value[2] or 0),
+                "view_delta": int(value[3] or 0),
+                "want_delta": int(value[4] or 0),
+            } for value in cursor.fetchall()]
+
+        sufficient_data = (
+            recommendation_distinct_days >= 14
+            and recommendation_window_count >= 20
+        )
+        best_window = max(
+            observation_windows,
+            key=lambda value: (value["view_delta"], value["exposure_delta"]),
+            default=None,
+        )
+        has_positive_traffic = bool(
+            best_window
+            and (
+                best_window["view_delta"] > 0
+                or best_window["exposure_delta"] > 0
+            )
+        )
+        recommendation = None
+        if sufficient_data and has_positive_traffic:
+            start_hour = int(best_window["start_hour"])
+            end_hour = int(best_window["end_hour"])
+            end_label = f"次日 {end_hour:02d}:00" if best_window[
+                "crosses_midnight"
+            ] else f"{end_hour:02d}:00"
+            recommendation = {
+                "type": "timing",
+                "semantics": "observation_window",
+                "hour": start_hour,
+                "start_hour": start_hour,
+                "end_hour": end_hour,
+                "crosses_midnight": best_window["crosses_midnight"],
+                "average_duration_hours": best_window["average_duration_hours"],
+                "precision": "approximate_observation_window",
+                "message": (
+                    f"流量增量较高的观测窗口约为 {start_hour:02d}:00-{end_label}，"
+                    f"平均跨度 {best_window['average_duration_hours']:.1f} 小时。"
+                    "增量只能归因到整个观测窗口，不能细分到某一小时；"
+                    "可在窗口内分批试验擦亮或超级曝光，系统不会自动执行。"
+                ),
+            }
+        reason = ""
+        if not sufficient_data:
+            reason = "至少需要 14 天且 20 个接近四小时采样的有效观测窗口"
+        elif not has_positive_traffic:
+            reason = "样本已达标，但尚无正向流量增量"
+        return {
+            "metric_source": "seller_backend_verified_snapshots",
+            "aggregation_semantics": "counter_delta_between_consecutive_snapshots",
+            "time_precision": "observation_window",
+            "timezone": "Asia/Shanghai",
+            "schedule_interval_hours": 4,
+            "snapshot_count": snapshot_count,
+            "valid_snapshot_count": valid_snapshot_count,
+            "valid_observation_window_count": valid_snapshot_count,
+            "recommendation_window_count": recommendation_window_count,
+            "recommendation_distinct_days": recommendation_distinct_days,
+            "irregular_window_count": max(
+                valid_snapshot_count - recommendation_window_count,
+                0,
+            ),
+            "distinct_days": distinct_days,
+            "reset_count": reset_count,
+            "totals": totals,
+            "observation_windows": observation_windows,
+            "hourly": hourly,
+            "hourly_semantics": "legacy_observation_window_end_hour",
+            "items": items,
+            "sufficient_data": sufficient_data and has_positive_traffic,
+            "data_requirement": {
+                "minimum_days": 14,
+                "minimum_snapshots": 20,
+                "minimum_observation_windows": 20,
+                "minimum_window_hours": (
+                    ITEM_METRIC_RECOMMENDATION_MIN_INTERVAL_SECONDS / 3600
+                ),
+                "maximum_window_hours": (
+                    ITEM_METRIC_RECOMMENDATION_MAX_INTERVAL_SECONDS / 3600
+                ),
+            },
+            "insufficient_reason": reason,
+            "recommendation": recommendation,
+        }
+
+    def get_item_performance_analytics(
+        self,
+        *,
+        user_id: int,
+        start_date: str = None,
+        end_date: str = None,
+    ) -> Dict[str, Any]:
+        """Order-derived item performance. It intentionally does not claim traffic."""
+        if user_id is None:
+            raise ValueError("get_item_performance_analytics 必须提供 user_id")
+        from_clause = "orders AS o JOIN cookies AS c ON c.id = o.cookie_id"
+        where_clause, params = self._analytics_where(
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            include_statuses=list(("pending_ship", "shipped", "completed")),
+        )
+        item_where = where_clause + " AND o.item_id IS NOT NULL AND o.item_id != ''"
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(f"""
+                SELECT
+                    COUNT(DISTINCT o.order_id),
+                    COUNT(DISTINCT CASE WHEN o.paid_amount_fen IS NOT NULL
+                        THEN o.order_id END)
+                FROM {from_clause}
+                {where_clause}
+            """, params)
+            coverage_row = cursor.fetchone() or (0, 0)
+            total_orders = int(coverage_row[0] or 0)
+            with_amount = int(coverage_row[1] or 0)
+            cursor.execute(f"""
+                SELECT
+                    o.item_id,
+                    MAX(CASE WHEN o.item_title != '' THEN o.item_title ELSE '' END),
+                    COUNT(DISTINCT o.order_id),
+                    SUM(o.paid_amount_fen) / 100.0,
+                    AVG(o.paid_amount_fen) / 100.0,
+                    COUNT(DISTINCT CASE WHEN o.paid_amount_fen IS NOT NULL
+                        THEN o.order_id END)
+                FROM {from_clause}
+                {item_where}
+                GROUP BY o.item_id
+                ORDER BY COUNT(DISTINCT o.order_id) DESC,
+                    SUM(COALESCE(o.paid_amount_fen, 0)) DESC
+                LIMIT 50
+            """, params)
+            items = [{
+                "item_id": row[0],
+                "item_title": row[1] or "",
+                "order_count": int(row[2] or 0),
+                "total_amount": round(row[3] or 0, 2),
+                "avg_amount": round(row[4] or 0, 2),
+                "orders_with_amount": int(row[5] or 0),
+            } for row in cursor.fetchall()]
+        return {
+            "metric_source": "order_transactions",
+            "amount_coverage": {
+                "total_orders": total_orders,
+                "with_amount": with_amount,
+                "coverage_rate": round(with_amount / total_orders, 4)
+                if total_orders else 0.0,
+            },
+            "items": items,
+        }
 
     def update_order_address(self, order_id: str, receiver_address: str = None, receiver_city: str = None):
         """

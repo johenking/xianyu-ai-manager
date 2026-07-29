@@ -90,6 +90,18 @@
   "/analytics/buyers": [
     "GET"
   ],
+  "/analytics/items/metrics/status": [
+    "GET"
+  ],
+  "/analytics/items/metrics/sync": [
+    "POST"
+  ],
+  "/analytics/items/performance": [
+    "GET"
+  ],
+  "/analytics/items/traffic": [
+    "GET"
+  ],
   "/analytics/orders": [
     "GET"
   ],
@@ -606,9 +618,6 @@
     "GET"
   ],
   "/verify-captcha": [
-    "POST"
-  ],
-  "/xianyu/reply": [
     "POST"
   ]
 }

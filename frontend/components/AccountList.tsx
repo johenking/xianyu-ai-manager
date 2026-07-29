@@ -5,6 +5,7 @@ import AITrainingLab from './AITrainingLab';
 import ModelSelector from './ModelSelector';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import { AccountAvatar, CookieEditor } from './ui/AccountVisuals';
+import AuthenticatedImage from './ui/AuthenticatedImage';
 import {
   getAccountDetails,
   updateAccountStatus,
@@ -307,11 +308,8 @@ const AccountList: React.FC = () => {
   const getReachableVerificationImage = (imageUrl?: string | null, screenshotPath?: string | null) => {
     if (imageUrl) return imageUrl;
     if (!screenshotPath) return '';
-    if (screenshotPath.startsWith('/static/')) {
+    if (screenshotPath.startsWith('/')) {
       return screenshotPath;
-    }
-    if (screenshotPath.startsWith('static/')) {
-      return `/${screenshotPath}`;
     }
     return '';
   };
@@ -1511,7 +1509,7 @@ const AccountList: React.FC = () => {
               )}
               {sessionStatus.state === 'verification_required' && sessionStatus.verification_image_url && (
                 <div className="mt-4 overflow-hidden rounded-xl border border-amber-200 bg-white p-2">
-                  <img src={`${sessionStatus.verification_image_url}?t=${sessionStatus.updated_at || Date.now()}`} alt="闲鱼身份验证" className="mx-auto max-h-[520px] w-auto max-w-full object-contain" />
+                  <AuthenticatedImage src={sessionStatus.verification_image_url} alt="闲鱼身份验证" className="mx-auto max-h-[520px] w-auto max-w-full object-contain" />
                 </div>
               )}
             </div>
@@ -1699,7 +1697,7 @@ const AccountList: React.FC = () => {
                       <div className="text-center">
                         <div className="relative mx-auto mb-4 flex h-[260px] w-full max-w-[420px] items-center justify-center overflow-hidden rounded-xl border border-gray-200 bg-[#F7F8FA] shadow-inner sm:mb-6 sm:h-[360px]">
                           {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
-                          {qrStatus === 'waiting' && qrCodeUrl && <img src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full object-contain p-3" />}
+                          {qrStatus === 'waiting' && qrCodeUrl && <AuthenticatedImage src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full object-contain p-3" />}
                           {qrStatus === 'scanned' && (
                             <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-blue-600 animate-fade-in">
                               <Loader2 className="w-10 h-10 mb-4 animate-spin" />
@@ -1717,7 +1715,7 @@ const AccountList: React.FC = () => {
                           {qrStatus === 'verification_required' && (
                             qrVerificationImage ? (
                               <div className="absolute inset-0 bg-white flex flex-col items-center justify-center animate-fade-in p-3">
-                                <img src={qrVerificationImage} alt="闲鱼安全验证页面" className="w-full h-full object-contain p-2" />
+                                <AuthenticatedImage src={qrVerificationImage} alt="闲鱼安全验证页面" className="w-full h-full object-contain p-2" />
                                 <span className="absolute bottom-3 rounded-full bg-white/95 px-3 py-1 text-xs font-bold text-orange-600 shadow-sm">请按官方页面提示完成验证</span>
                               </div>
                             ) : (
@@ -1791,7 +1789,7 @@ const AccountList: React.FC = () => {
 
                         {(qrCodeUrl || qrVerificationImage) && (
                           <div className="flex max-h-[360px] min-h-[220px] items-center justify-center overflow-hidden rounded-2xl border border-gray-200 bg-gray-50 p-3">
-                            <img
+                            <AuthenticatedImage
                               src={qrVerificationImage || qrCodeUrl}
                               alt={qrVerificationImage ? '本机 Chrome 闲鱼验证页面' : '本机 Chrome 闲鱼二维码'}
                               className="max-h-[330px] w-full object-contain"
@@ -2051,7 +2049,7 @@ const AccountList: React.FC = () => {
                         {passwordStatus === 'verification_required' && (
                           <div className="space-y-3">
                             {passwordVerificationImage && (
-                              <img
+                              <AuthenticatedImage
                                 src={passwordVerificationImage}
                                 alt="闲鱼安全验证截图"
                                 className="w-full max-h-80 object-contain rounded-2xl bg-gray-50 border border-gray-100"

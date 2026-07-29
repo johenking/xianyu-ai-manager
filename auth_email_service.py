@@ -8,11 +8,11 @@ from email.utils import formataddr
 import hmac
 import json
 import re
-import smtplib
 import ssl
 from typing import Any, Mapping
 
 from security_utils import SystemSecretCipher
+from utils.outbound_smtp import open_public_smtp
 
 
 SMTP_CONFIGURATION_KEYS = frozenset(
@@ -106,8 +106,10 @@ class SMTPConfiguration:
             raise SMTPConfigurationError("SMTP端口无效")
         use_tls = _as_bool(settings.get("smtp_use_tls", True))
         use_ssl = _as_bool(settings.get("smtp_use_ssl", False))
-        if use_tls and use_ssl:
-            raise SMTPConfigurationError("STARTTLS 与 SSL 不能同时启用")
+        if use_tls == use_ssl:
+            if use_tls:
+                raise SMTPConfigurationError("STARTTLS 与 SSL 不能同时启用")
+            raise SMTPConfigurationError("SMTP 必须启用 STARTTLS 或 SSL")
         from_name = _clean_header(
             settings.get("smtp_from"),
             label="发件人名称",
@@ -162,22 +164,17 @@ class SMTPEmailSender:
 
         connection = None
         try:
-            if configuration.use_ssl:
-                connection = smtplib.SMTP_SSL(
-                    configuration.server,
-                    configuration.port,
-                    timeout=self.timeout_seconds,
-                    context=ssl.create_default_context(),
-                )
-            else:
-                connection = smtplib.SMTP(
-                    configuration.server,
-                    configuration.port,
-                    timeout=self.timeout_seconds,
-                )
+            context = ssl.create_default_context()
+            connection = open_public_smtp(
+                configuration.server,
+                configuration.port,
+                use_ssl=configuration.use_ssl,
+                timeout_seconds=self.timeout_seconds,
+                tls_context=context,
+            )
             connection.ehlo()
             if configuration.use_tls:
-                connection.starttls(context=ssl.create_default_context())
+                connection.starttls(context=context)
                 connection.ehlo()
             connection.login(configuration.username, configuration.password)
             connection.send_message(message)

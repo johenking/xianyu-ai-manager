@@ -63,7 +63,7 @@ describe('DashboardCharts 状态与地区分布', () => {
   });
 });
 
-describe('DashboardCharts 爆品榜', () => {
+describe('DashboardCharts 成交爆品榜', () => {
   const current: OrderAnalytics = {
     revenue_stats: { total_amount: 3000, total_orders: 30 },
     daily_stats: [{ date: '2026-07-10', amount: 1000, order_count: 10 }],
@@ -86,7 +86,7 @@ describe('DashboardCharts 爆品榜', () => {
 
   it('渲染环比增长率、新品标记与金额/客单价', () => {
     render(<DashboardCharts analytics={current} previous={previous} itemNames={names} />);
-    expect(screen.getByText('🔥 爆品榜')).toBeInTheDocument();
+    expect(screen.getByText('成交爆品榜')).toBeInTheDocument();
     expect(screen.getByText('复古相机')).toBeInTheDocument();
     expect(screen.getByText('+200%')).toBeInTheDocument();
     expect(screen.getByText('🆕 新品')).toBeInTheDocument();
@@ -125,6 +125,6 @@ describe('DashboardCharts 爆品榜', () => {
       item_stats: [{ item_id: 'low', order_count: 1, total_amount: 50, avg_amount: 50 }],
     };
     render(<DashboardCharts analytics={sparse} previous={previous} itemNames={names} />);
-    expect(screen.getByText('暂无符合条件的爆品（当期订单量需 ≥ 2）')).toBeInTheDocument();
+    expect(screen.getByText('暂无符合条件的成交爆品（当期订单量需 ≥ 2）')).toBeInTheDocument();
   });
 });

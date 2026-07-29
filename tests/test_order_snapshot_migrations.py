@@ -1,4 +1,4 @@
-"""订单身份快照迁移（2026072601..2026072609）双路径测试。
+"""订单身份快照与商品指标迁移（2026072601..2026072703）双路径测试。
 
 “生产旧库”路径用 tests/fixtures/orders_schema_2026072301.sql 固件构造：
 原生 sqlite3 建库 + 11 行迁移账本，绕开 DBManager 的即席 ALTER 轨道，
@@ -116,6 +116,9 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072607",
                 "2026072608",
                 "2026072609",
+                "2026072701",
+                "2026072702",
+                "2026072703",
             ],
         )
 
@@ -126,6 +129,10 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         self.assertIn("customer_profiles", tables)
+        self.assertIn("item_metric_snapshots", tables)
+        self.assertIn("item_metric_collection_states", tables)
+        self.assertIn("fulfillment_attempts", tables)
+        self.assertIn("fulfillment_card_reservations", tables)
         indexes = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")
@@ -134,6 +141,15 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
         self.assertIn("idx_orders_cookie_ordered_order", indexes)
         self.assertIn("idx_customer_profiles_last_observed", indexes)
+        if "system_settings" in tables:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT key FROM system_settings "
+                    "WHERE key IN ('item_metric_collection_enabled', "
+                    "'item_metric_canary_success_count', 'item_metric_schedule_hours')"
+                ).fetchall(),
+                [],
+            )
         self.assertEqual(
             connection.execute("PRAGMA quick_check").fetchone()[0], "ok"
         )
@@ -172,6 +188,9 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
                 "2026072607",
                 "2026072608",
                 "2026072609",
+                "2026072701",
+                "2026072702",
+                "2026072703",
             ],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
@@ -191,6 +210,9 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")
         }
         self.assertIn("customer_profiles", tables)
+        self.assertIn("item_metric_collection_states", tables)
+        self.assertIn("fulfillment_attempts", tables)
+        self.assertIn("fulfillment_card_reservations", tables)
         self.assertIn("idx_orders_cookie_buyer", indexes)
         self.assertIn("idx_orders_cookie_ordered_at", indexes)
         self.assertIn("idx_orders_cookie_ordered_order", indexes)
@@ -431,7 +453,10 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         connection.commit()
 
         applied = MigrationRunner(
-            connection, str(self.db_path), backup_enabled=False
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version <= "2026072609"],
+            backup_enabled=False,
         ).run()
         self.assertEqual(applied, ["2026072609"])
 
@@ -454,7 +479,12 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
             "买家昵称来源保留，买家头像来源（组级套用）保守降档为空",
         )
         self.assertEqual(
-            MigrationRunner(connection, str(self.db_path), backup_enabled=False).run(),
+            MigrationRunner(
+                connection,
+                str(self.db_path),
+                migrations=[m for m in MIGRATIONS if m.version <= "2026072609"],
+                backup_enabled=False,
+            ).run(),
             [],
         )
         connection.close()
@@ -477,7 +507,12 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         )
         connection.commit()
 
-        MigrationRunner(connection, str(self.db_path), backup_enabled=False).run()
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version <= "2026072609"],
+            backup_enabled=False,
+        ).run()
         self.assertEqual(
             connection.execute(
                 "SELECT avatar_source FROM customer_profiles WHERE buyer_id = 'buyer-rt'"
@@ -507,7 +542,12 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         )
         connection.commit()
 
-        MigrationRunner(connection, str(self.db_path), backup_enabled=False).run()
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version <= "2026072609"],
+            backup_enabled=False,
+        ).run()
         rows = connection.execute(
             "SELECT order_id, item_image_source FROM orders"
             " WHERE order_id IN ('order-2', 'order-3') ORDER BY order_id"
@@ -644,6 +684,109 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         finally:
             manager.close()
 
+    def test_metric_owner_constraint_repairs_mismatch_and_rejects_new_drift(self):
+        connection = sqlite3.connect(self.db_path)
+        MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version <= "2026072702"],
+            backup_enabled=False,
+        ).run()
+        connection.execute(
+            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+            ("other", "other@example.test", "synthetic-hash"),
+        )
+        other_user_id = connection.execute(
+            "SELECT id FROM users WHERE username = 'other'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO item_metric_snapshots "
+            "(user_id, cookie_id, item_id, observed_hour, observed_at, view_count, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                other_user_id,
+                "acct-a",
+                "item-mismatch",
+                1,
+                3600.0,
+                1,
+                "seller_backend_verified",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO item_metric_collection_states "
+            "(user_id, cookie_id, canary_success_count, enabled) VALUES (?, ?, 3, 1)",
+            (other_user_id, "acct-a"),
+        )
+        connection.commit()
+
+        runner = MigrationRunner(
+            connection,
+            str(self.db_path),
+            migrations=[m for m in MIGRATIONS if m.version == "2026072703"],
+            backup_enabled=False,
+        )
+        self.assertEqual(runner.run(), ["2026072703"])
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM item_metric_snapshots WHERE item_id = ?",
+                ("item-mismatch",),
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT COUNT(*) FROM item_metric_collection_states WHERE cookie_id = ?",
+                ("acct-a",),
+            ).fetchone()[0],
+            0,
+        )
+
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(item_metric_snapshots)"
+        ).fetchall()
+        composite_pairs = {
+            (str(row[3]), str(row[4]))
+            for row in foreign_keys
+            if str(row[2]) == "cookies"
+        }
+        self.assertEqual(
+            composite_pairs,
+            {("cookie_id", "id"), ("user_id", "user_id")},
+        )
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        self.assertIn("fulfillment_attempts", tables)
+        self.assertIn("fulfillment_card_reservations", tables)
+        triggers = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        self.assertIn("trg_fulfillment_reservation_card_owner_insert", triggers)
+        self.assertIn("trg_fulfillment_reservation_card_owner_update", triggers)
+        with self.assertRaises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO item_metric_snapshots "
+                "(user_id, cookie_id, item_id, observed_hour, observed_at, view_count, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    other_user_id,
+                    "acct-a",
+                    "item-rejected",
+                    2,
+                    7200.0,
+                    1,
+                    "seller_backend_verified",
+                ),
+            )
+        connection.close()
+
 
 class FreshDatabaseTests(IsolatedKeysTestCase):
     def test_empty_database_first_build_contains_snapshot_schema(self):
@@ -661,6 +804,8 @@ class FreshDatabaseTests(IsolatedKeysTestCase):
                 )
             }
             self.assertIn("customer_profiles", tables)
+            self.assertIn("fulfillment_attempts", tables)
+            self.assertIn("fulfillment_card_reservations", tables)
             versions = {
                 row[0]
                 for row in manager.conn.execute(

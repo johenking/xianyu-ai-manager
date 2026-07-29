@@ -70,7 +70,7 @@ class SMTPEmailServiceTests(unittest.TestCase):
 
     def test_sender_uses_saved_smtp_only_and_sends_a_real_message(self):
         fake = FakeSMTP()
-        with patch("auth_email_service.smtplib.SMTP", return_value=fake) as factory:
+        with patch("auth_email_service.open_public_smtp", return_value=fake) as factory:
             SMTPEmailSender(timeout_seconds=7).send(
                 SMTP_SETTINGS,
                 recipient="recipient@example.test",
@@ -78,7 +78,13 @@ class SMTPEmailServiceTests(unittest.TestCase):
                 text="This is a delivery test.",
             )
 
-        factory.assert_called_once_with("smtp.example.test", 587, timeout=7)
+        factory.assert_called_once_with(
+            "smtp.example.test",
+            587,
+            use_ssl=False,
+            timeout_seconds=7,
+            tls_context=ANY,
+        )
         self.assertEqual(fake.starttls_calls, 1)
         self.assertEqual(
             fake.login_args,
@@ -98,13 +104,10 @@ class SMTPEmailServiceTests(unittest.TestCase):
             "smtp_use_tls": "false",
         }
 
-        with (
-            patch(
-                "auth_email_service.smtplib.SMTP_SSL",
-                return_value=fake,
-            ) as ssl_factory,
-            patch("auth_email_service.smtplib.SMTP") as plain_factory,
-        ):
+        with patch(
+            "auth_email_service.open_public_smtp",
+            return_value=fake,
+        ) as ssl_factory:
             SMTPEmailSender(timeout_seconds=9).send(
                 ssl_settings,
                 recipient="recipient@example.test",
@@ -115,10 +118,10 @@ class SMTPEmailServiceTests(unittest.TestCase):
         ssl_factory.assert_called_once_with(
             "smtp.qq.com",
             465,
-            timeout=9,
-            context=ANY,
+            use_ssl=True,
+            timeout_seconds=9,
+            tls_context=ANY,
         )
-        plain_factory.assert_not_called()
         self.assertEqual(fake.starttls_calls, 0)
         self.assertEqual(
             fake.login_args,
@@ -132,7 +135,7 @@ class SMTPEmailServiceTests(unittest.TestCase):
             "recipient@example.test synthetic-smtp-secret refused"
         )
         with patch(
-            "auth_email_service.smtplib.SMTP",
+            "auth_email_service.open_public_smtp",
             side_effect=network_error,
         ) as factory:
             with self.assertRaises(SMTPDeliveryError) as raised:
@@ -153,6 +156,16 @@ class SMTPEmailServiceTests(unittest.TestCase):
         with self.assertRaises(SMTPConfigurationError):
             SMTPConfiguration.from_settings(
                 {**SMTP_SETTINGS, "smtp_use_ssl": "true"}
+            )
+
+    def test_configuration_rejects_plaintext_authenticated_smtp(self):
+        with self.assertRaises(SMTPConfigurationError):
+            SMTPConfiguration.from_settings(
+                {
+                    **SMTP_SETTINGS,
+                    "smtp_use_tls": "false",
+                    "smtp_use_ssl": "false",
+                }
             )
 
 

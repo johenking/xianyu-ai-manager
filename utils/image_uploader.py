@@ -139,12 +139,14 @@ class ImageUploader:
             async with self.session.post(self.upload_url, data=data, headers=headers) as response:
                 if response.status == 200:
                     response_text = await response.text()
-                    logger.debug(f"上传响应: {response_text}")
+                    logger.debug(
+                        f"图片上传响应已接收: body_length={len(response_text)}"
+                    )
 
                     # 解析响应获取图片URL
                     image_url = self._parse_upload_response(response_text)
                     if image_url:
-                        logger.info(f"图片上传成功: {image_url}")
+                        logger.info("图片上传成功")
                         return image_url
                     else:
                         logger.error("解析上传响应失败")
@@ -178,7 +180,7 @@ class ImageUploader:
                     logger.error("   4. 复制完整的Cookie字符串，更新配置文件中的Cookie")
                     return None
                 else:
-                    logger.error(f"收到HTML响应而非JSON，可能是Cookie失效: {response_text[:500]}")
+                    logger.error("收到HTML响应而非JSON，可能是Cookie失效")
                     return None
 
             # 尝试解析JSON响应
@@ -192,7 +194,7 @@ class ImageUploader:
             if 'object' in response_data and isinstance(response_data['object'], dict):
                 obj = response_data['object']
                 if 'url' in obj:
-                    logger.info(f"从object.url提取到图片URL: {obj['url']}")
+                    logger.info("从object.url提取到图片URL")
                     return obj['url']
 
             # 方式3: 直接在根级别
@@ -211,12 +213,14 @@ class ImageUploader:
                 if 'file_url' in data:
                     return data['file_url']
 
-            logger.error(f"无法从响应中提取图片URL: {response_data}")
+            logger.error(
+                f"无法从响应中提取图片URL: response_type={type(response_data).__name__}"
+            )
             return None
 
         except json.JSONDecodeError:
             # 如果不是JSON格式，尝试其他解析方式
-            logger.error(f"响应不是有效的JSON格式，可能是Cookie失效: {response_text[:200]}...")
+            logger.error("响应不是有效的JSON格式，可能是Cookie失效")
             return None
         except Exception as e:
             logger.error(f"解析上传响应异常: {e}")

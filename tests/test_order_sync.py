@@ -1,11 +1,16 @@
+import asyncio
 import os
 import tempfile
 import time
 import unittest
+from datetime import datetime
+from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
+import order_sync_service
 from db_manager import DBManager
-from utils.order_fetcher_optimized import OrderFetcherOptimized
 from order_sync_service import (
+    _parse_order_timestamp,
     OrderSyncCoordinator,
     XianyuOrderListClient,
     choose_order_status,
@@ -13,6 +18,7 @@ from order_sync_service import (
     extract_order_list,
     normalize_order_status,
     normalize_order_record,
+    parse_amount_fen,
     parse_order_api_payload,
 )
 from utils.browser_pool import cookie_fingerprint
@@ -24,6 +30,12 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(normalize_order_status(3, "买家已签收，交易成功"), "completed")
         self.assertEqual(normalize_order_status(6, "退款成功，钱款已原路退返"), "refunded")
         self.assertEqual(normalize_order_status(10, "买家撤销退款申请"), "refund_cancelled")
+
+    def test_waiting_for_buyer_confirmation_is_not_completed(self):
+        self.assertEqual(
+            normalize_order_status("", "待买家确认收货"),
+            "shipped",
+        )
 
     def test_numeric_and_english_statuses_are_normalized(self):
         self.assertEqual(normalize_order_status(2, ""), "pending_ship")
@@ -52,12 +64,35 @@ class OrderStatusNormalizationTests(unittest.TestCase):
                 self.assertEqual(result["code"], "session_expired")
                 self.assertTrue(result["requires_login"])
 
+    def test_platform_permission_exception_is_not_misclassified_as_login_expiry(self):
+        result = classify_platform_error([
+            "PERMISSION_EXCEPTION::seller order permission denied"
+        ])
+
+        self.assertEqual(result["code"], "platform_permission_denied")
+        self.assertFalse(result["requires_login"])
+
     def test_api_payload_preserves_session_failure_instead_of_returning_unknown(self):
         result = parse_order_api_payload({"ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"]})
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error_code"], "session_expired")
         self.assertTrue(result["requires_login"])
+
+    def test_success_payload_without_data_is_invalid_schema(self):
+        result = parse_order_api_payload({"ret": ["SUCCESS::调用成功"]})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "invalid_response_schema")
+
+    def test_rate_limit_and_server_errors_are_retryable(self):
+        rate_limited = classify_platform_error(["HTTP_429::订单接口请求失败"])
+        unavailable = classify_platform_error(["HTTP_503::订单接口请求失败"])
+
+        self.assertEqual(rate_limited["code"], "rate_limited")
+        self.assertTrue(rate_limited["retryable"])
+        self.assertEqual(unavailable["code"], "platform_unavailable")
+        self.assertTrue(unavailable["retryable"])
 
     def test_recent_order_list_payload_is_extracted_and_normalized(self):
         payload = {
@@ -113,6 +148,56 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(order["amount"], "35.00")
         self.assertEqual(order["quantity"], "3")
 
+    def test_order_list_does_not_infer_unverified_buyer_identity_fields(self):
+        order = normalize_order_record({
+            "commonData": {"orderId": "order-private"},
+            "buyerInfoVO": {
+                "buyerId": "buyer-private",
+                "nick": "unverified-nickname",
+                "avatar": "https://example.test/unverified-avatar.jpg",
+            },
+        }, "account-1")
+
+        self.assertEqual(order["buyer_id"], "buyer-private")
+        self.assertEqual(order["buyer_nickname"], "")
+        self.assertEqual(order["buyer_avatar_url"], "")
+
+    def test_order_list_does_not_default_missing_quantity_to_one(self):
+        order = normalize_order_record({
+            "commonData": {"orderId": "order-no-quantity"},
+        }, "account-1")
+
+        self.assertEqual(order["quantity"], "")
+
+    def test_zero_amount_is_preserved_as_a_known_value(self):
+        order = normalize_order_record({
+            "commonData": {"orderId": "order-zero-amount"},
+            "payAmount": 0,
+        }, "account-1")
+
+        self.assertEqual(order["amount"], "0")
+        self.assertEqual(parse_amount_fen(order["amount"]), 0)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires time.tzset")
+    def test_platform_clock_is_parsed_as_shanghai_time_on_any_host_timezone(self):
+        original_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "UTC"
+            time.tzset()
+            expected = datetime(
+                2026, 7, 1, 10, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+            ).timestamp()
+            self.assertEqual(
+                _parse_order_timestamp("2026-07-01 10:00:00"),
+                expected,
+            )
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            time.tzset()
+
     def test_merchant_refund_flag_overrides_non_refund_status(self):
         order = normalize_order_record({
             "commonData": {
@@ -126,16 +211,14 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(order["order_status"], "refunding")
         self.assertEqual(order["quantity"], "2")
 
-    def test_detail_fetcher_uses_shared_refund_mapping(self):
-        fetcher = OrderFetcherOptimized("account-1", "unb=account-1")
-
-        result = fetcher._parse_api_response({
-            "status": 8,
-            "utArgs": {"orderStatusName": "退款成功，钱款已原路退返"},
-            "components": [],
-        })
-
-        self.assertEqual(result["order_status"], "refunded")
+    def test_trusted_order_quantity_accepts_only_bounded_positive_integers(self):
+        parser = getattr(order_sync_service, "parse_trusted_order_quantity", None)
+        self.assertTrue(callable(parser))
+        self.assertEqual(parser(1), 1)
+        self.assertEqual(parser("3"), 3)
+        for value in (None, "", True, 0, -1, "2.5", "lots", 101):
+            with self.subTest(value=value):
+                self.assertIsNone(parser(value))
 
     def test_cookie_fingerprint_changes_when_login_cookie_changes(self):
         first = cookie_fingerprint("unb=account-1; cookie2=old")
@@ -373,6 +456,41 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.get_order_by_id("order-existing")["order_status"], "completed")
         self.assertEqual(self.db.get_order_by_id("order-new")["order_status"], "refunded")
 
+    async def test_unknown_status_is_partial_failure_even_when_reliable_fields_are_saved(self):
+        self.db.insert_or_update_order(
+            order_id="order-known",
+            order_status="shipped",
+            cookie_id="account-1",
+        )
+
+        async def discoverer(**_kwargs):
+            return {
+                "success": True,
+                "orders": [{
+                    "order_id": "order-known",
+                    "item_id": "item-1",
+                    "amount": "19.90",
+                    "order_status": "unknown",
+                    "platform_status_text": "",
+                }],
+            }
+
+        result = await OrderSyncCoordinator(
+            self.db,
+            discoverer=discoverer,
+        ).sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["error_code"], "status_unconfirmed")
+        self.assertEqual(result["summary"]["status_unconfirmed"], 1)
+        self.assertEqual(result["summary"]["failed"], 1)
+        self.assertEqual(self.db.get_order_by_id("order-known")["order_status"], "shipped")
+        self.assertEqual(self.db.get_order_by_id("order-known")["paid_amount_fen"], 1990)
+
     async def test_recent_order_client_paginates_and_stops_at_date_cutoff(self):
         requested_pages = []
 
@@ -418,6 +536,70 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual([row["order_id"] for row in result["orders"]], ["recent-order"])
         self.assertEqual(requested_pages, [1, 2])
+
+    async def test_recent_order_client_does_not_stop_on_one_old_row_in_a_mixed_page(self):
+        requested_pages = []
+
+        async def page_loader(**kwargs):
+            page_number = kwargs["page_number"]
+            requested_pages.append(page_number)
+            if page_number == 1:
+                return {
+                    "ret": ["SUCCESS::调用成功"],
+                    "data": {
+                        "module": {
+                            "nextPage": "true",
+                            "items": [
+                                {
+                                    "commonData": {
+                                        "orderId": "pinned-old-order",
+                                        "orderStatus": "交易成功",
+                                        "createTime": "2026-01-01 10:00:00",
+                                    }
+                                },
+                                {
+                                    "commonData": {
+                                        "orderId": "recent-order",
+                                        "orderStatus": "交易成功",
+                                        "createTime": "2026-07-01 10:00:00",
+                                    }
+                                },
+                            ],
+                        }
+                    },
+                }
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {
+                    "module": {
+                        "nextPage": "false",
+                        "items": [{
+                            "commonData": {
+                                "orderId": "later-recent-order",
+                                "orderStatus": "待发货",
+                                "createTime": "2026-06-30 10:00:00",
+                            }
+                        }],
+                    }
+                },
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            now_fn=lambda: 1783180800.0,
+            page_size=2,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+            days=90,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(requested_pages, [1, 2])
+        self.assertEqual(
+            [row["order_id"] for row in result["orders"]],
+            ["recent-order", "later-recent-order"],
+        )
 
     async def test_recent_order_client_surfaces_session_expiry(self):
         async def page_loader(**_kwargs):
@@ -475,6 +657,227 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error_code"], "account_identity_mismatch")
+
+    async def test_recent_order_client_rejects_success_without_list_container(self):
+        async def page_loader(**_kwargs):
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {"module": {"nextPage": "false"}},
+            }
+
+        result = await XianyuOrderListClient(page_loader=page_loader).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "invalid_response_schema")
+
+    async def test_recent_order_client_retries_transient_failure_with_backoff(self):
+        calls = 0
+        sleep = AsyncMock()
+
+        async def page_loader(**_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"ret": ["HTTP_429::订单接口请求失败"]}
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {"module": {"items": [], "nextPage": "false"}},
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            sleep_fn=sleep,
+            jitter_fn=lambda _start, _end: 0.0,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(calls, 2)
+        sleep.assert_awaited_once_with(0.75)
+
+    async def test_recent_order_client_stops_when_target_order_is_found(self):
+        requested_pages = []
+
+        async def page_loader(**kwargs):
+            requested_pages.append(kwargs["page_number"])
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {
+                    "module": {
+                        "items": [{
+                            "commonData": {
+                                "orderId": "target-order",
+                                "orderStatus": "待发货",
+                            }
+                        }],
+                        "nextPage": "true",
+                    }
+                },
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            page_size=1,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+            target_order_id="target-order",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(requested_pages, [1])
+        self.assertEqual(result["orders"][0]["order_id"], "target-order")
+
+    async def test_recent_order_client_rejects_non_object_order_rows(self):
+        async def page_loader(**_kwargs):
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {"module": {"items": ["invalid-row"], "nextPage": "false"}},
+            }
+
+        result = await XianyuOrderListClient(page_loader=page_loader).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "invalid_response_schema")
+
+    async def test_recent_order_client_marks_page_limit_as_truncated(self):
+        requested_pages = []
+
+        async def page_loader(**kwargs):
+            page_number = kwargs["page_number"]
+            requested_pages.append(page_number)
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {
+                    "module": {
+                        "items": [{
+                            "commonData": {
+                                "orderId": f"order-{page_number}",
+                                "orderStatus": "待发货",
+                            }
+                        }],
+                        "nextPage": "true",
+                    }
+                },
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            page_size=1,
+            max_pages=2,
+            max_orders=10,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["pages_scanned"], 2)
+        self.assertEqual(requested_pages, [1, 2])
+
+    async def test_recent_order_client_marks_order_limit_as_truncated(self):
+        async def page_loader(**_kwargs):
+            return {
+                "ret": ["SUCCESS::调用成功"],
+                "data": {
+                    "module": {
+                        "items": [
+                            {
+                                "commonData": {
+                                    "orderId": "order-1",
+                                    "orderStatus": "待发货",
+                                }
+                            },
+                            {
+                                "commonData": {
+                                    "orderId": "order-2",
+                                    "orderStatus": "待发货",
+                                }
+                            },
+                        ],
+                        "nextPage": "true",
+                    }
+                },
+            }
+
+        result = await XianyuOrderListClient(
+            page_loader=page_loader,
+            page_size=2,
+            max_pages=10,
+            max_orders=1,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["orders"]), 1)
+
+    async def test_coordinator_reports_sync_limit_reached(self):
+        async def discoverer(**_kwargs):
+            return {
+                "success": True,
+                "truncated": True,
+                "orders": [{
+                    "order_id": "order-limit",
+                    "order_status": "pending_ship",
+                    "platform_status_text": "待发货",
+                    "quantity": "1",
+                }],
+            }
+
+        result = await OrderSyncCoordinator(
+            self.db,
+            discoverer=discoverer,
+        ).sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["error_code"], "sync_limit_reached")
+
+    async def test_account_syncs_are_serialized_for_the_same_account(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        max_active = 0
+
+        async def discoverer(**_kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            entered.set()
+            await release.wait()
+            active -= 1
+            return {"success": True, "orders": []}
+
+        coordinator = OrderSyncCoordinator(self.db, discoverer=discoverer)
+        first = asyncio.create_task(coordinator.sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+        ))
+        await entered.wait()
+        second = asyncio.create_task(coordinator.sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+        ))
+        await asyncio.sleep(0)
+        self.assertEqual(max_active, 1)
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(max_active, 1)
 
     async def test_coordinator_persists_refreshed_cookie_without_returning_it(self):
         updates = []
@@ -565,7 +968,9 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             days=90,
         )
 
-        self.assertCountEqual(requested_order_ids, ["order-shipped", "order-completed", "order-legacy-closed"])
+        self.assertCountEqual(requested_order_ids, [
+            "order-shipped", "order-completed", "order-refunded", "order-legacy-closed",
+        ])
         self.assertEqual(result["summary"]["status_updated"], 3)
         self.assertEqual(self.db.get_order_by_id("order-shipped")["order_status"], "completed")
         self.assertEqual(self.db.get_order_by_id("order-completed")["order_status"], "refunded")
@@ -605,6 +1010,43 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["success"])
         self.assertTrue(result["requires_login"])
         self.assertEqual(self.db.get_order_by_id("order-shipped")["order_status"], "shipped")
+
+    async def test_detail_unknown_status_counts_as_failure_and_preserves_known_status(self):
+        self.db.insert_or_update_order(
+            order_id="order-shipped",
+            order_status="shipped",
+            cookie_id="account-1",
+            created_at="2026-07-01 10:00:00",
+        )
+
+        async def discoverer(**_kwargs):
+            return {"success": True, "orders": []}
+
+        async def detail_fetcher(**_kwargs):
+            return [{
+                "order_id": "order-shipped",
+                "order_status": "unknown",
+                "amount": "28.00",
+            }]
+
+        result = await OrderSyncCoordinator(
+            self.db,
+            discoverer=discoverer,
+            detail_fetcher=detail_fetcher,
+            now_fn=lambda: 1783180800.0,
+        ).sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+            days=90,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["error_code"], "status_unconfirmed")
+        self.assertEqual(result["summary"]["status_unconfirmed"], 1)
+        stored = self.db.get_order_by_id("order-shipped")
+        self.assertEqual(stored["order_status"], "shipped")
+        self.assertEqual(stored["paid_amount_fen"], 2800)
 
 
 if __name__ == "__main__":
