@@ -31,12 +31,21 @@ class SnapshotWriteTestCase(unittest.TestCase):
         handle, self.db_path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
         self.db = DBManager(self.db_path)
+        admin_id = self.db.get_user_by_username("admin")["id"]
+        self.assertTrue(
+            self.db.create_user(
+                "snapshot-seller-two",
+                "snapshot-seller-two@example.test",
+                "Synthetic-pass-2026!",
+            )
+        )
+        seller_two_id = self.db.get_user_by_username("snapshot-seller-two")["id"]
         with self.db.lock:
             self.db.conn.executemany(
                 "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
                 (
-                    ("account-1", "unb=account-1; cookie2=value", 1),
-                    ("account-2", "unb=account-2; cookie2=value", 2),
+                    ("account-1", "unb=account-1; cookie2=value", admin_id),
+                    ("account-2", "unb=account-2; cookie2=value", seller_two_id),
                 ),
             )
             self.db.conn.commit()
@@ -499,10 +508,11 @@ class CoordinatorWiringTests(unittest.IsolatedAsyncioTestCase):
         handle, self.db_path = tempfile.mkstemp(suffix=".db")
         os.close(handle)
         self.db = DBManager(self.db_path)
+        admin_id = self.db.get_user_by_username("admin")["id"]
         with self.db.lock:
             self.db.conn.execute(
                 "INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
-                ("account-1", "unb=account-1; cookie2=value", 1),
+                ("account-1", "unb=account-1; cookie2=value", admin_id),
             )
             self.db.conn.commit()
 
@@ -682,9 +692,11 @@ class BackfillScriptTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tempdir.name, "backfill.db")
         db = DBManager(self.db_path)
+        admin_id = db.get_user_by_username("admin")["id"]
         with db.lock:
             db.conn.execute(
-                "INSERT INTO cookies (id, value, user_id) VALUES ('acct', 'unb=1', 1)"
+                "INSERT INTO cookies (id, value, user_id) VALUES ('acct', 'unb=1', ?)",
+                (admin_id,),
             )
             db.conn.commit()
         db.insert_or_update_order(

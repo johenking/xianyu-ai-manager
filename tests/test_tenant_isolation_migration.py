@@ -109,8 +109,11 @@ class TenantIsolationMigrationTests(unittest.TestCase):
             card_two = self._seed_card(self.user_two)
             consistent = self._seed_rule(card_two, self.user_two)
             # 卡券已被删除的悬空规则：无法推断归属，保持原状
+            self.db.conn.commit()
+            self.db.conn.execute("PRAGMA foreign_keys = OFF")
             dangling = self._seed_rule(999999, self.user_one)
             self.db.conn.commit()
+            self.db.conn.execute("PRAGMA foreign_keys = ON")
         self._apply()
         self.assertEqual(self._rule_owner(consistent), self.user_two)
         self.assertEqual(self._rule_owner(dangling), self.user_one)

@@ -190,31 +190,6 @@
   "/api/browser-extension/pairings/{pairing_id}": [
     "GET"
   ],
-  "/api/captcha/check_completion": [
-    "POST"
-  ],
-  "/api/captcha/control": [
-    "GET"
-  ],
-  "/api/captcha/control/{session_id}": [
-    "GET"
-  ],
-  "/api/captcha/mouse_event": [
-    "POST"
-  ],
-  "/api/captcha/screenshot/{session_id}": [
-    "GET"
-  ],
-  "/api/captcha/session/{session_id}": [
-    "DELETE",
-    "GET"
-  ],
-  "/api/captcha/sessions": [
-    "GET"
-  ],
-  "/api/captcha/status/{session_id}": [
-    "GET"
-  ],
   "/api/check-default-password": [
     "GET"
   ],
@@ -236,6 +211,9 @@
     "POST"
   ],
   "/api/official-login/sessions/{session_id}": [
+    "GET"
+  ],
+  "/api/official-login/sessions/{session_id}/image": [
     "GET"
   ],
   "/api/official-login/sessions/{session_id}/cancel": [
@@ -573,6 +551,9 @@
   ],
   "/qr-login/generate": [
     "POST"
+  ],
+  "/qr-login/verification-image/{session_id}": [
+    "GET"
   ],
   "/register": [
     "POST"
