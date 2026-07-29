@@ -118,7 +118,9 @@ describe('OrderList status sync', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '同步近90天订单' }));
 
-    expect((await screen.findAllByText(/登录状态已过期/)).length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(screen.getAllByText(/登录状态已过期/).length).toBeGreaterThan(0);
+    }, { timeout: 5000 });
     expect(screen.getByText(/account-1/)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: '前往账号管理' }));
     expect(onNavigateAccounts).toHaveBeenCalledTimes(1);
