@@ -239,6 +239,57 @@ class DatabaseHardeningTests(unittest.TestCase):
             self.assertFalse(self.db.import_backup(backup, self.owner_a["id"]))
         self.assertIsNotNone(self.db.get_cookie("account-a"))
 
+    def test_user_import_clears_traversal_image_references(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE keywords SET type = 'image', image_url = ? "
+                "WHERE cookie_id = ?",
+                ("static/uploads/images/../../../private.txt", "account-a"),
+            )
+            self.db.conn.execute(
+                "INSERT INTO default_replies "
+                "(cookie_id, enabled, reply_image_url) VALUES (?, ?, ?)",
+                (
+                    "account-a",
+                    1,
+                    "static/uploads/images/../../../../etc/passwd",
+                ),
+            )
+            self.db.conn.commit()
+
+        backup = self.db.export_backup(self.owner_a["id"])
+        self.assertTrue(self.db.import_backup(backup, self.owner_a["id"]))
+
+        keyword_path = self.db.conn.execute(
+            "SELECT image_url FROM keywords WHERE cookie_id = ?",
+            ("account-a",),
+        ).fetchone()[0]
+        default_path = self.db.conn.execute(
+            "SELECT reply_image_url FROM default_replies WHERE cookie_id = ?",
+            ("account-a",),
+        ).fetchone()[0]
+        self.assertEqual(keyword_path, "")
+        self.assertEqual(default_path, "")
+
+    def test_system_backup_card_image_traversal_is_cleaned(self):
+        prepared = {
+            "cards": {
+                "columns": ["id", "image_url"],
+                "rows": [
+                    [1, "static/uploads/images/../../../private.txt"],
+                    [2, "https://gw.alicdn.com/synthetic.jpg"],
+                ],
+            }
+        }
+
+        self.db._sanitize_imported_image_references(prepared)
+
+        self.assertEqual(prepared["cards"]["rows"][0][1], "")
+        self.assertEqual(
+            prepared["cards"]["rows"][1][1],
+            "https://gw.alicdn.com/synthetic.jpg",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

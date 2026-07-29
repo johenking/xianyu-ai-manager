@@ -155,6 +155,33 @@ DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float, 'expires_at': float}}
 TOKEN_EXPIRE_TIME = 30 * 24 * 60 * 60  # token过期时间：30天
 USER_BACKUP_MAX_BYTES = 25 * 1024 * 1024
+IMAGE_UPLOAD_MAX_BYTES = 5 * 1024 * 1024
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_upload_with_limit(
+    upload: UploadFile,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    """Read an upload incrementally and reject at the first over-limit byte."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(
+            min(UPLOAD_READ_CHUNK_BYTES, max_bytes + 1 - total)
+        )
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{label}超过{max_bytes // (1024 * 1024)}MB",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
@@ -4567,8 +4594,12 @@ async def add_image_keyword(
             logger.warning(f"无效的图片文件类型: {image.content_type}")
             raise HTTPException(status_code=400, detail="请上传图片文件")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4627,8 +4658,12 @@ async def upload_image(
             logger.warning(f"无效的图片文件类型: {image.content_type}")
             raise HTTPException(status_code=400, detail="请上传图片文件")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4860,6 +4895,15 @@ async def update_card_with_image(
     try:
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
 
+        # 必须先验证资源所有权，再读取 multipart 文件体。
+        from db_manager import db_manager
+        existing_card = db_manager.get_card_by_id(
+            card_id,
+            current_user["user_id"],
+        )
+        if not existing_card:
+            raise HTTPException(status_code=404, detail="卡券不存在")
+
         # 验证图片文件
         if not image.content_type or not image.content_type.startswith('image/'):
             logger.warning(f"无效的图片文件类型: {image.content_type}")
@@ -4870,8 +4914,12 @@ async def update_card_with_image(
             if not spec_name or not spec_value:
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
-        # 读取图片数据
-        image_data = await image.read()
+        # 分块读取，并在解码前执行硬大小门禁。
+        image_data = await _read_upload_with_limit(
+            image,
+            max_bytes=IMAGE_UPLOAD_MAX_BYTES,
+            label="图片文件",
+        )
         logger.info(f"读取图片数据成功，大小: {len(image_data)} bytes")
 
         # 保存图片
@@ -4883,7 +4931,6 @@ async def update_card_with_image(
         logger.info(f"图片保存成功: {image_url}")
 
         # 更新卡券
-        from db_manager import db_manager
         success = db_manager.update_card(
             card_id=card_id,
             name=name,
