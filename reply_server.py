@@ -847,17 +847,19 @@ async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
 # 修改管理员密码接口
 @auth_router.post('/change-admin-password')
 async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict[str, Any] = Depends(verify_admin_token)):
-    from db_manager import db_manager
-
     try:
         # 验证当前密码（使用用户表验证）
         if not db_manager.verify_user_password('admin', request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
-        # 更新密码（使用用户表更新）
-        success = db_manager.update_user_password('admin', request.new_password)
+        # 密码与全部持久化会话在同一事务内更新
+        changed_user_id = db_manager.update_user_password_and_revoke_sessions(
+            'admin',
+            request.new_password,
+        )
 
-        if success:
+        if changed_user_id is not None:
+            _drop_user_sessions_from_memory(changed_user_id)
             logger.info(f"【admin#{admin_user['user_id']}】管理员密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:
@@ -871,8 +873,6 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
 # 普通用户修改密码接口
 @auth_router.post('/change-password')
 async def change_user_password(request: ChangePasswordRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    from db_manager import db_manager
-
     try:
         username = current_user.get('username')
         user_id = current_user.get('user_id')
@@ -884,10 +884,14 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
         if not db_manager.verify_user_password(username, request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
-        # 更新密码
-        success = db_manager.update_user_password(username, request.new_password)
+        # 密码与全部持久化会话在同一事务内更新
+        changed_user_id = db_manager.update_user_password_and_revoke_sessions(
+            username,
+            request.new_password,
+        )
 
-        if success:
+        if changed_user_id is not None:
+            _drop_user_sessions_from_memory(changed_user_id)
             logger.info(f"【{username}#{user_id}】用户密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:

@@ -5147,6 +5147,38 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def update_user_password_and_revoke_sessions(
+        self,
+        username: str,
+        new_password: str,
+    ) -> Optional[int]:
+        """原子更新后台密码并撤销该用户的全部持久化会话。"""
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                user = self.user_repository.get_by_identifier(username)
+                if not user or not user.get("is_active"):
+                    self.conn.rollback()
+                    return None
+                password_hash_v2 = hash_user_password(new_password)
+                user_id = int(user["id"])
+                row_count = self.user_repository.set_password_by_id(
+                    user_id,
+                    password_hash_v2,
+                    PASSWORD_HASH_VERSION,
+                )
+                if row_count != 1:
+                    self.conn.rollback()
+                    return None
+                self.auth_session_repository.delete_by_user_id(user_id)
+                self.conn.commit()
+                logger.info(f"用户密码与会话更新成功 user_id={user_id}")
+                return user_id
+            except Exception as e:
+                logger.error(f"更新用户密码与会话失败: {type(e).__name__}")
+                self.conn.rollback()
+                return None
+
     def generate_verification_code(self) -> str:
         """生成6位数字验证码"""
         return ''.join(random.choices(string.digits, k=6))
@@ -9041,35 +9073,6 @@ class DBManager:
         except Exception as e:
             logger.error(f"升级keywords表失败: {e}")
             raise
-    def get_item_replay(self, item_id: str) -> Optional[Dict[str, Any]]:
-        """
-        根据商品ID获取商品回复信息，并返回统一格式
-
-        Args:
-            item_id (str): 商品ID
-
-        Returns:
-            Optional[Dict[str, Any]]: 商品回复信息字典（统一格式），找不到返回 None
-        """
-        try:
-            with self.lock:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                    SELECT reply_content FROM item_replay
-                    WHERE item_id = ?
-                ''', (item_id,))
-
-                row = cursor.fetchone()
-                if row:
-                    (reply_content,) = row
-                    return {
-                        'reply_content': reply_content or ''
-                    }
-                return None
-        except Exception as e:
-            logger.error(f"获取商品回复失败: {e}")
-            return None
-
     def get_item_reply(self, cookie_id: str, item_id: str) -> Optional[Dict[str, Any]]:
         """
         获取指定账号和商品的回复内容
