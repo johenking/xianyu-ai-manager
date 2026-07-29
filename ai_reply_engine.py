@@ -11,6 +11,7 @@ AI回复引擎模块
 
 import os
 import json
+import hashlib
 import time
 import sqlite3
 import threading
@@ -22,6 +23,11 @@ from loguru import logger
 from openai import OpenAI
 from db_manager import db_manager
 from utils.outbound_http import request_public_http_sync
+
+
+def _ai_identifier_reference(value: Any, label: str) -> str:
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:10]
+    return f"{label}_{digest}"
 
 
 class AIReplyEngine:
@@ -263,7 +269,11 @@ class AIReplyEngine:
                 return ''
             return str(prompt.get('content') or '').strip()
         except Exception as e:
-            logger.warning(f"读取专家提示词失败 {cookie_id}/{intent}: {e}")
+            logger.warning(
+                f"读取专家提示词失败 "
+                f"{_ai_identifier_reference(cookie_id, 'account')}/{intent}: "
+                f"{type(e).__name__}"
+            )
             return ''
 
     def build_product_system_prompt(self, intent: str, custom_prompts_raw: str,
@@ -606,7 +616,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             )
             return self.parse_rule_audit(raw, rules)
         except Exception as e:
-            logger.warning(f"规则审计失败 {cookie_id}: {e}")
+            logger.warning(
+                f"规则审计失败 "
+                f"{_ai_identifier_reference(cookie_id, 'account')}: "
+                f"{type(e).__name__}"
+            )
             return self.parse_rule_audit('', rules)
 
     def generate_rule_checked_reply(self, settings: Dict, cookie_id: str, messages: List[Dict],
@@ -747,7 +761,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             return checked['reply']
 
         except Exception as e:
-            logger.error(f"AI训练回复生成失败 {cookie_id}: {e}")
+            logger.error(
+                f"AI训练回复生成失败 "
+                f"{_ai_identifier_reference(cookie_id, 'account')}: "
+                f"{type(e).__name__}"
+            )
             return None
 
     def _call_dashscope_api(self, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
@@ -978,7 +996,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             return 'default'
 
         except Exception as e:
-            logger.error(f"本地意图检测失败 {cookie_id}: {e}")
+            logger.error(
+                f"本地意图检测失败 "
+                f"{_ai_identifier_reference(cookie_id, 'account')}: "
+                f"{type(e).__name__}"
+            )
             return 'default'
 
     def _get_chat_lock(self, chat_id: str) -> threading.Lock:
@@ -996,20 +1018,22 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             return None
 
         try:
+            account_ref = _ai_identifier_reference(cookie_id, "account")
+            item_ref = _ai_identifier_reference(item_id, "item")
             # 先检测意图（用于后续保存）
             intent = self.detect_intent(message, cookie_id)
-            logger.info(f"检测到意图: {intent} (账号: {cookie_id})")
+            logger.info(f"检测到意图: {intent} ({account_ref})")
 
             # 在锁外先保存用户消息到数据库，让所有消息都能立即保存
             message_created_at = self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
 
             # 如果调用方已经实现了去抖（debounce），可以通过 skip_wait=True 跳过内部等待
             if not skip_wait:
-                logger.info(f"【{cookie_id}】消息已保存，等待10秒收集后续消息")
+                logger.info(f"【{account_ref}】消息已保存，等待10秒收集后续消息")
                 # 固定等待10秒，等待可能的后续消息（在锁外延迟，避免阻塞其他消息保存）
                 time.sleep(10)
             else:
-                logger.info(f"【{cookie_id}】消息已保存，外部防抖已启用")
+                logger.info(f"【{account_ref}】消息已保存，外部防抖已启用")
 
             # 获取该chat_id的锁，确保同一对话的消息串行处理
             chat_lock = self._get_chat_lock(chat_id)
@@ -1021,16 +1045,16 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 # 如果 skip_wait=False（内部等待），查询窗口为25秒（10秒等待 + 10秒消息间隔 + 5秒缓冲）
                 query_seconds = 6 if skip_wait else 25
                 recent_messages = self._get_recent_user_messages(chat_id, cookie_id, item_id, seconds=query_seconds)
-                logger.info(f"【{cookie_id}】最近{query_seconds}秒内消息数量: {len(recent_messages)}")
+                logger.info(f"【{account_ref}】最近{query_seconds}秒内消息数量: {len(recent_messages)}")
 
                 if recent_messages and len(recent_messages) > 0:
                     # 只处理最后一条消息（时间戳最新的）
                     latest_message = recent_messages[-1]
                     if message_created_at != latest_message['created_at']:
-                        logger.info(f"【{cookie_id}】检测到更新消息，跳过较早消息")
+                        logger.info(f"【{account_ref}】检测到更新消息，跳过较早消息")
                         return None
                     else:
-                        logger.info(f"【{cookie_id}】当前消息为最新消息，开始处理")
+                        logger.info(f"【{account_ref}】当前消息为最新消息，开始处理")
 
                 # 1. 获取AI回复设置
                 settings = db_manager.get_ai_reply_settings(cookie_id)
@@ -1103,17 +1127,23 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 )
                 reply = checked['reply']
                 if checked['regenerated']:
-                    logger.info(f"规则审计触发一次重答 (账号: {cookie_id}, 商品: {item_id})")
+                    logger.info(
+                        f"规则审计触发一次重答 ({account_ref}, {item_ref})"
+                    )
 
                 # 11. 保存AI回复到对话记录
                 self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", reply, intent)
 
-                logger.info(f"AI回复生成成功 (账号: {cookie_id}, 回复长度: {len(reply)})")
+                logger.info(
+                    f"AI回复生成成功 ({account_ref}, 回复长度: {len(reply)})"
+                )
                 return reply
 
         except Exception as e:
             logger.error(
-                f"AI回复生成失败 {cookie_id}: error_type={type(e).__name__}"
+                f"AI回复生成失败 "
+                f"{_ai_identifier_reference(cookie_id, 'account')}: "
+                f"error_type={type(e).__name__}"
             )
             return None
 

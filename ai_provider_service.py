@@ -58,6 +58,8 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
         "default_model": "",
     },
 }
+PROVIDER_MODEL_MAX_COUNT = 500
+PROVIDER_MODEL_NAME_MAX_LENGTH = 200
 
 
 def _local_encryption_secret() -> str:
@@ -111,11 +113,16 @@ def mask_provider_key(value: str) -> str:
 
 
 def extract_openai_models(payload: Dict[str, Any]) -> List[str]:
-    models = {
-        str(item.get("id") or "").strip()
-        for item in payload.get("data", [])
-        if isinstance(item, dict) and str(item.get("id") or "").strip()
-    }
+    models = set()
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("id") or "").strip()
+        if not name or len(name) > PROVIDER_MODEL_NAME_MAX_LENGTH:
+            continue
+        models.add(name)
+        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
+            break
     return sorted(models, key=str.lower)
 
 
@@ -130,8 +137,10 @@ def extract_gemini_models(payload: Dict[str, Any]) -> List[str]:
         name = str(item.get("name") or "").strip()
         if name.startswith("models/"):
             name = name[7:]
-        if name:
+        if name and len(name) <= PROVIDER_MODEL_NAME_MAX_LENGTH:
             models.add(name)
+        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
+            break
     return sorted(models, key=str.lower)
 
 
@@ -273,8 +282,16 @@ def test_provider_reply(
 class ProviderTestTokenStore:
     """Short-lived, one-time proof that a provider/model generated a reply."""
 
-    def __init__(self, ttl_seconds: int = 600):
+    def __init__(
+        self,
+        ttl_seconds: int = 600,
+        *,
+        max_entries: int = 512,
+        max_entries_per_user: int = 16,
+    ):
         self.ttl_seconds = ttl_seconds
+        self.max_entries = max(1, int(max_entries))
+        self.max_entries_per_user = max(1, int(max_entries_per_user))
         self._tokens: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -282,6 +299,16 @@ class ProviderTestTokenStore:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self._cleanup()
+            matching_user_tokens = [
+                existing_token
+                for existing_token, record in self._tokens.items()
+                if record["user_id"] == int(user_id)
+            ]
+            overflow = len(matching_user_tokens) - self.max_entries_per_user + 1
+            for existing_token in matching_user_tokens[:max(0, overflow)]:
+                self._tokens.pop(existing_token, None)
+            while len(self._tokens) >= self.max_entries:
+                self._tokens.pop(next(iter(self._tokens)), None)
             self._tokens[token] = {
                 "user_id": int(user_id),
                 "profile_id": int(profile_id),

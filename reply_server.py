@@ -10,7 +10,7 @@ from fastapi.responses import (
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Awaitable, Callable, List, Tuple, Optional, Dict, Any, Literal
 from pathlib import Path
 from urllib.parse import quote, unquote, urljoin, urlsplit
@@ -31,6 +31,7 @@ import importlib.util
 import sqlite3
 import threading
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 import cookie_manager
 from db_manager import AccountIdentityMismatchError, db_manager
@@ -186,7 +187,112 @@ async def _read_upload_with_limit(
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
 
-ai_reply_lab_sessions = {}  # {session_id: {'cookie_id': str, 'user_id': int, 'history': list, 'timestamp': float}}
+AI_MODEL_NAME_MAX_LENGTH = 200
+AI_MESSAGE_MAX_LENGTH = 4000
+AI_ITEM_ID_MAX_LENGTH = 160
+AI_ITEM_TITLE_MAX_LENGTH = 500
+AI_ITEM_DESCRIPTION_MAX_LENGTH = 8000
+AI_PROMPT_OVERRIDE_MAX_LENGTH = 8000
+AI_SESSION_ID_MAX_LENGTH = 128
+AI_TRAINING_RULE_MAX_COUNT = 50
+AI_TRAINING_RULE_MAX_LENGTH = 2000
+AI_TRAINING_RULE_SERIALIZED_MAX_BYTES = 4096
+AI_LAB_MAX_SESSIONS_PER_USER = 8
+AI_LAB_MAX_SESSIONS_GLOBAL = 128
+AI_LAB_SESSION_TTL_SECONDS = 6 * 3600
+AI_INTERACTIVE_GLOBAL_LIMIT = 4
+AI_INTERACTIVE_PER_USER_LIMIT = 2
+AI_INTERACTIVE_TIMEOUT_SECONDS = 45.0
+
+ai_reply_lab_sessions: Dict[str, Dict[str, Any]] = {}
+_ai_lab_sessions_lock = threading.Lock()
+_ai_interactive_executor = ThreadPoolExecutor(
+    max_workers=AI_INTERACTIVE_GLOBAL_LIMIT,
+    thread_name_prefix="ai-interactive",
+)
+_ai_interactive_global_slots = threading.BoundedSemaphore(
+    AI_INTERACTIVE_GLOBAL_LIMIT
+)
+_ai_interactive_user_slots: Dict[int, threading.BoundedSemaphore] = {}
+_ai_interactive_user_slots_lock = threading.Lock()
+
+
+def _ai_log_reference(value: Any, label: str) -> str:
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:10]
+    return f"{label}_{digest}"
+
+
+def _get_ai_user_slot(user_id: int) -> threading.BoundedSemaphore:
+    normalized_user_id = int(user_id)
+    with _ai_interactive_user_slots_lock:
+        return _ai_interactive_user_slots.setdefault(
+            normalized_user_id,
+            threading.BoundedSemaphore(AI_INTERACTIVE_PER_USER_LIMIT),
+        )
+
+
+def _run_bounded_ai_call(
+    user_id: int,
+    work: Callable[[], Any],
+) -> Any:
+    """Run expensive interactive AI work behind bounded global/user slots."""
+    if not _ai_interactive_global_slots.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="AI 请求繁忙，请稍后重试")
+    user_slot = _get_ai_user_slot(user_id)
+    if not user_slot.acquire(blocking=False):
+        _ai_interactive_global_slots.release()
+        raise HTTPException(status_code=429, detail="当前用户 AI 请求繁忙，请稍后重试")
+    try:
+        future = _ai_interactive_executor.submit(work)
+    except Exception:
+        user_slot.release()
+        _ai_interactive_global_slots.release()
+        raise
+
+    def release_slots(_future: Any) -> None:
+        user_slot.release()
+        _ai_interactive_global_slots.release()
+
+    future.add_done_callback(release_slots)
+    try:
+        return future.result(timeout=AI_INTERACTIVE_TIMEOUT_SECONDS)
+    except FuturesTimeoutError as exc:
+        raise HTTPException(status_code=504, detail="AI 请求超时，请稍后重试") from exc
+
+
+def _prune_ai_lab_sessions(current_time: float, *, user_id: int) -> None:
+    """Bound process-local training sessions by expiry, user and total size."""
+    normalized_user_id = int(user_id)
+    with _ai_lab_sessions_lock:
+        expired = [
+            session_id
+            for session_id, session in ai_reply_lab_sessions.items()
+            if current_time - float(session.get("timestamp") or 0)
+            > AI_LAB_SESSION_TTL_SECONDS
+        ]
+        for session_id in expired:
+            ai_reply_lab_sessions.pop(session_id, None)
+
+        owned = sorted(
+            (
+                (session_id, float(session.get("timestamp") or 0))
+                for session_id, session in ai_reply_lab_sessions.items()
+                if int(session.get("user_id") or -1) == normalized_user_id
+            ),
+            key=lambda row: row[1],
+        )
+        for session_id, _timestamp in owned[:-AI_LAB_MAX_SESSIONS_PER_USER]:
+            ai_reply_lab_sessions.pop(session_id, None)
+
+        all_sessions = sorted(
+            (
+                (session_id, float(session.get("timestamp") or 0))
+                for session_id, session in ai_reply_lab_sessions.items()
+            ),
+            key=lambda row: row[1],
+        )
+        for session_id, _timestamp in all_sessions[:-AI_LAB_MAX_SESSIONS_GLOBAL]:
+            ai_reply_lab_sessions.pop(session_id, None)
 
 # Direct API QR sessions are owner-scoped and persisted at most once.
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
@@ -5518,44 +5624,110 @@ class AIReplySettings(BaseModel):
 
 
 class AIProviderProfileCreate(BaseModel):
-    name: str
-    provider_type: str = "openai_compatible"
-    preset: str = "custom"
-    base_url: str = ""
-    api_key: str = ""
-    default_model: str = ""
+    name: str = Field(..., min_length=1, max_length=100)
+    provider_type: str = Field(default="openai_compatible", max_length=50)
+    preset: str = Field(default="custom", max_length=50)
+    base_url: str = Field(default="", max_length=2048)
+    api_key: str = Field(default="", max_length=8192)
+    default_model: str = Field(default="", max_length=AI_MODEL_NAME_MAX_LENGTH)
     is_default: bool = False
 
 
 class AIProviderProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    provider_type: Optional[str] = None
-    preset: Optional[str] = None
-    base_url: Optional[str] = None
-    api_key: str = ""
-    api_key_action: str = "keep"
-    default_model: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    provider_type: Optional[str] = Field(default=None, max_length=50)
+    preset: Optional[str] = Field(default=None, max_length=50)
+    base_url: Optional[str] = Field(default=None, max_length=2048)
+    api_key: str = Field(default="", max_length=8192)
+    api_key_action: str = Field(default="keep", max_length=20)
+    default_model: Optional[str] = Field(
+        default=None,
+        max_length=AI_MODEL_NAME_MAX_LENGTH,
+    )
     is_default: Optional[bool] = None
 
 
 class AIProviderTestRequest(BaseModel):
-    model_name: str
+    model_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=AI_MODEL_NAME_MAX_LENGTH,
+    )
+
+
+class AIReplyTestRequest(BaseModel):
+    message: str = Field(default="你好", max_length=AI_MESSAGE_MAX_LENGTH)
+    item_title: str = Field(
+        default="测试商品",
+        max_length=AI_ITEM_TITLE_MAX_LENGTH,
+    )
+    item_price: float = Field(default=100, ge=0, le=1_000_000_000)
+    item_desc: str = Field(
+        default="这是一个测试商品",
+        max_length=AI_ITEM_DESCRIPTION_MAX_LENGTH,
+    )
 
 
 class AIReplyLabRequest(BaseModel):
-    session_id: Optional[str] = None
-    message: str
-    item_id: Optional[str] = None
-    item_title: str = "测试商品"
-    item_price: Any = 100
-    item_desc: str = "这是一个测试商品"
-    training_rules: List[Any] = Field(default_factory=list)
-    prompt_override: str = ""
+    session_id: Optional[str] = Field(
+        default=None,
+        max_length=AI_SESSION_ID_MAX_LENGTH,
+    )
+    message: str = Field(..., min_length=1, max_length=AI_MESSAGE_MAX_LENGTH)
+    item_id: Optional[str] = Field(
+        default=None,
+        max_length=AI_ITEM_ID_MAX_LENGTH,
+    )
+    item_title: str = Field(
+        default="测试商品",
+        max_length=AI_ITEM_TITLE_MAX_LENGTH,
+    )
+    item_price: float = Field(default=100, ge=0, le=1_000_000_000)
+    item_desc: str = Field(
+        default="这是一个测试商品",
+        max_length=AI_ITEM_DESCRIPTION_MAX_LENGTH,
+    )
+    training_rules: List[Any] = Field(
+        default_factory=list,
+        max_length=AI_TRAINING_RULE_MAX_COUNT,
+    )
+    prompt_override: str = Field(
+        default="",
+        max_length=AI_PROMPT_OVERRIDE_MAX_LENGTH,
+    )
+
+    @field_validator("training_rules")
+    @classmethod
+    def validate_training_rules(cls, rules: List[Any]) -> List[Any]:
+        for rule in rules:
+            text = rule.get("text") if isinstance(rule, dict) else rule
+            if len(str(text or "")) > AI_TRAINING_RULE_MAX_LENGTH:
+                raise ValueError("训练规则过长")
+            try:
+                serialized = json.dumps(
+                    rule,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("训练规则格式无效") from exc
+            if len(serialized) > AI_TRAINING_RULE_SERIALIZED_MAX_BYTES:
+                raise ValueError("训练规则负载过大")
+        return rules
 
 
 class AIReplyLabSaveRequest(BaseModel):
-    item_id: str = ""
-    training_rules: List[Any] = Field(default_factory=list)
+    item_id: str = Field(default="", max_length=AI_ITEM_ID_MAX_LENGTH)
+    training_rules: List[Any] = Field(
+        default_factory=list,
+        max_length=AI_TRAINING_RULE_MAX_COUNT,
+    )
+
+    @field_validator("training_rules")
+    @classmethod
+    def validate_training_rules(cls, rules: List[Any]) -> List[Any]:
+        return AIReplyLabRequest.validate_training_rules(rules)
 
 
 class AITrainingRuleStatusRequest(BaseModel):
@@ -5710,14 +5882,18 @@ def _dedupe_rules(rules: List[str]) -> List[str]:
 def _normalize_scoped_rules(rules: List[Any], default_scope: str = 'item') -> List[Dict[str, str]]:
     seen = set()
     cleaned = []
-    for rule in rules or []:
+    for rule in (rules or [])[:AI_TRAINING_RULE_MAX_COUNT]:
         if isinstance(rule, dict):
             scope = str(rule.get('scope') or default_scope).strip().lower()
             text = str(rule.get('text') or '').strip()
         else:
             scope = default_scope
             text = str(rule or '').strip()
-        if scope not in {'global', 'item'} or not text:
+        if (
+            scope not in {'global', 'item'}
+            or not text
+            or len(text) > AI_TRAINING_RULE_MAX_LENGTH
+        ):
             continue
         key = (scope, text)
         if key in seen:
@@ -5915,9 +6091,14 @@ def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = D
     if not profile:
         raise HTTPException(status_code=404, detail='平台配置不存在')
     try:
-        models = discover_provider_models(profile)
+        models = _run_bounded_ai_call(
+            user_id,
+            lambda: discover_provider_models(profile),
+        )
         db_manager.update_ai_provider_models(profile_id, user_id, models)
         return {'models': models, 'cached_at': time.time()}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f'平台模型列表刷新失败 profile={profile_id}: {type(e).__name__}')
         raise HTTPException(status_code=400, detail='模型列表读取失败，可手动填写模型 ID 后测试')
@@ -5932,7 +6113,10 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
         raise HTTPException(status_code=404, detail='平台配置不存在')
     model_name = payload.model_name.strip()
     try:
-        reply = test_provider_reply(profile, model_name)
+        reply = _run_bounded_ai_call(
+            user_id,
+            lambda: test_provider_reply(profile, model_name),
+        )
         if not reply:
             raise ValueError('模型返回空内容')
         db_manager.update_ai_provider_verification(profile_id, user_id, 'verified', '测试回复生成成功')
@@ -5943,6 +6127,8 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
             'test_token': token,
             'model_name': model_name,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         db_manager.update_ai_provider_verification(profile_id, user_id, 'failed', '测试回复生成失败')
         logger.warning(f'AI平台测试失败 profile={profile_id} model={model_name}: {type(e).__name__}')
@@ -6121,8 +6307,8 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"获取AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取AI回复设置失败")
 
 
 @ai_router.put("/ai-reply-settings/{cookie_id}")
@@ -6179,9 +6365,13 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
 
             # 如果启用了AI回复，记录日志
             if settings.ai_enabled:
-                logger.info(f"账号 {cookie_id} 启用AI回复")
+                logger.info(
+                    f"{_ai_log_reference(cookie_id, 'account')} 启用AI回复"
+                )
             else:
-                logger.info(f"账号 {cookie_id} 禁用AI回复")
+                logger.info(
+                    f"{_ai_log_reference(cookie_id, 'account')} 禁用AI回复"
+                )
 
             return {"message": "AI回复设置更新成功"}
         else:
@@ -6189,8 +6379,8 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"更新AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"更新AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="更新AI回复设置失败")
 
 
 @ai_router.get("/ai-reply-settings")
@@ -6224,14 +6414,14 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
             user_settings[cid] = settings
         return user_settings
     except Exception as e:
-        logger.error(f"获取所有AI回复设置异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"获取所有AI回复设置异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="获取AI回复设置失败")
 
 
 @ai_router.post("/ai-reply-test/{cookie_id}")
 def test_ai_reply(
     cookie_id: str,
-    test_data: dict,
+    test_data: AIReplyTestRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """测试AI回复功能"""
@@ -6256,22 +6446,25 @@ def test_ai_reply(
             raise HTTPException(status_code=400, detail='未配置API地址，请先在AI设置中配置API地址')
 
         # 构造测试数据
-        test_message = test_data.get('message', '你好')
+        test_message = test_data.message
         test_item_info = {
-            'title': test_data.get('item_title', '测试商品'),
-            'price': test_data.get('item_price', 100),
-            'desc': test_data.get('item_desc', '这是一个测试商品')
+            'title': test_data.item_title,
+            'price': test_data.item_price,
+            'desc': test_data.item_desc,
         }
 
         # 生成测试回复（跳过等待时间）
-        reply = ai_reply_engine.generate_reply(
-            message=test_message,
-            item_info=test_item_info,
-            chat_id=f"test_{int(time.time())}",
-            cookie_id=cookie_id,
-            user_id="test_user",
-            item_id="test_item",
-            skip_wait=True  # 测试时跳过10秒等待
+        reply = _run_bounded_ai_call(
+            current_user['user_id'],
+            lambda: ai_reply_engine.generate_reply(
+                message=test_message,
+                item_info=test_item_info,
+                chat_id=f"test_{int(time.time())}",
+                cookie_id=cookie_id,
+                user_id="test_user",
+                item_id="test_item",
+                skip_wait=True,
+            ),
         )
 
         if reply:
@@ -6282,10 +6475,8 @@ def test_ai_reply(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"测试AI回复异常: {e}")
-        import traceback
-        logger.error(f"详细错误: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"测试AI回复异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="测试AI回复失败")
 
 
 @ai_router.post("/ai-reply-lab/reply/{cookie_id}")
@@ -6319,31 +6510,37 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             item_desc = db_item.get('item_detail') or db_item.get('item_description') or item_desc
 
         current_time = time.time()
-        expired_sessions = [
-            sid for sid, session in ai_reply_lab_sessions.items()
-            if current_time - session.get('timestamp', 0) > 6 * 3600
-        ]
-        for sid in expired_sessions:
-            ai_reply_lab_sessions.pop(sid, None)
+        _prune_ai_lab_sessions(
+            current_time,
+            user_id=current_user['user_id'],
+        )
 
         session_id = request.session_id or secrets.token_urlsafe(16)
         registry = get_session_registry()
         persisted = registry.get(session_id)
         if persisted and persisted.get('owner_user_id') != current_user['user_id']:
             raise HTTPException(status_code=403, detail='无权限访问该训练会话')
-        session = ai_reply_lab_sessions.get(session_id)
         normalized_item_id = str(request.item_id or '')
-        if (not session or session.get('cookie_id') != cookie_id
-                or session.get('user_id') != current_user['user_id']
-                or session.get('item_id') != normalized_item_id):
-            session = {
-                'cookie_id': cookie_id,
-                'user_id': current_user['user_id'],
-                'item_id': normalized_item_id,
-                'history': [],
-                'timestamp': current_time,
-            }
-            ai_reply_lab_sessions[session_id] = session
+        with _ai_lab_sessions_lock:
+            session = ai_reply_lab_sessions.get(session_id)
+            if (not session or session.get('cookie_id') != cookie_id
+                    or session.get('user_id') != current_user['user_id']
+                    or session.get('item_id') != normalized_item_id):
+                session = {
+                    'cookie_id': cookie_id,
+                    'user_id': current_user['user_id'],
+                    'item_id': normalized_item_id,
+                    'history': [],
+                    'timestamp': current_time,
+                }
+                ai_reply_lab_sessions[session_id] = session
+            history = list(session.get('history', []))
+        _prune_ai_lab_sessions(
+            current_time,
+            user_id=current_user['user_id'],
+        )
+
+        if not persisted and not registry.get(session_id):
             registry.register(
                 session_id,
                 "ai_training",
@@ -6356,20 +6553,22 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
         else:
             registry.update(session_id, status="processing", ttl_seconds=6 * 3600)
 
-        history = session.get('history', [])
-        reply_result = ai_reply_engine.generate_lab_reply(
-            message=message,
-            item_info={
-                'title': item_title,
-                'price': item_price,
-                'desc': item_desc,
-            },
-            cookie_id=cookie_id,
-            context=history,
-            training_rules=_normalize_scoped_rules(request.training_rules),
-            item_id=normalized_item_id,
-            prompt_override=request.prompt_override,
-            return_metadata=True,
+        reply_result = _run_bounded_ai_call(
+            current_user['user_id'],
+            lambda: ai_reply_engine.generate_lab_reply(
+                message=message,
+                item_info={
+                    'title': item_title,
+                    'price': item_price,
+                    'desc': item_desc,
+                },
+                cookie_id=cookie_id,
+                context=history,
+                training_rules=_normalize_scoped_rules(request.training_rules),
+                item_id=normalized_item_id,
+                prompt_override=request.prompt_override,
+                return_metadata=True,
+            ),
         )
 
         if not reply_result or not reply_result.get('reply'):
@@ -6380,15 +6579,17 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
             {'role': 'user', 'content': message},
             {'role': 'assistant', 'content': reply},
         ])
-        session['history'] = history[-24:]
-        session['timestamp'] = current_time
+        with _ai_lab_sessions_lock:
+            session['history'] = history[-24:]
+            session['timestamp'] = current_time
+            response_history = list(session['history'])
         registry.update(session_id, status="success", ttl_seconds=6 * 3600)
 
         return {
             "session_id": session_id,
             "reply": reply,
             "warnings": _detect_ai_reply_warnings(reply),
-            "history": session['history'],
+            "history": response_history,
             "rule_context": reply_result.get('rule_context', {}),
             "rule_audit": reply_result.get('audit', {}),
             "regenerated": bool(reply_result.get('regenerated')),
@@ -6402,8 +6603,8 @@ def ai_reply_lab_reply(cookie_id: str, request: AIReplyLabRequest, current_user:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"AI训练实验室回复异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"AI训练实验室回复异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="AI训练实验室回复失败")
 
 
 @ai_router.post("/ai-reply-lab/save/{cookie_id}")
@@ -6424,8 +6625,8 @@ def save_ai_reply_lab_rules(cookie_id: str, request: AIReplyLabSaveRequest, curr
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"保存AI训练规则异常: {e}")
-        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+        logger.error(f"保存AI训练规则异常: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="保存AI训练规则失败")
 
 
 @ai_router.get("/ai-training-rules/{cookie_id}")
@@ -6503,7 +6704,11 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"生成商品知识草稿失败 {cookie_id}/{item_id}: {e}")
+        logger.error(
+            f"生成商品知识草稿失败 "
+            f"{_ai_log_reference(cookie_id, 'account')}/"
+            f"{_ai_log_reference(item_id, 'item')}: {type(e).__name__}"
+        )
         raise HTTPException(status_code=500, detail='AI草稿生成失败，请检查AI配置')
 
 
