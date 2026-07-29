@@ -10,10 +10,22 @@ import json
 import time
 import sys
 import os
+import threading
+import weakref
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from loguru import logger
+
+from search_limits import (
+    SEARCH_ACCOUNT_ID_MAX_CHARS,
+    SEARCH_GLOBAL_CONCURRENCY,
+    SEARCH_KEYWORD_MAX_CHARS,
+    SEARCH_OPERATION_TIMEOUT_SECONDS,
+    SEARCH_PAGE_MAX,
+    SEARCH_PAGE_SIZE_MAX,
+    SEARCH_TOTAL_PAGES_MAX,
+)
 
 # 修复Docker环境中的asyncio事件循环策略问题
 if sys.platform.startswith('linux') or os.getenv('DOCKER_ENV'):
@@ -42,6 +54,90 @@ except ImportError:
 
 
 SEARCH_RESPONSE_ITEM_LIMIT = 200
+
+
+class _LoopSearchBudget:
+    def __init__(self) -> None:
+        self.global_slots = asyncio.Semaphore(SEARCH_GLOBAL_CONCURRENCY)
+        self.account_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+
+_SEARCH_BUDGETS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_SEARCH_BUDGETS_LOCK = threading.Lock()
+
+
+def _loop_search_budget() -> _LoopSearchBudget:
+    loop = asyncio.get_running_loop()
+    with _SEARCH_BUDGETS_LOCK:
+        budget = _SEARCH_BUDGETS.get(loop)
+        if budget is None:
+            budget = _LoopSearchBudget()
+            _SEARCH_BUDGETS[loop] = budget
+        return budget
+
+
+def _normalize_search_request(
+    keyword: str,
+    account_id: str,
+    *,
+    page: int = 1,
+    page_size: int = 20,
+    total_pages: int = 1,
+) -> tuple[str, str, int, int, int]:
+    normalized_keyword = str(keyword or "").strip()
+    normalized_account_id = str(account_id or "").strip()
+    try:
+        normalized_page = int(page)
+        normalized_page_size = int(page_size)
+        normalized_total_pages = int(total_pages)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("搜索分页参数无效") from exc
+
+    if not normalized_keyword or len(normalized_keyword) > SEARCH_KEYWORD_MAX_CHARS:
+        raise ValueError("搜索关键词长度无效")
+    if (
+        not normalized_account_id
+        or len(normalized_account_id) > SEARCH_ACCOUNT_ID_MAX_CHARS
+    ):
+        raise ValueError("搜索账号标识长度无效")
+    if not 1 <= normalized_page <= SEARCH_PAGE_MAX:
+        raise ValueError("搜索页码超过安全上限")
+    if not 1 <= normalized_page_size <= SEARCH_PAGE_SIZE_MAX:
+        raise ValueError("搜索每页数量超过安全上限")
+    if not 1 <= normalized_total_pages <= SEARCH_TOTAL_PAGES_MAX:
+        raise ValueError("搜索总页数超过安全上限")
+    return (
+        normalized_keyword,
+        normalized_account_id,
+        normalized_page,
+        normalized_page_size,
+        normalized_total_pages,
+    )
+
+
+async def _run_bounded_search(
+    account_id: str,
+    operation: Callable[[], Awaitable[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    budget = _loop_search_budget()
+    account_lock = budget.account_locks.setdefault(account_id, asyncio.Lock())
+    try:
+        async with budget.global_slots:
+            async with account_lock:
+                return await asyncio.wait_for(
+                    operation(),
+                    timeout=SEARCH_OPERATION_TIMEOUT_SECONDS,
+                )
+    except asyncio.TimeoutError:
+        logger.warning("商品搜索超过整体时限，已取消并释放浏览器")
+        return {
+            "items": [],
+            "total": 0,
+            "error": "商品搜索超时",
+            "error_code": "search_timeout",
+        }
 
 
 class SearchAccountBindingError(RuntimeError):
@@ -386,7 +482,10 @@ class XianyuSearcher:
                     'error': 'Playwright 不可用，无法获取真实数据'
                 }
 
-            logger.info(f"使用 Playwright 搜索闲鱼商品: 关键词='{keyword}', 页码={page}, 每页={page_size}")
+            logger.info(
+                f"使用 Playwright 搜索闲鱼商品: keyword_length={len(keyword)}, "
+                f"页码={page}, 每页={page_size}"
+            )
 
             await self.init_browser()
 
@@ -454,7 +553,7 @@ class XianyuSearcher:
 
                 await self.page.wait_for_load_state("networkidle", timeout=10000)
 
-                logger.info(f"正在搜索关键词: {keyword}")
+                logger.info(f"正在搜索关键词: keyword_length={len(keyword)}")
                 await self.page.fill('input[class*="search-input"]', keyword)
 
                 # 注册响应监听
@@ -544,7 +643,10 @@ class XianyuSearcher:
 
     async def _get_fallback_data(self, keyword: str, page: int, page_size: int) -> Dict[str, Any]:
         """获取备选数据（模拟数据）"""
-        logger.info(f"使用备选数据: 关键词='{keyword}', 页码={page}, 每页={page_size}")
+        logger.info(
+            f"使用备选数据: keyword_length={len(keyword)}, "
+            f"页码={page}, 每页={page_size}"
+        )
 
         # 模拟搜索延迟
         await asyncio.sleep(0.5)
@@ -789,7 +891,10 @@ class XianyuSearcher:
                     'error': 'Playwright 不可用，无法获取真实数据'
                 }
 
-            logger.info(f"使用 Playwright 搜索多页闲鱼商品: 关键词='{keyword}', 总页数={total_pages}")
+            logger.info(
+                f"使用 Playwright 搜索多页闲鱼商品: "
+                f"keyword_length={len(keyword)}, 总页数={total_pages}"
+            )
 
             # 确保浏览器初始化
             await self.init_browser()
@@ -886,7 +991,7 @@ class XianyuSearcher:
                 logger.info(f"当前页面标题: {page_title}")
                 logger.info(f"当前页面URL: {page_url}")
 
-                logger.info(f"正在搜索关键词: {keyword}")
+                logger.info(f"正在搜索关键词: keyword_length={len(keyword)}")
 
                 # 尝试多种搜索框选择器
                 search_selectors = [
@@ -917,7 +1022,7 @@ class XianyuSearcher:
                     raise Exception("页面在查找搜索框后被关闭")
 
                 await search_input.fill(keyword)
-                logger.info(f"✅ 搜索关键词 '{keyword}' 已填入搜索框")
+                logger.info("搜索关键词已填入搜索框")
 
                 # 注册响应监听
                 self.page.on("response", on_response)
@@ -1083,7 +1188,10 @@ class XianyuSearcher:
 
     async def _get_multiple_fallback_data(self, keyword: str, total_pages: int) -> Dict[str, Any]:
         """获取多页备选数据（模拟数据）"""
-        logger.info(f"使用多页备选数据: 关键词='{keyword}', 总页数={total_pages}")
+        logger.info(
+            f"使用多页备选数据: keyword_length={len(keyword)}, "
+            f"总页数={total_pages}"
+        )
 
         # 模拟搜索延迟
         await asyncio.sleep(1)
@@ -1126,7 +1234,7 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(
+async def _search_xianyu_items_impl(
     keyword: str,
     *,
     user_id: int,
@@ -1207,7 +1315,7 @@ async def search_xianyu_items(
     }
 
 
-async def search_multiple_pages_xianyu(
+async def _search_multiple_pages_xianyu_impl(
     keyword: str,
     *,
     user_id: int,
@@ -1284,3 +1392,86 @@ async def search_multiple_pages_xianyu(
         'total': 0,
         'error': "未知错误"
     }
+
+
+async def search_xianyu_items(
+    keyword: str,
+    *,
+    user_id: int,
+    account_id: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
+    """Run one bounded, account-serialized Chromium search."""
+
+    try:
+        (
+            keyword,
+            account_id,
+            page,
+            page_size,
+            _,
+        ) = _normalize_search_request(
+            keyword,
+            account_id,
+            page=page,
+            page_size=page_size,
+        )
+    except ValueError as exc:
+        return {
+            "items": [],
+            "total": 0,
+            "error": str(exc),
+            "error_code": "invalid_search_request",
+        }
+
+    return await _run_bounded_search(
+        account_id,
+        lambda: _search_xianyu_items_impl(
+            keyword,
+            user_id=user_id,
+            account_id=account_id,
+            page=page,
+            page_size=page_size,
+        ),
+    )
+
+
+async def search_multiple_pages_xianyu(
+    keyword: str,
+    *,
+    user_id: int,
+    account_id: str,
+    total_pages: int = 1,
+) -> Dict[str, Any]:
+    """Run bounded multi-page work under the shared Chromium budget."""
+
+    try:
+        (
+            keyword,
+            account_id,
+            _,
+            _,
+            total_pages,
+        ) = _normalize_search_request(
+            keyword,
+            account_id,
+            total_pages=total_pages,
+        )
+    except ValueError as exc:
+        return {
+            "items": [],
+            "total": 0,
+            "error": str(exc),
+            "error_code": "invalid_search_request",
+        }
+
+    return await _run_bounded_search(
+        account_id,
+        lambda: _search_multiple_pages_xianyu_impl(
+            keyword,
+            user_id=user_id,
+            account_id=account_id,
+            total_pages=total_pages,
+        ),
+    )

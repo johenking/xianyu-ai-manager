@@ -108,6 +108,13 @@ from session_registry import (
     sanitize_log_record,
     sanitize_runtime_error,
 )
+from search_limits import (
+    SEARCH_ACCOUNT_ID_MAX_CHARS,
+    SEARCH_KEYWORD_MAX_CHARS,
+    SEARCH_PAGE_MAX,
+    SEARCH_PAGE_SIZE_MAX,
+    SEARCH_TOTAL_PAGES_MAX,
+)
 from official_login_sessions import OfficialLoginSessionCoordinator, OfficialLoginSessionRecord
 from utils.xianyu_official_login import OfficialLoginResult, XianyuOfficialLoginService
 from browser_extension_pairing import (
@@ -5139,16 +5146,23 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 # ==================== 商品搜索 API ====================
 
+def _public_item_search_error_code(result: Dict[str, Any]) -> str:
+    raw_code = str(result.get("error_code") or "").strip().lower()
+    if raw_code and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", raw_code):
+        return raw_code
+    return "search_failed"
+
+
 class ItemSearchRequest(BaseModel):
-    keyword: str
-    account_id: str
-    page: int = 1
-    page_size: int = 20
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
+    account_id: str = Field(min_length=1, max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
+    page: int = Field(default=1, ge=1, le=SEARCH_PAGE_MAX)
+    page_size: int = Field(default=20, ge=1, le=SEARCH_PAGE_SIZE_MAX)
 
 class ItemSearchMultipleRequest(BaseModel):
-    keyword: str
-    account_id: str
-    total_pages: int = 1
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
+    account_id: str = Field(min_length=1, max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
+    total_pages: int = Field(default=1, ge=1, le=SEARCH_TOTAL_PAGES_MAX)
 
 @content_router.post("/items/search")
 async def search_items(
@@ -5156,10 +5170,17 @@ async def search_items(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索闲鱼商品"""
-    user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
+    user_info = get_user_log_prefix(current_user)
 
     try:
-        logger.info(f"{user_info} 开始单页搜索: 关键词='{search_request.keyword}', 页码={search_request.page}, 每页={search_request.page_size}")
+        _require_skill_monitor_account_ready(
+            current_user['user_id'],
+            search_request.account_id,
+        )
+        logger.info(
+            f"{user_info} 开始单页搜索: keyword_length={len(search_request.keyword)}, "
+            f"页码={search_request.page}, 每页={search_request.page_size}"
+        )
 
         from utils.item_search import search_xianyu_items
 
@@ -5173,14 +5194,17 @@ async def search_items(
         )
 
         # 检查是否有错误
-        has_error = result.get("error")
+        has_error = bool(result.get("error"))
+        error_code = _public_item_search_error_code(result) if has_error else ""
         items_count = len(result.get("items", []))
 
-        logger.info(f"{user_info} 单页搜索完成: 获取到 {items_count} 条数据" +
-                   (f", 错误: {has_error}" if has_error else ""))
+        logger.info(
+            f"{user_info} 单页搜索完成: 获取到 {items_count} 条数据, "
+            f"error_code={error_code or 'none'}"
+        )
 
         response_data = {
-            "success": True,
+            "success": not has_error,
             "data": result.get("items", []),
             "total": result.get("total", 0),
             "page": search_request.page,
@@ -5190,16 +5214,17 @@ async def search_items(
             "source": result.get("source", "unknown")
         }
 
-        # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = "商品搜索暂时不可用"
+            response_data["error_code"] = error_code
 
         return response_data
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"{user_info} 商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"商品搜索失败: {error_msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"{user_info} 商品搜索失败: type={type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="商品搜索暂时不可用") from exc
 
 
 @accounts_router.get("/cookies/check")
@@ -5256,10 +5281,17 @@ async def search_multiple_pages(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """搜索多页闲鱼商品"""
-    user_info = f"【{current_user.get('username', 'unknown')}#{current_user.get('user_id', 'unknown')}】" if current_user else "【未登录】"
+    user_info = get_user_log_prefix(current_user)
 
     try:
-        logger.info(f"{user_info} 开始多页搜索: 关键词='{search_request.keyword}', 页数={search_request.total_pages}")
+        _require_skill_monitor_account_ready(
+            current_user['user_id'],
+            search_request.account_id,
+        )
+        logger.info(
+            f"{user_info} 开始多页搜索: keyword_length={len(search_request.keyword)}, "
+            f"页数={search_request.total_pages}"
+        )
 
         from utils.item_search import search_multiple_pages_xianyu
 
@@ -5272,14 +5304,17 @@ async def search_multiple_pages(
         )
 
         # 检查是否有错误
-        has_error = result.get("error")
+        has_error = bool(result.get("error"))
+        error_code = _public_item_search_error_code(result) if has_error else ""
         items_count = len(result.get("items", []))
 
-        logger.info(f"{user_info} 多页搜索完成: 获取到 {items_count} 条数据" +
-                   (f", 错误: {has_error}" if has_error else ""))
+        logger.info(
+            f"{user_info} 多页搜索完成: 获取到 {items_count} 条数据, "
+            f"error_code={error_code or 'none'}"
+        )
 
         response_data = {
-            "success": True,
+            "success": not has_error,
             "data": result.get("items", []),
             "total": result.get("total", 0),
             "total_pages": search_request.total_pages,
@@ -5289,16 +5324,17 @@ async def search_multiple_pages(
             "source": result.get("source", "unknown")
         }
 
-        # 如果有错误信息，也包含在响应中
         if has_error:
-            response_data["error"] = has_error
+            response_data["error"] = "商品搜索暂时不可用"
+            response_data["error_code"] = error_code
 
         return response_data
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"多页商品搜索失败: {error_msg}")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"{user_info} 多页商品搜索失败: type={type(exc).__name__}")
+        raise HTTPException(status_code=500, detail="商品搜索暂时不可用") from exc
 
 
 
@@ -5482,34 +5518,49 @@ class AIItemKnowledgeCopyRequest(BaseModel):
 
 
 class SkillMonitorTaskIn(BaseModel):
-    name: str = ""
-    keyword: str
+    name: str = Field(default="", max_length=128)
+    keyword: str = Field(min_length=1, max_length=SEARCH_KEYWORD_MAX_CHARS)
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    region: str = ""
-    published_within_hours: int = 24
-    ai_filter: str = ""
+    region: str = Field(default="", max_length=64)
+    published_within_hours: int = Field(default=24, ge=1, le=24 * 365)
+    ai_filter: str = Field(default="", max_length=2000)
     notify_enabled: bool = False
-    account_id: str = ""
+    account_id: str = Field(default="", max_length=SEARCH_ACCOUNT_ID_MAX_CHARS)
     enabled: bool = True
     schedule_enabled: bool = False
-    schedule_interval_minutes: int = 60
+    schedule_interval_minutes: int = Field(default=60, ge=1, le=10080)
     next_run_at: Optional[str] = None
 
 
 class SkillMonitorTaskUpdate(BaseModel):
-    name: Optional[str] = None
-    keyword: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=128)
+    keyword: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=SEARCH_KEYWORD_MAX_CHARS,
+    )
     min_price: Optional[float] = None
     max_price: Optional[float] = None
-    region: Optional[str] = None
-    published_within_hours: Optional[int] = None
-    ai_filter: Optional[str] = None
+    region: Optional[str] = Field(default=None, max_length=64)
+    published_within_hours: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=24 * 365,
+    )
+    ai_filter: Optional[str] = Field(default=None, max_length=2000)
     notify_enabled: Optional[bool] = None
-    account_id: Optional[str] = None
+    account_id: Optional[str] = Field(
+        default=None,
+        max_length=SEARCH_ACCOUNT_ID_MAX_CHARS,
+    )
     enabled: Optional[bool] = None
     schedule_enabled: Optional[bool] = None
-    schedule_interval_minutes: Optional[int] = None
+    schedule_interval_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10080,
+    )
     next_run_at: Optional[str] = None
 
 
