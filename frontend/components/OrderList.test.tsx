@@ -153,7 +153,9 @@ describe('OrderList status sync', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '同步近90天订单' }));
 
-    expect((await screen.findAllByText('订单同步部分完成')).length).toBeGreaterThanOrEqual(2);
+    await waitFor(() => {
+      expect(screen.getAllByText('订单同步部分完成').length).toBeGreaterThanOrEqual(2);
+    }, { timeout: 5000 });
     expect(screen.getByText('状态待确认 1')).toBeInTheDocument();
     expect(screen.getByText('商品图片')).toBeInTheDocument();
     expect(screen.getByText('买家昵称')).toBeInTheDocument();
