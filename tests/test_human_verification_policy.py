@@ -211,6 +211,39 @@ class HumanVerificationPolicyTests(unittest.TestCase):
         self.assertFalse(live.can_auto_delivery(""))
         self.assertFalse(live.can_auto_delivery(None))
 
+    def test_default_reply_never_uses_an_item_reply_from_an_unscoped_account(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "tenant-account-a"
+        database = Mock()
+        database.get_item_reply.return_value = None
+        database.get_default_reply.return_value = {
+            "enabled": True,
+            "reply_content": "tenant-a default",
+            "reply_once": False,
+            "reply_image_url": "",
+        }
+        database.get_item_replay.return_value = {
+            "reply_content": "tenant-b private reply",
+        }
+
+        with patch("db_manager.db_manager", database):
+            result = asyncio.run(
+                live.get_default_reply(
+                    send_user_name="buyer",
+                    send_user_id="buyer-id",
+                    send_message="hello",
+                    chat_id="chat-id",
+                    item_id="shared-item-id",
+                )
+            )
+
+        self.assertEqual(result["text"], "tenant-a default")
+        database.get_item_reply.assert_called_once_with(
+            "tenant-account-a",
+            "shared-item-id",
+        )
+        database.get_item_replay.assert_not_called()
+
     def test_red_reminder_without_identity_is_not_persisted(self):
         handler = OrderStatusHandler()
         database = Mock()

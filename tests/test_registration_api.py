@@ -718,6 +718,220 @@ class LoginAndPasswordResetAPITests(RegistrationAPIFixture):
         self.assertEqual(inactive_login.status_code, 401)
         self.assertEqual(inactive_login.json()["code"], "INVALID_CREDENTIALS")
 
+    def test_login_runs_one_bcrypt_verification_for_active_inactive_and_missing_accounts(self):
+        cases = (
+            ("ordinary-user", "Original-pass-2026!", 200),
+            ("inactive-user", "Original-pass-2026!", 401),
+            ("missing-user", "Original-pass-2026!", 401),
+        )
+        self.assertTrue(
+            self.db.create_user(
+                "inactive-user",
+                "inactive@example.com",
+                "Original-pass-2026!",
+            )
+        )
+        inactive = self.db.get_user_by_username("inactive-user")
+        self.db.auth_service.set_user_active(inactive["id"], False)
+
+        from services import auth_service
+
+        original_verify = auth_service.verify_user_password_hash
+        for identifier, password, expected_status in cases:
+            with self.subTest(identifier=identifier):
+                with patch(
+                    "services.auth_service.verify_user_password_hash",
+                    wraps=original_verify,
+                ) as password_verifier:
+                    response = self.client.post(
+                        "/login",
+                        json={
+                            "identifier": identifier,
+                            "password": password,
+                        },
+                    )
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(password_verifier.call_count, 1)
+
+    def test_change_password_revokes_all_existing_user_sessions(self):
+        first = self.client.post(
+            "/login",
+            json={
+                "identifier": "ordinary-user",
+                "password": "Original-pass-2026!",
+            },
+        ).json()
+        second = self.client.post(
+            "/login",
+            json={
+                "identifier": "ordinary@example.com",
+                "password": "Original-pass-2026!",
+            },
+        ).json()
+
+        changed = self.client.post(
+            "/change-password",
+            headers={"Authorization": f"Bearer {first['token']}"},
+            json={
+                "current_password": "Original-pass-2026!",
+                "new_password": "Changed-direct-pass-2026!",
+            },
+        )
+
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertTrue(changed.json()["success"])
+        for token in (first["token"], second["token"]):
+            self.assertFalse(
+                self.client.get(
+                    "/verify",
+                    headers={"Authorization": f"Bearer {token}"},
+                ).json()["authenticated"]
+            )
+        user = self.db.get_user_by_username("ordinary-user")
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()[0],
+            0,
+        )
+        new_login = self.client.post(
+            "/login",
+            json={
+                "identifier": "ordinary-user",
+                "password": "Changed-direct-pass-2026!",
+            },
+        )
+        self.assertEqual(new_login.status_code, 200, new_login.text)
+
+    def test_change_admin_password_revokes_all_existing_admin_sessions(self):
+        self.assertTrue(
+            self.db.update_user_password(
+                "admin",
+                "Original-admin-pass-2026!",
+            )
+        )
+        admin = self.db.get_user_by_username("admin")
+        first_token, _ = reply_server.create_login_session(admin)
+        second_token, _ = reply_server.create_login_session(admin)
+
+        changed = self.client.post(
+            "/change-admin-password",
+            headers={"Authorization": f"Bearer {first_token}"},
+            json={
+                "current_password": "Original-admin-pass-2026!",
+                "new_password": "Changed-admin-pass-2026!",
+            },
+        )
+
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertTrue(changed.json()["success"])
+        for token in (first_token, second_token):
+            self.assertFalse(
+                self.client.get(
+                    "/verify",
+                    headers={"Authorization": f"Bearer {token}"},
+                ).json()["authenticated"]
+            )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?",
+                (admin["id"],),
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_failed_session_revocation_rolls_back_the_password_change(self):
+        login = self.client.post(
+            "/login",
+            json={
+                "identifier": "ordinary-user",
+                "password": "Original-pass-2026!",
+            },
+        ).json()
+        user = self.db.get_user_by_username("ordinary-user")
+
+        with patch.object(
+            self.db.auth_session_repository,
+            "delete_by_user_id",
+            side_effect=RuntimeError("synthetic session-store failure"),
+        ):
+            changed_user_id = self.db.update_user_password_and_revoke_sessions(
+                "ordinary-user",
+                "Must-not-commit-pass-2026!",
+            )
+
+        self.assertIsNone(changed_user_id)
+        self.assertTrue(
+            self.db.verify_user_password(
+                "ordinary-user",
+                "Original-pass-2026!",
+            )
+        )
+        self.assertFalse(
+            self.db.verify_user_password(
+                "ordinary-user",
+                "Must-not-commit-pass-2026!",
+            )
+        )
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) FROM auth_sessions WHERE user_id = ?",
+                (user["id"],),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertTrue(
+            self.client.get(
+                "/verify",
+                headers={"Authorization": f"Bearer {login['token']}"},
+            ).json()["authenticated"]
+        )
+
+    def test_login_forwarding_header_requires_the_direct_peer_to_be_trusted(self):
+        spoofed_ip = "198.51.100.77"
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "check_login_limit",
+        ) as login_limit:
+            response = self.client.post(
+                "/login",
+                headers={"CF-Connecting-IP": spoofed_ip},
+                json={
+                    "identifier": "ordinary-user",
+                    "password": "Original-pass-2026!",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        login_limit.assert_called_once_with(
+            ip="127.0.0.1",
+            account="ordinary-user",
+        )
+
+        self.assertTrue(
+            self.db.set_system_setting("auth_trusted_proxies", "127.0.0.1")
+        )
+        with patch.object(
+            self.db.auth_rate_limiter,
+            "check_login_limit",
+        ) as trusted_login_limit:
+            trusted_response = self.client.post(
+                "/login",
+                headers={"CF-Connecting-IP": spoofed_ip},
+                json={
+                    "identifier": "ordinary-user",
+                    "password": "Original-pass-2026!",
+                },
+            )
+
+        self.assertEqual(trusted_response.status_code, 200, trusted_response.text)
+        trusted_login_limit.assert_called_once_with(
+            ip=spoofed_ip,
+            account="ordinary-user",
+        )
+
     def test_password_reset_revokes_all_old_sessions_and_new_password_works(self):
         old_login = self.client.post(
             "/login",
