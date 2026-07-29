@@ -78,7 +78,10 @@ class ItemMetricScheduler:
                 user_id=int(user_id),
                 cookie_id=cookie_id,
             )
-            if not state.get("enabled"):
+            if not (
+                state.get("enabled")
+                and int(state.get("canary_success_count") or 0) >= 3
+            ):
                 continue
             result = await collect_item_metrics_once(
                 db_manager,

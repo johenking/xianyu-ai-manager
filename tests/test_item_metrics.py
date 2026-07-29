@@ -1,11 +1,15 @@
 """商品指标快照、观测窗口、重置处理和租户隔离。"""
 
 import asyncio
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import inspect
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -280,11 +284,12 @@ class ItemMetricSnapshotTests(unittest.TestCase):
             ("account-one", self.owner_one["id"]),
             ("account-two", self.owner_two["id"]),
         ):
-            for _ in range(3):
+            for index in range(3):
                 self.db.record_item_metric_canary_result(
                     user_id=user_id,
                     cookie_id=cookie_id,
                     success=True,
+                    observed_at=1785106800.0 + index * 3600,
                 )
         scheduler = ItemMetricScheduler()
         with patch.object(item_metric_scheduler_module, "db_manager", self.db), patch.object(
@@ -321,12 +326,30 @@ class ItemMetricSnapshotTests(unittest.TestCase):
             4 * 60 * 60,
         )
 
+    def test_scheduler_rechecks_canary_count_even_when_enabled_flag_is_true(self):
+        collector = AsyncMock(return_value=[])
+        register_item_metric_collector(collector)
+        scheduler = ItemMetricScheduler()
+        with patch.object(
+            item_metric_scheduler_module,
+            "db_manager",
+            self.db,
+        ), patch.object(
+            self.db,
+            "get_item_metric_collection_state",
+            return_value={"enabled": True, "canary_success_count": 2},
+        ):
+            asyncio.run(scheduler._collect_all_accounts())
+
+        collector.assert_not_awaited()
+
     def test_canary_state_is_account_scoped(self):
-        for _ in range(3):
+        for index in range(3):
             state = self.db.record_item_metric_canary_result(
                 user_id=self.owner_one["id"],
                 cookie_id="account-one",
                 success=True,
+                observed_at=1785106800.0 + index * 3600,
             )
 
         other = self.db.get_item_metric_collection_state(
@@ -337,6 +360,17 @@ class ItemMetricSnapshotTests(unittest.TestCase):
         self.assertEqual(state["canary_success_count"], 3)
         self.assertFalse(other["enabled"])
         self.assertEqual(other["canary_success_count"], 0)
+
+    def test_database_rejects_enabled_state_before_three_canaries(self):
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "CHECK constraint"):
+            with self.db.lock:
+                self.db.conn.execute(
+                    "INSERT INTO item_metric_collection_states "
+                    "(user_id, cookie_id, canary_success_count, enabled) "
+                    "VALUES (?, ?, 2, 1)",
+                    (self.owner_one["id"], "account-one"),
+                )
+        self.db.conn.rollback()
 
     def test_metric_batch_rolls_back_when_any_row_is_invalid(self):
         async def collector(**_kwargs):
@@ -518,12 +552,121 @@ class ItemMetricSnapshotTests(unittest.TestCase):
             canary=True,
         ))
         self.assertFalse(result["success"])
-        self.assertEqual(result["error_code"], "metric_collection_failed")
+        self.assertEqual(result["error_code"], "metric_adapter_result_not_bounded")
         self.assertEqual(
             self.db.get_item_traffic_analytics(user_id=self.owner_one["id"])[
                 "snapshot_count"
             ],
             0,
+        )
+
+    def test_unbounded_adapter_iterable_is_rejected_without_consumption(self):
+        consumed = False
+
+        def rows():
+            nonlocal consumed
+            consumed = True
+            yield {
+                "item_id": "item-unbounded",
+                "observed_at": 1785114000.0,
+                "source": "seller_backend_verified",
+                "view_count": 1,
+            }
+
+        async def collector(**_kwargs):
+            return rows()
+
+        register_item_metric_collector(collector)
+        result = asyncio.run(collect_item_metrics_once(
+            self.db,
+            user_id=self.owner_one["id"],
+            cookie_id="account-one",
+            cookie_string="unb=one; cookie2=x",
+            canary=True,
+        ))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "metric_adapter_result_not_bounded")
+        self.assertFalse(consumed)
+
+    def test_db_batch_checks_sequence_length_before_indexing(self):
+        class OversizedSequence(Sequence):
+            def __len__(self):
+                return 201
+
+            def __getitem__(self, _index):
+                raise AssertionError("oversized result must not be indexed")
+
+        with self.assertRaisesRegex(ValueError, "最多保存 200"):
+            self.db.record_item_metric_snapshots(
+                user_id=self.owner_one["id"],
+                cookie_id="account-one",
+                rows=OversizedSequence(),
+            )
+
+    def test_duplicate_observation_does_not_advance_canary(self):
+        calls = 0
+
+        async def collector(**_kwargs):
+            nonlocal calls
+            observed_at = 1785114000.0 + calls * 600
+            calls += 1
+            return [{
+                "item_id": "item-canary",
+                "observed_at": observed_at,
+                "source": "seller_backend_verified",
+                "view_count": 10,
+            }]
+
+        register_item_metric_collector(collector)
+        results = [
+            asyncio.run(collect_item_metrics_once(
+                self.db,
+                user_id=self.owner_one["id"],
+                cookie_id="account-one",
+                cookie_string="unb=one; cookie2=x",
+                canary=True,
+            ))
+            for _ in range(3)
+        ]
+
+        self.assertEqual(
+            [result["canary_successes"] for result in results],
+            [1, 1, 1],
+        )
+        self.assertEqual(
+            [result["canary_advanced"] for result in results],
+            [True, False, False],
+        )
+        self.assertFalse(results[-1]["collection_enabled"])
+
+    def test_cross_connection_duplicate_canary_is_atomic(self):
+        other = DBManager(self.db.db_path)
+        barrier = threading.Barrier(2)
+
+        def record(manager):
+            barrier.wait(timeout=5)
+            return manager.record_item_metric_canary_result(
+                user_id=self.owner_one["id"],
+                cookie_id="account-one",
+                success=True,
+                observed_at=1785114000.0,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                states = list(executor.map(record, (self.db, other)))
+            final_state = self.db.get_item_metric_collection_state(
+                user_id=self.owner_one["id"],
+                cookie_id="account-one",
+            )
+        finally:
+            other.close()
+
+        self.assertEqual(final_state["canary_success_count"], 1)
+        self.assertEqual(
+            sum(int(state["canary_advanced"]) for state in states),
+            1,
         )
 
     def test_collection_failure_does_not_expose_adapter_error_details(self):
@@ -677,9 +820,9 @@ class ItemMetricApiTests(unittest.TestCase):
             calls.append(cookie_id)
             return [{
                 "item_id": "item-1",
-                "observed_at": 1785114000.0,
+                "observed_at": 1785110400.0 + len(calls) * 3600,
                 "source": "seller_backend_verified",
-                "view_count": 10,
+                "view_count": 9 + len(calls),
             }]
 
         register_item_metric_collector(collector)
@@ -721,11 +864,12 @@ class ItemMetricApiTests(unittest.TestCase):
         collector.assert_not_awaited()
 
     def test_metric_status_reports_only_current_users_accounts(self):
-        for _ in range(3):
+        for index in range(3):
             self.db.record_item_metric_canary_result(
                 user_id=self.owner_one["id"],
                 cookie_id="metric-account-one",
                 success=True,
+                observed_at=1785106800.0 + index * 3600,
             )
         response = self.client.get(
             "/analytics/items/metrics/status",

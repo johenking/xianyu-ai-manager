@@ -10153,19 +10153,25 @@ class DBManager:
         *,
         user_id: int,
         cookie_id: str,
-        rows: Iterable[Dict[str, Any]],
-    ) -> Dict[str, int]:
+        rows: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         """Persist one adapter batch atomically; any invalid row rolls it all back."""
         if user_id is None:
             raise ValueError("record_item_metric_snapshots 必须提供 user_id")
         cookie_id = str(cookie_id or "").strip()
         if not cookie_id:
             raise ValueError("商品指标必须提供账号")
-        normalized_rows = list(rows or [])
-        if not normalized_rows:
+        if isinstance(rows, (str, bytes, bytearray)) or not isinstance(
+            rows,
+            Sequence,
+        ):
+            raise TypeError("商品指标适配器必须返回有界序列")
+        row_count = len(rows)
+        if row_count == 0:
             raise ValueError("商品指标适配器没有返回已验证快照")
-        if len(normalized_rows) > 200:
+        if row_count > 200:
             raise ValueError("商品指标单批最多保存 200 行")
+        normalized_rows = [rows[index] for index in range(row_count)]
         prepared_rows = [
             self._prepare_item_metric_snapshot(
                 item_id=str(row.get("item_id") or ""),
@@ -10209,6 +10215,14 @@ class DBManager:
             "inserted": sum(int(bool(row["inserted"])) for row in results),
             "duplicates": sum(int(not row["inserted"]) for row in results),
             "counter_resets": sum(int(bool(row["counter_reset"])) for row in results),
+            "newest_inserted_observed_at": max(
+                (
+                    prepared["observed_at"]
+                    for prepared, result in zip(prepared_rows, results)
+                    if result["inserted"]
+                ),
+                default=None,
+            ),
         }
 
     def get_item_metric_collection_state(
@@ -10228,7 +10242,7 @@ class DBManager:
                 raise PermissionError("账号不存在或无权访问")
             row = cursor.execute(
                 "SELECT canary_success_count, enabled, last_attempt_at, "
-                "last_success_at, last_error_code, updated_at "
+                "last_success_at, last_canary_observed_at, last_error_code, updated_at "
                 "FROM item_metric_collection_states "
                 "WHERE user_id = ? AND cookie_id = ?",
                 (int(user_id), cookie_id),
@@ -10240,6 +10254,7 @@ class DBManager:
                 "enabled": False,
                 "last_attempt_at": None,
                 "last_success_at": None,
+                "last_canary_observed_at": None,
                 "last_error_code": "",
                 "updated_at": None,
             }
@@ -10249,8 +10264,9 @@ class DBManager:
             "enabled": bool(row[1]),
             "last_attempt_at": row[2],
             "last_success_at": row[3],
-            "last_error_code": str(row[4] or ""),
-            "updated_at": row[5],
+            "last_canary_observed_at": row[4],
+            "last_error_code": str(row[5] or ""),
+            "updated_at": row[6],
         }
 
     def record_item_metric_canary_result(
@@ -10259,10 +10275,21 @@ class DBManager:
         user_id: int,
         cookie_id: str,
         success: bool,
+        observed_at: Optional[float] = None,
         error_code: str = "",
     ) -> Dict[str, Any]:
         cookie_id = str(cookie_id or "").strip()
         now = time.time()
+        normalized_observed_at: Optional[float] = None
+        if success and observed_at is not None:
+            normalized_observed_at = float(observed_at)
+            if (
+                not math.isfinite(normalized_observed_at)
+                or normalized_observed_at <= 0
+                or normalized_observed_at
+                > now + ITEM_METRIC_MAX_FUTURE_SKEW_SECONDS
+            ):
+                raise ValueError("商品指标金丝雀观测时间无效")
         with self.lock:
             cursor = self.conn.cursor()
             try:
@@ -10274,19 +10301,42 @@ class DBManager:
                 if not owner or int(owner[0]) != int(user_id):
                     raise PermissionError("账号不存在或无权访问")
                 row = cursor.execute(
-                    "SELECT canary_success_count FROM item_metric_collection_states "
+                    "SELECT canary_success_count, last_canary_observed_at "
+                    "FROM item_metric_collection_states "
                     "WHERE user_id = ? AND cookie_id = ?",
                     (int(user_id), cookie_id),
                 ).fetchone()
                 current = int(row[0] or 0) if row else 0
-                updated = min(current + 1, 3) if success else 0
+                previous_observed_at = (
+                    float(row[1]) if row and row[1] is not None else None
+                )
+                canary_advanced = bool(
+                    success
+                    and normalized_observed_at is not None
+                    and (
+                        previous_observed_at is None
+                        or normalized_observed_at > previous_observed_at
+                    )
+                )
+                if not success:
+                    updated = 0
+                elif canary_advanced:
+                    updated = min(current + 1, 3)
+                else:
+                    updated = current
                 enabled = int(success and updated >= 3)
+                latest_observed_at = (
+                    normalized_observed_at
+                    if canary_advanced
+                    else previous_observed_at
+                )
                 cursor.execute(
                     """
                     INSERT INTO item_metric_collection_states (
                         user_id, cookie_id, canary_success_count, enabled,
-                        last_attempt_at, last_success_at, last_error_code, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        last_attempt_at, last_success_at, last_canary_observed_at,
+                        last_error_code, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, cookie_id) DO UPDATE SET
                         canary_success_count = excluded.canary_success_count,
                         enabled = excluded.enabled,
@@ -10295,12 +10345,17 @@ class DBManager:
                             excluded.last_success_at,
                             item_metric_collection_states.last_success_at
                         ),
+                        last_canary_observed_at = COALESCE(
+                            excluded.last_canary_observed_at,
+                            item_metric_collection_states.last_canary_observed_at
+                        ),
                         last_error_code = excluded.last_error_code,
                         updated_at = excluded.updated_at
                     """,
                     (
                         int(user_id), cookie_id, updated, enabled, now,
-                        now if success else None,
+                        now if canary_advanced else None,
+                        latest_observed_at,
                         "" if success else str(error_code or "metric_collection_failed"),
                         now,
                     ),
@@ -10309,10 +10364,11 @@ class DBManager:
             except Exception:
                 self.conn.rollback()
                 raise
-        return self.get_item_metric_collection_state(
+        state = self.get_item_metric_collection_state(
             user_id=int(user_id),
             cookie_id=cookie_id,
         )
+        return {**state, "canary_advanced": canary_advanced}
 
     def has_enabled_item_metric_collection(self) -> bool:
         with self.lock:
@@ -10320,7 +10376,7 @@ class DBManager:
                 "SELECT 1 FROM item_metric_collection_states AS s "
                 "JOIN cookies AS c "
                 "ON c.id = s.cookie_id AND c.user_id = s.user_id "
-                "WHERE s.enabled = 1 LIMIT 1"
+                "WHERE s.enabled = 1 AND s.canary_success_count >= 3 LIMIT 1"
             ).fetchone()
         return bool(row)
 
