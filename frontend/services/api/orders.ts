@@ -177,42 +177,46 @@ export const getValidOrders = async (dateRange: {start_date: string; end_date: s
 
 // 经营驾驶舱：订单时段分析。租户隔离由后端按登录用户强制执行。
 export const getTrafficAnalytics = async (
-    dateRange: { start_date: string; end_date: string },
+  dateRange: { start_date: string; end_date: string },
+  signal?: AbortSignal,
 ): Promise<TrafficAnalytics> => {
     return get('/analytics/traffic', {
         start_date: dateRange.start_date,
         end_date: dateRange.end_date,
-    });
+    }, signal);
 }
 
 // 经营驾驶舱：买家行为分析。租户隔离由后端按登录用户强制执行。
 export const getBuyerBehaviorAnalytics = async (
-    dateRange: { start_date: string; end_date: string },
+  dateRange: { start_date: string; end_date: string },
+  signal?: AbortSignal,
 ): Promise<BuyerBehaviorAnalytics> => {
     return get('/analytics/buyers', {
         start_date: dateRange.start_date,
         end_date: dateRange.end_date,
-    });
+    }, signal);
 }
 
 export const getItemPerformanceAnalytics = async (
-    dateRange: { start_date: string; end_date: string },
+  dateRange: { start_date: string; end_date: string },
+  signal?: AbortSignal,
 ): Promise<ItemPerformanceAnalytics> => {
     return get('/analytics/items/performance', {
         start_date: dateRange.start_date,
         end_date: dateRange.end_date,
-    });
+    }, signal);
 }
 
 export const getItemTrafficAnalytics = async (
-    dateRange: { start_date: string; end_date: string },
+  dateRange: { start_date: string; end_date: string },
+  signal?: AbortSignal,
 ): Promise<ItemTrafficAnalytics> => {
     return get('/analytics/items/traffic', {
         start_date: dateRange.start_date,
         end_date: dateRange.end_date,
-    });
+    }, signal);
 }
 
-export const getItemMetricStatus = async (): Promise<ItemMetricStatus> => {
-    return get('/analytics/items/metrics/status');
+export const getItemMetricStatus = async (signal?: AbortSignal): Promise<ItemMetricStatus> => {
+    return get('/analytics/items/metrics/status', undefined, signal);
 };

@@ -149,8 +149,8 @@ describe('BusinessInsights', () => {
     expect(screen.getByText('老客甲')).toBeInTheDocument();
     expect(screen.getByText('b2')).toBeInTheDocument();
     expect(screen.queryByText('时段流量分析')).not.toBeInTheDocument();
-    expect(getItemPerformanceAnalytics).toHaveBeenCalledWith(range);
-    expect(getItemTrafficAnalytics).toHaveBeenCalledWith(range);
+    expect(getItemPerformanceAnalytics).toHaveBeenCalledWith(range, expect.any(AbortSignal));
+    expect(getItemTrafficAnalytics).toHaveBeenCalledWith(range, expect.any(AbortSignal));
   });
 
   it('shows time and amount coverage warnings without dropping order counts', async () => {
@@ -265,6 +265,36 @@ describe('BusinessInsights', () => {
     expect(screen.getByText('成交商品表现')).toBeInTheDocument();
     expect(screen.getByText('买家行为分析')).toBeInTheDocument();
     expect(screen.getByText('流量接口暂时不可用')).toBeInTheDocument();
+  });
+
+  it('renders core analytics while the optional traffic request is still pending', async () => {
+    let resolveTraffic: (value: ItemTrafficAnalytics) => void = () => undefined;
+    vi.mocked(getItemTrafficAnalytics).mockImplementation(
+      () => new Promise((resolve) => { resolveTraffic = resolve; }),
+    );
+    render(<BusinessInsights range={range} />);
+
+    expect(await screen.findByText('复古相机')).toBeInTheDocument();
+    expect(screen.getByText('订单时段分析')).toBeInTheDocument();
+    expect(screen.getByText('买家行为分析')).toBeInTheDocument();
+    expect(screen.getByText('正在加载...')).toBeInTheDocument();
+
+    resolveTraffic(emptyItemTraffic);
+    expect(await screen.findByText('真实商品流量采集尚未启用')).toBeInTheDocument();
+  });
+
+  it('keeps historical traffic visible when the live adapter is unavailable', async () => {
+    vi.mocked(getItemTrafficAnalytics).mockResolvedValue({
+      ...emptyItemTraffic,
+      snapshot_count: 3,
+      valid_snapshot_count: 3,
+      totals: { exposure_delta: 1200, view_delta: 240, want_delta: 18 },
+    });
+    render(<BusinessInsights range={range} />);
+
+    expect(await screen.findByText(/历史快照仍可查看/)).toBeInTheDocument();
+    expect(screen.getByText('1,200')).toBeInTheDocument();
+    expect(screen.queryByText('真实商品流量采集尚未启用')).not.toBeInTheDocument();
   });
 
   it('shows metric status failures without hiding the other analytics', async () => {

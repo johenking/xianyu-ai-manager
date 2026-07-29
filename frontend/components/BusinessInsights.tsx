@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bar,
   BarChart,
@@ -55,6 +55,12 @@ const SectionError: React.FC<{ message: string }> = ({ message }) => (
   </div>
 );
 
+const SectionLoading: React.FC = () => (
+  <div className="flex min-h-36 items-center justify-center text-sm text-gray-400" role="status">
+    <Activity className="mr-2 h-5 w-5 animate-spin text-[#D6B500]" />正在加载...
+  </div>
+);
+
 const BusinessInsights: React.FC<{
   range: { start_date: string; end_date: string };
 }> = ({ range }) => {
@@ -63,49 +69,59 @@ const BusinessInsights: React.FC<{
   const [performance, setPerformance] = useState<ItemPerformanceAnalytics | null>(null);
   const [itemTraffic, setItemTraffic] = useState<ItemTrafficAnalytics | null>(null);
   const [metricStatus, setMetricStatus] = useState<ItemMetricStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<Record<InsightKey, boolean>>({
+    timing: true,
+    buyers: true,
+    performance: true,
+    itemTraffic: true,
+    metricStatus: true,
+  });
   const [errors, setErrors] = useState<Partial<Record<InsightKey, string>>>({});
   const requestGeneration = useRef(0);
+  const [reloadGeneration, setReloadGeneration] = useState(0);
 
-  const load = useCallback(async () => {
+  useEffect(() => {
     if (!range.start_date || !range.end_date) return;
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
-    setLoading(true);
-    const results = await Promise.allSettled([
-      getTrafficAnalytics(range),
-      getBuyerBehaviorAnalytics(range),
-      getItemPerformanceAnalytics(range),
-      getItemTrafficAnalytics(range),
-      getItemMetricStatus(),
-    ]);
-    if (requestGeneration.current !== generation) return;
+    const controller = new AbortController();
+    setLoading({
+      timing: true,
+      buyers: true,
+      performance: true,
+      itemTraffic: true,
+      metricStatus: true,
+    });
+    setErrors({});
 
-    const nextErrors: Partial<Record<InsightKey, string>> = {};
-    const applyResult = <T,>(
+    const run = async <T,>(
       key: InsightKey,
-      result: PromiseSettledResult<T>,
       setter: React.Dispatch<React.SetStateAction<T | null>>,
+      request: () => Promise<T>,
     ) => {
-      if (result.status === 'fulfilled') {
-        setter(result.value);
-      } else {
+      try {
+        const value = await request();
+        if (requestGeneration.current !== generation || controller.signal.aborted) return;
+        setter(value);
+      } catch (reason) {
+        if (requestGeneration.current !== generation || controller.signal.aborted) return;
         setter(null);
-        nextErrors[key] = errorMessage(result.reason);
+        setErrors((current) => ({ ...current, [key]: errorMessage(reason) }));
+      } finally {
+        if (requestGeneration.current === generation && !controller.signal.aborted) {
+          setLoading((current) => ({ ...current, [key]: false }));
+        }
       }
     };
-    applyResult('timing', results[0], setTiming);
-    applyResult('buyers', results[1], setBuyers);
-    applyResult('performance', results[2], setPerformance);
-    applyResult('itemTraffic', results[3], setItemTraffic);
-    applyResult('metricStatus', results[4], setMetricStatus);
-    setErrors(nextErrors);
-    setLoading(false);
-  }, [range]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+    void run('timing', setTiming, () => getTrafficAnalytics(range, controller.signal));
+    void run('buyers', setBuyers, () => getBuyerBehaviorAnalytics(range, controller.signal));
+    void run('performance', setPerformance, () => getItemPerformanceAnalytics(range, controller.signal));
+    void run('itemTraffic', setItemTraffic, () => getItemTrafficAnalytics(range, controller.signal));
+    void run('metricStatus', setMetricStatus, () => getItemMetricStatus(controller.signal));
+
+    return () => controller.abort();
+  }, [range, reloadGeneration]);
 
   const hourlyData = useMemo(() => {
     const byHour = new Map<number, TrafficAnalytics['hourly'][number]>();
@@ -170,7 +186,12 @@ const BusinessInsights: React.FC<{
   const hasItemTraffic = (itemTraffic?.snapshot_count || 0) > 0;
   const metricAdapterUnavailable = metricStatus?.adapter_available === false;
 
-  if (loading) {
+  const allAnalyticsLoading = loading.timing
+    && loading.buyers
+    && loading.performance
+    && loading.itemTraffic;
+
+  if (allAnalyticsLoading) {
     return (
       <div className="ios-card flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400" role="status" aria-label="经营分析加载中">
         <Activity className="mr-2 h-5 w-5 animate-spin text-[#D6B500]" />经营分析加载中...
@@ -179,7 +200,8 @@ const BusinessInsights: React.FC<{
   }
 
   const allAnalyticsFailed = Boolean(
-    errors.timing && errors.buyers && errors.performance && errors.itemTraffic,
+    !Object.values(loading).some(Boolean)
+      && errors.timing && errors.buyers && errors.performance && errors.itemTraffic,
   );
 
   if (allAnalyticsFailed) {
@@ -187,7 +209,7 @@ const BusinessInsights: React.FC<{
       <div className="ios-card flex flex-col items-center justify-center gap-3 rounded-2xl bg-white py-14 text-center">
         <AlertCircle className="h-8 w-8 text-red-500" />
         <p className="text-sm text-gray-500">{errors.timing}</p>
-        <button type="button" onClick={() => void load()} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white">
+        <button type="button" onClick={() => setReloadGeneration((value) => value + 1)} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white">
           <RefreshCw className="h-4 w-4" />重试
         </button>
       </div>
@@ -224,7 +246,9 @@ const BusinessInsights: React.FC<{
           </div>
         ) : null}
 
-        {errors.timing ? (
+        {loading.timing ? (
+          <SectionLoading />
+        ) : errors.timing ? (
           <SectionError message={errors.timing} />
         ) : !hasTiming ? (
           <div className="flex h-56 flex-col items-center justify-center text-gray-400">
@@ -283,7 +307,9 @@ const BusinessInsights: React.FC<{
           </div>
         )}
 
-        {errors.performance ? (
+        {loading.performance ? (
+          <SectionLoading />
+        ) : errors.performance ? (
           <SectionError message={errors.performance} />
         ) : !hasPerformance ? (
           <div className="flex h-40 flex-col items-center justify-center text-gray-400">
@@ -336,9 +362,18 @@ const BusinessInsights: React.FC<{
           </div>
         )}
 
-        {errors.itemTraffic ? (
+        {metricAdapterUnavailable && hasItemTraffic && (
+          <div className="mb-5 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>历史快照仍可查看；当前卖家后台适配器不可用，暂停新增采集。</span>
+          </div>
+        )}
+
+        {loading.itemTraffic ? (
+          <SectionLoading />
+        ) : errors.itemTraffic ? (
           <SectionError message={errors.itemTraffic} />
-        ) : metricAdapterUnavailable ? (
+        ) : metricAdapterUnavailable && !hasItemTraffic ? (
           <div className="flex h-48 flex-col items-center justify-center px-4 text-center text-gray-400">
             <Database className="mb-3 h-11 w-11 opacity-20" />
             <p className="font-medium">真实商品流量采集尚未启用</p>
@@ -418,7 +453,9 @@ const BusinessInsights: React.FC<{
         </div>
         <p className="mb-5 text-sm text-gray-400">复购与下单频次（仅统计下单行为，不涉及客户画像）</p>
 
-        {errors.buyers ? (
+        {loading.buyers ? (
+          <SectionLoading />
+        ) : errors.buyers ? (
           <SectionError message={errors.buyers} />
         ) : !hasBuyers ? (
           <div className="flex h-56 flex-col items-center justify-center text-gray-400">
