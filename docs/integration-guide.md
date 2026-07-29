@@ -35,7 +35,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | Official account login | Web QR through `/qr-login/*`; local headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
-| Dashboard and orders | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh` |
+| Dashboard, orders and analytics | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh`, `GET /analytics/items/performance`, `GET /analytics/items/traffic`, `GET /analytics/items/metrics/status`, `POST /analytics/items/metrics/sync` |
 | Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
 
 Routes below require `Authorization: Bearer $TOKEN` unless they are explicitly described as public.
