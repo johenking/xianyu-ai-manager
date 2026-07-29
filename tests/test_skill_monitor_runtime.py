@@ -86,7 +86,7 @@ class SkillNotificationTests(unittest.TestCase):
             reply_server._send_skill_notification_to_channel(
                 {
                     "type": "webhook",
-                    "config": {"webhook_url": "http://127.0.0.1/internal"},
+                    "config": {"webhook_url": "https://127.0.0.1/internal"},
                 },
                 {"keyword": "iPhone"},
                 {"title": "iPhone 15"},
