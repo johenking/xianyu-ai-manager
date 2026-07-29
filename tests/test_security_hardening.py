@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from pydantic import ValidationError
+
 from app_factory import create_app
 from utils.outbound_http import PublicHTTPResponse
 
@@ -88,6 +90,46 @@ class ApiLogIdentityTests(unittest.TestCase):
         self.assertEqual(prefix, f"【user_{expected}】")
         self.assertNotIn(user_info["username"], prefix)
         self.assertNotIn(str(user_info["user_id"]), prefix)
+
+
+class GeetestStatusStoreTests(unittest.TestCase):
+    def setUp(self):
+        reply_server.geetest_status_store.clear()
+
+    def tearDown(self):
+        reply_server.geetest_status_store.clear()
+
+    def test_validation_payload_fields_are_bounded(self):
+        with self.assertRaises(ValidationError):
+            reply_server.GeetestValidateRequest(
+                challenge="x" * (reply_server.GEETEST_CHALLENGE_MAX_LENGTH + 1),
+                validate="valid",
+                seccode="secure",
+            )
+        with self.assertRaises(ValidationError):
+            reply_server.GeetestValidateRequest(
+                challenge="a" * 32,
+                validate="v" * (reply_server.GEETEST_PROOF_MAX_LENGTH + 1),
+                seccode="secure",
+            )
+
+    def test_status_store_rejects_oversized_keys_and_evicts_oldest(self):
+        self.assertFalse(
+            reply_server.set_geetest_status(
+                "x" * (reply_server.GEETEST_CHALLENGE_MAX_LENGTH + 1),
+                1,
+            )
+        )
+        with patch.object(reply_server, "GEETEST_STATUS_MAX_ENTRIES", 3):
+            for index in range(5):
+                self.assertTrue(
+                    reply_server.set_geetest_status(f"challenge-{index}", 0)
+                )
+
+        self.assertEqual(len(reply_server.geetest_status_store), 3)
+        self.assertNotIn("challenge-0", reply_server.geetest_status_store)
+        self.assertNotIn("challenge-1", reply_server.geetest_status_store)
+        self.assertIn("challenge-4", reply_server.geetest_status_store)
 
 
 class UserBackupUploadTests(unittest.IsolatedAsyncioTestCase):

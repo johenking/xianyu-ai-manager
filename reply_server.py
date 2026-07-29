@@ -30,7 +30,7 @@ import asyncio
 import importlib.util
 import sqlite3
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 import cookie_manager
 from db_manager import AccountIdentityMismatchError, db_manager
@@ -995,8 +995,14 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 
 # ==================== 极验滑动验证码 ====================
 
-# 极验验证状态存储: {challenge: {"status": int, "expires_at": float}}
-geetest_status_store: dict = {}
+# 极验验证状态只用于短期幂等响应。公开接口必须同时限制单键大小和
+# 进程内条目数量，避免攻击者用任意 challenge 扩大常驻内存。
+GEETEST_CHALLENGE_MAX_LENGTH = 64
+GEETEST_PROOF_MAX_LENGTH = 2048
+GEETEST_STATUS_MAX_ENTRIES = 2048
+GEETEST_STATUS_TTL_SECONDS = 300
+geetest_status_store: OrderedDict[str, Dict[str, float | int]] = OrderedDict()
+_geetest_status_lock = threading.Lock()
 
 # Lightweight, process-local diagnostics caches. They deliberately avoid account
 # browser profiles and never call the Xianyu website.
@@ -1009,29 +1015,55 @@ _browser_probe_cache: Dict[str, Any] = {}
 _browser_probe_checking = False
 
 
-def cleanup_expired_geetest_status():
-    """清理过期的极验验证状态"""
+def _cleanup_expired_geetest_status_locked(current_time: float) -> None:
+    """Remove expired rows while the caller holds ``_geetest_status_lock``."""
+    expired_keys = [
+        key
+        for key, value in geetest_status_store.items()
+        if float(value["expires_at"]) < current_time
+    ]
+    for key in expired_keys:
+        geetest_status_store.pop(key, None)
+
+
+def cleanup_expired_geetest_status() -> None:
+    """清理过期的极验验证状态。"""
     current_time = time.time()
-    expired_keys = [k for k, v in geetest_status_store.items() if v["expires_at"] < current_time]
-    for k in expired_keys:
-        del geetest_status_store[k]
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
 
 
-def set_geetest_status(challenge: str, status: int):
-    """设置极验验证状态"""
-    cleanup_expired_geetest_status()
-    geetest_status_store[challenge] = {
-        "status": status,
-        "expires_at": time.time() + 300  # 5分钟有效
-    }
+def set_geetest_status(challenge: str, status: int) -> bool:
+    """设置有界的极验验证状态；非法或过长键不会进入内存。"""
+    normalized = str(challenge or "").strip()
+    if not normalized or len(normalized) > GEETEST_CHALLENGE_MAX_LENGTH:
+        return False
+    if status not in {0, 1}:
+        return False
+    current_time = time.time()
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
+        geetest_status_store[normalized] = {
+            "status": status,
+            "expires_at": current_time + GEETEST_STATUS_TTL_SECONDS,
+        }
+        geetest_status_store.move_to_end(normalized)
+        while len(geetest_status_store) > GEETEST_STATUS_MAX_ENTRIES:
+            geetest_status_store.popitem(last=False)
+    return True
 
 
 def get_geetest_status(challenge: str) -> int:
     """获取极验验证状态，返回0表示未验证或已过期"""
-    cleanup_expired_geetest_status()
-    stored = geetest_status_store.get(challenge)
-    if stored and stored["expires_at"] > time.time():
-        return stored["status"]
+    normalized = str(challenge or "").strip()
+    if not normalized or len(normalized) > GEETEST_CHALLENGE_MAX_LENGTH:
+        return 0
+    current_time = time.time()
+    with _geetest_status_lock:
+        _cleanup_expired_geetest_status_locked(current_time)
+        stored = geetest_status_store.get(normalized)
+        if stored and float(stored["expires_at"]) > current_time:
+            return int(stored["status"])
     return 0
 
 
@@ -1045,9 +1077,18 @@ class GeetestRegisterResponse(BaseModel):
 
 class GeetestValidateRequest(BaseModel):
     """极验二次验证请求"""
-    challenge: str
-    validate_str: str = Field(..., alias='validate')
-    seccode: str
+    challenge: str = Field(
+        ...,
+        min_length=1,
+        max_length=GEETEST_CHALLENGE_MAX_LENGTH,
+    )
+    validate_str: str = Field(
+        ...,
+        alias='validate',
+        min_length=1,
+        max_length=GEETEST_PROOF_MAX_LENGTH,
+    )
+    seccode: str = Field(..., min_length=1, max_length=GEETEST_PROOF_MAX_LENGTH)
 
     model_config = {'populate_by_name': True}
 
@@ -1073,7 +1114,10 @@ async def geetest_register():
         result = await gt_lib.register()
 
         data = result.to_dict()
-        logger.info(f"极验初始化结果: status={result.status}, data={data}")
+        logger.info(
+            f"极验初始化结果: status={result.status}, "
+            f"fields={sorted(str(key) for key in data.keys())}"
+        )
 
         # 记录初始状态
         challenge = data.get("challenge", "")
