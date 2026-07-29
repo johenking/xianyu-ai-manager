@@ -5,6 +5,7 @@ from fastapi.responses import (
     HTMLResponse,
     RedirectResponse,
     JSONResponse,
+    Response,
     StreamingResponse,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -68,6 +69,13 @@ from account_session_refresh import (
     supports_automatic_refresh,
 )
 from utils.qr_login import qr_login_manager
+from utils.browser_interaction import (
+    InteractionQueueFull,
+    InteractionRateLimited,
+    InteractionUnavailable,
+    InteractionValidationError,
+    StaleFrameRevision,
+)
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from utils.outbound_http import (
@@ -647,7 +655,7 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
 
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.10.0",
+    version="1.10.1",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -1813,6 +1821,25 @@ class QRLoginCancelIn(BaseModel):
     ] = "user_cancelled"
 
 
+class BrowserInteractionPointIn(BaseModel):
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
+class BrowserInteractionIn(BaseModel):
+    kind: Literal["gesture", "text", "key", "wheel"]
+    frame_revision: int = Field(..., ge=1)
+    points: List[BrowserInteractionPointIn] = Field(
+        default_factory=list,
+        max_length=80,
+    )
+    duration_ms: int = Field(0, ge=0, le=5000)
+    text: str = Field("", max_length=128)
+    key: Literal["", "Enter", "Backspace", "Tab", "Escape"] = ""
+    delta_x: float = Field(0, ge=-2000, le=2000)
+    delta_y: float = Field(0, ge=-2000, le=2000)
+
+
 class CookieStatusIn(BaseModel):
     enabled: bool
 
@@ -2589,7 +2616,7 @@ async def _complete_official_login_session(
         elif record.mode == "sms":
             update_kwargs.update({
                 "username": account or None,
-                "show_browser": True,
+                "show_browser": record.show_browser,
             })
         update_success = await asyncio.to_thread(
             db_manager.update_cookie_account_info,
@@ -2646,6 +2673,41 @@ def _private_verification_image_response(path: str) -> FileResponse:
     )
 
 
+def _private_browser_frame_response(frame: bytes) -> Response:
+    return Response(
+        content=frame,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+def _raise_browser_interaction_error(exc: Exception) -> None:
+    if isinstance(exc, PermissionError):
+        raise HTTPException(
+            status_code=403,
+            detail="无权限操作该登录会话",
+        ) from exc
+    if isinstance(exc, KeyError):
+        raise HTTPException(
+            status_code=404,
+            detail="登录会话不存在或已过期",
+        ) from exc
+    if isinstance(exc, (InteractionRateLimited, InteractionQueueFull)):
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    if isinstance(exc, InteractionValidationError):
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if isinstance(
+        exc,
+        (InteractionUnavailable, StaleFrameRevision, RuntimeError),
+    ):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail="浏览器操作无效") from exc
+
+
 def _expected_owned_unb(user_id: int, account: str) -> str:
     value = str(account or "").strip()
     if not value:
@@ -2670,7 +2732,7 @@ async def create_official_login_session(
     mode = str(request.get("mode") or "qr").strip().lower()
     account = str(request.get("account") or "").strip()
     show_browser = bool(request.get("show_browser", False))
-    if mode in {"qr", "sms"} or show_browser:
+    if show_browser:
         _require_server_browser_access(http_request, current_user)
     try:
         session = await official_login_coordinator.start(
@@ -2716,6 +2778,23 @@ async def get_official_login_session_image(
     session_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    get_frame = getattr(
+        official_login_coordinator,
+        "get_interaction_frame",
+        None,
+    )
+    if callable(get_frame):
+        try:
+            frame, _revision = await get_frame(
+                session_id,
+                current_user["user_id"],
+            )
+            return _private_browser_frame_response(frame)
+        except PermissionError as exc:
+            _raise_browser_interaction_error(exc)
+        except (KeyError, RuntimeError):
+            pass
+
     image_path = await official_login_coordinator.get_image_path(
         session_id,
         current_user["user_id"],
@@ -2727,6 +2806,27 @@ async def get_official_login_session_image(
     if persisted and persisted.get("owner_user_id") != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="无权限访问该登录会话")
     raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
+
+
+@accounts_router.post("/api/official-login/sessions/{session_id}/interact")
+async def interact_with_official_login_session(
+    session_id: str,
+    payload: BrowserInteractionIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        result = await official_login_coordinator.interact(
+            session_id,
+            current_user["user_id"],
+            payload.model_dump(),
+        )
+    except Exception as exc:
+        _raise_browser_interaction_error(exc)
+    return {
+        "success": True,
+        "accepted": bool(result.get("accepted")),
+        "frame_revision": int(result.get("frame_revision") or 0),
+    }
 
 
 @accounts_router.post("/api/official-login/sessions/{session_id}/show-browser")
@@ -2983,10 +3083,37 @@ async def get_qr_login_verification_image(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     _require_owned_qr_session(session_id, current_user)
+    get_frame = getattr(qr_login_manager, "get_interaction_frame", None)
+    if callable(get_frame):
+        frame_info = get_frame(session_id)
+        if frame_info is not None:
+            frame, _revision = frame_info
+            return _private_browser_frame_response(frame)
     image_path = qr_login_manager.get_verification_image_path(session_id)
     if not image_path:
         raise HTTPException(status_code=404, detail="验证图片不存在或已过期")
     return _private_verification_image_response(image_path)
+
+
+@accounts_router.post("/qr-login/interact/{session_id}")
+async def interact_with_qr_login_session(
+    session_id: str,
+    payload: BrowserInteractionIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_owned_qr_session(session_id, current_user)
+    try:
+        qr_login_manager.submit_interaction(
+            session_id,
+            payload.model_dump(),
+        )
+    except Exception as exc:
+        _raise_browser_interaction_error(exc)
+    return {
+        "success": True,
+        "accepted": True,
+        "frame_revision": payload.frame_revision,
+    }
 
 
 @accounts_router.get("/qr-login/check/{session_id}")
@@ -5203,7 +5330,6 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
 def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除卡券"""
     try:
-        from db_manager import db_manager
         success = db_manager.delete_card(card_id, user_id=current_user['user_id'])
         if success:
             return {"message": "卡券删除成功"}

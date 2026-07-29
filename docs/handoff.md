@@ -1,5 +1,45 @@
 # Handoff
 
+## v1.10.1 Login Verification Hotfix Candidate On 2026-07-29
+
+This hotfix keeps QR, SMS and password login in the same server-Chrome session
+through slider, face, SMS and unknown interactive verification. Page or tab
+replacement no longer ends monitoring. Browser shutdown still follows real
+message-Token validation, identity matching and account persistence; a scanned
+QR, page text, an ordinary Cookie or one Page closing is not success.
+
+The web console now exposes owner-scoped, no-store browser frames plus bounded
+gesture, wheel, text and safe-key actions. Remote ordinary users may start an
+offscreen SMS login and complete it in this surface. Displaying the physical
+server window remains restricted to an administrator on the loopback console.
+Mobile-scan verification remains a scannable image. The Chrome extension is an
+explicit advanced import option rather than the automatic risk-control path.
+
+Local release gates completed on the candidate source: Ruff, the explicit
+Python compilation list, Gitleaks preparation, the OpenAPI snapshot and
+`git diff --check` passed. The complete backend suite passed 704 tests in
+153.939 seconds. The frontend passed 24 files with 147 tests, TypeScript, npm
+audit with zero vulnerabilities and two byte-identical production builds; the
+extension passed 6 tests. The OpenAPI contract adds two owner-scoped interaction
+methods and now contains 229 methods. No schema migration or dependency change
+is part of this hotfix.
+
+An isolated single-worker candidate on `127.0.0.1:8092` was exercised as an
+ordinary web-console user at desktop and mobile widths. It opened the real
+public Goofish SMS-login page in the authenticated live interaction surface and
+exposed bounded text, pointer and safe-key controls. Cancellation returned in
+0.330 seconds; a fresh process inspection found no candidate Chrome/Profile
+residue and the candidate log contained no error or traceback. This rehearsal
+also found and fixed a cross-thread Playwright cancellation path before the
+complete backend suite was rerun.
+
+No registered Goofish account credentials, SMS code, slider or face challenge
+were submitted during this isolated rehearsal. Consequently, real account Token
+validation, identity matching and persistence through a naturally triggered
+platform risk-control chain remain an explicit post-release human canary, not a
+claimed result. Production deployment evidence is appended only after the
+deployment gates actually occur.
+
 ## v1.10.0 Production Release On 2026-07-29
 
 PR `#45` squash-merged the order-sync, analytics and security hardening release
@@ -463,7 +503,7 @@ Run before release or deployment:
 source .venv/bin/activate
 pip install -r requirements-dev.lock
 ruff check .
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 
 cd frontend

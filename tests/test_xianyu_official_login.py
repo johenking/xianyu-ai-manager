@@ -86,28 +86,44 @@ class FakePage:
         self.url = "https://www.goofish.com/im"
         self.goto_calls = []
         self.user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36"
+        self.closed = False
+        self.init_scripts = []
+
+    def _ensure_open(self):
+        if self.closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    def is_closed(self):
+        return self.closed
 
     def query_selector(self, selector):
+        self._ensure_open()
         return self.selectors.get(selector)
 
     def get_by_text(self, text, exact=True):
+        self._ensure_open()
         del exact
         return FakeLocator(self.texts.get(text))
 
     def goto(self, url, **kwargs):
+        self._ensure_open()
         self.goto_calls.append((url, kwargs))
 
     def wait_for_timeout(self, timeout):
+        self._ensure_open()
         del timeout
 
     def screenshot(self, path, **kwargs):
+        self._ensure_open()
         del kwargs
         Path(path).write_bytes(b"verification")
 
     def add_init_script(self, script):
-        del script
+        self._ensure_open()
+        self.init_scripts.append(script)
 
     def evaluate(self, expression):
+        self._ensure_open()
         if expression == "navigator.userAgent":
             return self.user_agent
         return False
@@ -520,6 +536,57 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         )
         self.assertTrue(Path(result.verification_image_path).is_file())
 
+    def test_qr_session_rebinds_to_replacement_page_until_token_validation(self):
+        first_page = FakePage()
+        replacement_page = FakePage()
+        context = FakeContext(first_page)
+        verification_url = "https://passport.goofish.com/iv/check"
+        probe_calls = 0
+
+        def replace_page():
+            first_page.closed = True
+            context.pages = [replacement_page]
+            context.cookies_data = authenticated_cookies("9988")
+
+        first_page.selectors[".qrcode-img"] = FakeElement(
+            on_screenshot=replace_page,
+        )
+
+        def probe(cookie_string, _browser_user_agent):
+            nonlocal probe_calls
+            probe_calls += 1
+            cookies = parse_cookie_string(cookie_string)
+            if probe_calls == 1:
+                return SessionProbeResult(
+                    status=PROBE_VERIFICATION_REQUIRED,
+                    cookies=cookies,
+                    verification_url=verification_url,
+                    error_code="human_verification_required",
+                )
+            return SessionProbeResult(
+                status=PROBE_SUCCESS,
+                cookies=cookies,
+                access_token="validated-token",
+            )
+
+        service = self.make_service(
+            SequencePlaywrightFactory([context]),
+            session_validator=probe,
+            verification_timeout=0.08,
+        )
+
+        result = service.login_with_qr(show_browser=False)
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.unb, "9988")
+        self.assertEqual(result.access_token, "validated-token")
+        self.assertEqual(
+            [url for url, _options in replacement_page.goto_calls],
+            [verification_url],
+        )
+        self.assertGreaterEqual(len(replacement_page.init_scripts), 1)
+        self.assertTrue(context.closed)
+
     def test_pre_cancelled_worker_stops_before_browser_launch(self):
         factory = SequencePlaywrightFactory([])
         service = self.make_service(factory)
@@ -534,6 +601,23 @@ class XianyuOfficialLoginTests(unittest.TestCase):
 
         self.assertEqual(result.status, "cancelled")
         self.assertEqual(factory.launches, [])
+
+    def test_worker_cancel_never_closes_playwright_from_the_caller_thread(self):
+        page = FakePage()
+        context = FakeContext(page)
+        worker = OfficialLoginWorker()
+        worker.attach(context, object())
+        worker.interaction_channel.publish_frame(
+            b"frame",
+            viewport_width=1440,
+            viewport_height=960,
+        )
+
+        worker.close_browser()
+
+        self.assertTrue(worker.cancel_event.is_set())
+        self.assertFalse(context.closed)
+        self.assertFalse(worker.interaction_snapshot()["interaction_supported"])
 
     def test_profile_promotion_restores_backup_when_replacement_fails(self):
         service = self.make_service(SequencePlaywrightFactory([]))

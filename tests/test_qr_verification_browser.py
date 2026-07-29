@@ -2,6 +2,7 @@ import unittest
 import tempfile
 from unittest.mock import Mock, patch
 
+from utils.browser_interaction import BrowserInteractionChannel
 from utils.qr_verification_browser import QRVerificationBrowser
 from utils.xianyu_session_probe import SessionProbeResult
 
@@ -9,13 +10,29 @@ from utils.xianyu_session_probe import SessionProbeResult
 class _FakePage:
     frames = []
 
+    def __init__(self, *, closed=False):
+        self._closed = closed
+        self.goto_calls = []
+        self.viewport_size = {"width": 1280, "height": 860}
+
+    def is_closed(self):
+        return self._closed
+
     def goto(self, *_args, **_kwargs):
+        if self._closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        self.goto_calls.append((_args, _kwargs))
         return None
+
+    def screenshot(self, *_args, **_kwargs):
+        if self._closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return b"interactive-frame"
 
 
 class _FakeContext:
-    def __init__(self, cookies):
-        self.pages = [_FakePage()]
+    def __init__(self, cookies, pages=None):
+        self.pages = list(pages or [_FakePage()])
         self._cookies = cookies
 
     def add_cookies(self, _cookies):
@@ -23,6 +40,11 @@ class _FakeContext:
 
     def cookies(self):
         return list(self._cookies)
+
+    def new_page(self):
+        page = _FakePage()
+        self.pages.append(page)
+        return page
 
 
 class _FakeChromium:
@@ -119,6 +141,34 @@ class QRVerificationBrowserTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["unb"], "account-1")
         self.assertEqual(result["access_token"], "verified-token")
+
+    def test_rebinds_to_open_page_and_publishes_interactive_frame(self):
+        closed_page = _FakePage(closed=True)
+        replacement_page = _FakePage()
+        context = _FakeContext([], pages=[closed_page, replacement_page])
+        channel = BrowserInteractionChannel()
+        updates = []
+
+        with tempfile.TemporaryDirectory() as profile_root:
+            browser = _TestBrowser(
+                profile_root=profile_root,
+                playwright_factory=lambda: _FakePlaywrightManager(context),
+                session_validator=None,
+            )
+            with patch("utils.qr_verification_browser.time.sleep", return_value=None):
+                result = browser.run(
+                    "session-replacement",
+                    "https://passport.goofish.com/verify",
+                    on_update=updates.append,
+                    should_stop=lambda: True,
+                    interaction_channel=channel,
+                )
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(len(replacement_page.goto_calls), 1)
+        self.assertTrue(updates)
+        self.assertEqual(updates[0]["required_action"], "interact_in_console")
+        self.assertEqual(updates[0]["frame_revision"], 1)
 
 
 if __name__ == "__main__":

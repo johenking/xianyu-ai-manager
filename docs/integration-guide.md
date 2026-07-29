@@ -32,7 +32,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
-| Official account login | Web QR through `/qr-login/*`; local headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
+| Official account login | Web QR through `/qr-login/*`; headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, owner-scoped `POST .../interact`, administrator-loopback `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Dashboard, orders and analytics | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh`, `GET /analytics/items/performance`, `GET /analytics/items/traffic`, `GET /analytics/items/metrics/status`, `POST /analytics/items/metrics/sync` |
@@ -290,9 +290,9 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- Local Chrome QR (administrator loopback console only): create `{"mode":"qr","show_browser":true}` through `/api/official-login/sessions`. The window opens on the Mac running the service.
-- Web QR (recommended for remote access): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The QR image is rendered locally from the official `codeContent`; it is not a browser screenshot.
-- Visible official window: create explicit `sms` or visible `password` sessions through `/api/official-login/sessions` from an administrator loopback console. SMS codes are entered only on the official page.
+- Server Chrome QR: create `{"mode":"qr","show_browser":false}` through `/api/official-login/sessions` and operate any interactive page through the owner-scoped console surface. An administrator on the service Mac loopback console may instead request `show_browser:true`.
+- Web QR (recommended for remote access): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; if secondary verification starts, the same server-Chrome session supplies either a mobile-scan image or an interactive live frame.
+- SMS or password: create a headed Chrome session through `/api/official-login/sessions`. Remote SMS uses `show_browser:false` and the live console surface; the application does not store or echo the code. Only an administrator loopback request may display the physical Chrome window.
 - User Chrome extension: create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings`, then import from the user's Chrome to the fixed production HTTPS endpoint.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
@@ -305,7 +305,7 @@ curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
   -d '{"mode":"qr","show_browser":true}'
 ```
 
-Poll `GET /api/official-login/sessions/{session_id}`. QR and SMS clients share the same state contract: `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, and terminal `success`, `expired`, `failed`, `cancelled`, or `interrupted`. Show the same window through `POST .../show-browser` and cancel it through `POST .../cancel`. Starting a new account leaves `expected_unb` empty; the validated platform `unb` selects the created or existing account row.
+Poll `GET /api/official-login/sessions/{session_id}`. QR and SMS clients share the same state contract: `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, and terminal `success`, `expired`, `failed`, `cancelled`, or `interrupted`. When `required_action` is `interact_in_console`, fetch the returned no-store image with its revision and submit bounded pointer, wheel, text, or safe-key actions to `POST /api/official-login/sessions/{session_id}/interact`; a navigation or newer frame invalidates the old revision. Only an administrator loopback request may show the physical window through `POST .../show-browser`. Cancel through `POST .../cancel`. Starting a new account leaves `expected_unb` empty; the validated platform `unb` selects the created or existing account row.
 
 Start the web QR session:
 
@@ -314,18 +314,18 @@ curl -sS -X POST "$BASE_URL/qr-login/generate" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. A `mobile_scan` verification remains a scannable image; `interactive` and `unknown` verification require the user's Chrome extension and the QR session ends with `switched_to_extension`. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
+Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification continue in the same server-Chrome session: fetch the revisioned no-store frame and submit bounded actions to `POST /qr-login/interact/{session_id}`. The Chrome extension remains an explicit advanced import option and is not an automatic QR fallback. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
 
-Start a visible SMS session without collecting the code in the application:
+Start a remote SMS session without collecting the code in the application:
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"mode":"sms","account":"<optional-phone>","show_browser":true}'
+  -d '{"mode":"sms","account":"<optional-phone>","show_browser":false}'
 ```
 
-The user requests and enters the SMS code on the official page. The application never receives or stores the code. Poll `GET /api/official-login/sessions/{session_id}`. The safe response contains state, a fixed message, optional safe screenshot path, expiry, and account metadata only. Valid states are `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, `success`, `expired`, `failed`, `cancelled`, and `interrupted`. Show or cancel the same local system-Chrome session through `POST .../{session_id}/show-browser` and `POST .../{session_id}/cancel`.
+The user requests and enters the SMS code on the official page through the live console frame. The application forwards the bounded input to the owning browser thread and never stores or echoes the code. Poll `GET /api/official-login/sessions/{session_id}`. The safe response contains state, a fixed message, a revisioned frame URL when interaction is required, expiry, and account metadata only. Valid states are `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, `success`, `expired`, `failed`, `cancelled`, and `interrupted`. Submit actions through `POST .../{session_id}/interact`; show the physical window only from an administrator loopback console, or cancel through `POST .../{session_id}/cancel`.
 
 Start an explicit password session without supplying an account ID:
 

@@ -2,6 +2,7 @@ import asyncio
 import unittest
 
 from official_login_sessions import OfficialLoginSessionCoordinator
+from utils.browser_interaction import BrowserInteractionChannel
 from utils.xianyu_official_login import OfficialLoginResult
 
 
@@ -26,16 +27,27 @@ class FakeWorker:
         self.cancelled = False
         self.visible_requested = False
         self.active = True
+        self.interaction_channel = BrowserInteractionChannel()
 
     def close_browser(self):
         self.cancelled = True
         self.active = False
+        self.interaction_channel.close()
 
     def request_visible(self):
         self.visible_requested = True
 
     def browser_active(self):
         return self.active
+
+    def interaction_snapshot(self):
+        return self.interaction_channel.snapshot()
+
+    def interaction_frame(self):
+        return self.interaction_channel.latest_frame()
+
+    def submit_interaction(self, payload):
+        return self.interaction_channel.submit(payload)
 
 
 class SuccessfulQrService:
@@ -93,6 +105,15 @@ class ValidatedHandoffService:
         kwargs["on_validated"](result)
         self.events.append("browser_returned")
         return result
+
+
+class OffscreenSmsService:
+    def __init__(self, seen):
+        self.seen = seen
+
+    def login_with_official_window(self, **kwargs):
+        self.seen.append(kwargs["show_browser"])
+        return OfficialLoginResult(status="cancelled", error_code="cancelled")
 
 
 class OfficialLoginSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
@@ -179,6 +200,77 @@ class OfficialLoginSessionCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(terminal["state"], "cancelled")
         self.assertEqual(terminal["ended_by"], "user_cancelled")
         self.assertFalse(terminal["browser_active"])
+
+    async def test_owner_scoped_interaction_uses_worker_channel(self):
+        import threading
+
+        gate = threading.Event()
+        worker = FakeWorker()
+        coordinator = OfficialLoginSessionCoordinator(
+            completion_handler=lambda *args: None,
+            service_factory=lambda: BlockingQrService(gate),
+            worker_factory=lambda: worker,
+            registry=FakeRegistry(),
+        )
+        created = await coordinator.start(owner_user_id=7, mode="qr")
+        session_id = created["session_id"]
+        await coordinator.wait_until_ready(session_id, 7, timeout=1)
+        coordinator._sessions[session_id].state = "verification_required"
+        coordinator._sessions[session_id].required_action = "interact_in_console"
+        worker.interaction_channel.publish_frame(
+            b"official-frame",
+            viewport_width=1440,
+            viewport_height=960,
+        )
+
+        status = await coordinator.get_status(session_id, 7)
+        self.assertTrue(status["interaction_supported"])
+        self.assertEqual(status["frame_revision"], 1)
+        frame, revision = await coordinator.get_interaction_frame(session_id, 7)
+        self.assertEqual(frame, b"official-frame")
+        self.assertEqual(revision, 1)
+        accepted = await coordinator.interact(
+            session_id,
+            7,
+            {
+                "kind": "key",
+                "key": "Enter",
+                "frame_revision": revision,
+            },
+        )
+        self.assertTrue(accepted["accepted"])
+        with self.assertRaises(PermissionError):
+            await coordinator.interact(
+                session_id,
+                8,
+                {
+                    "kind": "key",
+                    "key": "Enter",
+                    "frame_revision": revision,
+                },
+            )
+
+        await coordinator.cancel(session_id, 7)
+        gate.set()
+
+    async def test_sms_session_respects_offscreen_browser_request(self):
+        seen = []
+        coordinator = OfficialLoginSessionCoordinator(
+            completion_handler=lambda *args: None,
+            service_factory=lambda: OffscreenSmsService(seen),
+            worker_factory=FakeWorker,
+            registry=FakeRegistry(),
+        )
+
+        created = await coordinator.start(
+            owner_user_id=7,
+            mode="sms",
+            account="13800138000",
+            show_browser=False,
+        )
+        await coordinator.wait_for_terminal(created["session_id"], 7, timeout=1)
+
+        self.assertEqual(seen, [False])
 
     async def test_active_status_polling_has_no_lifecycle_side_effects(self):
         import threading

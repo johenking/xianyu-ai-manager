@@ -60,13 +60,13 @@
 
 同一后台用户重新扫码、密码登录或更新 Cookie 时，系统会优先按 Cookie 中的闲鱼 `unb` 找回原账号记录，因此原账号 ID、AI 配置、训练规则和商品知识可以继续复用。不要通过“删除账号”来解决过期登录：删除操作会清理该账号关联数据。
 
-新增账号的扫码面板先显示两个显式入口，打开面板本身不会发起请求。“本机 Chrome 扫码”只供管理员从服务 Mac 的回环控制台使用；“网页二维码”调用官方接口取得 `codeContent` 并在本地渲染，适合远程访问且普通生成/轮询不会启动浏览器。手机号验证码窗口同样只在管理员回环控制台开放，应用不接收验证码；密码登录成功后系统使用独立密钥加密保存凭据。系统按真实 `unb` 保存账号，并把浏览器会话归档为 `browser_data/user_<unb>`。前端不要求账号 ID；旧客户端传入的 `account_id` 或 `id` 仅为兼容字段，不参与身份判定。
+新增账号的扫码面板先显示两个显式入口，打开面板本身不会发起请求。“服务器 Chrome 扫码”只允许管理员从服务 Mac 的回环控制台显式显示物理窗口；“网页二维码”调用官方接口取得 `codeContent` 并在本地渲染，适合远程访问且普通生成/轮询不会启动浏览器。扫码后若进入二次风控，服务器会把同一 Chrome 会话的实时页面安全地显示在监控台中。手机号验证码登录也可在远程监控台的同一交互页面完成；应用不保存或回显验证码。密码登录成功后系统使用独立密钥加密保存凭据。系统按真实 `unb` 保存账号，并把浏览器会话归档为 `browser_data/user_<unb>`。前端不要求账号 ID；旧客户端传入的 `account_id` 或 `id` 仅为兼容字段，不参与身份判定。
 
 只有 `password + 有效账号 + 加密密码` 具备自动续期能力。续期先复用官方浏览器档案，档案完全退出后才使用保存凭据重新登录。扫码、验证码、扩展、手填 Cookie 和历史来源过期后进入 `manual_reauth_required`，系统显示对应重登入口，并暂停 WebSocket 建连、消息 Token 探测和 Chrome 启动，直到对应登录成功。人工验证期间同一窗口最多保留 15 分钟；Cookie、实际浏览器 User-Agent 和监听任务交接完成后才结束会话。
 
-官方登录使用本机系统 Chrome 的真实版本和有头窗口；后台运行只把窗口移到屏幕外。服务器 Chrome 需要人工验证时，管理员可从回环控制台把同一窗口移回屏幕内。远程网页二维码遇到手机继续扫码时展示验证图，遇到滑块、人脸或未知交互型风控时转到用户自己的 Chrome 扩展。完成后系统只有在真实 `unb`、关键会话 Cookie 和消息接口真实 `accessToken` 同时通过，并确认账号已落库时，才报告成功并恢复监听。不要通过删除账号来重试登录。
+官方登录使用本机系统 Chrome 的真实版本和有头窗口；后台运行只把窗口移到屏幕外。服务器 Chrome 需要人工验证时，远程用户在监控台的实时页面中继续操作，管理员也可从回环控制台把同一物理窗口移回屏幕内。远程网页二维码遇到手机继续扫码时展示验证图；遇到滑块、人脸、短信或未知交互型风控时，继续显示同一个服务器 Chrome 会话，不再自动切换到扩展。扩展只保留为显式高级导入方式。完成后系统只有在真实 `unb`、关键会话 Cookie 和消息接口真实 `accessToken` 同时通过，并确认账号已落库时，才报告成功并恢复监听。不要通过删除账号来重试登录。
 
-本机 Chrome 扫码通过 `POST /api/official-login/sessions` 创建 `{mode:"qr", show_browser:true}` 的统一官方会话，并与手机号验证码共用状态、显示窗口和取消流程；网页扫码继续使用 `/qr-login/generate` 和 `/qr-login/check/{session_id}`，显式结束使用 `/qr-login/cancel/{session_id}`。隐藏账号弹窗只隐藏界面，后台轮询继续；切换方式或用户明确取消才结束会话。旧的 QR 浏览器刷新和冷却接口已移除。完整能力边界见 [登录策略](docs/login-strategy.md)，请求示例见 [接入指南](docs/integration-guide.md#account-binding-and-refresh)。
+服务器 Chrome 扫码通过 `POST /api/official-login/sessions` 创建统一官方会话，并与手机号验证码共用状态、实时画面、交互和取消流程；只有管理员回环请求可以设置 `show_browser:true` 显示物理窗口。网页扫码继续使用 `/qr-login/generate` 和 `/qr-login/check/{session_id}`，二次风控通过 `/qr-login/interact/{session_id}` 回传受限操作，显式结束使用 `/qr-login/cancel/{session_id}`。统一官方会话使用 `/api/official-login/sessions/{session_id}/interact`。隐藏账号弹窗只隐藏界面，后台轮询继续；切换方式或用户明确取消才结束会话。旧的 QR 浏览器刷新和冷却接口已移除。完整能力边界见 [登录策略](docs/login-strategy.md)，请求示例见 [接入指南](docs/integration-guide.md#account-binding-and-refresh)。
 
 ## 直接注册与找回
 
@@ -153,7 +153,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from loguru import logger
+from utils.browser_interaction import BrowserInteractionChannel
 from utils.xianyu_session_probe import (
     PROBE_EXPIRED,
     PROBE_RETRYABLE_ERROR,
@@ -76,6 +77,7 @@ class OfficialLoginWorker:
         self._resource_lock = threading.RLock()
         self._context: Any = None
         self._playwright: Any = None
+        self.interaction_channel = BrowserInteractionChannel()
 
     def attach(self, context: Any, playwright: Any) -> None:
         with self._resource_lock:
@@ -89,16 +91,9 @@ class OfficialLoginWorker:
                 self._playwright = None
 
     def close_browser(self) -> None:
+        """Request shutdown without touching Playwright from the caller thread."""
         self.cancel_event.set()
-        with self._resource_lock:
-            context = self._context
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                # Playwright objects are owned by the login thread. The event is
-                # authoritative; closing here is only a best-effort wake-up.
-                pass
+        self.interaction_channel.close()
 
     def request_visible(self) -> None:
         self.show_event.set()
@@ -106,6 +101,25 @@ class OfficialLoginWorker:
     def browser_active(self) -> bool:
         with self._resource_lock:
             return self._context is not None
+
+    def interaction_snapshot(self) -> dict[str, int | bool]:
+        return self.interaction_channel.snapshot()
+
+    def interaction_frame(self) -> Optional[tuple[bytes, int]]:
+        return self.interaction_channel.latest_frame()
+
+    def submit_interaction(self, payload: dict[str, Any]) -> int:
+        return self.interaction_channel.submit(payload)
+
+    def capture_frame(self, page: Any) -> bool:
+        try:
+            self.interaction_channel.capture(page)
+            return True
+        except Exception:
+            return False
+
+    def drain_interactions(self, page: Any) -> int:
+        return self.interaction_channel.drain(page)
 
 
 class XianyuOfficialLoginService:
@@ -392,11 +406,12 @@ class XianyuOfficialLoginService:
         account: str = "",
         expected_unb: str = "",
         timeout: float = 900.0,
+        show_browser: bool = True,
         worker: Optional[OfficialLoginWorker] = None,
         on_status: Optional[Callable[[OfficialLoginResult], None]] = None,
         on_validated: Optional[Callable[[OfficialLoginResult], Any]] = None,
     ) -> OfficialLoginResult:
-        """Wait for a user-completed SMS login in a visible official Chrome window."""
+        """Wait for user-completed SMS login in the same official Chrome session."""
         worker = worker or OfficialLoginWorker()
         self.profile_root.mkdir(parents=True, exist_ok=True)
         temporary_profile = self.profile_root / f".window_{uuid.uuid4().hex}"
@@ -409,7 +424,7 @@ class XianyuOfficialLoginService:
                     profile_path=temporary_profile,
                     account=account,
                     password="",
-                    show_browser=True,
+                    show_browser=show_browser,
                     current_cookie="",
                     expected_unb=expected_unb,
                     allow_password=False,
@@ -534,9 +549,7 @@ class XianyuOfficialLoginService:
                 worker.attach(context, playwright)
                 self._seed_cookie_if_needed(context, current_cookie)
 
-                pages = list(getattr(context, "pages", []) or [])
-                page = pages[0] if pages else context.new_page()
-                self._install_official_message_listener(page)
+                page = self._active_page(context)
                 entry_url = (
                     active_verification_url
                     or (GOOFISH_LOGIN_URL if mode in {"qr", "password", "sms"} else GOOFISH_IM_URL)
@@ -546,6 +559,7 @@ class XianyuOfficialLoginService:
                     page.wait_for_timeout(1500)
                 except Exception:
                     worker.cancel_event.wait(1.0)
+                worker.capture_frame(page)
 
                 browser_user_agent = self._browser_user_agent(page)
                 immediate = self._successful_result(
@@ -563,12 +577,12 @@ class XianyuOfficialLoginService:
                         immediate.verification_url
                         and immediate.verification_url != active_verification_url
                     ):
-                        active_verification_url = immediate.verification_url
                         page.goto(
-                            active_verification_url,
+                            immediate.verification_url,
                             wait_until="domcontentloaded",
                             timeout=60000,
                         )
+                        active_verification_url = immediate.verification_url
                     verification_image_path = self._save_verification_screenshot(
                         page,
                         expected_unb or account or "verify",
@@ -606,12 +620,18 @@ class XianyuOfficialLoginService:
                             status="verification_required",
                             error_code="reauth_required",
                             message=(
-                                "请在官方窗口完成手机号验证码登录"
+                                (
+                                    "请在官方窗口完成手机号验证码登录"
+                                    if show_browser
+                                    else "请在监控台完成手机号验证码登录"
+                                )
                                 if mode == "sms"
                                 else "官方登录态已失效，请手动重新登录"
                             ),
                             verification_image_path=verification_image_path,
                             requires_manual_action=True,
+                            verification_kind="interactive",
+                            required_action="interact_in_console",
                             used_password=False,
                         )
                         self._emit_status(on_status, status)
@@ -694,6 +714,7 @@ class XianyuOfficialLoginService:
                         playwright.stop()
                     except Exception:
                         pass
+                worker.interaction_channel.close()
 
         return OfficialLoginResult(
             status="failed",
@@ -801,136 +822,205 @@ class XianyuOfficialLoginService:
         official_result_observed = False
         probe_manual_action_active = bool(verification_status_emitted)
         last_probe_at = 0.0
+        last_frame_at = 0.0
 
         while True:
-            if worker.cancel_event.is_set():
-                return self._cancelled_result(used_password)
-            if background_window and worker.show_event.is_set():
-                worker.show_event.clear()
-                if self._show_existing_window(context, page):
-                    background_window = False
-                else:
+            try:
+                if worker.cancel_event.is_set():
+                    return self._cancelled_result(used_password)
+                page = self._active_page(
+                    context,
+                    page,
+                    recover_url=GOOFISH_IM_URL,
+                )
+                worker.drain_interactions(page)
+                now = time.monotonic()
+                if now - last_frame_at >= 1.0:
+                    worker.capture_frame(page)
+                    last_frame_at = now
+                if background_window and worker.show_event.is_set():
+                    worker.show_event.clear()
+                    if self._show_existing_window(context, page):
+                        background_window = False
+                    else:
+                        self._emit_status(
+                            on_status,
+                            OfficialLoginResult(
+                                status=(
+                                    "verification_required"
+                                    if self._has_security_verification(page)
+                                    else "waiting_user"
+                                ),
+                                error_code="show_browser_failed",
+                                message="同一官方窗口暂未移到桌面，后台检测仍在继续",
+                                verification_image_path=verification_image_path,
+                                requires_manual_action=True,
+                                verification_kind="interactive",
+                                required_action="interact_in_console",
+                                used_password=used_password,
+                                browser_user_agent=browser_user_agent,
+                            ),
+                        )
+
+                if not keep_login_confirmed and self._confirm_keep_login(page):
+                    keep_login_confirmed = True
+                    worker.cancel_event.wait(0.3)
+
+                security_verification_active = self._has_security_verification(page)
+                if (
+                    not official_result_observed
+                    and not security_verification_active
+                    and self._official_login_result_received(page)
+                ):
+                    official_result_observed = True
                     self._emit_status(
                         on_status,
                         OfficialLoginResult(
-                            status=(
-                                "verification_required"
-                                if self._has_security_verification(page)
-                                else "waiting_user"
-                            ),
-                            error_code="show_browser_failed",
-                            message="同一官方窗口暂未移到桌面，后台检测仍在继续",
+                            status="waiting_user",
+                            message="已收到官方登录结果，正在确认会话 Cookie",
                             verification_image_path=verification_image_path,
                             requires_manual_action=True,
                             used_password=used_password,
-                            browser_user_agent=browser_user_agent,
                         ),
                     )
 
-            if not keep_login_confirmed and self._confirm_keep_login(page):
-                keep_login_confirmed = True
-                worker.cancel_event.wait(0.3)
-
-            security_verification_active = self._has_security_verification(page)
-            if (
-                not official_result_observed
-                and not security_verification_active
-                and self._official_login_result_received(page)
-            ):
-                official_result_observed = True
-                self._emit_status(
-                    on_status,
-                    OfficialLoginResult(
-                        status="waiting_user",
-                        message="已收到官方登录结果，正在确认会话 Cookie",
-                        verification_image_path=verification_image_path,
-                        requires_manual_action=True,
-                        used_password=used_password,
-                    ),
-                )
-
-            inspection = None
-            now = time.monotonic()
-            if now - last_probe_at >= self.probe_interval:
-                inspection = self._successful_result(
-                    page,
-                    context,
-                    expected_unb,
-                    used_password,
-                    browser_user_agent,
-                )
-                last_probe_at = now
-            if inspection and inspection.status in {"success", "failed"}:
-                return inspection
-            if inspection and inspection.requires_manual_action:
-                probe_manual_action_active = True
-                if (
-                    inspection.verification_url
-                    and inspection.verification_url != active_verification_url
-                ):
-                    active_verification_url = inspection.verification_url
-                    page.goto(
-                        active_verification_url,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
+                inspection = None
+                now = time.monotonic()
+                if now - last_probe_at >= self.probe_interval:
+                    inspection = self._successful_result(
+                        page,
+                        context,
+                        expected_unb,
+                        used_password,
+                        browser_user_agent,
                     )
-                    security_verification_active = True
-                if not verification_status_emitted:
-                    latest_image_path = self._save_verification_screenshot(page, profile_key)
-                    if latest_image_path:
-                        verification_image_path = latest_image_path
-                    inspection.verification_image_path = verification_image_path
-                    inspection.browser_user_agent = browser_user_agent
-                    self._emit_status(on_status, inspection)
-                    verification_status_emitted = True
-
-            login_error = self._detect_login_error(page)
-            if login_error:
-                return OfficialLoginResult(
-                    status="failed",
-                    error_code="invalid_credentials",
-                    message=login_error,
-                    used_password=used_password,
-                )
-
-            if security_verification_active or probe_manual_action_active:
-                if not verification_status_emitted:
-                    latest_image_path = self._save_verification_screenshot(page, profile_key)
-                    if latest_image_path:
-                        verification_image_path = latest_image_path
-                    status = OfficialLoginResult(
-                        status="verification_required",
-                        error_code="verification_required",
-                        message="需要完成闲鱼身份验证，验证后系统会自动继续",
-                        verification_image_path=verification_image_path,
-                        requires_manual_action=True,
-                        used_password=used_password,
-                        browser_user_agent=browser_user_agent,
+                    last_probe_at = now
+                if inspection and inspection.status in {"success", "failed"}:
+                    return inspection
+                if inspection and inspection.requires_manual_action:
+                    probe_manual_action_active = True
+                    inspection.verification_kind = (
+                        inspection.verification_kind or "interactive"
                     )
-                    self._emit_status(on_status, status)
-                    verification_status_emitted = True
-                if verification_deadline is None:
-                    verification_deadline = time.monotonic() + max(0.001, wait_seconds)
-                if time.monotonic() >= verification_deadline:
+                    inspection.required_action = "interact_in_console"
+                    if (
+                        inspection.verification_url
+                        and inspection.verification_url != active_verification_url
+                    ):
+                        page.goto(
+                            inspection.verification_url,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                        active_verification_url = inspection.verification_url
+                        security_verification_active = True
+                        worker.capture_frame(page)
+                    if not verification_status_emitted:
+                        latest_image_path = self._save_verification_screenshot(page, profile_key)
+                        if latest_image_path:
+                            verification_image_path = latest_image_path
+                        inspection.verification_image_path = verification_image_path
+                        inspection.browser_user_agent = browser_user_agent
+                        self._emit_status(on_status, inspection)
+                        verification_status_emitted = True
+
+                login_error = self._detect_login_error(page)
+                if login_error:
                     return OfficialLoginResult(
-                        status="timeout",
-                        error_code="verification_timeout",
-                        message="身份验证等待超时",
-                        verification_image_path=verification_image_path,
-                        requires_manual_action=True,
+                        status="failed",
+                        error_code="invalid_credentials",
+                        message=login_error,
                         used_password=used_password,
                     )
-            elif time.monotonic() >= login_deadline:
-                return OfficialLoginResult(
-                    status="timeout" if wait_for_login_form else "failed",
-                    error_code="login_timeout" if wait_for_login_form else "login_state_unknown",
-                    message="官方登录会话已过期" if wait_for_login_form else "官方登录页未能确认登录成功",
-                    verification_image_path=verification_image_path,
-                    requires_manual_action=wait_for_login_form,
-                    used_password=used_password,
-                )
 
-            worker.cancel_event.wait(self.poll_interval)
+                if security_verification_active or probe_manual_action_active:
+                    if not verification_status_emitted:
+                        latest_image_path = self._save_verification_screenshot(page, profile_key)
+                        if latest_image_path:
+                            verification_image_path = latest_image_path
+                        status = OfficialLoginResult(
+                            status="verification_required",
+                            error_code="verification_required",
+                            message="请在监控台完成闲鱼身份验证，验证后系统会自动继续",
+                            verification_image_path=verification_image_path,
+                            requires_manual_action=True,
+                            verification_kind="interactive",
+                            required_action="interact_in_console",
+                            used_password=used_password,
+                            browser_user_agent=browser_user_agent,
+                        )
+                        self._emit_status(on_status, status)
+                        verification_status_emitted = True
+                    if verification_deadline is None:
+                        verification_deadline = time.monotonic() + max(0.001, wait_seconds)
+                    if time.monotonic() >= verification_deadline:
+                        return OfficialLoginResult(
+                            status="timeout",
+                            error_code="verification_timeout",
+                            message="身份验证等待超时",
+                            verification_image_path=verification_image_path,
+                            requires_manual_action=True,
+                            verification_kind="interactive",
+                            required_action="interact_in_console",
+                            used_password=used_password,
+                        )
+                elif time.monotonic() >= login_deadline:
+                    return OfficialLoginResult(
+                        status="timeout" if wait_for_login_form else "failed",
+                        error_code="login_timeout" if wait_for_login_form else "login_state_unknown",
+                        message="官方登录会话已过期" if wait_for_login_form else "官方登录页未能确认登录成功",
+                        verification_image_path=verification_image_path,
+                        requires_manual_action=wait_for_login_form,
+                        used_password=used_password,
+                    )
+
+                worker.cancel_event.wait(self.poll_interval)
+            except Exception as exc:
+                if self._is_page_closed_error(exc):
+                    worker.cancel_event.wait(self.poll_interval)
+                    continue
+                raise
+
+    def _active_page(
+        self,
+        context: Any,
+        current_page: Any = None,
+        *,
+        recover_url: str = "",
+    ) -> Any:
+        pages = list(getattr(context, "pages", []) or [])
+        active_pages = [
+            candidate
+            for candidate in pages
+            if not self._page_is_closed(candidate)
+        ]
+        page = active_pages[-1] if active_pages else context.new_page()
+        if page is not current_page:
+            self._install_official_message_listener(page)
+        if not active_pages and recover_url:
+            page.goto(recover_url, wait_until="domcontentloaded", timeout=60000)
+        return page
+
+    @staticmethod
+    def _page_is_closed(page: Any) -> bool:
+        if page is None:
+            return True
+        is_closed = getattr(page, "is_closed", None)
+        if callable(is_closed):
+            try:
+                return bool(is_closed())
+            except Exception:
+                return True
+        return False
+
+    @staticmethod
+    def _is_page_closed_error(exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "targetclosed" in text
+            or "target page, context or browser has been closed" in text
+            or "page has been closed" in text
+        )
 
     @staticmethod
     def _show_existing_window(context: Any, page: Any) -> bool:

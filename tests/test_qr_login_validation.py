@@ -86,6 +86,75 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, logs)
             self.assertNotIn(secret, result["message"])
 
+    async def test_h5_token_and_redirect_cookie_jar_are_merged_into_session(self):
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=AsyncMock(),
+        )
+        session = QRLoginSession("redirect-cookie-session")
+        client = AsyncMock()
+        client.__aenter__.return_value = client
+        client.__aexit__.return_value = None
+        client.cookies = httpx.Cookies()
+        client.cookies.set("_m_h5_tk", "token-value_1700000000000")
+        client.cookies.set("_m_h5_tk_enc", "encrypted-token")
+        client.get.return_value = httpx.Response(
+            200,
+            request=httpx.Request("GET", manager.api_h5_tk),
+        )
+
+        async def post(*_args, **_kwargs):
+            client.cookies.set("cookie2", "redirect-session")
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", manager.api_h5_tk),
+            )
+
+        client.post.side_effect = post
+
+        with patch("utils.qr_login.httpx.AsyncClient", return_value=client):
+            await manager._get_mh5tk(session)
+
+        self.assertEqual(session.cookies.get("_m_h5_tk"), "token-value_1700000000000")
+        self.assertEqual(session.cookies.get("_m_h5_tk_enc"), "encrypted-token")
+        self.assertEqual(session.cookies.get("cookie2"), "redirect-session")
+        params = client.post.call_args.kwargs["params"]
+        expected_sign_input = (
+            f"token-value&{params['t']}&34839810&"
+            '{"bizScene":"home"}'
+        )
+        self.assertEqual(
+            params["sign"],
+            __import__("hashlib").md5(expected_sign_input.encode()).hexdigest(),
+        )
+
+    async def test_unknown_qr_status_retries_until_an_explicit_terminal_state(self):
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=AsyncMock(),
+        )
+        session = QRLoginSession("unknown-status-session")
+        manager.sessions[session.session_id] = session
+        responses = [
+            httpx.Response(
+                200,
+                json={"content": {"data": {"qrCodeStatus": "PENDING_CONFIRM"}}},
+                request=httpx.Request("POST", manager.api_scan_status),
+            ),
+            httpx.Response(
+                200,
+                json={"content": {"data": {"qrCodeStatus": "EXPIRED"}}},
+                request=httpx.Request("POST", manager.api_scan_status),
+            ),
+        ]
+        manager._poll_qrcode_status = AsyncMock(side_effect=responses)
+
+        with patch("utils.qr_login.asyncio.sleep", new=AsyncMock()):
+            await manager._monitor_qr_status(session.session_id, max_wait_time=1)
+
+        self.assertEqual(session.status, "expired")
+        self.assertEqual(manager._poll_qrcode_status.await_count, 2)
+
     async def test_expired_terminal_state_is_stable_until_retention_ends(self):
         manager = QRLoginManager(
             verification_browser=FakeVerificationBrowser(),
@@ -149,14 +218,75 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
             "verification_browser_status": "waiting",
             "verification_screenshot_path": "/static/uploads/images/verification.png",
             "verification_kind": "interactive",
-            "required_action": "use_local_chrome",
+            "required_action": "interact_in_console",
         })
+        session.interaction_channel.publish_frame(
+            b"interactive-frame",
+            viewport_width=1280,
+            viewport_height=860,
+        )
         status = manager.get_session_status(session.session_id)
         self.assertEqual(status["verification_kind"], "interactive")
-        self.assertEqual(status["required_action"], "use_local_chrome")
+        self.assertEqual(status["required_action"], "interact_in_console")
+        self.assertTrue(status["interaction_supported"])
+        self.assertEqual(status["frame_revision"], 1)
+        self.assertEqual(status["viewport_width"], 1280)
+        self.assertEqual(
+            status["verification_screenshot_path"],
+            f"/qr-login/verification-image/{session.session_id}",
+        )
+        frame, revision = manager.get_interaction_frame(session.session_id)
+        self.assertEqual(frame, b"interactive-frame")
+        self.assertEqual(revision, 1)
+        self.assertEqual(
+            manager.submit_interaction(
+                session.session_id,
+                {
+                    "kind": "key",
+                    "key": "Enter",
+                    "frame_revision": revision,
+                },
+            ),
+            1,
+        )
+        session.required_action = "scan_image"
+        with self.assertRaisesRegex(RuntimeError, "不需要远程操作"):
+            manager.submit_interaction(
+                session.session_id,
+                {
+                    "kind": "key",
+                    "key": "Enter",
+                    "frame_revision": revision,
+                },
+            )
         self.assertTrue(status["browser_active"])
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_verification_probe_without_safe_url_uses_fixed_official_entry(self):
+        validator = AsyncMock(return_value=SessionProbeResult(
+            status="verification_required",
+            cookies={"unb": "account-1", "cookie2": "session"},
+            verification_url="https://example.invalid/private-verification",
+            error_code="human_verification_required",
+        ))
+        manager = QRLoginManager(
+            verification_browser=FakeVerificationBrowser(),
+            session_validator=validator,
+        )
+        session = QRLoginSession("verification-fallback-session")
+        session.cookies = {"unb": "account-1", "cookie2": "session"}
+        session.unb = "account-1"
+        manager.sessions[session.session_id] = session
+        manager._ensure_verification_browser = Mock()
+
+        validated = await manager._validate_candidate_session(session)
+
+        self.assertFalse(validated)
+        self.assertEqual(session.status, "verification_required")
+        self.assertEqual(session.verification_url, "https://www.goofish.com/im")
+        self.assertEqual(session.required_action, "render_verification")
+        manager._ensure_verification_browser.assert_called_once_with(session.session_id)
 
     async def test_success_status_without_access_token_is_not_accepted(self):
         validator = AsyncMock(return_value=SessionProbeResult(

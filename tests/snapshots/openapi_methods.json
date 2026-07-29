@@ -216,6 +216,9 @@
   "/api/official-login/sessions/{session_id}/image": [
     "GET"
   ],
+  "/api/official-login/sessions/{session_id}/interact": [
+    "POST"
+  ],
   "/api/official-login/sessions/{session_id}/cancel": [
     "POST"
   ],
@@ -550,6 +553,9 @@
     "POST"
   ],
   "/qr-login/generate": [
+    "POST"
+  ],
+  "/qr-login/interact/{session_id}": [
     "POST"
   ],
   "/qr-login/verification-image/{session_id}": [

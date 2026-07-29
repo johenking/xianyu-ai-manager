@@ -11,7 +11,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
         openapi = app.openapi()
-        self.assertEqual(openapi["info"]["version"], "1.10.0")
+        self.assertEqual(openapi["info"]["version"], "1.10.1")
         paths = openapi["paths"]
         signatures = {
             (method.upper(), path)
@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 227)
+        self.assertEqual(len(signatures), 229)
         self.assertEqual(
             set(app.state.domain_routers),
             {

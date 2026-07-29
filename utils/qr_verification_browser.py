@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
+from utils.browser_interaction import BrowserInteractionChannel
 from utils.verification_images import (
     ensure_private_verification_root,
     remove_private_verification_image,
@@ -28,7 +29,7 @@ from utils.xianyu_session_probe import (
 )
 
 
-BrowserUpdateCallback = Callable[[Dict[str, str]], None]
+BrowserUpdateCallback = Callable[[Dict[str, object]], None]
 StopCallback = Callable[[], bool]
 
 
@@ -101,6 +102,7 @@ class QRVerificationBrowser:
         max_wait_time: int = 450,
         on_update: Optional[BrowserUpdateCallback] = None,
         should_stop: Optional[StopCallback] = None,
+        interaction_channel: Optional[BrowserInteractionChannel] = None,
     ) -> Dict[str, object]:
         """打开验证页并等待用户完成身份验证。"""
         if not verification_url:
@@ -132,7 +134,7 @@ class QRVerificationBrowser:
                     viewport={"width": 1280, "height": 860},
                     locale="zh-CN",
                 )
-                page = context.pages[0] if context.pages else context.new_page()
+                page = self._active_page(context)
 
                 self._add_initial_cookies(context, initial_cookies or {})
 
@@ -148,7 +150,13 @@ class QRVerificationBrowser:
                 screenshot_path = self._capture_screenshot(page, session_id)
                 verification_kind = self._classify_verification(page)
                 required_action = (
-                    "scan_image" if verification_kind == "mobile_scan" else "use_local_chrome"
+                    "scan_image"
+                    if verification_kind == "mobile_scan"
+                    else "interact_in_console"
+                )
+                frame_revision = self._capture_interaction_frame(
+                    interaction_channel,
+                    page,
                 )
                 if on_update:
                     on_update({
@@ -156,10 +164,16 @@ class QRVerificationBrowser:
                         "verification_browser_status": "waiting",
                         "verification_kind": verification_kind,
                         "required_action": required_action,
+                        **self._interaction_update(
+                            interaction_channel,
+                            frame_revision,
+                        ),
                     })
 
                 started_at = time.time()
                 last_screenshot_at = time.time()
+                last_frame_at = time.time()
+                last_probe_at = 0.0
                 redirected_after_success_hint = False
 
                 while time.time() - started_at < max_wait_time:
@@ -171,55 +185,99 @@ class QRVerificationBrowser:
                             "message": "验证会话已停止",
                         }
 
-                    cookies = self._cookies_to_dict(context.cookies())
-                    if self._has_login_cookie(cookies) and self.session_validator is not None:
-                        probe = self.session_validator(
-                            self._cookies_to_string(cookies),
-                            self._browser_user_agent(page),
+                    try:
+                        page = self._active_page(
+                            context,
+                            page,
+                            recover_url=verification_url,
                         )
-                        if probe.succeeded:
-                            verified_cookies = probe.cookies or cookies
-                            verified_unb = str(verified_cookies.get("unb") or "").strip()
-                            if verified_unb:
-                                preserve_profile = True
-                                logger.info(
-                                    f"扫码二次验证已通过消息 Token 校验: session={session_id}, "
-                                    f"cookie_count={len(verified_cookies)}, has_unb=True"
-                                )
-                                return {
-                                    "status": "success",
-                                    "cookies": verified_cookies,
-                                    "unb": verified_unb,
-                                    "access_token": probe.access_token,
-                                    "screenshot_path": screenshot_path,
-                                }
-
-                    if not redirected_after_success_hint and self._has_success_hint(page):
-                        redirected_after_success_hint = True
-                        logger.info(f"扫码二次验证页面提示成功，尝试进入闲鱼页面换取 Cookie: session={session_id}")
-                        try:
-                            page.goto("https://www.goofish.com/im", wait_until="domcontentloaded", timeout=45000)
-                            time.sleep(3)
-                        except Exception as exc:
-                            logger.debug(
-                                f"扫码二次验证成功后跳转闲鱼页面失败: "
-                                f"session={session_id}, 错误类型: {type(exc).__name__}"
+                        drained = (
+                            interaction_channel.drain(page)
+                            if interaction_channel is not None
+                            else 0
+                        )
+                        now = time.time()
+                        if drained or now - last_frame_at >= 0.75:
+                            verification_kind = self._classify_verification(page)
+                            required_action = (
+                                "scan_image"
+                                if verification_kind == "mobile_scan"
+                                else "interact_in_console"
                             )
-
-                    if time.time() - last_screenshot_at >= 8:
-                        updated_screenshot = self._capture_screenshot(page, session_id)
-                        if updated_screenshot:
-                            screenshot_path = updated_screenshot
+                            frame_revision = self._capture_interaction_frame(
+                                interaction_channel,
+                                page,
+                            )
                             if on_update:
                                 on_update({
                                     "verification_screenshot_path": screenshot_path,
                                     "verification_browser_status": "waiting",
                                     "verification_kind": verification_kind,
                                     "required_action": required_action,
+                                    **self._interaction_update(
+                                        interaction_channel,
+                                        frame_revision,
+                                    ),
                                 })
-                        last_screenshot_at = time.time()
+                            last_frame_at = now
 
-                    time.sleep(2)
+                        cookies = self._cookies_to_dict(context.cookies())
+                        if (
+                            self._has_login_cookie(cookies)
+                            and self.session_validator is not None
+                            and now - last_probe_at >= 2.0
+                        ):
+                            last_probe_at = now
+                            probe = self.session_validator(
+                                self._cookies_to_string(cookies),
+                                self._browser_user_agent(page),
+                            )
+                            if probe.succeeded:
+                                verified_cookies = probe.cookies or cookies
+                                verified_unb = str(
+                                    verified_cookies.get("unb") or ""
+                                ).strip()
+                                if verified_unb:
+                                    preserve_profile = True
+                                    logger.info(
+                                        f"扫码二次验证已通过消息 Token 校验: session={session_id}, "
+                                        f"cookie_count={len(verified_cookies)}, has_unb=True"
+                                    )
+                                    return {
+                                        "status": "success",
+                                        "cookies": verified_cookies,
+                                        "unb": verified_unb,
+                                        "access_token": probe.access_token,
+                                        "screenshot_path": screenshot_path,
+                                    }
+
+                        if (
+                            not redirected_after_success_hint
+                            and self._has_success_hint(page)
+                        ):
+                            logger.info(
+                                f"扫码二次验证页面提示成功，尝试进入闲鱼页面换取 Cookie: session={session_id}"
+                            )
+                            page.goto(
+                                "https://www.goofish.com/im",
+                                wait_until="domcontentloaded",
+                                timeout=45000,
+                            )
+                            redirected_after_success_hint = True
+
+                        if now - last_screenshot_at >= 8:
+                            updated_screenshot = self._capture_screenshot(
+                                page,
+                                session_id,
+                            )
+                            if updated_screenshot:
+                                screenshot_path = updated_screenshot
+                            last_screenshot_at = now
+                    except Exception as exc:
+                        if not self._is_page_closed_error(exc):
+                            raise
+
+                    time.sleep(0.5)
 
                 logger.warning(f"扫码二次验证等待超时: session={session_id}")
                 return {
@@ -239,6 +297,8 @@ class QRVerificationBrowser:
                 "message": "安全验证浏览器处理失败，请重新生成二维码",
             }
         finally:
+            if interaction_channel is not None:
+                interaction_channel.close()
             if not preserve_profile:
                 try:
                     shutil.rmtree(user_data_dir, ignore_errors=True)
@@ -251,7 +311,80 @@ class QRVerificationBrowser:
         return [
             "--lang=zh-CN",
             "--window-size=1280,860",
+            "--window-position=-32000,-32000",
         ]
+
+    def _active_page(
+        self,
+        context: Any,
+        current_page: Any = None,
+        *,
+        recover_url: str = "",
+    ) -> Any:
+        pages = list(getattr(context, "pages", []) or [])
+        active_pages = [
+            candidate
+            for candidate in pages
+            if not self._page_is_closed(candidate)
+        ]
+        page = active_pages[-1] if active_pages else context.new_page()
+        if not active_pages and recover_url:
+            page.goto(
+                recover_url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+        return page
+
+    @staticmethod
+    def _page_is_closed(page: Any) -> bool:
+        if page is None:
+            return True
+        is_closed = getattr(page, "is_closed", None)
+        if callable(is_closed):
+            try:
+                return bool(is_closed())
+            except Exception:
+                return True
+        return False
+
+    @staticmethod
+    def _is_page_closed_error(exc: Exception) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return (
+            "targetclosed" in text
+            or "target page, context or browser has been closed" in text
+            or "page has been closed" in text
+        )
+
+    @staticmethod
+    def _capture_interaction_frame(
+        interaction_channel: Optional[BrowserInteractionChannel],
+        page: Any,
+    ) -> int:
+        if interaction_channel is None:
+            return 0
+        try:
+            return interaction_channel.capture(page)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _interaction_update(
+        interaction_channel: Optional[BrowserInteractionChannel],
+        frame_revision: int,
+    ) -> Dict[str, object]:
+        if interaction_channel is None:
+            return {
+                "interaction_supported": False,
+                "frame_revision": 0,
+                "viewport_width": 0,
+                "viewport_height": 0,
+            }
+        snapshot = interaction_channel.snapshot()
+        if frame_revision and not snapshot.get("frame_revision"):
+            snapshot["frame_revision"] = frame_revision
+        return snapshot
 
     def _add_initial_cookies(self, context, cookies: Dict[str, str]) -> None:
         if not cookies:

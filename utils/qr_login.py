@@ -16,6 +16,7 @@ import qrcode
 import qrcode.constants
 from loguru import logger
 import hashlib
+from utils.browser_interaction import BrowserInteractionChannel
 from utils.qr_verification_browser import (
     QRVerificationBrowser,
     remove_verification_screenshot,
@@ -29,8 +30,11 @@ from utils.xianyu_session_probe import (
     cookies_to_string,
     detect_default_browser_user_agent,
     has_core_session_cookies,
+    is_allowed_verification_url,
     probe_message_session_async,
 )
+
+GOOFISH_IM_URL = "https://www.goofish.com/im"
 
 
 def generate_headers():
@@ -87,6 +91,7 @@ class QRLoginSession:
         self.validated = False
         self.terminal_at = None
         self.ended_by = ""
+        self.interaction_channel = BrowserInteractionChannel()
 
     def is_expired(self) -> bool:
         """检查是否过期"""
@@ -162,6 +167,11 @@ class QRLoginManager:
         """将Cookie字典转换为字符串"""
         return "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
+    @staticmethod
+    def _verification_entry_url(value: Any) -> str:
+        candidate = str(value or "").strip()
+        return candidate if is_allowed_verification_url(candidate) else GOOFISH_IM_URL
+
     def _make_qr_data_url(self, content: str) -> str:
         """生成二维码Data URL"""
         from io import BytesIO
@@ -181,45 +191,91 @@ class QRLoginManager:
         qr_base64 = base64.b64encode(buffer.getvalue()).decode()
         return f"data:image/png;base64,{qr_base64}"
 
+    @staticmethod
+    def _merge_response_cookies(
+        session: QRLoginSession,
+        client: Any,
+        response: Optional[httpx.Response] = None,
+    ) -> None:
+        """Merge the complete redirect-aware client jar without logging values."""
+        sources = []
+        client_cookies = getattr(client, "cookies", None)
+        if client_cookies is not None:
+            sources.append(client_cookies)
+        if response is not None:
+            sources.extend(
+                [getattr(item, "cookies", None) for item in response.history]
+            )
+            sources.append(response.cookies)
+        for source in sources:
+            if source is None:
+                continue
+            if not isinstance(source, (httpx.Cookies, dict)):
+                continue
+            items = list(source.items())
+            for name, value in items:
+                if name and value is not None:
+                    session.cookies[str(name)] = str(value)
+
+    @staticmethod
+    def _h5_token_value(cookies: Dict[str, str]) -> str:
+        raw = str(cookies.get("_m_h5_tk") or "")
+        return raw.split("_", 1)[0].strip()
+
     async def _get_mh5tk(self, session: QRLoginSession) -> dict:
         """获取m_h5_tk和m_h5_tk_enc"""
         data = {"bizScene": "home"}
         data_str = json.dumps(data, separators=(',', ':'))
-        t = str(int(time.time() * 1000))
         app_key = "34839810"
 
         # 先发一次 GET 请求，获取 cookie 中的 m_h5_tk
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=self.proxy) as client:
             try:
-                resp = await client.get(self.api_h5_tk, headers=self.headers)
-                cookies = {k: v for k, v in resp.cookies.items()}
-                session.cookies.update(cookies)
+                resp = await client.get(
+                    self.api_h5_tk,
+                    headers=self.headers,
+                    cookies=session.cookies,
+                )
+                self._merge_response_cookies(session, client, resp)
+                token = self._h5_token_value(session.cookies)
 
-                m_h5_tk = cookies.get("m_h5_tk", "")
-                token = m_h5_tk.split("_")[0] if "_" in m_h5_tk else ""
+                def signed_params(signing_token: str) -> dict:
+                    request_time = str(int(time.time() * 1000))
+                    sign_input = (
+                        f"{signing_token}&{request_time}&{app_key}&{data_str}"
+                    )
+                    return {
+                        "jsv": "2.7.2",
+                        "appKey": app_key,
+                        "t": request_time,
+                        "sign": hashlib.md5(sign_input.encode()).hexdigest(),
+                        "v": "1.0",
+                        "type": "originaljson",
+                        "dataType": "json",
+                        "timeout": 20000,
+                        "api": "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get",
+                        "data": data_str,
+                    }
 
-                # 生成签名
-                sign_input = f"{token}&{t}&{app_key}&{data_str}"
-                sign = hashlib.md5(sign_input.encode()).hexdigest()
+                # 发请求正式获取数据；若服务端刷新 Token，只用新 Token 重签一次。
+                posted = await client.post(
+                    self.api_h5_tk,
+                    params=signed_params(token),
+                    headers=self.headers,
+                    cookies=session.cookies,
+                )
+                self._merge_response_cookies(session, client, posted)
+                refreshed_token = self._h5_token_value(session.cookies)
+                if refreshed_token and refreshed_token != token:
+                    posted = await client.post(
+                        self.api_h5_tk,
+                        params=signed_params(refreshed_token),
+                        headers=self.headers,
+                        cookies=session.cookies,
+                    )
+                    self._merge_response_cookies(session, client, posted)
 
-                # 构造最终请求参数
-                params = {
-                    "jsv": "2.7.2",
-                    "appKey": app_key,
-                    "t": t,
-                    "sign": sign,
-                    "v": "1.0",
-                    "type": "originaljson",
-                    "dataType": "json",
-                    "timeout": 20000,
-                    "api": "mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get",
-                    "data": data_str,
-                }
-
-                # 发请求正式获取数据，确保 token 有效
-                await client.post(self.api_h5_tk, params=params, headers=self.headers, cookies=session.cookies)
-
-                return cookies
+                return dict(session.cookies)
             except httpx.ConnectTimeout:
                 logger.error("获取m_h5_tk时连接超时")
                 raise
@@ -254,6 +310,7 @@ class QRLoginManager:
                     cookies=session.cookies,
                     headers=self.headers,
                 )
+                self._merge_response_cookies(session, client, resp)
 
                 # 正则匹配需要的json数据
                 pattern = r"window\.viewData\s*=\s*(\{.*?\});"
@@ -300,8 +357,10 @@ class QRLoginManager:
                 resp = await client.get(
                     self.api_generate_qr,
                     params=login_params,
-                    headers=self.headers
+                    headers=self.headers,
+                    cookies=session.cookies,
                 )
+                self._merge_response_cookies(session, client, resp)
 
                 try:
                     results = resp.json()
@@ -381,6 +440,7 @@ class QRLoginManager:
                 cookies=session.cookies,
                 headers=self.headers,
             )
+            self._merge_response_cookies(session, client, resp)
             return resp
 
     async def _validate_candidate_session(self, session: QRLoginSession) -> bool:
@@ -425,19 +485,18 @@ class QRLoginManager:
 
         if result.status == PROBE_VERIFICATION_REQUIRED:
             session.cookies.update(result.cookies or {})
-            session.verification_url = result.verification_url or session.verification_url
+            session.verification_url = self._verification_entry_url(
+                result.verification_url or session.verification_url
+            )
             session.status = "verification_required"
             session.verification_browser_status = None
             session.verification_error = None
-            session.verification_kind = "" if session.verification_url else "unknown"
-            session.required_action = (
-                "render_verification" if session.verification_url else "use_local_chrome"
-            )
+            session.verification_kind = ""
+            session.required_action = "render_verification"
             session.error_code = result.error_code
             session.message = "闲鱼要求完成安全验证，正在识别验证方式"
             session.validated = False
-            if session.verification_url:
-                self._ensure_verification_browser(session.session_id)
+            self._ensure_verification_browser(session.session_id)
             return False
 
         self._mark_terminal(
@@ -467,6 +526,7 @@ class QRLoginManager:
 
             # 监控登录状态
             start_time = time.time()
+            unknown_status_count = 0
 
             while time.time() - start_time < max_wait_time:
                 try:
@@ -484,6 +544,7 @@ class QRLoginManager:
                     )
 
                     if qrcode_status == "CONFIRMED":
+                        unknown_status_count = 0
                         # 登录确认
                         if (
                             resp.json()
@@ -494,22 +555,21 @@ class QRLoginManager:
                         ):
                             # 账号被风控，需要手机验证
                             session.status = 'verification_required'
-                            iframe_url = (
+                            raw_iframe_url = (
                                 resp.json()
                                 .get("content", {})
                                 .get("data", {})
                                 .get("iframeRedirectUrl")
                             )
-                            session.verification_url = iframe_url
-                            session.verification_browser_status = None if iframe_url else 'failed'
-                            session.verification_error = None if iframe_url else '未获取到安全验证链接'
-                            session.verification_kind = "" if iframe_url else "unknown"
-                            session.required_action = (
-                                "render_verification" if iframe_url else "use_local_chrome"
+                            session.verification_url = self._verification_entry_url(
+                                raw_iframe_url
                             )
+                            session.verification_browser_status = None
+                            session.verification_error = None
+                            session.verification_kind = ""
+                            session.required_action = "render_verification"
                             session.message = '闲鱼要求完成安全验证，正在识别验证方式'
-                            if iframe_url:
-                                self._ensure_verification_browser(session_id)
+                            self._ensure_verification_browser(session_id)
                             logger.warning(f"账号被风控，需要手机验证: {session_id}, 已保存验证链接")
                             break
                         else:
@@ -526,10 +586,12 @@ class QRLoginManager:
                             break
 
                     elif qrcode_status == "NEW":
+                        unknown_status_count = 0
                         # 二维码未被扫描，继续轮询
-                        continue
+                        await asyncio.sleep(0.8)
 
                     elif qrcode_status == "EXPIRED":
+                        unknown_status_count = 0
                         if preserve_verification or session.verification_url:
                             session.status = 'verification_required'
                             logger.info(f"二维码查询显示过期，保留安全验证状态: {session_id}")
@@ -544,15 +606,30 @@ class QRLoginManager:
                         break
 
                     elif qrcode_status == "SCANED":
+                        unknown_status_count = 0
                         # 二维码已被扫描，等待确认
                         if session.status == 'waiting':
                             session.status = 'scanned'
                             logger.info(f"二维码已扫描，等待确认: {session_id}")
-                    else:
-                        # 用户取消确认
+                    elif qrcode_status in {"CANCELLED", "CANCELED", "CANCEL"}:
                         self._mark_terminal(session, 'cancelled', '扫码登录已取消')
                         logger.info(f"用户取消登录: {session_id}")
                         break
+                    else:
+                        unknown_status_count += 1
+                        if unknown_status_count >= 5:
+                            self._mark_terminal(
+                                session,
+                                "error",
+                                "平台返回了未知扫码状态，请重新生成二维码",
+                                ended_by="validation_failed",
+                            )
+                            session.error_code = "qr_status_unknown"
+                            logger.warning(
+                                "二维码状态连续异常，已停止轮询: session={}",
+                                session_id,
+                            )
+                            break
 
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 
@@ -609,7 +686,11 @@ class QRLoginManager:
                 f"错误类型: {type(exc).__name__}"
             )
 
-    def _apply_verification_browser_update(self, session_id: str, update: Dict[str, str]):
+    def _apply_verification_browser_update(
+        self,
+        session_id: str,
+        update: Dict[str, object],
+    ):
         """接收浏览器线程回传的安全验证页面状态。"""
         session = self.sessions.get(session_id)
         if not session or session.status in {'success', 'expired', 'cancelled', 'error'}:
@@ -629,8 +710,8 @@ class QRLoginManager:
             session.verification_kind = verification_kind
 
         required_action = update.get('required_action')
-        if required_action in {'scan_image', 'use_local_chrome'}:
-            session.required_action = required_action
+        if required_action in {'scan_image', 'interact_in_console'}:
+            session.required_action = str(required_action)
 
     def _should_stop_verification_browser(self, session_id: str) -> bool:
         session = self.sessions.get(session_id)
@@ -654,6 +735,7 @@ class QRLoginManager:
             min(450, session.verification_expire_time),
             lambda update: self._apply_verification_browser_update(session_id, update),
             lambda: self._should_stop_verification_browser(session_id),
+            session.interaction_channel,
         )
 
         session = self.sessions.get(session_id)
@@ -720,6 +802,7 @@ class QRLoginManager:
             logger.warning(f"扫码二次验证浏览器处理失败: {session_id}, 状态: {status}")
 
     def _cleanup_verification_artifacts(self, session: QRLoginSession):
+        session.interaction_channel.close()
         remove_verification_screenshot(session.verification_screenshot_path)
         session.verification_screenshot_path = None
         task = session.verification_task
@@ -812,13 +895,17 @@ class QRLoginManager:
                 session.verification_task and not session.verification_task.done()
             ),
             'ended_by': session.ended_by,
+            **session.interaction_channel.snapshot(),
         }
         logger.info(f"获取二维码会话状态: status={public_status}")
 
         if session.status in ['verification_required', 'verification_checking'] and session.verification_url:
             result['verification_screenshot_path'] = (
                 f"/qr-login/verification-image/{session_id}"
-                if session.verification_screenshot_path
+                if (
+                    session.verification_screenshot_path
+                    or session.interaction_channel.latest_frame() is not None
+                )
                 else None
             )
             result['verification_browser_status'] = session.verification_browser_status
@@ -826,8 +913,8 @@ class QRLoginManager:
                 result['message'] = session.verification_error or '安全验证浏览器处理失败，请重新生成二维码'
             elif session.verification_browser_status == 'starting':
                 result['message'] = '正在识别闲鱼安全验证方式，请稍候'
-            elif session.required_action == 'use_local_chrome':
-                result['message'] = '此验证需要滑块、人脸或页面交互，请改用你的 Chrome'
+            elif session.required_action == 'interact_in_console':
+                result['message'] = '请直接在监控台完成滑块、人脸或页面验证，系统会持续检测登录结果'
             elif session.required_action == 'scan_image' and session.verification_screenshot_path:
                 result['message'] = '请用手机版闲鱼扫描图中的身份验证二维码，完成后系统会自动检测'
             else:
@@ -844,6 +931,37 @@ class QRLoginManager:
             result['unb'] = session.unb
 
         return result
+
+    def get_interaction_frame(
+        self,
+        session_id: str,
+    ) -> Optional[tuple[bytes, int]]:
+        session = self.sessions.get(session_id)
+        if session is None or session.status not in {
+            'verification_required',
+            'verification_checking',
+        }:
+            return None
+        if session.required_action != 'interact_in_console':
+            return None
+        return session.interaction_channel.latest_frame()
+
+    def submit_interaction(
+        self,
+        session_id: str,
+        payload: Dict[str, Any],
+    ) -> int:
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        if session.status not in {
+            'verification_required',
+            'verification_checking',
+        }:
+            raise RuntimeError("二维码验证会话已结束")
+        if session.required_action != 'interact_in_console':
+            raise RuntimeError("当前二维码验证页面不需要远程操作")
+        return session.interaction_channel.submit(payload)
 
     def get_verification_image_path(self, session_id: str) -> Optional[str]:
         session = self.sessions.get(session_id)

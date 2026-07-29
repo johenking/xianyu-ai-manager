@@ -18,6 +18,8 @@ import {
   cancelOfficialLoginSession,
   createOfficialLoginSession,
   getOfficialLoginSession,
+  interactWithOfficialLogin,
+  interactWithQRLogin,
   refreshAccountSession,
   showAccountSessionRefreshBrowser,
   showOfficialLoginBrowser,
@@ -43,6 +45,8 @@ vi.mock('../services/api', () => ({
   checkPasswordLoginStatus: vi.fn(),
   createOfficialLoginSession: vi.fn(),
   getOfficialLoginSession: vi.fn(),
+  interactWithOfficialLogin: vi.fn(),
+  interactWithQRLogin: vi.fn(),
   showOfficialLoginBrowser: vi.fn(),
   cancelOfficialLoginSession: vi.fn(),
   showAccountSessionRefreshBrowser: vi.fn(),
@@ -184,6 +188,16 @@ describe('AccountList session verification UI', () => {
       expires_at: 9999999999,
     });
     vi.mocked(cancelOfficialLoginSession).mockResolvedValue({ success: true });
+    vi.mocked(interactWithOfficialLogin).mockResolvedValue({
+      success: true,
+      accepted: true,
+      frame_revision: 1,
+    });
+    vi.mocked(interactWithQRLogin).mockResolvedValue({
+      success: true,
+      accepted: true,
+      frame_revision: 1,
+    });
     vi.mocked(showOfficialLoginBrowser).mockResolvedValue({ success: true });
     vi.mocked(showAccountSessionRefreshBrowser).mockResolvedValue({ success: true });
     vi.mocked(getAccountSessionStatus).mockResolvedValue({
@@ -400,7 +414,7 @@ describe('AccountList session verification UI', () => {
     });
   });
 
-  it('moves remote password interaction verification to one-time Chrome pairing', async () => {
+  it('keeps remote password risk verification in the same web-operated session', async () => {
     vi.mocked(createOfficialLoginSession).mockResolvedValue({
       success: true,
       session_id: 'password-risk-session',
@@ -417,25 +431,11 @@ describe('AccountList session verification UI', () => {
       message: '需要滑块验证',
       error_code: 'human_verification_required',
       verification_kind: 'interactive',
-      required_action: 'use_local_chrome',
+      required_action: 'interact_in_console',
+      verification_image_url: '/api/official-login/sessions/password-risk-session/image',
+      interaction_supported: true,
+      frame_revision: 1,
       browser_active: true,
-    });
-    vi.mocked(createBrowserExtensionPairing).mockResolvedValue({
-      pairing_id: 'password-risk-pairing',
-      protocol_version: 2,
-      pairing_token: 'P'.repeat(43),
-      status: 'waiting',
-      message: '等待 Chrome 扩展导入',
-      expires_at: 9_999_999_999,
-      import_url: 'https://xianyu.cxywjx.top/api/browser-extension/import',
-      console_origin: 'https://xianyu.cxywjx.top',
-    });
-    vi.mocked(getBrowserExtensionPairing).mockResolvedValue({
-      pairing_id: 'password-risk-pairing',
-      protocol_version: 2,
-      status: 'waiting',
-      message: '等待 Chrome 扩展导入',
-      expires_at: 9_999_999_999,
     });
     render(<AccountList />);
 
@@ -450,9 +450,24 @@ describe('AccountList session verification UI', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: '开始账号密码登录' }));
 
-    expect(await screen.findByText('从你的 Chrome 导入', {}, { timeout: 4000 })).toBeInTheDocument();
-    expect(cancelOfficialLoginSession).toHaveBeenCalledWith('password-risk-session');
-    expect(createBrowserExtensionPairing).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByRole(
+        'region',
+        { name: '闲鱼登录页面远程操作' },
+        { timeout: 4000 },
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '发送回车键' }));
+    await waitFor(() => expect(interactWithOfficialLogin).toHaveBeenCalledWith(
+      'password-risk-session',
+      {
+        kind: 'key',
+        frame_revision: 1,
+        key: 'Enter',
+      },
+    ));
+    expect(cancelOfficialLoginSession).not.toHaveBeenCalled();
+    expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
   });
 
   it('offers SMS login through a visible official window without collecting the code', async () => {
@@ -470,7 +485,7 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
     fireEvent.click(await screen.findByRole('button', { name: '手机号验证码' }));
 
-    expect(await screen.findByText('在闲鱼官方窗口完成验证码登录')).toBeInTheDocument();
+    expect(await screen.findByText('在同一闲鱼官方页面完成验证码登录')).toBeInTheDocument();
     expect(screen.queryByLabelText('短信验证码')).not.toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('用于在官方页面预填'), {
       target: { value: '13800138000' },
@@ -520,7 +535,7 @@ describe('AccountList session verification UI', () => {
     });
   });
 
-  it('offers web QR and the user Chrome to remote users without exposing server Chrome', async () => {
+  it('offers web QR, SMS, and the explicit Chrome fallback to remote users', async () => {
     vi.mocked(createBrowserExtensionPairing).mockResolvedValue({
       pairing_id: 'pairing-id',
       protocol_version: 2,
@@ -542,13 +557,13 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    expect(await screen.findByRole('button', { name: '你的 Chrome' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '手机号验证码' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '网页二维码' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '服务器 Chrome 扫码' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '手机号验证码' })).not.toBeInTheDocument();
     expect(generateQRLogin).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
 
+    fireEvent.click(screen.getByRole('button', { name: '高级方式' }));
     fireEvent.click(screen.getByRole('button', { name: '你的 Chrome' }));
     expect(await screen.findByText('从你的 Chrome 导入')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '下载扩展 ZIP' })).toHaveAttribute(
@@ -819,32 +834,18 @@ describe('AccountList session verification UI', () => {
   });
 
   it.each(['interactive', 'unknown'] as const)(
-    'moves %s verification directly to one-time Chrome pairing',
+    'keeps %s verification in the same web QR session',
     async (verificationKind) => {
       vi.mocked(checkQRLoginStatus).mockResolvedValue({
         status: 'verification_required',
         session_id: 'qr-session',
         message: '需要页面交互',
         verification_kind: verificationKind,
-        required_action: 'use_local_chrome',
+        required_action: 'interact_in_console',
+        verification_screenshot_path: '/qr-login/verification-image/qr-session',
+        interaction_supported: true,
+        frame_revision: 1,
         browser_active: true,
-      });
-      vi.mocked(createBrowserExtensionPairing).mockResolvedValue({
-        pairing_id: 'risk-pairing',
-        protocol_version: 2,
-        pairing_token: 'R'.repeat(43),
-        status: 'waiting',
-        message: '等待 Chrome 扩展导入',
-        expires_at: 9_999_999_999,
-        import_url: 'https://xianyu.cxywjx.top/api/browser-extension/import',
-        console_origin: 'https://xianyu.cxywjx.top',
-      });
-      vi.mocked(getBrowserExtensionPairing).mockResolvedValue({
-        pairing_id: 'risk-pairing',
-        protocol_version: 2,
-        status: 'waiting',
-        message: '等待 Chrome 扩展导入',
-        expires_at: 9_999_999_999,
       });
       render(<AccountList />);
 
@@ -852,9 +853,27 @@ describe('AccountList session verification UI', () => {
       fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
       fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
 
-      expect(await screen.findByText('从你的 Chrome 导入', {}, { timeout: 3500 })).toBeInTheDocument();
-      expect(cancelQRLogin).toHaveBeenCalledWith('qr-session', 'switched_to_extension');
-      expect(createBrowserExtensionPairing).toHaveBeenCalledTimes(1);
+      expect(
+        await screen.findByRole(
+          'region',
+          { name: '闲鱼登录页面远程操作' },
+          { timeout: 3500 },
+        ),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: '发送回车键' }));
+      await waitFor(() => expect(interactWithQRLogin).toHaveBeenCalledWith(
+        'qr-session',
+        {
+          kind: 'key',
+          frame_revision: 1,
+          key: 'Enter',
+        },
+      ));
+      expect(cancelQRLogin).not.toHaveBeenCalledWith(
+        'qr-session',
+        'switched_to_extension',
+      );
+      expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
     },
   );
 
@@ -899,7 +918,7 @@ describe('AccountList session verification UI', () => {
 
   it.each([
     ['qr_login', '重新扫码', 'button', '网页二维码'],
-    ['sms_login', '验证码登录', 'text', '从你的 Chrome 导入'],
+    ['sms_login', '验证码登录', 'text', '在同一闲鱼官方页面完成验证码登录'],
     ['password_login', '账号密码登录', 'text', '支持自动续期'],
     ['chrome_extension_import', '重新导入', 'text', '从你的 Chrome 导入'],
     ['manual_cookie', '重新填写', 'placeholder', '粘贴从浏览器复制的 Cookie'],

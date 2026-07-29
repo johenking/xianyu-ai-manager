@@ -119,7 +119,7 @@ class OfficialLoginSessionCoordinator:
                 mode=mode,
                 account=normalized_account,
                 expected_unb=normalized_expected_unb,
-                show_browser=True if mode == "sms" else show_browser,
+                show_browser=show_browser,
                 expires_at=time.time() + self.session_ttl_seconds,
                 worker=self.worker_factory(),
             )
@@ -136,7 +136,7 @@ class OfficialLoginSessionCoordinator:
             self._run(
                 record,
                 password=password,
-                show_browser=True if mode == "sms" else show_browser,
+                show_browser=show_browser,
             ),
             name=f"official-login:{session_id}",
         )
@@ -218,6 +218,7 @@ class OfficialLoginSessionCoordinator:
                     account=record.account,
                     expected_unb=record.expected_unb,
                     timeout=self.session_ttl_seconds,
+                    show_browser=show_browser,
                     worker=record.worker,
                     on_status=on_status,
                     on_validated=on_validated,
@@ -325,7 +326,7 @@ class OfficialLoginSessionCoordinator:
             required_action=(
                 result.required_action
                 or ("scan_image" if state == "waiting_user" and record.mode == "qr" else "")
-                or ("use_local_chrome" if state == "verification_required" else "")
+                or ("interact_in_console" if state == "verification_required" else "")
             ),
         )
 
@@ -410,6 +411,57 @@ class OfficialLoginSessionCoordinator:
         resolved = resolve_private_verification_image(record.image_path)
         return str(resolved) if resolved is not None else None
 
+    async def get_interaction_frame(
+        self,
+        session_id: str,
+        owner_user_id: int,
+    ) -> tuple[bytes, int]:
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise KeyError(session_id)
+        if record.owner_user_id != owner_user_id:
+            raise PermissionError(session_id)
+        if record.state not in {"waiting_user", "verification_required"}:
+            raise RuntimeError("登录会话当前不可操作")
+        if record.required_action != "interact_in_console":
+            raise RuntimeError("当前登录页面不需要远程操作")
+        latest_frame = getattr(record.worker, "interaction_frame", None)
+        if not callable(latest_frame):
+            raise RuntimeError("浏览器交互尚未就绪")
+        frame = latest_frame()
+        if frame is None:
+            raise RuntimeError("浏览器交互尚未就绪")
+        return frame
+
+    async def interact(
+        self,
+        session_id: str,
+        owner_user_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        record = self._sessions.get(session_id)
+        if record is None:
+            raise KeyError(session_id)
+        if record.owner_user_id != owner_user_id:
+            raise PermissionError(session_id)
+        if record.state not in {"waiting_user", "verification_required"}:
+            raise RuntimeError("登录会话当前不可操作")
+        if record.required_action != "interact_in_console":
+            raise RuntimeError("当前登录页面不需要远程操作")
+        submit = getattr(record.worker, "submit_interaction", None)
+        if not callable(submit):
+            raise RuntimeError("浏览器交互尚未就绪")
+        submit(payload)
+        snapshot = self._interaction_snapshot(record)
+        return {
+            "accepted": True,
+            "frame_revision": int(
+                snapshot.get("frame_revision")
+                or payload.get("frame_revision")
+                or 0
+            ),
+        }
+
     async def wait_until_ready(
         self,
         session_id: str,
@@ -481,9 +533,10 @@ class OfficialLoginSessionCoordinator:
         return True
 
     def _safe_status(self, record: OfficialLoginSessionRecord) -> dict[str, Any]:
+        interaction = self._interaction_snapshot(record)
         image_url = (
             f"/api/official-login/sessions/{record.session_id}/image"
-            if record.image_path
+            if record.image_path or interaction["interaction_supported"]
             else ""
         )
         browser_active = False
@@ -510,4 +563,33 @@ class OfficialLoginSessionCoordinator:
             "created_at": record.created_at,
             "updated_at": record.updated_at,
             "expires_at": record.expires_at,
+            **interaction,
+        }
+
+    @staticmethod
+    def _interaction_snapshot(
+        record: OfficialLoginSessionRecord,
+    ) -> dict[str, int | bool]:
+        default: dict[str, int | bool] = {
+            "interaction_supported": False,
+            "frame_revision": 0,
+            "viewport_width": 0,
+            "viewport_height": 0,
+        }
+        if record.state in TERMINAL_STATES:
+            return default
+        snapshot = getattr(record.worker, "interaction_snapshot", None)
+        if not callable(snapshot):
+            return default
+        try:
+            value = snapshot()
+        except Exception:
+            return default
+        if not isinstance(value, dict):
+            return default
+        return {
+            "interaction_supported": bool(value.get("interaction_supported")),
+            "frame_revision": int(value.get("frame_revision") or 0),
+            "viewport_width": int(value.get("viewport_width") or 0),
+            "viewport_height": int(value.get("viewport_height") or 0),
         }

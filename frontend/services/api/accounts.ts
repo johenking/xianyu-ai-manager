@@ -66,8 +66,12 @@ export interface QRLoginStatusResponse {
   message?: string;
   error_code?: string;
   verification_kind?: '' | 'mobile_scan' | 'interactive' | 'unknown';
-  required_action?: '' | 'render_verification' | 'scan_image' | 'use_local_chrome';
+  required_action?: '' | 'render_verification' | 'scan_image' | 'interact_in_console';
   browser_active?: boolean;
+  interaction_supported?: boolean;
+  frame_revision?: number;
+  viewport_width?: number;
+  viewport_height?: number;
   ended_by?: string;
   verification_url?: string;
   verification_qr_code_url?: string;
@@ -145,8 +149,12 @@ export interface OfficialLoginSessionResponse {
   message: string;
   error_code: string;
   verification_kind?: '' | 'mobile_scan' | 'interactive' | 'unknown';
-  required_action?: '' | 'render_verification' | 'scan_image' | 'use_local_chrome';
+  required_action?: '' | 'render_verification' | 'scan_image' | 'interact_in_console';
   browser_active?: boolean;
+  interaction_supported?: boolean;
+  frame_revision?: number;
+  viewport_width?: number;
+  viewport_height?: number;
   ended_by?: string;
   qr_image_url?: string;
   verification_image_url?: string;
@@ -156,6 +164,30 @@ export interface OfficialLoginSessionResponse {
   updated_at?: number;
   expires_at?: number;
 }
+
+export type BrowserInteractionAction =
+  | {
+    kind: 'gesture';
+    frame_revision: number;
+    points: Array<{ x: number; y: number }>;
+    duration_ms: number;
+  }
+  | {
+    kind: 'text';
+    frame_revision: number;
+    text: string;
+  }
+  | {
+    kind: 'key';
+    frame_revision: number;
+    key: 'Enter' | 'Backspace' | 'Tab' | 'Escape';
+  }
+  | {
+    kind: 'wheel';
+    frame_revision: number;
+    delta_x: number;
+    delta_y: number;
+  };
 
 export const createOfficialLoginSession = async (data: {
   mode: 'qr' | 'password' | 'sms';
@@ -176,6 +208,13 @@ export const showOfficialLoginBrowser = async (sessionId: string): Promise<ApiRe
 
 export const cancelOfficialLoginSession = async (sessionId: string): Promise<ApiResponse> => {
   return post(`/api/official-login/sessions/${sessionId}/cancel`, {});
+};
+
+export const interactWithOfficialLogin = async (
+  sessionId: string,
+  action: BrowserInteractionAction,
+): Promise<{ success: boolean; accepted: boolean; frame_revision: number }> => {
+  return post(`/api/official-login/sessions/${sessionId}/interact`, action);
 };
 
 export const addAccountCookie = async (data: { id?: string; value: string }): Promise<ApiResponse & { account_id?: string }> => {
@@ -199,6 +238,13 @@ export const cancelQRLogin = async (
   endedBy: 'user_cancelled' | 'switched_method' | 'switched_to_extension' = 'user_cancelled',
 ): Promise<QRLoginStatusResponse> => {
   return post(`/qr-login/cancel/${sessionId}`, { ended_by: endedBy });
+};
+
+export const interactWithQRLogin = async (
+  sessionId: string,
+  action: BrowserInteractionAction,
+): Promise<{ success: boolean; accepted: boolean; frame_revision: number }> => {
+  return post(`/qr-login/interact/${sessionId}`, action);
 };
 
 export const createBrowserExtensionPairing = async (): Promise<BrowserExtensionPairing> => {

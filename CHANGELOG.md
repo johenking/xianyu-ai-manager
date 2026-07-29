@@ -4,6 +4,44 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-07-29
+
+### Added
+
+- Add owner-scoped, same-session browser frames and bounded pointer, wheel, text,
+  and key actions for completing slider, face, SMS, and unknown interactive
+  verification from the web console.
+
+### Changed
+
+- Keep web QR, SMS, and password browser sessions alive across verification page
+  and tab replacement. The Chrome extension remains an explicit advanced import
+  option instead of the automatic risk-control path.
+- Allow ordinary remote users to start an offscreen SMS browser session while
+  keeping physical server-window controls restricted to an administrator on the
+  loopback console.
+
+### Fixed
+
+- Close a login browser only after a real message Token is validated and the
+  resulting account Cookie and identity have been persisted; a scanned QR,
+  initial page closing, tab replacement, or verification prompt is not success.
+- Merge redirect Cookies into the QR client, use the correct `_m_h5_tk`, re-sign
+  once after an explicit Token rotation, and retry unknown QR states instead of
+  treating them as cancellation.
+- When the platform reports required verification without a usable URL, carry
+  the QR Cookie into the fixed official Goofish entry page; accept explicit
+  verification redirects only from allowlisted Goofish or Taobao HTTPS hosts.
+- Cancel login and refresh sessions by signalling the Playwright-owning thread;
+  the request thread no longer closes a browser context and triggers cross-thread
+  callback failures.
+
+### Security
+
+- Bound live frames, gestures, text length, queue depth, and action rate; reject
+  stale or cross-navigation frames and never echo entered text or accepted keys
+  in API responses or logs.
+
 ## [1.10.0] - 2026-07-29
 
 ### Added

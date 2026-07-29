@@ -63,6 +63,14 @@ class FakeCoordinator:
     async def cancel(self, session_id, owner_user_id):
         return session_id == "session-1" and owner_user_id == 7
 
+    async def interact(self, session_id, owner_user_id, payload):
+        if session_id != "session-1":
+            raise KeyError(session_id)
+        if owner_user_id != 7:
+            raise PermissionError(session_id)
+        self.last_interaction = payload
+        return {"accepted": True, "frame_revision": payload["frame_revision"]}
+
 
 class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -201,3 +209,93 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(public_admin.exception.status_code, 403)
         self.assertEqual(local_user.exception.status_code, 403)
         self.assertEqual(public_show.exception.status_code, 403)
+
+    async def test_public_user_can_start_offscreen_sms_but_not_show_server_window(self):
+        with patch.object(reply_server, "official_login_coordinator", self.coordinator):
+            try:
+                result = await reply_server.create_official_login_session(
+                    {
+                        "mode": "sms",
+                        "account": "13800138000",
+                        "show_browser": False,
+                    },
+                    http_request=self.public_request,
+                    current_user=self.user,
+                )
+            except HTTPException as exc:
+                self.fail(
+                    f"公网普通用户的站内短信登录被错误拒绝: HTTP {exc.status_code}"
+                )
+            with self.assertRaises(HTTPException) as visible:
+                await reply_server.create_official_login_session(
+                    {
+                        "mode": "sms",
+                        "account": "13800138000",
+                        "show_browser": True,
+                    },
+                    http_request=self.public_request,
+                    current_user=self.user,
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(self.coordinator.start_calls[-1]["mode"], "sms")
+        self.assertFalse(self.coordinator.start_calls[-1]["show_browser"])
+        self.assertEqual(visible.exception.status_code, 403)
+
+    async def test_owner_scoped_interaction_route_accepts_no_secret_echo(self):
+        endpoint = getattr(reply_server, "interact_with_official_login_session", None)
+        self.assertIsNotNone(endpoint, "官方登录交互端点尚未实现")
+        payload_type = getattr(reply_server, "BrowserInteractionIn", None)
+        self.assertIsNotNone(payload_type, "交互请求模型尚未实现")
+        payload = payload_type(
+            kind="key",
+            frame_revision=3,
+            key="Enter",
+        )
+
+        with patch.object(reply_server, "official_login_coordinator", self.coordinator):
+            result = await endpoint(
+                "session-1",
+                payload,
+                current_user=self.user,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["frame_revision"], 3)
+        self.assertNotIn("key", result)
+
+    async def test_qr_interaction_route_is_owner_scoped_and_echoes_no_text(self):
+        registry = unittest.mock.Mock()
+        registry.get.return_value = {
+            "session_id": "qr-session",
+            "owner_user_id": 7,
+            "expires_at": 9_999_999_999,
+        }
+        manager = unittest.mock.Mock()
+        payload = reply_server.BrowserInteractionIn(
+            kind="text",
+            frame_revision=4,
+            text="482615",
+        )
+
+        with (
+            patch.object(reply_server, "get_session_registry", return_value=registry),
+            patch.object(reply_server, "qr_login_manager", manager),
+        ):
+            result = await reply_server.interact_with_qr_login_session(
+                "qr-session",
+                payload,
+                current_user=self.user,
+            )
+            with self.assertRaises(HTTPException) as forbidden:
+                await reply_server.interact_with_qr_login_session(
+                    "qr-session",
+                    payload,
+                    current_user={"user_id": 8, "username": "other"},
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["frame_revision"], 4)
+        self.assertNotIn("text", result)
+        self.assertEqual(forbidden.exception.status_code, 403)
+        manager.submit_interaction.assert_called_once()

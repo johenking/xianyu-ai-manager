@@ -2,19 +2,19 @@
 
 ## 最终结论
 
-添加账号的“扫码”面板先显示两个入口，打开面板本身不创建会话：“本机 Chrome 扫码”只供管理员从运行服务的 Mac 回环控制台使用；“网页二维码”继续由 `utils/qr_login.py` 从闲鱼官方接口取得 `codeContent`，并在后端本地渲染为 PNG Data URL，适合远程访问。平台要求手机继续扫码时，页面展示可扫码验证图；滑块、人脸和未知交互型风控结束原二维码会话并转到用户自己的 Chrome 扩展，不把不可操作的页面截图当作验证入口。
+添加账号的“扫码”面板默认使用网页二维码：`utils/qr_login.py` 从闲鱼官方接口取得 `codeContent`，并在后端本地渲染为 PNG Data URL。扫码后仍由同一个服务器 Chrome 会话承接官方页面；页面跳转、原标签关闭或新标签打开都不会提前结束登录。平台要求手机继续扫码时，控制台展示可扫码验证图；出现滑块、人脸、短信或未知交互风控时，控制台展示同一会话的实时页面并把用户操作回传给该会话。只有消息 Token 验证和账号 Cookie 落库都成功后才关闭浏览器并显示成功。
 
 只有通过账号密码官方登录，并保存了格式有效的登录账号和加密密码时，账号才具备自动续期能力。扫码、手机号验证码、用户 Chrome 扩展和手填 Cookie 到期后进入 `manual_reauth_required`，账号页显示对应的人工重登入口，不重复启动隐藏浏览器。
 
-自动续期和手机号验证码登录使用本机安装版 Chrome，浏览器通道为 `chrome`。系统为每个闲鱼 `unb` 使用独立的 `browser_data/user_<unb>` 档案，不读取或污染用户的日常 Chrome Profile。官方页面要求短信、扫码、人脸或其他风控验证时，必须由用户在可见官方窗口中完成。
+自动续期、二维码验证接力和手机号验证码登录使用服务端安装版 Chrome，浏览器通道为 `chrome`。系统为每个闲鱼 `unb` 使用独立的 `browser_data/user_<unb>` 档案，不读取或污染用户的日常 Chrome Profile。远程用户在站内交互面板完成官方页面要求的短信、扫码、滑块、人脸或其他风控；管理员在服务 Mac 的回环控制台仍可显式显示同一 Chrome 窗口。
 
 ## 登录方式
 
 | 登录来源 | 实现 | 自动续期 | 到期后的操作 | 主要限制 |
 |---|---|---:|---|---|
-| `qr` | 可选管理员回环控制台的统一官方 Chrome QR，或官方二维码 API 返回 `codeContent` 并由后端本地渲染 | 否 | 重新扫码或转用户侧扩展 | 服务器 Chrome 只在服务 Mac 操作；网页 QR 适合远程访问；手机扫码型风控展示图片，交互型风控转扩展 |
-| `password` | 安装版 Chrome 打开官方登录页，凭据使用独立密钥加密保存 | 是 | 自动续期失败后重新账号密码登录 | 密码错误、短信、人脸和页面变化仍需人工处理 |
-| `sms_window` | 可见官方 Chrome 窗口，用户在官方页面收码并输入 | 否 | 重新验证码登录 | 仅管理员回环控制台可用；应用不接收验证码；窗口最多等待 15 分钟 |
+| `qr` | 官方二维码 API 返回 `codeContent`；扫码后的官方 Chrome 验证页在同一网页会话中继续操作 | 否 | 重新扫码 | 手机扫码型风控展示可扫码图片；滑块、人脸和未知交互在站内实时页面完成 |
+| `password` | 安装版 Chrome 打开官方登录页，凭据使用独立密钥加密保存 | 是 | 自动续期失败后重新账号密码登录 | 密码错误、短信、人脸和页面变化在同一会话中人工处理 |
+| `sms_window` | 服务端 Chrome 打开官方登录页，用户在站内实时页面收码并输入 | 否 | 重新验证码登录 | 验证码只进入当前浏览器会话；窗口最多等待 15 分钟 |
 | `chrome_extension` | 用户主动从自己的日常 Chrome Cookie Store 导入固定正式 HTTPS 控制台 | 否 | 重新导入 | 协议 v2、高熵 Token、五分钟、单次使用，扩展不持久化配对凭据或 Cookie |
 | `manual_cookie` | 用户手动粘贴 Cookie | 否 | 重新填写 | 格式容易出错，生命周期不可预测 |
 | `unknown` | 迁移前保存的历史账号 | 否 | 选择一种登录方式 | 缺少可信来源，不能推断续期能力 |
@@ -44,9 +44,11 @@
 
 ## 官方窗口登录
 
-`POST /api/official-login/sessions` 支持 `mode='qr'`、`mode='password'` 和 `mode='sms'`。前端本机扫码提交 `{mode:'qr', show_browser:true}`，手机号验证码和账号密码也复用此统一会话协议；网页二维码保持 `/qr-login/*` 契约。短信模式固定打开可见 Chrome，系统只等待官方页面产生经过验证的 Cookie，不接收或保存短信验证码。
+`POST /api/official-login/sessions` 支持 `mode='qr'`、`mode='password'` 和 `mode='sms'`。手机号验证码和账号密码复用此统一会话协议；网页二维码保持 `/qr-login/*` 契约，并在扫码后的二次验证阶段接入同一套浏览器交互通道。远程短信模式提交 `show_browser:false`，管理员回环控制台可显式提交 `show_browser:true`；系统只等待官方页面产生经过验证的 Cookie，不保存或回显短信验证码。
 
-客户端轮询 `GET /api/official-login/sessions/{session_id}`。QR 和 SMS 统一处理 `preparing`、`waiting_user`、`verification_required`、`persisting`、`restarting_listener` 以及 `success`、`expired`、`failed`、`cancelled`、`interrupted` 终态。需要时可调用 `POST .../{session_id}/show-browser`；这些服务器浏览器动作都要求管理员和回环控制台。隐藏账号弹窗不停止轮询，只有显式取消或切换方式才调用取消接口。兼容端点 `/official-window-login*` 仍映射到同一个会话协调器。
+客户端轮询 `GET /api/official-login/sessions/{session_id}`。QR 和 SMS 统一处理 `preparing`、`waiting_user`、`verification_required`、`persisting`、`restarting_listener` 以及 `success`、`expired`、`failed`、`cancelled`、`interrupted` 终态。`required_action='interact_in_console'` 时，客户端从会话的 `image` 端点读取无缓存实时帧，并通过所有者隔离的 `interact` 端点提交归一化手势、滚动、文字或受限按键；导航后旧帧立即失效。需要时可调用 `POST .../{session_id}/show-browser`，但物理服务器窗口仍只允许管理员从回环控制台显示。隐藏账号弹窗不停止轮询，只有显式取消或切换方式才调用取消接口。兼容端点 `/official-window-login*` 仍映射到同一个会话协调器。
+
+浏览器工作线程始终重新选择当前未关闭的活动 Page。官方流程关闭初始标签、打开新标签或在风控页之间跳转时，监控和交互继续绑定新页面。只有真实消息 Token 校验、身份匹配、Cookie 落库以及监听器交接完成后，会话才进入 `success` 并关闭浏览器；页面文字、二维码已扫码、普通 Cookie 出现或某个 Page 关闭都不能单独判定成功。
 
 登录成功后按真实 `unb` 保存或归并账号，并把档案归档到 `browser_data/user_<unb>`；不另存 `storage_state.json`。新增 QR 会话不提供预期身份，短信重登已有账号时会绑定预期 `unb`；登录到其他账号不会覆盖原记录。服务初始化时只会最佳努力删除超过六小时的 `.login_*`、`.window_*` 和 `user_*.backup-*` 目录，正式 `user_*`、未知目录和新鲜临时目录保持不动。
 
@@ -79,7 +81,7 @@ QR 会话进入 `expired` 后至少保留 5 分钟。保留期内重复轮询稳
 
 登录续期只保留 `XianyuOfficialLoginService` 的安装版 headed Chrome 路径。商品、订单等非认证用途的浏览器逻辑不受此限制。
 
-官方浏览器、档案归档、QR 交接和二次验证失败只记录异常类型和固定摘要。API、日志和运行时会话注册表不得包含完整 Cookie、Token、二维码内容、密码、密码密文或官方验证 URL。
+官方浏览器、档案归档、QR 交接和二次验证失败只记录异常类型和固定摘要。API、日志和运行时会话注册表不得包含完整 Cookie、Token、二维码内容、密码、密码密文、短信验证码、交互文字或官方验证 URL。交互帧只保存在内存中，限制大小、队列深度和提交速率，并在会话结束时清空。
 
 ## 调研范围
 
