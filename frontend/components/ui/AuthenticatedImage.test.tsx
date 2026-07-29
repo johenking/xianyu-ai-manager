@@ -24,10 +24,13 @@ describe('AuthenticatedImage', () => {
       value: storage,
     });
     localStorage.setItem('auth_token', 'synthetic-token');
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
-      new Blob(['synthetic-image'], { type: 'image/png' }),
-      { status: 200, headers: { 'Content-Type': 'image/png' } },
-    )));
+    const imageBlob = new Blob(['synthetic-image'], { type: 'image/png' });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'Content-Type': 'image/png' }),
+      blob: vi.fn().mockResolvedValue(imageBlob),
+    } as unknown as Response));
     Object.defineProperty(URL, 'createObjectURL', {
       configurable: true,
       value: vi.fn(() => 'blob:authenticated-image'),
