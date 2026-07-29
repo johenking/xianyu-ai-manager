@@ -1,13 +1,13 @@
 # Handoff
 
-## v1.10.0 Candidate On 2026-07-28
+## v1.10.0 Production Release On 2026-07-29
 
-The current `codex/order-sync-analytics-hardening` branch is an unreleased
-candidate built on the v1.9.1 mainline. It has not been pushed, merged, tagged,
-or deployed, and production remains on the v1.9.1 schema until release gates
-say otherwise.
+PR `#45` squash-merged the order-sync, analytics and security hardening release
+as `7a4f4726b3facea7a9e0a50e785a5275c97b4799`. Production runs that exact
+application commit and annotated tag `v1.10.0` points to it. The production
+schema is `2026072703`.
 
-Candidate contract:
+Release contract:
 
 - The latest schema is `2026072703`: item metric rows and canary state are bound
   to their account owner, while `fulfillment_attempts` and
@@ -63,9 +63,38 @@ zero listeners. This is why candidate rehearsals must migrate first and disable
 every copied account by joining the final `cookies` table, rather than assuming
 that historical `cookie_status` rows are complete.
 
-GitHub PR/CI, production rollback packaging, deployment, tag creation and
-branch cleanup remain release gates at this point. Real platform detail and
-seller-metric canaries also remain external gates; their adapters stay closed.
+Production release evidence:
+
+- PR run `30427347536` passed both `secrets` and `test` on the final branch
+  head. The exact squash commit then passed both jobs again on main in run
+  `30427623552` before deployment.
+- The stopped-service, mode-`0700` rollback unit is
+  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.0-pre-deploy-20260729-142216`.
+  Its 2,323-entry SHA-256 manifest, Git bundle, SQLite integrity check, three
+  local keys, prior tracked source, static and upload files, browser profiles,
+  browser extension and LaunchAgent all verified before the production
+  checkout moved.
+- The clean production checkout fast-forwarded from `8e9f056` to `7a4f472`.
+  The production frontend build reported version `1.10.0`, retained 36 and 35
+  assets across two generations with zero orphans, and npm reported zero known
+  vulnerabilities.
+- Launchd restored one listener with PID `19929`. Local and public live and
+  readiness passed, the OpenAPI document reported version `1.10.0` with 227
+  methods, SQLite integrity remained `ok`, and 13 local/public readiness pairs
+  passed across the post-deploy observation window on migration `2026072703`.
+- The two entry assets and HTML matched disk, local HTTP and public HTTPS
+  byte-for-byte. Ten critical legacy table counts, all three keys, uploads and
+  browser profiles had zero deployment drift. Unauthenticated order, refresh,
+  item-performance, item-traffic, metric-status and metric-sync probes failed
+  closed with HTTP 401 locally and publicly.
+- The post-start slice covered 20 log files and 73,329 new bytes with zero
+  Traceback, HTTP 5xx, error/critical entries, raw authorization or Cookie
+  material, passwords, or verification URLs.
+
+Real platform order-detail and seller-metric canaries remain external gates.
+The unverified detail path and metric adapter therefore stay closed; synthetic
+and production infrastructure checks are not recorded as live seller-backend
+verification.
 
 ## v1.9.1 Login Risk-Control Relay Production Release On 2026-07-29
 
