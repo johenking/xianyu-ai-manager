@@ -52,6 +52,7 @@ from account_session_refresh import (
     normalize_login_method,
     supports_automatic_refresh,
 )
+from utils.image_utils import image_manager
 
 COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES = 1440
 COOKIE_REFRESH_MIN_INTERVAL_MINUTES = 60
@@ -136,6 +137,11 @@ BACKUP_AUTO_ID_TABLES = {
     "fulfillment_attempts",
     "fulfillment_card_reservations",
     "message_notifications",
+}
+BACKUP_IMAGE_REFERENCE_COLUMNS = {
+    "keywords": ("image_url",),
+    "default_replies": ("reply_image_url",),
+    "cards": ("image_url",),
 }
 
 
@@ -4526,6 +4532,27 @@ class DBManager:
             smtp_reconfiguration_required,
         )
 
+    @staticmethod
+    def _sanitize_imported_image_references(
+        prepared: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Drop backup-provided image references outside the managed boundary."""
+        for table_name, image_columns in BACKUP_IMAGE_REFERENCE_COLUMNS.items():
+            table = prepared.get(table_name)
+            if not table:
+                continue
+            columns = table["columns"]
+            indexes = [
+                columns.index(column)
+                for column in image_columns
+                if column in columns
+            ]
+            for row in table["rows"]:
+                for index in indexes:
+                    row[index] = image_manager.normalize_image_reference(
+                        row[index]
+                    )
+
     def _backup_table_columns(
         self,
         cursor: sqlite3.Cursor,
@@ -4623,6 +4650,8 @@ class DBManager:
             ) = self._prepare_imported_system_settings(
                 table["columns"], table["rows"]
             )
+
+        self._sanitize_imported_image_references(prepared)
 
         if user_id is not None:
             cookie_table = prepared["cookies"]

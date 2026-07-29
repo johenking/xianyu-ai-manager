@@ -2767,9 +2767,17 @@ class XianyuLive:
             import os
             from PIL import Image
 
-            # 创建临时目录
-            temp_dir = tempfile.gettempdir()
-            test_image_path = os.path.join(temp_dir, f'cookie_test_{self.cookie_id}.png')
+            # 验证图片也必须位于受控上传根，避免为上传器开放任意本地路径。
+            from utils.image_utils import image_manager
+
+            temp_file = tempfile.NamedTemporaryFile(
+                dir=image_manager.upload_root,
+                prefix="cookie_test_",
+                suffix=".png",
+                delete=False,
+            )
+            test_image_path = temp_file.name
+            temp_file.close()
 
             try:
                 # 创建1x1像素的白色图片
