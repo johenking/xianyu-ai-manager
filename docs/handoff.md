@@ -1,6 +1,6 @@
 # Handoff
 
-## v1.10.1 Login Verification Hotfix Candidate On 2026-07-29
+## v1.10.1 Login Verification Hotfix Release On 2026-07-29
 
 This hotfix keeps QR, SMS and password login in the same server-Chrome session
 through slider, face, SMS and unknown interactive verification. Page or tab
@@ -37,8 +37,45 @@ No registered Goofish account credentials, SMS code, slider or face challenge
 were submitted during this isolated rehearsal. Consequently, real account Token
 validation, identity matching and persistence through a naturally triggered
 platform risk-control chain remain an explicit post-release human canary, not a
-claimed result. Production deployment evidence is appended only after the
-deployment gates actually occur.
+claimed result.
+
+Production release evidence:
+
+- Application commit `8d6e78c66bfec3a631a99fbe02b376f6a8634d3d`
+  was pushed directly to `main`. GitHub Actions run `30447116945` passed
+  `secrets` in 9 seconds and the complete `test` job in 4 minutes 15 seconds.
+- The mode-`0700` rollback unit
+  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.1-pre-deploy-20260729-192456`
+  retains the previous `v1.10.0` source, SQLite backup, local keys, browser
+  Profile, static assets, uploads, extension, LaunchAgent and Git bundle. Its
+  SQLite integrity check and all 2,338 SHA-256 entries passed after the service
+  stopped.
+- Production fast-forwarded to the exact application commit and restarted as
+  one worker with PID `40759`. Local and public readiness passed, migration
+  `2026072703` remained unchanged, SQLite integrity was `ok`, and the runtime
+  session count remained zero.
+- Static publication retained two complete generations of 36 assets with zero
+  orphan files. The new entry SHA-256 is
+  `c78c80574ecf365e9c64cf8b8e0eb8f761586377da59afd3c36e1b98b09a947c`;
+  the extension ZIP SHA-256 is
+  `e344821ef36e4aecc7da6e0f9a8c0ce22ee31ed0fe934b30ff637ec96cd450ef`.
+  All 76 checked files matched byte-for-byte on disk, localhost and the public
+  HTTPS origin.
+- A 67-second zero-retry window passed 10 local and 10 public readiness samples
+  with a stable PID. One earlier public request exceeded an 8-second client
+  timeout; five immediate probes and the complete replacement window all
+  returned HTTP 200, with the slowest replacement request taking 3.195 seconds.
+- An existing authenticated console session was used read-only to confirm that
+  the public account modal advertises same-page QR verification and keeps the
+  extension under advanced methods. No login session was started and no account
+  state was changed. New production log output contained no traceback, error
+  level, HTTP 5xx or detected sensitive value.
+
+The remaining human canary is deliberately unchanged: a registered user must
+complete a naturally triggered slider, face or SMS verification and confirm
+that real Token validation, identity matching and account persistence occur
+before the browser closes. This release does not claim that external platform
+canary.
 
 ## v1.10.0 Production Release On 2026-07-29
 
