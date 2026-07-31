@@ -12,6 +12,7 @@ import io
 import base64
 import binascii
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from PIL import Image, ImageDraw, ImageFont
@@ -51,6 +52,14 @@ from auth_email_service import (
 from account_session_refresh import (
     normalize_login_method,
     supports_automatic_refresh,
+)
+from client_browser_login import (
+    RENEWAL_TASK_TTL_SECONDS,
+    ClientBrowserError,
+    normalize_browser_family,
+    normalize_device_id,
+    normalize_public_jwk,
+    seal_renewal_credential,
 )
 from utils.image_utils import image_manager
 
@@ -2458,13 +2467,21 @@ class DBManager:
                 capability = cursor.fetchone()
                 if not capability:
                     return False
-                auto_refresh_supported = supports_automatic_refresh(
-                    capability[0], capability[1], bool(capability[2] or capability[3])
+                binding = cursor.execute(
+                    """
+                    SELECT 1 FROM account_renewal_bindings AS b
+                    JOIN client_browser_devices AS d
+                      ON d.device_id = b.device_id AND d.user_id = b.user_id
+                    WHERE b.cookie_id = ? AND b.revoked_at IS NULL
+                      AND d.revoked_at IS NULL
+                    """,
+                    (cookie_id,),
+                ).fetchone()
+                auto_refresh_supported = bool(
+                    binding and capability[1] and (capability[2] or capability[3])
                 )
                 if enabled and not auto_refresh_supported:
-                    raise ValueError(
-                        "当前登录方式不支持自动续期，请先使用账号密码重新登录"
-                    )
+                    raise ValueError("当前账号尚未绑定可用的续期设备和凭据")
                 self._execute_sql(
                     cursor,
                     "UPDATE cookies SET cookie_refresh_enabled = ?, "
@@ -2508,8 +2525,18 @@ class DBManager:
                     interval = self._validate_cookie_refresh_interval(interval)
                 except ValueError:
                     interval = COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES
-                auto_refresh_supported = supports_automatic_refresh(
-                    row[2], row[3], bool(row[4] or row[5])
+                binding = self.conn.execute(
+                    """
+                    SELECT 1 FROM account_renewal_bindings AS b
+                    JOIN client_browser_devices AS d
+                      ON d.device_id = b.device_id AND d.user_id = b.user_id
+                    WHERE b.cookie_id = ? AND b.revoked_at IS NULL
+                      AND d.revoked_at IS NULL
+                    """,
+                    (cookie_id,),
+                ).fetchone()
+                auto_refresh_supported = bool(
+                    binding and row[3] and (row[4] or row[5])
                 )
                 return {
                     'enabled': bool(row[0]) if row[0] is not None and auto_refresh_supported else False,
@@ -2542,9 +2569,32 @@ class DBManager:
         if state not in allowed_states:
             raise ValueError(f"不支持的刷新状态: {state}")
         now = time.time()
+        schedule_client_task = False
+        task_owner_user_id = 0
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if state == 'manual_reauth_required':
+                    binding = cursor.execute(
+                        """
+                        SELECT c.user_id
+                        FROM cookies AS c
+                        JOIN account_renewal_bindings AS b
+                          ON b.cookie_id = c.id AND b.user_id = c.user_id
+                        JOIN client_browser_devices AS d
+                          ON d.device_id = b.device_id AND d.user_id = b.user_id
+                        WHERE c.id = ? AND c.cookie_refresh_enabled = 1
+                          AND b.revoked_at IS NULL AND d.revoked_at IS NULL
+                        """,
+                        (cookie_id,),
+                    ).fetchone()
+                    if binding:
+                        state = 'refreshing'
+                        message = '已等待绑定的当前设备领取续期任务'
+                        error_code = 'client_device_renewal_pending'
+                        expires_at = now + RENEWAL_TASK_TTL_SECONDS
+                        schedule_client_task = True
+                        task_owner_user_id = int(binding[0])
                 self._execute_sql(
                     cursor,
                     "SELECT state, last_success_at, started_at "
@@ -2579,6 +2629,17 @@ class DBManager:
                     started_at, now, last_success_at, expires_at, now,
                 ))
                 self.conn.commit()
+                if schedule_client_task:
+                    try:
+                        self.create_client_renewal_task(
+                            user_id=task_owner_user_id,
+                            cookie_id=cookie_id,
+                            trigger=trigger or 'runtime_expired',
+                            now=now,
+                        )
+                    except ClientBrowserError as task_error:
+                        if task_error.error_code != 'renewal_task_exists':
+                            raise
                 return True
             except Exception:
                 self.conn.rollback()
@@ -2874,6 +2935,578 @@ class DBManager:
                 logger.error(f"更新账号信息失败: {type(e).__name__}")
                 self.conn.rollback()
                 return False
+
+    def register_client_browser_device(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        browser_family: str,
+        display_name: str,
+        signing_public_jwk: Dict[str, Any],
+        encryption_public_jwk: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized_device_id = normalize_device_id(device_id)
+        normalized_family = normalize_browser_family(browser_family)
+        signing_jwk = normalize_public_jwk(signing_public_jwk)
+        encryption_jwk = normalize_public_jwk(encryption_public_jwk)
+        now = time.time()
+        with self.lock:
+            cursor = self.conn.cursor()
+            existing = cursor.execute(
+                "SELECT user_id, signing_public_jwk, encryption_public_jwk, revoked_at "
+                "FROM client_browser_devices WHERE device_id = ?",
+                (normalized_device_id,),
+            ).fetchone()
+            if existing and int(existing[0]) != int(user_id):
+                raise ClientBrowserError(
+                    "设备已属于其他用户",
+                    error_code="device_owner_mismatch",
+                    http_status=403,
+                )
+            serialized_signing = json.dumps(
+                signing_jwk, sort_keys=True, separators=(",", ":")
+            )
+            serialized_encryption = json.dumps(
+                encryption_jwk, sort_keys=True, separators=(",", ":")
+            )
+            if existing and (
+                existing[1] != serialized_signing
+                or existing[2] != serialized_encryption
+            ):
+                raise ClientBrowserError(
+                    "设备密钥与已注册记录不匹配，请生成新的设备连接",
+                    error_code="device_key_mismatch",
+                    http_status=409,
+                )
+            cursor.execute(
+                """
+                INSERT INTO client_browser_devices (
+                    device_id, user_id, browser_family, display_name,
+                    signing_public_jwk, encryption_public_jwk,
+                    registered_at, last_seen_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    browser_family = excluded.browser_family,
+                    display_name = excluded.display_name,
+                    last_seen_at = excluded.last_seen_at,
+                    revoked_at = NULL
+                WHERE client_browser_devices.user_id = excluded.user_id
+                """,
+                (
+                    normalized_device_id,
+                    int(user_id),
+                    normalized_family,
+                    str(display_name or "当前设备").strip()[:80],
+                    serialized_signing,
+                    serialized_encryption,
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+        return {
+            "device_id": normalized_device_id,
+            "browser_family": normalized_family,
+            "display_name": str(display_name or "当前设备").strip()[:80],
+            "last_seen_at": now,
+            "revoked": False,
+        }
+
+    def get_client_browser_device(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        include_public_keys: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_device_id = normalize_device_id(device_id)
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT device_id, browser_family, display_name, registered_at,
+                       last_seen_at, revoked_at, signing_public_jwk,
+                       encryption_public_jwk
+                FROM client_browser_devices
+                WHERE device_id = ? AND user_id = ?
+                """,
+                (normalized_device_id, int(user_id)),
+            ).fetchone()
+        if not row:
+            return None
+        result = {
+            "device_id": row[0],
+            "browser_family": row[1],
+            "display_name": row[2],
+            "registered_at": row[3],
+            "last_seen_at": row[4],
+            "revoked_at": row[5],
+            "revoked": row[5] is not None,
+        }
+        if include_public_keys:
+            result["signing_public_jwk"] = json.loads(row[6])
+            result["encryption_public_jwk"] = json.loads(row[7])
+        return result
+
+    def list_client_browser_devices(self, user_id: int) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT device_id, browser_family, display_name, registered_at,
+                       last_seen_at, revoked_at
+                FROM client_browser_devices
+                WHERE user_id = ?
+                ORDER BY revoked_at IS NOT NULL, last_seen_at DESC
+                """,
+                (int(user_id),),
+            ).fetchall()
+        return [
+            {
+                "device_id": row[0],
+                "browser_family": row[1],
+                "display_name": row[2],
+                "registered_at": row[3],
+                "last_seen_at": row[4],
+                "revoked_at": row[5],
+                "revoked": row[5] is not None,
+            }
+            for row in rows
+        ]
+
+    def find_active_client_browser_device(
+        self,
+        device_id: str,
+        *,
+        include_public_keys: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_device_id = normalize_device_id(device_id)
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT user_id, device_id, browser_family, display_name,
+                       registered_at, last_seen_at, signing_public_jwk,
+                       encryption_public_jwk
+                FROM client_browser_devices
+                WHERE device_id = ? AND revoked_at IS NULL
+                """,
+                (normalized_device_id,),
+            ).fetchone()
+        if not row:
+            return None
+        result = {
+            "user_id": int(row[0]),
+            "device_id": row[1],
+            "browser_family": row[2],
+            "display_name": row[3],
+            "registered_at": row[4],
+            "last_seen_at": row[5],
+        }
+        if include_public_keys:
+            result["signing_public_jwk"] = json.loads(row[6])
+            result["encryption_public_jwk"] = json.loads(row[7])
+        return result
+
+    def get_account_renewal_binding(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT b.device_id, b.credential_authorized_at, b.bound_at,
+                       d.browser_family, d.display_name, d.last_seen_at
+                FROM account_renewal_bindings AS b
+                JOIN client_browser_devices AS d
+                  ON d.device_id = b.device_id AND d.user_id = b.user_id
+                WHERE b.cookie_id = ? AND b.user_id = ?
+                  AND b.revoked_at IS NULL AND d.revoked_at IS NULL
+                """,
+                (cookie_id, int(user_id)),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "device_id": row[0],
+            "credential_authorized_at": row[1],
+            "bound_at": row[2],
+            "browser_family": row[3],
+            "display_name": row[4],
+            "last_seen_at": row[5],
+        }
+
+    def touch_client_browser_device(self, *, user_id: int, device_id: str) -> bool:
+        with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE client_browser_devices SET last_seen_at = ? "
+                "WHERE device_id = ? AND user_id = ? AND revoked_at IS NULL",
+                (time.time(), normalize_device_id(device_id), int(user_id)),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
+
+    def revoke_client_browser_device(self, *, user_id: int, device_id: str) -> bool:
+        normalized_device_id = normalize_device_id(device_id)
+        now = time.time()
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            updated = cursor.execute(
+                "UPDATE client_browser_devices SET revoked_at = ? "
+                "WHERE device_id = ? AND user_id = ? AND revoked_at IS NULL",
+                (now, normalized_device_id, int(user_id)),
+            ).rowcount
+            cursor.execute(
+                "UPDATE account_renewal_bindings SET revoked_at = ? "
+                "WHERE device_id = ? AND user_id = ? AND revoked_at IS NULL",
+                (now, normalized_device_id, int(user_id)),
+            )
+            cursor.execute(
+                "UPDATE client_renewal_tasks SET state = 'cancelled', "
+                "completed_at = ?, updated_at = ?, error_code = 'device_revoked', "
+                "encrypted_payload_json = '' WHERE device_id = ? AND user_id = ? "
+                "AND state IN ('pending', 'claimed', 'action_required', 'validating')",
+                (now, now, normalized_device_id, int(user_id)),
+            )
+            self.conn.commit()
+            return updated == 1
+
+    def bind_account_renewal_device(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        device_id: str,
+        username: str,
+        password: str,
+        authorized_at: float,
+    ) -> Dict[str, Any]:
+        normalized_device_id = normalize_device_id(device_id)
+        normalized_username = str(username or "").strip()
+        secret = str(password or "")
+        if not normalized_username or not secret:
+            raise ClientBrowserError(
+                "续期账号和密码不能为空", error_code="credential_missing"
+            )
+        now = time.time()
+        if abs(now - float(authorized_at)) > 300:
+            raise ClientBrowserError(
+                "保存密码授权已过期", error_code="credential_authorization_expired"
+            )
+        encrypted = AccountCredentialCipher(self.db_path).encrypt(secret)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            owned = cursor.execute(
+                "SELECT 1 FROM cookies WHERE id = ? AND user_id = ?",
+                (cookie_id, int(user_id)),
+            ).fetchone()
+            device = cursor.execute(
+                "SELECT 1 FROM client_browser_devices WHERE device_id = ? "
+                "AND user_id = ? AND revoked_at IS NULL",
+                (normalized_device_id, int(user_id)),
+            ).fetchone()
+            if not owned or not device:
+                self.conn.rollback()
+                raise ClientBrowserError(
+                    "账号或续期设备不匹配",
+                    error_code="renewal_binding_mismatch",
+                    http_status=403,
+                )
+            cursor.execute(
+                "UPDATE cookies SET username = ?, password = '', "
+                "password_encrypted = ?, password_encryption_version = ?, "
+                "cookie_refresh_enabled = 1 WHERE id = ? AND user_id = ?",
+                (
+                    normalized_username, encrypted,
+                    ACCOUNT_PASSWORD_ENCRYPTION_VERSION, cookie_id, int(user_id),
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO account_renewal_bindings (
+                    cookie_id, user_id, device_id, credential_authorized_at,
+                    bound_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(cookie_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    device_id = excluded.device_id,
+                    credential_authorized_at = excluded.credential_authorized_at,
+                    bound_at = excluded.bound_at,
+                    revoked_at = NULL
+                """,
+                (cookie_id, int(user_id), normalized_device_id, float(authorized_at), now),
+            )
+            self.conn.commit()
+        return {
+            "account_id": cookie_id,
+            "device_id": normalized_device_id,
+            "bound_at": now,
+            "credential_authorized_at": float(authorized_at),
+        }
+
+    def create_client_renewal_task(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        trigger: str,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        created_at = time.time() if now is None else float(now)
+        expires_at = created_at + RENEWAL_TASK_TTL_SECONDS
+        task_id = uuid.uuid4().hex
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                """
+                SELECT c.username, c.password_encrypted, b.device_id,
+                       d.encryption_public_jwk
+                FROM cookies AS c
+                JOIN account_renewal_bindings AS b
+                  ON b.cookie_id = c.id AND b.user_id = c.user_id
+                JOIN client_browser_devices AS d
+                  ON d.device_id = b.device_id AND d.user_id = b.user_id
+                WHERE c.id = ? AND c.user_id = ? AND c.cookie_refresh_enabled = 1
+                  AND b.revoked_at IS NULL AND d.revoked_at IS NULL
+                """,
+                (cookie_id, int(user_id)),
+            ).fetchone()
+            if not row or not row[1]:
+                self.conn.rollback()
+                raise ClientBrowserError(
+                    "账号尚未绑定可用续期设备",
+                    error_code="client_device_binding_required",
+                    http_status=409,
+                )
+            active = cursor.execute(
+                "SELECT task_id, state, expires_at FROM client_renewal_tasks "
+                "WHERE cookie_id = ? AND state IN "
+                "('pending', 'claimed', 'action_required', 'validating')",
+                (cookie_id,),
+            ).fetchone()
+            if active and float(active[2]) > created_at:
+                self.conn.rollback()
+                raise ClientBrowserError(
+                    "该账号已有续期任务",
+                    error_code="renewal_task_exists",
+                    http_status=409,
+                )
+            if active:
+                cursor.execute(
+                    "UPDATE client_renewal_tasks SET state = 'expired', "
+                    "completed_at = ?, updated_at = ?, encrypted_payload_json = '', "
+                    "error_code = 'task_expired' WHERE task_id = ?",
+                    (created_at, created_at, active[0]),
+                )
+            context = {
+                "version": 1,
+                "owner_user_id": int(user_id),
+                "device_id": row[2],
+                "account_id": cookie_id,
+                "task_id": task_id,
+                "expires_at": expires_at,
+            }
+            encrypted_payload = seal_renewal_credential(
+                encryption_public_jwk=json.loads(row[3]),
+                username=str(row[0] or ""),
+                password=AccountCredentialCipher(self.db_path).decrypt(row[1]),
+                context=context,
+            )
+            cursor.execute(
+                """
+                INSERT INTO client_renewal_tasks (
+                    task_id, user_id, cookie_id, device_id, state, trigger,
+                    public_context_json, encrypted_payload_json, expires_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id, int(user_id), cookie_id, row[2], str(trigger or "automatic")[:80],
+                    json.dumps(context, sort_keys=True, separators=(",", ":")),
+                    json.dumps(encrypted_payload, sort_keys=True, separators=(",", ":")),
+                    expires_at, created_at, created_at,
+                ),
+            )
+            self.conn.commit()
+        return {**context, "state": "pending"}
+
+    def claim_client_renewal_task(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        task_id: str,
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        claimed_at = time.time() if now is None else float(now)
+        normalized_device_id = normalize_device_id(device_id)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            row = cursor.execute(
+                "SELECT cookie_id, state, public_context_json, "
+                "encrypted_payload_json, expires_at FROM client_renewal_tasks "
+                "WHERE task_id = ? AND user_id = ? AND device_id = ?",
+                (task_id, int(user_id), normalized_device_id),
+            ).fetchone()
+            if not row:
+                self.conn.rollback()
+                raise ClientBrowserError(
+                    "续期任务不存在", error_code="renewal_task_not_found", http_status=404
+                )
+            if float(row[4]) <= claimed_at:
+                cursor.execute(
+                    "UPDATE client_renewal_tasks SET state = 'expired', "
+                    "completed_at = ?, updated_at = ?, encrypted_payload_json = '', "
+                    "error_code = 'task_expired' WHERE task_id = ?",
+                    (claimed_at, claimed_at, task_id),
+                )
+                self.conn.commit()
+                raise ClientBrowserError(
+                    "续期任务已过期", error_code="renewal_task_expired", http_status=410
+                )
+            if row[1] != "pending" or not row[3]:
+                self.conn.rollback()
+                raise ClientBrowserError(
+                    "续期任务已领取", error_code="renewal_task_already_claimed", http_status=409
+                )
+            cursor.execute(
+                "UPDATE client_renewal_tasks SET state = 'claimed', claimed_at = ?, "
+                "updated_at = ?, encrypted_payload_json = '' WHERE task_id = ? "
+                "AND state = 'pending'",
+                (claimed_at, claimed_at, task_id),
+            )
+            self.conn.commit()
+        return {
+            "task_id": task_id,
+            "account_id": row[0],
+            "state": "claimed",
+            "context": json.loads(row[2]),
+            "encrypted_payload": json.loads(row[3]),
+            "expires_at": row[4],
+        }
+
+    def claim_next_client_renewal_task(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        now: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        current_time = time.time() if now is None else float(now)
+        normalized_device_id = normalize_device_id(device_id)
+        with self.lock:
+            expired = self.conn.execute(
+                "UPDATE client_renewal_tasks SET state = 'expired', "
+                "completed_at = ?, updated_at = ?, encrypted_payload_json = '', "
+                "error_code = 'task_expired' WHERE user_id = ? AND device_id = ? "
+                "AND state = 'pending' AND expires_at <= ?",
+                (current_time, current_time, int(user_id), normalized_device_id, current_time),
+            )
+            row = self.conn.execute(
+                "SELECT task_id FROM client_renewal_tasks WHERE user_id = ? "
+                "AND device_id = ? AND state = 'pending' AND expires_at > ? "
+                "ORDER BY created_at, task_id LIMIT 1",
+                (int(user_id), normalized_device_id, current_time),
+            ).fetchone()
+            if expired.rowcount:
+                self.conn.commit()
+        if not row:
+            return None
+        return self.claim_client_renewal_task(
+            user_id=user_id,
+            device_id=normalized_device_id,
+            task_id=row[0],
+            now=current_time,
+        )
+
+    def set_client_renewal_task_state(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        task_id: str,
+        expected_state: str,
+        state: str,
+        error_code: str = "",
+    ) -> bool:
+        if state not in {"action_required", "validating", "success", "failed"}:
+            raise ValueError("续期任务状态无效")
+        now = time.time()
+        completed_at = now if state in {"success", "failed"} else None
+        time_guard = (
+            "expires_at > ?"
+            if expected_state == "claimed"
+            else "updated_at > ?"
+        )
+        freshness = now if expected_state == "claimed" else now - 900
+        with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE client_renewal_tasks SET state = ?, error_code = ?, "
+                "completed_at = ?, updated_at = ?, encrypted_payload_json = '' "
+                "WHERE task_id = ? AND user_id = ? AND device_id = ? "
+                f"AND state = ? AND {time_guard}",
+                (
+                    state, str(error_code or "")[:80], completed_at, now, task_id,
+                    int(user_id), normalize_device_id(device_id), expected_state, freshness,
+                ),
+            )
+            self.conn.commit()
+            return cursor.rowcount == 1
+
+    def get_client_renewal_task(
+        self,
+        *,
+        user_id: int,
+        device_id: str,
+        task_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT task_id, cookie_id, device_id, state, trigger, "
+                "public_context_json, claimed_at, completed_at, expires_at, "
+                "created_at, updated_at, error_code "
+                "FROM client_renewal_tasks WHERE task_id = ? AND user_id = ? "
+                "AND device_id = ?",
+                (task_id, int(user_id), normalize_device_id(device_id)),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "task_id": row[0],
+            "account_id": row[1],
+            "device_id": row[2],
+            "state": row[3],
+            "trigger": row[4],
+            "context": json.loads(row[5] or "{}"),
+            "claimed_at": row[6],
+            "completed_at": row[7],
+            "expires_at": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
+            "error_code": row[11],
+        }
+
+    def cancel_active_client_renewal_task(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+    ) -> bool:
+        now = time.time()
+        with self.lock:
+            cursor = self.conn.execute(
+                "UPDATE client_renewal_tasks SET state = 'cancelled', "
+                "completed_at = ?, updated_at = ?, encrypted_payload_json = '', "
+                "error_code = 'user_cancelled' WHERE user_id = ? AND cookie_id = ? "
+                "AND state IN ('pending', 'claimed', 'action_required', 'validating')",
+                (now, now, int(user_id), cookie_id),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
 
     def mark_cookie_expired(self, cookie_id: str) -> bool:
         """Record the first expiry for the current login without churning reminder keys."""

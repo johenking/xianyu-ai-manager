@@ -11,7 +11,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
         openapi = app.openapi()
-        self.assertEqual(openapi["info"]["version"], "1.10.1")
+        self.assertEqual(openapi["info"]["version"], "1.10.2")
         paths = openapi["paths"]
         signatures = {
             (method.upper(), path)
@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 229)
+        self.assertEqual(len(signatures), 243)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -60,6 +60,14 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/api/official-login/sessions/{session_id}/cancel"), signatures)
         self.assertIn(("POST", "/api/accounts/{cookie_id}/session-refresh/show-browser"), signatures)
         self.assertIn(("POST", "/qr-login/cancel/{session_id}"), signatures)
+        self.assertIn(("POST", "/api/accounts/{cid}/renewal-binding"), signatures)
+        self.assertIn(("POST", "/api/client-browser/devices"), signatures)
+        self.assertIn(("GET", "/api/client-browser/devices"), signatures)
+        self.assertIn(("DELETE", "/api/client-browser/devices/{device_id}"), signatures)
+        self.assertIn(("POST", "/api/client-browser/sessions"), signatures)
+        self.assertIn(("POST", "/api/client-browser/sessions/{session_id}/challenge"), signatures)
+        self.assertIn(("POST", "/api/client-browser/import"), signatures)
+        self.assertIn(("POST", "/api/client-browser/renewal/claim"), signatures)
         self.assertIn(("POST", "/official-window-login"), signatures)
         self.assertIn(("GET", "/official-window-login/check/{session_id}"), signatures)
         self.assertIn(("POST", "/official-window-login/cancel/{session_id}"), signatures)

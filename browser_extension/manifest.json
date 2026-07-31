@@ -1,15 +1,26 @@
 {
   "manifest_version": 3,
   "name": "咸鱼监控台登录态导入",
-  "version": "1.1.0",
-  "description": "由用户主动把自己的 Chrome 闲鱼登录状态通过一次性配对导入咸鱼监控台。",
-  "permissions": ["cookies", "activeTab"],
+  "version": "1.2.0",
+  "description": "在当前 Chrome 或 Edge 完成登录和安全验证，并将已验证登录态交给咸鱼监控台。",
+  "permissions": ["alarms", "cookies", "activeTab", "scripting", "storage", "tabs"],
   "host_permissions": [
     "https://goofish.com/*",
     "https://*.goofish.com/*",
     "https://taobao.com/*",
     "https://*.taobao.com/*",
     "https://xianyu.cxywjx.top/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://xianyu.cxywjx.top/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
   ],
   "action": {
     "default_title": "导入闲鱼登录态",

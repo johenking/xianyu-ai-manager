@@ -209,7 +209,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         active_refresh_registry.unregister("account-1")
         active_refresh_registry.consume_cancelled("account-1")
 
-    async def test_password_refresh_uses_persistent_profile_and_saved_credentials(self):
+    async def test_saved_password_never_restores_server_browser_refresh(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
@@ -234,22 +234,14 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             success = await live._try_password_login_refresh("手动立即刷新")
 
-        self.assertTrue(success)
-        self.assertEqual(len(FakeOfficialRefreshService.calls), 1)
-        refresh_call = FakeOfficialRefreshService.calls[0]
-        self.assertEqual(refresh_call["profile_unb"], "9988")
-        self.assertEqual(refresh_call["account"], "seller@example.com")
-        self.assertEqual(refresh_call["password"], "secret")
-        self.assertTrue(refresh_call["allow_password"])
-        live._update_cookies_and_restart.assert_awaited_once_with(
-            "unb=9988; cookie2=renewed; _m_h5_tk=token",
-            browser_user_agent=unittest.mock.ANY,
-            access_token="",
-            expected_revision=3,
-            expected_xianyu_unb="9988",
-        )
-        self.assertEqual(database.updates[-1][1]["state"], "success")
-        self.assertEqual(database.validated_calls, 1)
+        self.assertFalse(success)
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
+        live._update_cookies_and_restart.assert_not_awaited()
+        probe.assert_not_awaited()
+        self.assertEqual(database.updates[-1][1]["state"], "manual_reauth_required")
+        self.assertEqual(database.updates[-1][1]["error_code"], "manual_reauth_required")
+        self.assertIn("绑定当前设备", database.updates[-1][1]["message"])
+        self.assertEqual(database.validated_calls, 0)
 
     async def test_non_password_login_freezes_without_probe_or_browser(self):
         live = object.__new__(XianyuLive)
@@ -285,7 +277,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         probe.assert_not_awaited()
         live.send_token_refresh_notification.assert_not_awaited()
 
-    async def test_manual_password_failure_freezes_and_skips_later_browser_runs(self):
+    async def test_repeated_password_refresh_requests_never_start_server_browser(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
@@ -313,12 +305,12 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(first)
         self.assertFalse(second)
-        self.assertEqual(len(FailingOfficialRefreshService.calls), 1)
+        self.assertEqual(FailingOfficialRefreshService.calls, [])
         self.assertEqual(database.status["state"], "manual_reauth_required")
         self.assertEqual(database.status["error_code"], "manual_reauth_required")
         self.assertEqual(database.expired_calls, 1)
 
-    async def test_transient_official_failure_remains_retryable(self):
+    async def test_legacy_transient_path_does_not_restore_server_browser_refresh(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
@@ -350,10 +342,10 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(first)
         self.assertFalse(second)
-        self.assertEqual(len(FailingOfficialRefreshService.calls), 2)
-        self.assertEqual(database.status["state"], "failed")
-        self.assertEqual(database.status["error_code"], "profile_in_use")
-        self.assertEqual(database.expired_calls, 0)
+        self.assertEqual(FailingOfficialRefreshService.calls, [])
+        self.assertEqual(database.status["state"], "manual_reauth_required")
+        self.assertEqual(database.status["error_code"], "manual_reauth_required")
+        self.assertEqual(database.expired_calls, 1)
 
     async def test_message_token_probe_uses_persisted_browser_ua_and_never_starts_browser(self):
         live = object.__new__(XianyuLive)

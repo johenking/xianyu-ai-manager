@@ -82,9 +82,28 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
         result, logs = await self._generate_qr_with_response(response)
 
         self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "qr_upstream_invalid_response")
+        self.assertTrue(result["retryable"])
         for secret in (private_body, "COOKIE_SECRET", "TOKEN_SECRET", "VERIFY_SECRET"):
             self.assertNotIn(secret, logs)
             self.assertNotIn(secret, result["message"])
+
+    async def test_upstream_network_failure_is_stable_retryable_and_starts_no_browser(self):
+        browser = Mock()
+        manager = QRLoginManager(
+            verification_browser=browser,
+            session_validator=AsyncMock(),
+        )
+        manager._get_mh5tk = AsyncMock(side_effect=httpx.ConnectError("fixture"))
+
+        first = await manager.generate_qr_code()
+        second = await manager.generate_qr_code()
+
+        self.assertEqual(first["error_code"], "qr_upstream_unreachable")
+        self.assertEqual(second["error_code"], "qr_upstream_unreachable")
+        self.assertTrue(first["retryable"])
+        self.assertEqual(manager.sessions, {})
+        browser.run.assert_not_called()
 
     async def test_h5_token_and_redirect_cookie_jar_are_merged_into_session(self):
         manager = QRLoginManager(
@@ -188,7 +207,7 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
             manager.cleanup_expired_sessions(now=terminal_at + 301)
             self.assertNotIn(session.session_id, manager.sessions)
 
-    async def test_verification_probe_starts_renderer_and_propagates_action_state(self):
+    async def test_verification_probe_requires_client_device_without_server_renderer(self):
         validator = AsyncMock(return_value=SessionProbeResult(
             status="verification_required",
             cookies={"unb": "account-1", "cookie2": "session"},
@@ -209,8 +228,8 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(validated)
         self.assertEqual(session.status, "verification_required")
-        self.assertEqual(session.required_action, "render_verification")
-        manager._ensure_verification_browser.assert_called_once_with(session.session_id)
+        self.assertEqual(session.required_action, "continue_in_client_browser")
+        manager._ensure_verification_browser.assert_not_called()
 
         pending = asyncio.create_task(asyncio.sleep(60))
         session.verification_task = pending
@@ -263,7 +282,7 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
         pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
 
-    async def test_verification_probe_without_safe_url_uses_fixed_official_entry(self):
+    async def test_verification_probe_without_safe_url_uses_client_browser_entry(self):
         validator = AsyncMock(return_value=SessionProbeResult(
             status="verification_required",
             cookies={"unb": "account-1", "cookie2": "session"},
@@ -285,8 +304,8 @@ class QRLoginValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(validated)
         self.assertEqual(session.status, "verification_required")
         self.assertEqual(session.verification_url, "https://www.goofish.com/im")
-        self.assertEqual(session.required_action, "render_verification")
-        manager._ensure_verification_browser.assert_called_once_with(session.session_id)
+        self.assertEqual(session.required_action, "continue_in_client_browser")
+        manager._ensure_verification_browser.assert_not_called()
 
     async def test_success_status_without_access_token_is_not_accepted(self):
         validator = AsyncMock(return_value=SessionProbeResult(

@@ -17,13 +17,14 @@ class OfficialLoginArchitectureTests(unittest.TestCase):
         self.assertNotIn('/qr-login/cooldown-status', source)
         self.assertNotIn("refresh_cookies_from_qr_login(", source)
 
-    def test_runtime_refresh_is_gated_to_password_accounts(self):
+    def test_runtime_refresh_cannot_pass_legacy_server_browser_capability_gate(self):
         source = inspect.getsource(XianyuLive._try_password_login_refresh)
 
         self.assertIn("supports_automatic_refresh", source)
         self.assertIn('account_info.get("password")', source)
-        self.assertIn("allow_password=bool(username and password)", source)
         self.assertIn("manual_reauth_required", source)
+        from account_session_refresh import supports_automatic_refresh
+        self.assertFalse(supports_automatic_refresh("password", "fixture", True))
 
     def test_diagnostics_do_not_claim_saved_password_is_required_for_refresh(self):
         source = inspect.getsource(reply_server.diagnose_auto_reply)

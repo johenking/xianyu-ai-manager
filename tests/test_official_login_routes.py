@@ -111,7 +111,7 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cookies", status)
         self.assertNotIn("password", status)
 
-    async def test_password_delegates_to_coordinator_and_default_qr_uses_api_manager(self):
+    async def test_public_legacy_password_requires_client_browser_and_default_qr_uses_api_manager(self):
         class FakeQrManager:
             sessions = {"api-qr-session": object()}
 
@@ -147,15 +147,12 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
                 current_user=self.user,
             )
 
-        self.assertTrue(password["success"])
-        self.assertEqual(password["session_id"], "session-1")
+        self.assertFalse(password["success"])
+        self.assertEqual(password["error_code"], "client_browser_required")
         self.assertTrue(qr["success"])
         self.assertEqual(qr["qr_code_url"], "data:image/png;base64,api-qr")
         self.assertEqual(qr_status["status"], "waiting")
-        self.assertEqual(
-            [call["mode"] for call in self.coordinator.start_calls],
-            ["password"],
-        )
+        self.assertEqual(self.coordinator.start_calls, [])
 
     async def test_sms_window_binds_existing_owned_account_identity(self):
         details = {
@@ -210,37 +207,25 @@ class OfficialLoginRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(local_user.exception.status_code, 403)
         self.assertEqual(public_show.exception.status_code, 403)
 
-    async def test_public_user_can_start_offscreen_sms_but_not_show_server_window(self):
+    async def test_public_user_all_modes_never_start_server_browser(self):
         with patch.object(reply_server, "official_login_coordinator", self.coordinator):
-            try:
-                result = await reply_server.create_official_login_session(
-                    {
-                        "mode": "sms",
-                        "account": "13800138000",
-                        "show_browser": False,
-                    },
-                    http_request=self.public_request,
-                    current_user=self.user,
-                )
-            except HTTPException as exc:
-                self.fail(
-                    f"公网普通用户的站内短信登录被错误拒绝: HTTP {exc.status_code}"
-                )
-            with self.assertRaises(HTTPException) as visible:
-                await reply_server.create_official_login_session(
-                    {
-                        "mode": "sms",
-                        "account": "13800138000",
-                        "show_browser": True,
-                    },
-                    http_request=self.public_request,
-                    current_user=self.user,
-                )
+            for mode in ("qr", "sms", "password"):
+                for show_browser in (False, True):
+                    with self.subTest(mode=mode, show_browser=show_browser):
+                        with self.assertRaises(HTTPException) as blocked:
+                            await reply_server.create_official_login_session(
+                                {
+                                    "mode": mode,
+                                    "account": "fixture-account",
+                                    "password": "fixture-password",
+                                    "show_browser": show_browser,
+                                },
+                                http_request=self.public_request,
+                                current_user=self.user,
+                            )
+                        self.assertIn(blocked.exception.status_code, {403, 409})
 
-        self.assertTrue(result["success"])
-        self.assertEqual(self.coordinator.start_calls[-1]["mode"], "sms")
-        self.assertFalse(self.coordinator.start_calls[-1]["show_browser"])
-        self.assertEqual(visible.exception.status_code, 403)
+        self.assertEqual(self.coordinator.start_calls, [])
 
     async def test_owner_scoped_interaction_route_accepts_no_secret_echo(self):
         endpoint = getattr(reply_server, "interact_with_official_login_session", None)

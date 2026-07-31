@@ -106,20 +106,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            [
-                "2026072601",
-                "2026072602",
-                "2026072603",
-                "2026072604",
-                "2026072605",
-                "2026072606",
-                "2026072607",
-                "2026072608",
-                "2026072609",
-                "2026072701",
-                "2026072702",
-                "2026072703",
-            ],
+            [migration.version for migration in MIGRATIONS if migration.version > "2026072301"],
         )
 
         columns = order_columns(connection)
@@ -179,19 +166,7 @@ class ProductionLedgerMigrationTests(IsolatedKeysTestCase):
         runner = MigrationRunner(connection, str(self.db_path))
         self.assertEqual(
             runner.run(),
-            [
-                "2026072602",
-                "2026072603",
-                "2026072604",
-                "2026072605",
-                "2026072606",
-                "2026072607",
-                "2026072608",
-                "2026072609",
-                "2026072701",
-                "2026072702",
-                "2026072703",
-            ],
+            [migration.version for migration in MIGRATIONS if migration.version > "2026072601"],
         )
         self.assertTrue(SNAPSHOT_COLUMNS.issubset(order_columns(connection)))
         self.assertEqual(

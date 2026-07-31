@@ -9,6 +9,7 @@ from account_session_refresh import (
     is_runtime_event_active,
     is_valid_account_login_username,
     resolve_refresh_schedule_anchor,
+    supports_automatic_refresh,
 )
 from db_manager import DBManager
 
@@ -51,6 +52,11 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
     def tearDown(self):
         self.db.conn.close()
         os.unlink(self.db_path)
+
+    def test_saved_password_never_enables_server_browser_refresh(self):
+        self.assertFalse(
+            supports_automatic_refresh("password", "seller@example.com", True)
+        )
 
     def test_cookie_upsert_only_updates_cookie_and_preserves_account_data(self):
         self.assertTrue(
@@ -177,12 +183,12 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
             1_000.0,
         )
 
-    def test_cookie_refresh_settings_default_to_disabled_and_can_be_updated(self):
+    def test_cookie_refresh_settings_remain_disabled_until_client_device_binding(self):
         details = self.db.get_cookie_details("account-1")
 
         self.assertFalse(details["cookie_refresh_enabled"])
         self.assertEqual(details["cookie_refresh_interval_minutes"], 1440)
-        with self.assertRaisesRegex(ValueError, "账号密码"):
+        with self.assertRaisesRegex(ValueError, "绑定"):
             self.db.update_cookie_refresh_settings(
                 "account-1",
                 enabled=True,
@@ -199,18 +205,21 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(
+        with self.assertRaisesRegex(ValueError, "绑定"):
             self.db.update_cookie_refresh_settings(
                 "account-1",
                 enabled=True,
                 interval_minutes=360,
             )
-        )
 
         updated = self.db.get_cookie_details("account-1")
-        self.assertTrue(updated["cookie_refresh_enabled"])
-        self.assertEqual(updated["cookie_refresh_interval_minutes"], 360)
-        self.assertTrue(self.db.get_cookie_refresh_settings("account-1")["auto_refresh_supported"])
+        self.assertFalse(updated["cookie_refresh_enabled"])
+        self.assertEqual(updated["cookie_refresh_interval_minutes"], 1440)
+        self.assertFalse(
+            self.db.get_cookie_refresh_settings("account-1")["auto_refresh_supported"]
+        )
+        self.assertEqual(updated["username"], "13800138000")
+        self.assertEqual(updated["password"], "secret")
 
     def test_non_password_login_disables_existing_refresh_and_records_expiry_once(self):
         self.db.update_cookie_account_info(
@@ -220,9 +229,13 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
             login_method="password",
             login_validated=True,
         )
-        self.db.update_cookie_refresh_settings(
-            "account-1", enabled=True, interval_minutes=360
-        )
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE cookies SET cookie_refresh_enabled = 1, "
+                "cookie_refresh_interval_minutes = 360 WHERE id = ?",
+                ("account-1",),
+            )
+            self.db.conn.commit()
         self.db.update_cookie_account_info(
             "account-1", login_method="qr", login_validated=True
         )

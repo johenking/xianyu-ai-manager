@@ -1391,6 +1391,98 @@ def _item_metric_tenant_ownership_v2(
     )
 
 
+def _client_browser_devices_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Persist public device keys and one-device account renewal leases."""
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if not {"users", "cookies"} <= tables:
+        return
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_id_user "
+        "ON cookies(id, user_id)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_browser_devices (
+            device_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            browser_family TEXT NOT NULL CHECK (browser_family IN ('chrome', 'edge')),
+            display_name TEXT NOT NULL DEFAULT '',
+            signing_public_jwk TEXT NOT NULL,
+            encryption_public_jwk TEXT NOT NULL,
+            registered_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            revoked_at REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_browser_devices_owner "
+        "ON client_browser_devices(user_id, revoked_at, last_seen_at DESC)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_renewal_bindings (
+            cookie_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            credential_authorized_at REAL NOT NULL,
+            bound_at REAL NOT NULL,
+            revoked_at REAL,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(device_id)
+                REFERENCES client_browser_devices(device_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_renewal_bindings_device "
+        "ON account_renewal_bindings(user_id, device_id, revoked_at)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS client_renewal_tasks (
+            task_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'pending', 'claimed', 'action_required', 'validating',
+                'success', 'failed', 'expired', 'cancelled'
+            )),
+            trigger TEXT NOT NULL DEFAULT '',
+            public_context_json TEXT NOT NULL DEFAULT '{}',
+            encrypted_payload_json TEXT NOT NULL DEFAULT '',
+            claimed_at REAL,
+            completed_at REAL,
+            expires_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            error_code TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(device_id)
+                REFERENCES client_browser_devices(device_id) ON DELETE RESTRICT
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_client_renewal_active_account "
+        "ON client_renewal_tasks(cookie_id) "
+        "WHERE state IN ('pending', 'claimed', 'action_required', 'validating')"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_renewal_device_claim "
+        "ON client_renewal_tasks(device_id, state, expires_at, created_at)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1482,6 +1574,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026072703",
         "item_metric_tenant_ownership_v2",
         _item_metric_tenant_ownership_v2,
+    ),
+    Migration(
+        "2026073101",
+        "client_browser_devices_v1",
+        _client_browser_devices_v1,
     ),
 )
 

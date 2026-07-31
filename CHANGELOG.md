@@ -4,6 +4,37 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-07-31
+
+### Added
+
+- Add a five-minute, owner/device/mode-bound current-browser login protocol for
+  QR, SMS, and password login in the user's Chrome or Edge.
+- Add non-exportable P-256 extension device keys, single-use signed challenges,
+  and one-device renewal bindings with ECDH/HKDF/AES-GCM credential delivery.
+- Add migration `2026073101` for client devices, account renewal bindings, and
+  single-claim renewal tasks.
+
+### Changed
+
+- Restore two primary QR entries: current-device browser login and independent
+  web QR. Mobile-scan verification remains a scannable image; slider, face, SMS,
+  and unknown interactive checks hand off to the current-device browser.
+- Keep server Chrome only under the administrator loopback-only
+  "服务器运维登录" entry with a warning and double confirmation.
+- Require a second explicit authorization after a confirmed password login
+  before encrypting credentials or enabling device-bound renewal.
+
+### Security
+
+- Ordinary and compatibility login routes no longer start server Playwright;
+  missing extension handshakes create no server login session.
+- Report login or renewal success only after a single-use device proof, real
+  platform Token validation, `unb` identity match, account persistence, and,
+  for login, frontend account-list confirmation.
+- Clear renewal ciphertext on first claim, reject replayed tasks and login
+  authorizations, and reject public-key replacement for an active device ID.
+
 ## [1.10.1] - 2026-07-29
 
 ### Added

@@ -2,6 +2,15 @@ export const CONSOLE_ORIGIN = 'https://xianyu.cxywjx.top';
 export const PUBLIC_IMPORT_URL = `${CONSOLE_ORIGIN}/api/browser-extension/import`;
 export const ALLOWED_SUFFIXES = ['goofish.com', 'taobao.com'];
 
+export function bytesToBase64Url(bytes) {
+  const binary = Array.from(new Uint8Array(bytes), (value) => String.fromCharCode(value)).join('');
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+export function browserFamilyFromUserAgent(userAgent) {
+  return /Edg\//.test(String(userAgent || '')) ? 'edge' : 'chrome';
+}
+
 export function isAllowedImportUrl(value) {
   try {
     const url = new URL(String(value || ''));
@@ -10,6 +19,14 @@ export function isAllowedImportUrl(value) {
       && url.pathname === '/api/browser-extension/import'
       && !url.search
       && !url.hash;
+  } catch (_) {
+    return false;
+  }
+}
+
+export function isConsolePageUrl(value) {
+  try {
+    return new URL(String(value || '')).origin === CONSOLE_ORIGIN;
   } catch (_) {
     return false;
   }
@@ -96,4 +113,34 @@ export function buildImportPayload(pairing, cookies, userAgent) {
     cookies: (cookies || []).filter(isAllowedCookie).map(serializeCookie),
     user_agent: String(userAgent || ''),
   };
+}
+
+export function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function buildClientImportPayload(session, cookies, userAgent) {
+  return {
+    session_id: String(session.sessionId || ''),
+    device_id: String(session.deviceId || ''),
+    mode: String(session.mode || ''),
+    challenge_id: String(session.challengeId || ''),
+    signature: String(session.signature || ''),
+    cookies: (cookies || []).filter(isAllowedCookie).map(serializeCookie),
+    user_agent: String(userAgent || ''),
+  };
+}
+
+export function cookieFingerprint(cookies) {
+  const entries = (cookies || [])
+    .filter(isAllowedCookie)
+    .map((cookie) => [String(cookie.name || ''), String(cookie.value || ''), String(cookie.domain || '')])
+    .sort((left, right) => left.join('\0').localeCompare(right.join('\0')));
+  return entries.map((entry) => entry.join('=')).join(';');
 }

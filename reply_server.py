@@ -137,6 +137,12 @@ from browser_extension_pairing import (
     is_loopback_host,
     normalize_structured_cookies,
 )
+from client_browser_login import (
+    ClientBrowserError,
+    client_login_sessions,
+    device_challenges,
+    normalize_device_id,
+)
 from utils.xianyu_session_probe import (
     PROBE_RETRYABLE_ERROR,
     cookies_to_string as session_cookies_to_string,
@@ -636,6 +642,25 @@ def _require_server_browser_access(
         )
 
 
+def _has_server_browser_access(
+    request: Request,
+    current_user: Dict[str, Any],
+) -> bool:
+    try:
+        _require_server_browser_access(request, current_user)
+    except HTTPException:
+        return False
+    return True
+
+
+def _client_browser_required_detail() -> Dict[str, str]:
+    return {
+        "code": "client_browser_required",
+        "message": "请在当前设备的 Chrome 或 Edge 中继续登录",
+        "action": "open_client_browser",
+    }
+
+
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
     """带用户信息的日志记录"""
     prefix = get_user_log_prefix(user_info)
@@ -655,7 +680,7 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
 
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.10.1",
+    version="1.10.2",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -1813,6 +1838,65 @@ class BrowserExtensionImportIn(BaseModel):
     user_agent: str = Field(..., min_length=1, max_length=MAX_USER_AGENT_LENGTH)
 
 
+class ClientBrowserDeviceIn(BaseModel):
+    device_id: str = Field(..., min_length=16, max_length=80)
+    browser_family: Literal["chrome", "edge"]
+    display_name: str = Field("当前设备", min_length=1, max_length=80)
+    signing_public_jwk: Dict[str, Any]
+    encryption_public_jwk: Dict[str, Any]
+
+
+class ClientBrowserSessionIn(BaseModel):
+    device_id: str = Field(..., min_length=16, max_length=80)
+    mode: Literal["qr", "sms", "password"]
+
+
+class ClientBrowserChallengeIn(BaseModel):
+    device_id: str = Field(..., min_length=16, max_length=80)
+    purpose: Literal[
+        "login_import",
+        "renewal_claim",
+        "renewal_complete",
+        "renewal_action_required",
+    ]
+
+
+class ClientBrowserLoginCookieIn(BrowserExtensionCookieIn):
+    pass
+
+
+class ClientBrowserLoginImportIn(BaseModel):
+    session_id: str = Field(..., min_length=8, max_length=80)
+    device_id: str = Field(..., min_length=16, max_length=80)
+    mode: Literal["qr", "sms", "password"]
+    challenge_id: str = Field(..., min_length=8, max_length=80)
+    signature: str = Field(..., min_length=40, max_length=256)
+    cookies: List[ClientBrowserLoginCookieIn]
+    user_agent: str = Field(..., min_length=1, max_length=MAX_USER_AGENT_LENGTH)
+
+
+class ClientBrowserSessionAuthorizeIn(BaseModel):
+    device_id: str = Field(..., min_length=16, max_length=80)
+    mode: Literal["qr", "sms", "password"]
+
+
+class ClientBrowserConfirmIn(BaseModel):
+    account_id: str = Field(..., min_length=1, max_length=200)
+
+
+class ClientRenewalProofIn(BaseModel):
+    device_id: str = Field(..., min_length=16, max_length=80)
+    challenge_id: str = Field(..., min_length=8, max_length=80)
+    signature: str = Field(..., min_length=40, max_length=256)
+
+
+class ClientRenewalResultIn(ClientRenewalProofIn):
+    outcome: Literal["completed", "action_required", "failed"]
+    error_code: str = Field("", max_length=80)
+    cookies: List[ClientBrowserLoginCookieIn] = Field(default_factory=list)
+    user_agent: str = Field("", max_length=MAX_USER_AGENT_LENGTH)
+
+
 class QRLoginCancelIn(BaseModel):
     ended_by: Literal[
         "user_cancelled",
@@ -2104,6 +2188,298 @@ def create_browser_extension_pairing(
     }
 
 
+def _raise_client_browser_error(exc: ClientBrowserError) -> None:
+    raise HTTPException(
+        status_code=exc.http_status,
+        detail={"code": exc.error_code, "message": str(exc)},
+    ) from exc
+
+
+@accounts_router.post("/api/client-browser/devices")
+def register_client_browser_device(
+    payload: ClientBrowserDeviceIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        device = db_manager.register_client_browser_device(
+            user_id=current_user['user_id'],
+            device_id=payload.device_id,
+            browser_family=payload.browser_family,
+            display_name=payload.display_name,
+            signing_public_jwk=payload.signing_public_jwk,
+            encryption_public_jwk=payload.encryption_public_jwk,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": device}
+
+
+@accounts_router.get("/api/client-browser/devices")
+def list_client_browser_devices(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    return {
+        "success": True,
+        "data": db_manager.list_client_browser_devices(current_user['user_id']),
+    }
+
+
+@accounts_router.delete("/api/client-browser/devices/{device_id}")
+def revoke_client_browser_device(
+    device_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        revoked = db_manager.revoke_client_browser_device(
+            user_id=current_user['user_id'],
+            device_id=device_id,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    if not revoked:
+        raise HTTPException(status_code=404, detail="当前设备不存在或已撤销")
+    return {"success": True}
+
+
+@accounts_router.post("/api/client-browser/sessions")
+def create_client_browser_login_session(
+    payload: ClientBrowserSessionIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        device = db_manager.get_client_browser_device(
+            user_id=current_user['user_id'],
+            device_id=payload.device_id,
+        )
+        if not device or device.get("revoked"):
+            raise ClientBrowserError(
+                "请先安装或刷新当前设备浏览器连接",
+                error_code="client_device_missing",
+                http_status=409,
+            )
+        status_info = client_login_sessions.create(
+            owner_user_id=current_user['user_id'],
+            device_id=payload.device_id,
+            mode=payload.mode,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {
+        "success": True,
+        "data": status_info,
+    }
+
+
+@accounts_router.get("/api/client-browser/sessions/{session_id}")
+def get_client_browser_login_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        status_info = client_login_sessions.get_for_owner(
+            session_id, current_user['user_id']
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": status_info}
+
+
+@accounts_router.post("/api/client-browser/sessions/{session_id}/confirm")
+def confirm_client_browser_login_session(
+    session_id: str,
+    payload: ClientBrowserConfirmIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_owned_cookie(payload.account_id, current_user['user_id'])
+    try:
+        status_info = client_login_sessions.confirm(
+            session_id=session_id,
+            owner_user_id=current_user['user_id'],
+            account_id=payload.account_id,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": status_info}
+
+
+@accounts_router.post("/api/client-browser/sessions/{session_id}/cancel")
+def cancel_client_browser_login_session(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        status_info = client_login_sessions.cancel(
+            session_id, current_user['user_id']
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": status_info}
+
+
+@accounts_router.post("/api/client-browser/challenges")
+def create_client_browser_challenge(
+    payload: ClientBrowserChallengeIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        device = db_manager.get_client_browser_device(
+            user_id=current_user['user_id'],
+            device_id=payload.device_id,
+        )
+        if not device or device.get("revoked"):
+            raise ClientBrowserError(
+                "当前设备连接不存在",
+                error_code="client_device_missing",
+                http_status=404,
+            )
+        challenge = device_challenges.create(
+            device_id=payload.device_id,
+            owner_user_id=current_user['user_id'],
+            purpose=payload.purpose,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": challenge}
+
+
+@accounts_router.post("/api/client-browser/sessions/{session_id}/challenge")
+def create_client_browser_login_challenge(
+    session_id: str,
+    payload: ClientBrowserSessionAuthorizeIn,
+):
+    """Issue a proof challenge to the device bound to one login session."""
+    try:
+        record = client_login_sessions.get_for_device(
+            session_id=session_id,
+            device_id=payload.device_id,
+            mode=payload.mode,
+        )
+        device = db_manager.get_client_browser_device(
+            user_id=record.owner_user_id,
+            device_id=payload.device_id,
+        )
+        if not device or device.get("revoked"):
+            raise ClientBrowserError(
+                "当前设备连接已失效",
+                error_code="client_device_revoked",
+                http_status=403,
+            )
+        challenge = device_challenges.create(
+            device_id=payload.device_id,
+            owner_user_id=record.owner_user_id,
+            purpose="login_import",
+        )
+        client_login_sessions.mark_waiting_user(session_id)
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": challenge}
+
+
+@accounts_router.post("/api/client-browser/import")
+async def import_client_browser_login(
+    payload: ClientBrowserLoginImportIn,
+):
+    """Accept one device-proved login only after real platform validation."""
+    consumed = False
+    try:
+        record = client_login_sessions.get_for_device(
+            session_id=payload.session_id,
+            device_id=payload.device_id,
+            mode=payload.mode,
+        )
+        device = db_manager.get_client_browser_device(
+            user_id=record.owner_user_id,
+            device_id=payload.device_id,
+            include_public_keys=True,
+        )
+        if not device or device.get("revoked"):
+            raise ClientBrowserError(
+                "当前设备连接已失效",
+                error_code="client_device_revoked",
+                http_status=403,
+            )
+        binding = {
+            "session_id": payload.session_id,
+            "mode": payload.mode,
+            "device_id": payload.device_id,
+        }
+        device_challenges.verify(
+            challenge_id=payload.challenge_id,
+            device_id=payload.device_id,
+            purpose="login_import",
+            public_jwk=device["signing_public_jwk"],
+            signature=payload.signature,
+            binding=binding,
+            owner_user_id=record.owner_user_id,
+        )
+        imported_cookies = normalize_structured_cookies([
+            cookie.model_dump() for cookie in payload.cookies
+        ])
+        imported_unb = str(imported_cookies.get("unb") or "").strip()
+        probe = await probe_message_session_async(
+            session_cookies_to_string(imported_cookies),
+            payload.user_agent,
+        )
+        platform_unb = str((probe.cookies or {}).get("unb") or "").strip()
+        if not probe.succeeded:
+            raise ClientBrowserError(
+                probe.message or "平台未确认有效登录状态",
+                error_code=probe.error_code or "session_validation_failed",
+            )
+        if not platform_unb or platform_unb != imported_unb:
+            raise ClientBrowserError(
+                "平台验证身份与当前设备登录结果不一致",
+                error_code="account_mismatch",
+            )
+        record = client_login_sessions.consume_for_import(
+            session_id=payload.session_id,
+            device_id=payload.device_id,
+            mode=payload.mode,
+        )
+        consumed = True
+        now = time.time()
+        account_info = await _persist_validated_account_login(
+            user_id=record.owner_user_id,
+            cookies_str=session_cookies_to_string(probe.cookies),
+            validated_unb=platform_unb,
+            login_method={
+                "qr": "chrome_extension",
+                "sms": "sms_window",
+                "password": "password",
+            }[payload.mode],
+            browser_user_agent=payload.user_agent,
+            runtime_state={
+                "current_token": probe.access_token,
+                "last_token_refresh_time": now,
+                "browser_user_agent": payload.user_agent,
+                "cookie_refresh_anchor": now,
+                "item_sync_anchor": now,
+            },
+        )
+        db_manager.touch_client_browser_device(
+            user_id=record.owner_user_id, device_id=payload.device_id
+        )
+        status_info = client_login_sessions.persisted(
+            payload.session_id, account_id=account_info["account_id"]
+        )
+        return {"success": True, "data": status_info}
+    except ClientBrowserError as exc:
+        if consumed:
+            client_login_sessions.fail(
+                payload.session_id, message=str(exc), error_code=exc.error_code
+            )
+        _raise_client_browser_error(exc)
+    except Exception as exc:
+        if consumed:
+            client_login_sessions.fail(
+                payload.session_id,
+                message="当前设备登录处理失败",
+                error_code="client_login_failed",
+            )
+        logger.error(f"当前设备登录导入失败: {type(exc).__name__}")
+        raise HTTPException(status_code=400, detail="当前设备登录处理失败") from exc
+
+
 @accounts_router.get("/api/browser-extension/pairings/{pairing_id}")
 def get_browser_extension_pairing(
     pairing_id: str,
@@ -2250,6 +2626,15 @@ class CookieRefreshSettingsUpdate(BaseModel):
     cookie_refresh_interval_minutes: int
 
 
+class AccountRenewalBindingIn(BaseModel):
+    login_session_id: str = Field(..., min_length=8, max_length=80)
+    device_id: str = Field(..., min_length=16, max_length=80)
+    username: str = Field(..., min_length=1, max_length=200)
+    password: str = Field(..., min_length=1, max_length=500)
+    authorized: Literal[True]
+    authorized_at: float
+
+
 @accounts_router.put("/cookies/{cid}/login-info")
 def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新账号登录信息（用户名、密码、是否显示浏览器）"""
@@ -2261,6 +2646,19 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
 
         if cid not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if update_data.login_password:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "credential_authorization_required",
+                    "message": "请在当前设备登录成功后再次授权保存密码",
+                },
+            )
+        if update_data.show_browser is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="服务器浏览器设置仅在管理员本机运维入口中使用",
+            )
         if update_data.username is not None and update_data.username and not is_valid_account_login_username(update_data.username):
             raise HTTPException(status_code=400, detail="闲鱼登录账号不能填写 API 地址，请填写手机号、邮箱或闲鱼登录名")
 
@@ -2268,8 +2666,6 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
         success = db_manager.update_cookie_account_info(
             cid,
             username=update_data.username,
-            password=update_data.login_password if update_data.login_password else None,
-            show_browser=update_data.show_browser
         )
 
         if success:
@@ -2280,6 +2676,267 @@ def update_cookie_login_info(cid: str, update_data: AccountLoginInfoUpdate, curr
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@accounts_router.post("/api/accounts/{cid}/renewal-binding")
+def bind_account_renewal_device(
+    cid: str,
+    payload: AccountRenewalBindingIn,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_owned_cookie(cid, current_user['user_id'])
+    if not payload.authorized:
+        raise HTTPException(status_code=409, detail="需要明确授权后保存续期凭据")
+    try:
+        client_login_sessions.authorize_renewal(
+            session_id=payload.login_session_id,
+            owner_user_id=current_user['user_id'],
+            device_id=payload.device_id,
+            account_id=cid,
+        )
+        binding = db_manager.bind_account_renewal_device(
+            user_id=current_user['user_id'],
+            cookie_id=cid,
+            device_id=payload.device_id,
+            username=payload.username,
+            password=payload.password,
+            authorized_at=payload.authorized_at,
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": binding}
+
+
+@accounts_router.post("/api/client-browser/renewal/challenge")
+def create_client_renewal_challenge(payload: ClientBrowserChallengeIn):
+    if payload.purpose not in {
+        "renewal_claim", "renewal_complete", "renewal_action_required"
+    }:
+        raise HTTPException(status_code=400, detail="续期挑战用途无效")
+    try:
+        device = db_manager.find_active_client_browser_device(
+            payload.device_id, include_public_keys=True
+        )
+        if not device:
+            raise ClientBrowserError(
+                "当前设备连接不存在",
+                error_code="client_device_missing",
+                http_status=404,
+            )
+        challenge = device_challenges.create(
+            device_id=payload.device_id,
+            owner_user_id=device["user_id"],
+            purpose=payload.purpose,
+        )
+        if payload.purpose == "renewal_claim":
+            now = time.time()
+            with db_manager.lock:
+                due_accounts = db_manager.conn.execute(
+                    """
+                    SELECT c.id, c.user_id
+                    FROM cookies AS c
+                    JOIN account_renewal_bindings AS b
+                      ON b.cookie_id = c.id AND b.user_id = c.user_id
+                    WHERE b.device_id = ? AND b.revoked_at IS NULL
+                      AND c.cookie_refresh_enabled = 1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM client_renewal_tasks AS t
+                          WHERE t.cookie_id = c.id AND t.state IN (
+                              'pending', 'claimed', 'action_required', 'validating'
+                          )
+                      )
+                      AND COALESCE((
+                          SELECT COALESCE(s.last_success_at, s.last_attempt_at, 0)
+                          FROM account_session_refresh_status AS s
+                          WHERE s.cookie_id = c.id
+                      ), 0) <= ? - 60 * CASE
+                          WHEN c.cookie_refresh_interval_minutes BETWEEN 60 AND 10080
+                          THEN c.cookie_refresh_interval_minutes
+                          ELSE 1440
+                      END
+                    ORDER BY c.id
+                    LIMIT 1
+                    """,
+                    (payload.device_id, now),
+                ).fetchone()
+            if due_accounts:
+                try:
+                    db_manager.create_client_renewal_task(
+                        user_id=int(due_accounts[1]),
+                        cookie_id=str(due_accounts[0]),
+                        trigger="scheduled_client_device",
+                        now=now,
+                    )
+                except ClientBrowserError as task_error:
+                    if task_error.error_code != "renewal_task_exists":
+                        raise
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": challenge}
+
+
+def _verify_renewal_device_proof(
+    payload: ClientRenewalProofIn,
+    *,
+    purpose: str,
+    binding: Dict[str, Any],
+) -> Dict[str, Any]:
+    device = db_manager.find_active_client_browser_device(
+        payload.device_id, include_public_keys=True
+    )
+    if not device:
+        raise ClientBrowserError(
+            "当前设备连接不存在",
+            error_code="client_device_missing",
+            http_status=404,
+        )
+    device_challenges.verify(
+        challenge_id=payload.challenge_id,
+        device_id=payload.device_id,
+        purpose=purpose,
+        public_jwk=device["signing_public_jwk"],
+        signature=payload.signature,
+        binding=binding,
+        owner_user_id=device["user_id"],
+    )
+    return device
+
+
+@accounts_router.post("/api/client-browser/renewal/claim")
+def claim_client_renewal_task(payload: ClientRenewalProofIn):
+    binding = {"device_id": payload.device_id, "operation": "claim_next"}
+    try:
+        device = _verify_renewal_device_proof(
+            payload, purpose="renewal_claim", binding=binding
+        )
+        task = db_manager.claim_next_client_renewal_task(
+            user_id=device["user_id"], device_id=payload.device_id
+        )
+        db_manager.touch_client_browser_device(
+            user_id=device["user_id"], device_id=payload.device_id
+        )
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
+    return {"success": True, "data": task}
+
+
+@accounts_router.post("/api/client-browser/renewal/{task_id}/result")
+async def complete_client_renewal_task(
+    task_id: str,
+    payload: ClientRenewalResultIn,
+):
+    try:
+        device = db_manager.find_active_client_browser_device(
+            payload.device_id, include_public_keys=True
+        )
+        if not device:
+            raise ClientBrowserError(
+                "当前设备连接不存在",
+                error_code="client_device_missing",
+                http_status=404,
+            )
+        task = db_manager.get_client_renewal_task(
+            user_id=device["user_id"],
+            device_id=payload.device_id,
+            task_id=task_id,
+        )
+        if not task or task["state"] not in {"claimed", "action_required"}:
+            raise ClientBrowserError(
+                "续期任务状态无效",
+                error_code="renewal_task_state_invalid",
+                http_status=409,
+            )
+        purpose = (
+            "renewal_action_required"
+            if payload.outcome == "action_required"
+            else "renewal_complete"
+        )
+        binding = {
+            "device_id": payload.device_id,
+            "task_id": task_id,
+            "account_id": task["account_id"],
+            "outcome": payload.outcome,
+        }
+        _verify_renewal_device_proof(payload, purpose=purpose, binding=binding)
+        current_task_state = task["state"]
+        if payload.outcome == "action_required":
+            if current_task_state != "claimed":
+                raise ClientBrowserError(
+                    "续期任务已等待用户验证",
+                    error_code="renewal_task_already_updated",
+                    http_status=409,
+                )
+            updated = db_manager.set_client_renewal_task_state(
+                user_id=device["user_id"], device_id=payload.device_id,
+                task_id=task_id, expected_state=current_task_state,
+                state="action_required",
+                error_code=payload.error_code or "human_verification_required",
+            )
+            if not updated:
+                raise ClientBrowserError(
+                    "续期任务已更新",
+                    error_code="renewal_task_already_updated",
+                    http_status=409,
+                )
+            db_manager.update_account_session_refresh(
+                task["account_id"],
+                state="action_required",
+                trigger="client_device_renewal",
+                message="当前设备需要完成短信、滑块、人脸或其他官方验证",
+                error_code=payload.error_code or "human_verification_required",
+            )
+            return {"success": True, "data": {"state": "action_required"}}
+        if payload.outcome == "failed":
+            updated = db_manager.set_client_renewal_task_state(
+                user_id=device["user_id"], device_id=payload.device_id,
+                task_id=task_id, expected_state=current_task_state, state="failed",
+                error_code=payload.error_code or "client_renewal_failed",
+            )
+            if not updated:
+                raise ClientBrowserError(
+                    "续期任务已更新", error_code="renewal_task_already_updated", http_status=409
+                )
+            return {"success": True, "data": {"state": "failed"}}
+
+        imported = normalize_structured_cookies([cookie.model_dump() for cookie in payload.cookies])
+        expected_unb = str((db_manager.get_cookie_details(task["account_id"]) or {}).get("xianyu_unb") or "").strip()
+        imported_unb = str(imported.get("unb") or "").strip()
+        probe = await probe_message_session_async(
+            session_cookies_to_string(imported), payload.user_agent
+        )
+        platform_unb = str((probe.cookies or {}).get("unb") or "").strip()
+        if not probe.succeeded or not expected_unb or {expected_unb, imported_unb, platform_unb} != {expected_unb}:
+            raise ClientBrowserError(
+                "续期 Token 或账号身份验证失败",
+                error_code=probe.error_code or "renewal_identity_mismatch",
+            )
+        account_info = await _persist_validated_account_login(
+            user_id=device["user_id"],
+            cookies_str=session_cookies_to_string(probe.cookies),
+            validated_unb=platform_unb,
+            login_method="password",
+            browser_user_agent=payload.user_agent,
+            runtime_state={
+                "current_token": probe.access_token,
+                "last_token_refresh_time": time.time(),
+                "browser_user_agent": payload.user_agent,
+            },
+        )
+        if account_info["account_id"] != task["account_id"]:
+            raise ClientBrowserError(
+                "续期账号落库结果不匹配", error_code="renewal_persist_mismatch"
+            )
+        updated = db_manager.set_client_renewal_task_state(
+            user_id=device["user_id"], device_id=payload.device_id,
+            task_id=task_id, expected_state=current_task_state, state="success",
+        )
+        if not updated:
+            raise ClientBrowserError(
+                "续期任务已更新", error_code="renewal_task_already_updated", http_status=409
+            )
+        return {"success": True, "data": {"state": "success"}}
+    except ClientBrowserError as exc:
+        _raise_client_browser_error(exc)
 
 
 @accounts_router.put("/cookies/{cid}/cookie-refresh-settings")
@@ -2732,8 +3389,16 @@ async def create_official_login_session(
     mode = str(request.get("mode") or "qr").strip().lower()
     account = str(request.get("account") or "").strip()
     show_browser = bool(request.get("show_browser", False))
+    # This endpoint owns a server-side Playwright browser even when its window
+    # is hidden.  Therefore every invocation—not just show_browser=True—must be
+    # limited to the explicit administrator loopback maintenance surface.
     if show_browser:
         _require_server_browser_access(http_request, current_user)
+    elif not _has_server_browser_access(http_request, current_user):
+        raise HTTPException(
+            status_code=409,
+            detail=_client_browser_required_detail(),
+        )
     try:
         session = await official_login_coordinator.start(
             owner_user_id=current_user["user_id"],
@@ -2939,8 +3604,13 @@ async def password_login(
         password = request.get('password')
         show_browser = request.get('show_browser', False)
 
-        if show_browser:
-            _require_server_browser_access(http_request, current_user)
+        if not _has_server_browser_access(http_request, current_user):
+            return {
+                'success': False,
+                'error_code': 'client_browser_required',
+                'message': '请在当前设备的 Chrome 或 Edge 中继续账号密码登录',
+                'action': 'open_client_browser',
+            }
 
         if not account or not password:
             return {'success': False, 'message': '登录账号和密码不能为空'}
@@ -3073,6 +3743,8 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
         logger.error(f"生成接口二维码失败: {type(exc).__name__}")
         return {
             'success': False,
+            'error_code': 'qr_generation_failed',
+            'retryable': True,
             'message': '生成二维码失败，请稍后重试',
         }
 
@@ -7052,92 +7724,44 @@ def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = De
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh")
 async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
-    account_info = db_manager.get_cookie_details(cookie_id) or {}
-    if not supports_automatic_refresh(
-        account_info.get('login_method'),
-        account_info.get('username'),
-        bool(account_info.get('password')),
-    ):
-        login_method = normalize_login_method(account_info.get('login_method'))
-        message = reauth_message_for(login_method)
-        db_manager.mark_cookie_expired(cookie_id)
-        db_manager.update_account_session_refresh(
-            cookie_id,
-            state='manual_reauth_required',
-            trigger='manual',
-            message=message,
-            error_code='manual_reauth_required',
-        )
-        return {
-            'success': False,
-            'status': 'manual_reauth_required',
-            'message': message,
-            'reauth_action': reauth_action_for(login_method),
-            'data': db_manager.get_account_session_refresh(cookie_id),
-        }
-    current_status = _current_session_refresh_status(cookie_id)
-    if current_status.get('state') == 'manual_reauth_required':
-        return {
-            'success': False,
-            'status': 'manual_reauth_required',
-            'message': reauth_message_for('password'),
-            'reauth_action': 'password_login',
-            'data': current_status,
-        }
-    if active_refresh_registry.is_active(cookie_id):
-        return {'success': True, 'message': 'Cookie 刷新已经在进行中', 'data': current_status}
-
-    if current_status.get('state') in {'refreshing', 'verification_required'}:
-        db_manager.update_account_session_refresh(
-            cookie_id, state='failed', trigger='manual',
-            message='上一次刷新会话已中断，正在重新发起', error_code='interrupted',
-        )
-
-    from XianyuAutoAsync import XianyuLive
-    live_instance = XianyuLive.get_instance(cookie_id)
-    if live_instance is None:
-        raise HTTPException(status_code=409, detail="账号监听实例未运行，请先开启账号监听")
-
-    if not active_refresh_registry.register(cookie_id, live_instance):
-        return {
-            'success': True,
-            'message': 'Cookie 刷新已经在进行中',
-            'data': _current_session_refresh_status(cookie_id),
-        }
-
-    get_session_registry().register(
-        f"cookie-refresh:{cookie_id}",
-        "cookie_refresh",
-        current_user['user_id'],
-        account_id=cookie_id,
-        status="refreshing",
-        ttl_seconds=900,
-        transient=live_instance,
-    )
-
-    manager_loop = getattr(cookie_manager.manager, 'loop', None) if cookie_manager.manager else None
-    running_loop = asyncio.get_running_loop()
-    async def run_reserved_refresh():
-        try:
-            await live_instance._try_password_login_refresh(
-                "手动立即刷新",
-                reuse_active_registration=True,
-            )
-        finally:
-            active_refresh_registry.unregister(cookie_id)
-
     try:
-        if manager_loop and manager_loop is not running_loop and manager_loop.is_running():
-            asyncio.run_coroutine_threadsafe(run_reserved_refresh(), manager_loop)
-        else:
-            asyncio.create_task(run_reserved_refresh())
-    except Exception:
-        active_refresh_registry.unregister(cookie_id)
-        raise
-    await asyncio.sleep(0)
+        task = db_manager.create_client_renewal_task(
+            user_id=current_user['user_id'],
+            cookie_id=cookie_id,
+            trigger='manual_client_device',
+        )
+    except ClientBrowserError as exc:
+        if exc.error_code == 'renewal_task_exists':
+            return {
+                'success': True,
+                'status': 'client_device_pending',
+                'message': '当前设备续期任务已经在进行中',
+                'data': _current_session_refresh_status(cookie_id),
+            }
+        if exc.error_code == 'client_device_binding_required':
+            db_manager.update_account_session_refresh(
+                cookie_id, state='manual_reauth_required', trigger='manual',
+                message='绑定当前设备后可恢复自动续期',
+                error_code='client_device_binding_required',
+            )
+            return {
+                'success': False,
+                'status': 'client_device_binding_required',
+                'message': '请先绑定当前 Chrome 或 Edge 作为此账号的续期设备',
+                'reauth_action': 'bind_client_device',
+                'data': db_manager.get_account_session_refresh(cookie_id),
+            }
+        _raise_client_browser_error(exc)
+    db_manager.update_account_session_refresh(
+        cookie_id, state='refreshing', trigger='manual_client_device',
+        message='等待绑定的当前设备领取续期任务',
+        error_code='client_device_renewal_pending',
+        expires_at=task['expires_at'],
+    )
     return {
         'success': True,
-        'message': '已开始一次验证',
+        'status': 'client_device_pending',
+        'message': '已发送到绑定的当前设备',
         'data': _current_session_refresh_status(cookie_id),
     }
 
@@ -7146,7 +7770,9 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
 def cancel_account_session_refresh(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
     status_info = _current_session_refresh_status(cookie_id)
-    cancelled = active_refresh_registry.cancel(cookie_id)
+    cancelled = db_manager.cancel_active_client_renewal_task(
+        user_id=current_user['user_id'], cookie_id=cookie_id
+    ) or active_refresh_registry.cancel(cookie_id)
     if not cancelled:
         raise HTTPException(status_code=409, detail="当前没有正在运行的刷新任务")
     _remove_account_verification_images(cookie_id)

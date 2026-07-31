@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 
 const root = new URL('../', import.meta.url);
 const manifest = JSON.parse(await readFile(new URL('manifest.json', root), 'utf8'));
@@ -11,6 +12,8 @@ for (const relative of [
   'popup.css',
   'popup.js',
   'lib.mjs',
+  'background.js',
+  'content.js',
   'icons/icon-16.png',
   'icons/icon-32.png',
   'icons/icon-48.png',
@@ -18,6 +21,16 @@ for (const relative of [
 ]) {
   await access(new URL(relative, root));
 }
+
+const backgroundParse = spawnSync(
+  process.execPath,
+  ['--input-type=module', '--check'],
+  {
+    input: await readFile(new URL('background.js', root), 'utf8'),
+    encoding: 'utf8',
+  },
+);
+assert.equal(backgroundParse.status, 0, backgroundParse.stderr || 'background.js module parse failed');
 
 const popupHtml = await readFile(new URL('popup.html', root), 'utf8');
 assert.match(popupHtml, /<svg[\s>]/);

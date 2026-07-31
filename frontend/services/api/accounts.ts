@@ -129,6 +129,94 @@ export interface BrowserExtensionPairing {
   local_import_url?: string;
 }
 
+export interface ClientBrowserDevicePublic {
+  deviceId: string;
+  browserFamily: 'chrome' | 'edge';
+  signingPublicJwk: Record<string, unknown>;
+  encryptionPublicJwk: Record<string, unknown>;
+}
+
+export interface ClientBrowserLoginSession {
+  session_id: string;
+  device_id: string;
+  mode: 'qr' | 'sms' | 'password';
+  state:
+    | 'waiting_device'
+    | 'waiting_user'
+    | 'validating'
+    | 'awaiting_confirmation'
+    | 'success'
+    | 'failed'
+    | 'expired'
+    | 'cancelled';
+  message: string;
+  error_code?: string;
+  account_id?: string;
+  expires_at: number;
+  ended_by?: string;
+}
+
+export const registerClientBrowserDevice = async (
+  device: ClientBrowserDevicePublic,
+): Promise<void> => {
+  await post('/api/client-browser/devices', {
+    device_id: device.deviceId,
+    browser_family: device.browserFamily,
+    display_name: device.browserFamily === 'edge' ? '当前 Edge' : '当前 Chrome',
+    signing_public_jwk: device.signingPublicJwk,
+    encryption_public_jwk: device.encryptionPublicJwk,
+  });
+};
+
+export const createClientBrowserLoginSession = async (
+  deviceId: string,
+  mode: 'qr' | 'sms' | 'password',
+): Promise<ClientBrowserLoginSession> => {
+  const response = await post<{ success: boolean; data: ClientBrowserLoginSession }>(
+    '/api/client-browser/sessions',
+    { device_id: deviceId, mode },
+  );
+  return response.data;
+};
+
+export const getClientBrowserLoginSession = async (
+  sessionId: string,
+): Promise<ClientBrowserLoginSession> => {
+  const response = await get<{ success: boolean; data: ClientBrowserLoginSession }>(
+    '/api/client-browser/sessions/' + encodeURIComponent(sessionId),
+  );
+  return response.data;
+};
+
+export const confirmClientBrowserLoginSession = async (
+  sessionId: string,
+  accountId: string,
+): Promise<ClientBrowserLoginSession> => {
+  const response = await post<{ success: boolean; data: ClientBrowserLoginSession }>(
+    '/api/client-browser/sessions/' + encodeURIComponent(sessionId) + '/confirm',
+    { account_id: accountId },
+  );
+  return response.data;
+};
+
+export const cancelClientBrowserLoginSession = async (sessionId: string): Promise<void> => {
+  await post('/api/client-browser/sessions/' + encodeURIComponent(sessionId) + '/cancel', {});
+};
+
+export const bindAccountRenewalDevice = async (
+  accountId: string,
+  data: {
+    login_session_id: string;
+    device_id: string;
+    username: string;
+    password: string;
+    authorized: true;
+    authorized_at: number;
+  },
+): Promise<void> => {
+  await post('/api/accounts/' + encodeURIComponent(accountId) + '/renewal-binding', data);
+};
+
 export type OfficialLoginState =
   | 'preparing'
   | 'waiting_user'
@@ -221,7 +309,7 @@ export const addAccountCookie = async (data: { id?: string; value: string }): Pr
   return post('/cookies', data);
 };
 
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string }> => {
+export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string; error_code?: string; retryable?: boolean }> => {
   return post('/qr-login/generate');
 };
 

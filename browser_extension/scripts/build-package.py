@@ -16,6 +16,8 @@ PACKAGE_FILES = (
     "popup.css",
     "popup.js",
     "lib.mjs",
+    "background.js",
+    "content.js",
     "README.md",
     "icons/icon-16.png",
     "icons/icon-32.png",

@@ -5,8 +5,14 @@ import test from 'node:test';
 import {
   ALLOWED_SUFFIXES,
   buildImportPayload,
+  buildClientImportPayload,
+  browserFamilyFromUserAgent,
+  bytesToBase64Url,
+  canonicalJson,
+  cookieFingerprint,
   isAllowedImportUrl,
   isAllowedCookie,
+  isConsolePageUrl,
   parsePairingBundle,
   selectCookieStore,
   serializeCookie,
@@ -21,6 +27,12 @@ test('selects the Cookie Store that owns the active tab', () => {
     8,
   );
   assert.equal(selected.id, 'incognito');
+});
+
+test('encodes URL-safe device proof material and distinguishes Edge', () => {
+  assert.equal(bytesToBase64Url(Uint8Array.from([251, 255, 255])), '-___');
+  assert.equal(browserFamilyFromUserAgent('Mozilla/5.0 Edg/138.0.0.0'), 'edge');
+  assert.equal(browserFamilyFromUserAgent('Mozilla/5.0 Chrome/138.0.0.0'), 'chrome');
 });
 
 test('serializes structured cookie metadata including partition key', () => {
@@ -83,16 +95,22 @@ test('parses a versioned HTTPS pairing bundle without persistence', () => {
   assert.equal(isAllowedImportUrl('http://xianyu.cxywjx.top/api/browser-extension/import'), false);
   assert.equal(isAllowedImportUrl('https://example.com/api/browser-extension/import'), false);
   assert.equal(isAllowedImportUrl('https://xianyu.cxywjx.top/other'), false);
+  assert.equal(isConsolePageUrl('https://xianyu.cxywjx.top/accounts'), true);
+  assert.equal(isConsolePageUrl('http://xianyu.cxywjx.top/accounts'), false);
+  assert.equal(isConsolePageUrl('https://xianyu.cxywjx.top.evil.example/accounts'), false);
 });
 
-test('manifest permissions stay within the approved allowlist', async () => {
+test('manifest provides a strict MV3 current-device bridge', async () => {
   const manifest = JSON.parse(
     await readFile(new URL('../manifest.json', import.meta.url), 'utf8'),
   );
-  assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'cookies']);
-  assert.equal(manifest.background, undefined);
-  assert.equal(manifest.content_scripts, undefined);
-  assert.equal(manifest.permissions.includes('storage'), false);
+  assert.deepEqual(
+    [...manifest.permissions].sort(),
+    ['activeTab', 'alarms', 'cookies', 'scripting', 'storage', 'tabs'],
+  );
+  assert.deepEqual(manifest.background, { service_worker: 'background.js', type: 'module' });
+  assert.deepEqual(manifest.content_scripts[0].matches, ['https://xianyu.cxywjx.top/*']);
+  assert.deepEqual(manifest.content_scripts[0].js, ['content.js']);
   assert.equal(manifest.host_permissions.length, 5);
   for (const suffix of ALLOWED_SUFFIXES) {
     assert.equal(
@@ -112,4 +130,49 @@ test('popup code never writes sensitive values to extension storage', async () =
   assert.equal(/chrome\.storage|localStorage|sessionStorage/.test(popup), false);
   assert.equal(isAllowedCookie({ domain: '.taobao.com' }), true);
   assert.equal(isAllowedCookie({ domain: '.example.com' }), false);
+});
+
+test('background keeps secrets out of persistent extension storage', async () => {
+  const background = await readFile(new URL('../background.js', import.meta.url), 'utf8');
+  const content = await readFile(new URL('../content.js', import.meta.url), 'utf8');
+  assert.equal(/storage\.(local|sync)|localStorage|sessionStorage/.test(background), false);
+  assert.equal(/storage\.(local|sync)|localStorage|sessionStorage/.test(content), false);
+  assert.match(background, /storage\.session/);
+  assert.match(background, /indexedDB/);
+  assert.match(background, /generateKey\([\s\S]*false/);
+  assert.match(background, /requireConsoleSender\(sender\)/);
+  assert.equal(content.includes('https://xianyu.cxywjx.top'), true);
+  assert.equal(/console\.(log|debug|info|warn|error)/.test(background), false);
+});
+
+test('builds a client import payload without a transferable session secret', () => {
+  const payload = buildClientImportPayload({
+    sessionId: 'session-1',
+    deviceId: 'device_fixture_1234',
+    mode: 'sms',
+    challengeId: 'challenge-1',
+    signature: 'signature',
+  }, [
+    { name: 'unb', value: '123', domain: '.goofish.com', path: '/' },
+    { name: 'foreign', value: 'no', domain: '.example.com', path: '/' },
+  ], 'Browser UA');
+  assert.equal(payload.cookies.length, 1);
+  assert.equal(payload.session_token, undefined);
+  assert.equal(payload.device_id, 'device_fixture_1234');
+  assert.equal(
+    canonicalJson({ z: 1, a: { y: 2, x: 3 } }),
+    '{"a":{"x":3,"y":2},"z":1}',
+  );
+});
+
+test('fingerprints allowed Cookie state so renewal cannot submit a stale baseline', () => {
+  const baseline = cookieFingerprint([
+    { name: 'unb', value: '1', domain: '.goofish.com' },
+    { name: 'cookie2', value: 'old', domain: '.goofish.com' },
+  ]);
+  const renewed = cookieFingerprint([
+    { name: 'unb', value: '1', domain: '.goofish.com' },
+    { name: 'cookie2', value: 'new', domain: '.goofish.com' },
+  ]);
+  assert.notEqual(baseline, renewed);
 });

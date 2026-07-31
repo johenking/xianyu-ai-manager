@@ -320,19 +320,8 @@ class OfficialPasswordLoginBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(manager.add_calls), 1)
         self.assertEqual(len(manager.replace_calls), 1)
 
-    async def test_manual_session_refresh_reserves_the_account_before_scheduling(self):
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def run_refresh(*args, **kwargs):
-            del args, kwargs
-            started.set()
-            await release.wait()
-            return True
-
-        live = SimpleNamespace(
-            _try_password_login_refresh=AsyncMock(side_effect=run_refresh),
-        )
+    async def test_manual_session_refresh_requires_bound_client_device_without_server_browser(self):
+        live = SimpleNamespace(_try_password_login_refresh=AsyncMock())
         fake_db = SimpleNamespace(
             get_all_cookies=lambda user_id: {"legacy-account": "unb=stable-unb"},
             get_cookie_details=lambda cookie_id: {
@@ -352,31 +341,28 @@ class OfficialPasswordLoginBackendTests(unittest.IsolatedAsyncioTestCase):
                 "expires_at": None,
                 "updated_at": None,
             },
+            update_account_session_refresh=lambda *args, **kwargs: True,
+            create_client_renewal_task=unittest.mock.Mock(
+                side_effect=__import__('client_browser_login').ClientBrowserError(
+                    'binding required',
+                    error_code='client_device_binding_required',
+                    http_status=409,
+                )
+            ),
         )
 
         with (
             patch.object(reply_server, "db_manager", fake_db),
-            patch("XianyuAutoAsync.XianyuLive.get_instance", return_value=live),
-            patch.object(reply_server.cookie_manager, "manager", SimpleNamespace(loop=asyncio.get_running_loop())),
         ):
-            first = await reply_server.refresh_account_session(
-                "legacy-account",
-                current_user={"user_id": 1, "username": "admin"},
-            )
-            await started.wait()
-            second = await reply_server.refresh_account_session(
+            result = await reply_server.refresh_account_session(
                 "legacy-account",
                 current_user={"user_id": 1, "username": "admin"},
             )
 
-        self.assertEqual(first["message"], "已开始一次验证")
-        self.assertEqual(second["message"], "Cookie 刷新已经在进行中")
-        live._try_password_login_refresh.assert_awaited_once_with(
-            "手动立即刷新",
-            reuse_active_registration=True,
-        )
-        release.set()
-        await asyncio.sleep(0)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "client_device_binding_required")
+        fake_db.create_client_renewal_task.assert_called_once()
+        live._try_password_login_refresh.assert_not_awaited()
 
 
 if __name__ == "__main__":

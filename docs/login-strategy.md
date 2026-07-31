@@ -2,20 +2,23 @@
 
 ## 最终结论
 
-添加账号的“扫码”面板默认使用网页二维码：`utils/qr_login.py` 从闲鱼官方接口取得 `codeContent`，并在后端本地渲染为 PNG Data URL。扫码后仍由同一个服务器 Chrome 会话承接官方页面；页面跳转、原标签关闭或新标签打开都不会提前结束登录。平台要求手机继续扫码时，控制台展示可扫码验证图；出现滑块、人脸、短信或未知交互风控时，控制台展示同一会话的实时页面并把用户操作回传给该会话。只有消息 Token 验证和账号 Cookie 落库都成功后才关闭浏览器并显示成功。
+扫码面板有两个并列的主要入口。`当前设备浏览器登录` 通过 Chrome/Edge 扩展桥接，在用户自己的浏览器中打开官方页面；QR、短信、密码、滑块、人脸和未知交互验证都在该浏览器中完成，普通用户路径在服务 Mac 上启动零个 Chrome。`网页二维码` 只调用官方二维码接口并在控制台渲染；扫码后的 `mobile_scan` 或其他交互风控会提示用户回到当前设备浏览器，不启动服务端浏览器。
 
-只有通过账号密码官方登录，并保存了格式有效的登录账号和加密密码时，账号才具备自动续期能力。扫码、手机号验证码、用户 Chrome 扩展和手填 Cookie 到期后进入 `manual_reauth_required`，账号页显示对应的人工重登入口，不重复启动隐藏浏览器。
+只有平台 Token 真实验证、`unb` 身份匹配、Cookie 持久化和账号列表确认全部完成后，当前设备扩展才关闭官方标签页并显示成功。隐藏或关闭添加账号弹窗不会终止轮询，也不会把页面关闭当作成功。扩展缺失、来源不匹配或设备注册失败时，不创建服务端登录会话，并提供安装/刷新和网页二维码回退。
 
-自动续期、二维码验证接力和手机号验证码登录使用服务端安装版 Chrome，浏览器通道为 `chrome`。系统为每个闲鱼 `unb` 使用独立的 `browser_data/user_<unb>` 档案，不读取或污染用户的日常 Chrome Profile。远程用户在站内交互面板完成官方页面要求的短信、扫码、滑块、人脸或其他风控；管理员在服务 Mac 的回环控制台仍可显式显示同一 Chrome 窗口。
+服务器 Chrome 只保留为“服务器运维登录”高级入口。它要求管理员身份、服务 Mac 回环请求和两次确认，使用隔离 Profile，不复用管理员日常 Chrome；普通用户和公网请求不能调用它。手动 Cookie 与手动配对仍是高级人工导入方式。
+
+账号密码成功登录后，自动续期必须由用户再次明确授权并绑定一个当前设备。账号密码、验证码和风控输入不经过控制台，也不会自动保存。
 
 ## 登录方式
 
 | 登录来源 | 实现 | 自动续期 | 到期后的操作 | 主要限制 |
 |---|---|---:|---|---|
-| `qr` | 官方二维码 API 返回 `codeContent`；扫码后的官方 Chrome 验证页在同一网页会话中继续操作 | 否 | 重新扫码 | 手机扫码型风控展示可扫码图片；滑块、人脸和未知交互在站内实时页面完成 |
-| `password` | 安装版 Chrome 打开官方登录页，凭据使用独立密钥加密保存 | 是 | 自动续期失败后重新账号密码登录 | 密码错误、短信、人脸和页面变化在同一会话中人工处理 |
-| `sms_window` | 服务端 Chrome 打开官方登录页，用户在站内实时页面收码并输入 | 否 | 重新验证码登录 | 验证码只进入当前浏览器会话；窗口最多等待 15 分钟 |
-| `chrome_extension` | 用户主动从自己的日常 Chrome Cookie Store 导入固定正式 HTTPS 控制台 | 否 | 重新导入 | 协议 v2、高熵 Token、五分钟、单次使用，扩展不持久化配对凭据或 Cookie |
+| `qr` | 当前设备扩展桥接打开官方页面；网页二维码作为独立入口 | 否 | 重新扫码或回当前设备浏览器 | 所有扫码后风控在用户浏览器完成；网页二维码本身不启动服务端 Chrome |
+| `password` | 当前设备 Chrome/Edge 官方页面完成登录，成功后可单独授权续期 | 仅显式绑定设备后 | 当前设备重新登录 | 密码、短信、人脸和页面交互不进入控制台 |
+| `sms_window` | 当前设备 Chrome/Edge 官方页面完成手机号验证码登录 | 否 | 当前设备重新登录 | 验证码只留在用户浏览器 |
+| `chrome_extension` | 当前设备桥接或高级手动配对导入固定正式 HTTPS 控制台 | 仅显式绑定设备后 | 重新桥接或导入 | P-256 设备证明；手动配对 Token 五分钟、单次使用 |
+| `server_maintenance` | 管理员回环控制台显式打开隔离服务器 Chrome | 否 | 仅管理员运维重试 | 双确认；普通用户与公网请求拒绝 |
 | `manual_cookie` | 用户手动粘贴 Cookie | 否 | 重新填写 | 格式容易出错，生命周期不可预测 |
 | `unknown` | 迁移前保存的历史账号 | 否 | 选择一种登录方式 | 缺少可信来源，不能推断续期能力 |
 
@@ -36,27 +39,27 @@
 
 `GET /cookies/details` 返回登录来源、时间和能力字段，但不返回密码、密码密文、完整 Cookie、Token 或官方验证 URL。`auto_refresh_supported` 必须同时满足：
 
-1. `login_method == 'password'`。
+1. 存在未撤销的当前设备续期绑定。
 2. 已保存加密密码。
 3. 登录账号非空，且不是 HTTP API 地址。
 
-仅在编辑页填写账号和密码不会改变登录来源。要取得自动续期能力，必须完整走一次账号密码官方登录并通过平台会话验证。
+仅在编辑页填写账号和密码不会改变登录来源。要取得自动续期能力，必须完整走一次账号密码官方登录、完成账号列表确认，并在五分钟内用该会话的 `login_session_id` 再次明确授权保存。
 
 ## 官方窗口登录
 
-`POST /api/official-login/sessions` 支持 `mode='qr'`、`mode='password'` 和 `mode='sms'`。手机号验证码和账号密码复用此统一会话协议；网页二维码保持 `/qr-login/*` 契约，并在扫码后的二次验证阶段接入同一套浏览器交互通道。远程短信模式提交 `show_browser:false`，管理员回环控制台可显式提交 `show_browser:true`；系统只等待官方页面产生经过验证的 Cookie，不保存或回显短信验证码。
+普通用户使用 `/api/client-browser/devices` 注册或撤销当前浏览器设备，使用 `/api/client-browser/sessions` 创建 `qr`、`sms` 或 `password` 会话，再由扩展请求挑战、提交 P-256 签名和结构化 Cookie 到 `/api/client-browser/import`。服务端会调用真实平台 Token 接口，校验 `unb` 身份并完成账号落库；`/api/client-browser/sessions/{session_id}/confirm` 只有在账号列表确认后才允许扩展关闭标签页。挑战最长 60 秒、登录会话最长 5 分钟，挑战单次使用。
 
-客户端轮询 `GET /api/official-login/sessions/{session_id}`。QR 和 SMS 统一处理 `preparing`、`waiting_user`、`verification_required`、`persisting`、`restarting_listener` 以及 `success`、`expired`、`failed`、`cancelled`、`interrupted` 终态。`required_action='interact_in_console'` 时，客户端从会话的 `image` 端点读取无缓存实时帧，并通过所有者隔离的 `interact` 端点提交归一化手势、滚动、文字或受限按键；导航后旧帧立即失效。需要时可调用 `POST .../{session_id}/show-browser`，但物理服务器窗口仍只允许管理员从回环控制台显示。隐藏账号弹窗不停止轮询，只有显式取消或切换方式才调用取消接口。兼容端点 `/official-window-login*` 仍映射到同一个会话协调器。
+网页二维码使用 `/qr-login/generate`、`/qr-login/check/{session_id}` 和 `/qr-login/cancel/{session_id}`。二维码状态进入 `continue_in_client_browser` 时，控制台显示当前设备浏览器入口；`/qr-login/continue/{session_id}` 仅保留兼容状态更新，不再为普通用户启动服务器 Chrome。取消原因限定为 `user_cancelled`、`switched_method` 或 `switched_to_extension`。
 
-浏览器工作线程始终重新选择当前未关闭的活动 Page。官方流程关闭初始标签、打开新标签或在风控页之间跳转时，监控和交互继续绑定新页面。只有真实消息 Token 校验、身份匹配、Cookie 落库以及监听器交接完成后，会话才进入 `success` 并关闭浏览器；页面文字、二维码已扫码、普通 Cookie 出现或某个 Page 关闭都不能单独判定成功。
+服务器运维登录仍使用 `/api/official-login/sessions` 及其状态、交互、显示和取消接口，但每个入口都检查管理员身份与回环来源；`show_browser:true` 只在该维护面可用。旧兼容接口遇到普通用户请求时返回 `client_browser_required`，不创建协调器会话。隐藏账号弹窗只隐藏界面，当前设备和网页二维码轮询继续。
 
-登录成功后按真实 `unb` 保存或归并账号，并把档案归档到 `browser_data/user_<unb>`；不另存 `storage_state.json`。新增 QR 会话不提供预期身份，短信重登已有账号时会绑定预期 `unb`；登录到其他账号不会覆盖原记录。服务初始化时只会最佳努力删除超过六小时的 `.login_*`、`.window_*` 和 `user_*.backup-*` 目录，正式 `user_*`、未知目录和新鲜临时目录保持不动。
+当前设备流程不依赖服务器 Page 或 Profile。扩展跟踪用户浏览器中官方标签页的跳转，只有真实 Token 验证、身份匹配、Cookie 落库和前端确认全部完成后才关闭标签页。
 
 统一 Session Probe 在首次响应明确表示 H5 Token 过期、且响应 Cookie 提供了不同的 `_m_h5_tk` 时，会先合并全部 `Set-Cookie`（包括 `x5sec`、`cookie2` 等），再用新时间戳和新签名在同一 HTTP 客户端中重试一次。没有新 Token、人工验证、身份过期或普通临时错误不重试，也不因此启动浏览器。成功合并的 Cookie 仍由调用方通过现有 compare-and-swap 保存。
 
 ## 自动续期与人工重登
 
-密码账号续期先复用 `browser_data/user_<unb>`。只有官方档案已经完全退出时，才解密保存的凭据重新登录。浏览器始终为 headed Chrome；后台续期通过把窗口放到屏幕外实现，不使用 headless Chromium。需要人工验证时会显示同一个窗口并最多等待 15 分钟。
+密码账号续期由已绑定的当前设备扩展执行。服务端先创建 60 秒一次性任务，用 P-256 ECDH/HKDF/AES-GCM 将凭据密封给该设备；设备首次领取后服务端立即清空密文，任务不能第二次领取。扩展只在内存中短暂解密并在用户浏览器打开官方页面；滑块、人脸或其他风控出现时保留非敏感任务元数据并暂停，等待用户完成后再验证 Cookie。
 
 非密码来源调用 `POST /api/accounts/{cookie_id}/session-refresh` 时，后端直接返回 `manual_reauth_required`、固定安全消息和对应 `reauth_action`，不会启动 Chrome。密码续期遇到以下终态时也进入稳定人工重登状态，CTA 固定为 `password_login`：
 
@@ -65,7 +68,7 @@
 - 人工验证或官方登录超时。
 - 官方登录页面结构失配。
 
-已进入 `manual_reauth_required` 后，账号监听进入被动等待，不再建立 WebSocket、探测消息 Token 或启动浏览器；定时刷新、运行时过期处理和手动刷新也不会重复执行。`profile_in_use`、临时浏览器错误、平台探测临时失败和用户取消仍保持可重试。成功完成对应登录后清除过期状态并恢复监听。
+已进入 `manual_reauth_required` 后，账号监听进入被动等待，不再建立 WebSocket、探测消息 Token 或启动浏览器；定时刷新、运行时过期处理和手动刷新也不会重复执行。`profile_in_use`、临时平台错误和用户取消仍保持可重试。成功完成对应登录后清除过期状态并恢复监听。
 
 `reauth_action` 可能为 `qr_login`、`sms_login`、`password_login`、`chrome_extension_import`、`manual_cookie` 或 `choose_login`。账号页按 `account_id + last_expired_at` 记录一次性提醒，同一次过期不重复弹窗；账号卡持续显示对应入口。
 
@@ -79,7 +82,7 @@ QR 会话进入 `expired` 后至少保留 5 分钟。保留期内重复轮询稳
 - `POST /qr-login/reset-cooldown/{cookie_id}`
 - `GET /qr-login/cooldown-status/{cookie_id}`
 
-登录续期只保留 `XianyuOfficialLoginService` 的安装版 headed Chrome 路径。商品、订单等非认证用途的浏览器逻辑不受此限制。
+登录续期只保留当前设备扩展路径；`XianyuOfficialLoginService` 的 headed Chrome 仅供管理员回环运维入口使用。商品、订单等非认证用途的浏览器逻辑不受此限制。
 
 官方浏览器、档案归档、QR 交接和二次验证失败只记录异常类型和固定摘要。API、日志和运行时会话注册表不得包含完整 Cookie、Token、二维码内容、密码、密码密文、短信验证码、交互文字或官方验证 URL。交互帧只保存在内存中，限制大小、队列深度和提交速率，并在会话结束时清空。
 

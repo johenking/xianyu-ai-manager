@@ -13,7 +13,7 @@ LOGIN_METHOD_LABELS = {
     "qr": "扫码登录",
     "password": "账号密码",
     "sms_window": "手机号验证码",
-    "chrome_extension": "本机 Chrome",
+    "chrome_extension": "当前设备浏览器",
     "manual_cookie": "手填 Cookie",
     "unknown": "历史登录",
 }
@@ -27,7 +27,7 @@ REAUTH_ACTIONS = {
 }
 REAUTH_MESSAGES = {
     "qr": "当前登录态需要重新扫码",
-    "password": "账号密码续期未完成，请重新登录",
+    "password": "服务器续期已停用，绑定当前设备后恢复自动续期",
     "sms_window": "当前登录态需要重新完成手机号验证码登录",
     "chrome_extension": "当前登录态需要从本机 Chrome 重新导入",
     "manual_cookie": "当前登录态需要重新填写 Cookie",
@@ -101,11 +101,14 @@ def supports_automatic_refresh(
     username: Optional[str],
     has_password: bool,
 ) -> bool:
-    return (
-        normalize_login_method(login_method) == "password"
-        and bool(has_password)
-        and is_valid_account_login_username(username)
-    )
+    """Return whether legacy server-side browser refresh may run.
+
+    Password material, a valid username, and an old enable flag are no longer
+    authority to launch Playwright on the service host. Client-device renewal
+    is evaluated separately against a verified device binding.
+    """
+    del login_method, username, has_password
+    return False
 
 
 def password_refresh_requires_manual_reauth(error_code: Optional[str]) -> bool:

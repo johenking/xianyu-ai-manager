@@ -290,13 +290,13 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- Server Chrome QR: create `{"mode":"qr","show_browser":false}` through `/api/official-login/sessions` and operate any interactive page through the owner-scoped console surface. An administrator on the service Mac loopback console may instead request `show_browser:true`.
-- Web QR (recommended for remote access): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; if secondary verification starts, the same server-Chrome session supplies either a mobile-scan image or an interactive live frame.
-- SMS or password: create a headed Chrome session through `/api/official-login/sessions`. Remote SMS uses `show_browser:false` and the live console surface; the application does not store or echo the code. Only an administrator loopback request may display the physical Chrome window.
-- User Chrome extension: create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings`, then import from the user's Chrome to the fixed production HTTPS endpoint.
+- Current-device browser: register the extension device through `/api/client-browser/devices`, create a five-minute `qr`, `sms`, or `password` session through `/api/client-browser/sessions`, then let the extension open and track the official tab in the user's Chrome/Edge. Device proof, Token validation, `unb` identity, persistence, and frontend confirmation are all required before the tab closes.
+- Web QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; `mobile_scan` keeps a scannable image while slider, face, SMS, interactive, and unknown verification hand off to a current-device session.
+- Server maintenance: `/api/official-login/sessions` is reserved for an administrator on the service Mac loopback console. It is not an ordinary-user login path, and showing a physical server window requires `show_browser:true`.
+- Advanced extension import: create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings`, then import from the user's Chrome/Edge to the fixed production HTTPS endpoint.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
-Start a local headed Chrome QR session:
+Start a server-maintenance Chrome QR session from an administrator loopback console:
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
@@ -305,7 +305,7 @@ curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
   -d '{"mode":"qr","show_browser":true}'
 ```
 
-Poll `GET /api/official-login/sessions/{session_id}`. QR and SMS clients share the same state contract: `preparing`, `waiting_user`, `verification_required`, `persisting`, `restarting_listener`, and terminal `success`, `expired`, `failed`, `cancelled`, or `interrupted`. When `required_action` is `interact_in_console`, fetch the returned no-store image with its revision and submit bounded pointer, wheel, text, or safe-key actions to `POST /api/official-login/sessions/{session_id}/interact`; a navigation or newer frame invalidates the old revision. Only an administrator loopback request may show the physical window through `POST .../show-browser`. Cancel through `POST .../cancel`. Starting a new account leaves `expected_unb` empty; the validated platform `unb` selects the created or existing account row.
+Poll `GET /api/official-login/sessions/{session_id}` only for this maintenance flow. The endpoint and all physical-window controls require administrator loopback access. Ordinary users use `/api/client-browser/sessions` and never create a server-side browser.
 
 Start the web QR session:
 
@@ -314,9 +314,11 @@ curl -sS -X POST "$BASE_URL/qr-login/generate" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Poll `GET /qr-login/check/{session_id}`. Ordinary generation and scanning do not start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification continue in the same server-Chrome session: fetch the revisioned no-store frame and submit bounded actions to `POST /qr-login/interact/{session_id}`. The Chrome extension remains an explicit advanced import option and is not an automatic QR fallback. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
+Poll `GET /qr-login/check/{session_id}`. Generation and scanning never start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification return `continue_in_client_browser`; end the web QR with `switched_to_extension` and create a current-device `qr` session. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
 
-Start a remote SMS session without collecting the code in the application:
+The old remote SMS example below is server-maintenance-only. Ordinary SMS login
+is started by the console's current-device bridge and the code is entered only
+in the user's Chrome/Edge.
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \

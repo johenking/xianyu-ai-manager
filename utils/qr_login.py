@@ -417,19 +417,36 @@ class QRLoginManager:
 
         except GetLoginQRCodeError as exc:
             logger.warning("二维码生成失败: {}", exc)
-            return {'success': False, 'message': str(exc)}
+            return {
+                'success': False,
+                'error_code': 'qr_upstream_invalid_response',
+                'retryable': True,
+                'message': str(exc),
+            }
         except httpx.ConnectTimeout:
             logger.error("二维码接口连接超时")
-            return {'success': False, 'message': f'连接超时，请检查网络或尝试使用代理'}
+            return {
+                'success': False, 'error_code': 'qr_upstream_connect_timeout',
+                'retryable': True, 'message': '二维码服务连接超时，请原地重试',
+            }
         except httpx.ReadTimeout:
             logger.error("二维码接口读取超时")
-            return {'success': False, 'message': f'读取超时，服务器响应过慢'}
+            return {
+                'success': False, 'error_code': 'qr_upstream_read_timeout',
+                'retryable': True, 'message': '二维码服务响应超时，请原地重试',
+            }
         except httpx.ConnectError:
             logger.error("二维码接口连接错误")
-            return {'success': False, 'message': f'连接错误，请检查网络或代理设置'}
+            return {
+                'success': False, 'error_code': 'qr_upstream_unreachable',
+                'retryable': True, 'message': '二维码服务暂时不可达，请原地重试',
+            }
         except Exception as exc:
             logger.error("二维码生成过程中发生异常: {}", type(exc).__name__)
-            return {'success': False, 'message': '生成二维码失败，请稍后重试'}
+            return {
+                'success': False, 'error_code': 'qr_generation_failed',
+                'retryable': True, 'message': '生成二维码失败，请原地重试',
+            }
 
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
@@ -492,11 +509,10 @@ class QRLoginManager:
             session.verification_browser_status = None
             session.verification_error = None
             session.verification_kind = ""
-            session.required_action = "render_verification"
+            session.required_action = "continue_in_client_browser"
             session.error_code = result.error_code
-            session.message = "闲鱼要求完成安全验证，正在识别验证方式"
+            session.message = "闲鱼要求安全验证，请在当前设备浏览器继续"
             session.validated = False
-            self._ensure_verification_browser(session.session_id)
             return False
 
         self._mark_terminal(
@@ -567,10 +583,9 @@ class QRLoginManager:
                             session.verification_browser_status = None
                             session.verification_error = None
                             session.verification_kind = ""
-                            session.required_action = "render_verification"
-                            session.message = '闲鱼要求完成安全验证，正在识别验证方式'
-                            self._ensure_verification_browser(session_id)
-                            logger.warning(f"账号被风控，需要手机验证: {session_id}, 已保存验证链接")
+                            session.required_action = "continue_in_client_browser"
+                            session.message = '闲鱼要求安全验证，请在当前设备浏览器继续'
+                            logger.warning(f"账号被风控，需要客户设备继续验证: {session_id}")
                             break
                         else:
                             # 先收集扫码 Cookie，再通过真实消息会话接口校验。
@@ -827,7 +842,8 @@ class QRLoginManager:
             self._cleanup_verification_artifacts(session)
             return {'status': 'expired', 'message': '二维码已过期，请重新扫码'}
 
-        self._ensure_verification_browser(session_id)
+        session.required_action = "continue_in_client_browser"
+        session.message = '请在当前设备浏览器继续完成安全验证'
         return self.get_session_status(session_id)
 
     def cancel_session(
