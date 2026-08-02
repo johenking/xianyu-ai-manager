@@ -8,6 +8,7 @@
 - 前端：状态机覆盖检测助手、打开 Chrome、等待用户、验证、确认账号和成功；成功确认后才调用助手关闭官方标签页；主路径不发送 `XMC_GET_DEVICE`。
 - 最终本地门禁：Ruff 通过；后端 `746 tests`；前端 `24 files / 153 tests`；扩展 `11 tests`；npm audit 0 vulnerabilities；TypeScript、生产构建、静态保留、扩展包和 `git diff --check` 均通过。
 - macOS 包：标准 `onedir` `.app` 启动约 1.76 秒，只监听 `127.0.0.1`；`codesign --verify --deep --strict` 通过，版本化 ZIP 已生成。当前仅 ad-hoc 签名，Developer ID 公证仍是大众分发门禁。
-- Windows 包：原生 Windows workflow、PyInstaller 规格和 DPAPI 测试已就绪；真实 `.exe.zip` 必须由 Windows runner 构建并下载验证后才进入正式静态下载目录。
-- 生产基线：单 worker ready，迁移 `2026073101`，SQLite integrity `ok`；部署前必须新建完整代码/数据库/静态/配置/助手回滚单元。
-- 剩余门禁：Windows 原生产物、完整回滚与正式部署、普通用户电脑真实登录金丝雀、macOS Developer ID/公证和 Windows Authenticode。
+- Windows 包：GitHub Windows runner 已构建真实 x64 `.exe.zip`；ZIP、PE32+/COFF 和 PyInstaller 归档结构均已验证，SHA-256 为 `8c492863e1d74c86e34f38ba4f20fe6eab60ef38136468c7e81323765bc3d50a`。
+- 正式部署：`1.10.4` 已部署到正式单 worker，迁移 `2026080101`、SQLite integrity `ok`；本地与公网 HTTP/2 readiness、OpenAPI、HTML 入口、静态资源、macOS/Windows 助手包和扩展包均已验证。
+- 回滚：完整原子回滚单元位于 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146`；应用和隧道两份脚本的语法与 `--check` 均通过。
+- 剩余门禁：普通用户电脑真实登录金丝雀、macOS Developer ID/公证和 Windows Authenticode。

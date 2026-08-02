@@ -637,8 +637,36 @@ The standard macOS `.app` started in about 1.76 seconds, listened only on
 `127.0.0.1`, returned helper version `1.0.1`, and passed deep strict bundle
 verification.
 
-The macOS candidate is ad-hoc signed because this machine has no Developer ID or
-notarization credential. The Windows native workflow exists but its actual
-`.exe.zip` must be built and verified on a Windows runner. These signing gates,
-formal deployment, and a real user-account canary remain separate from the local
-automated evidence above.
+GitHub CI run `30729570218` and native package run `30729574347` passed for
+`012db7495c0180a312b60055a09dea388397e40c`. The Windows runner produced a real
+x64 PE executable; its ZIP SHA-256 is
+`8c492863e1d74c86e34f38ba4f20fe6eab60ef38136468c7e81323765bc3d50a`.
+The macOS CI ZIP SHA-256 is
+`bf9952e3771e946101cfb7dc40d9fd5882dd14de67002717afe78e49cf450f1c`;
+the downloaded app passed strict deep verification, started from the public ZIP,
+listened only on loopback, and accepted the production console Origin with PNA
+headers. macOS remains ad-hoc signed, and Windows remains unsigned.
+
+The first production rollout passed every local gate but the public tunnel
+returned HTTP/2 `530/1033`, so the complete application rollback ran immediately
+and restored version `1.10.3`, migration `2026073101`, SQLite integrity, static
+assets, and the single worker. The public failure persisted after rollback.
+Tunnel prechecks showed QUIC available while TCP 7844 was blocked; the dedicated
+LaunchAgent was switched from HTTP/2 to QUIC after a temporary connector proved
+two registered edge connections and public HTTP 200. Its separate rollback script
+is retained with the application rollback unit.
+
+The second rollout deployed the exact `012db74` source tree, migration
+`2026080101`, the 36-asset production generation, the versioned macOS and Windows
+helper ZIPs, and extension `1.2.1`. The production checkout uses local merge
+commit `a8caed4` only to preserve the pre-existing production candidate history;
+its source tree has zero file differences from `origin/main@012db74`. Local and
+public readiness, OpenAPI `1.10.4`, HTML entry `assets/index-B3_Qlwcs.js`, all
+three public package hashes, SQLite integrity, one listener, repeated public
+HTTP/2 samples, and both rollback checks passed. The complete record is
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146/verification.md`.
+
+The remaining live-provider gate is a real ordinary-user login from that user's
+computer: start the downloaded helper, let it open that user's Chrome, complete
+the platform verification, verify Token and `unb`, confirm the persisted account
+in the frontend, and confirm only the helper-owned tab closes.
