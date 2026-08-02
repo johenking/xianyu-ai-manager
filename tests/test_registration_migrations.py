@@ -155,6 +155,21 @@ class RegistrationMigrationTests(unittest.TestCase):
         )
         connection.close()
 
+    def test_native_helper_transport_migration_skips_a_legacy_database_without_devices(self):
+        connection = sqlite3.connect(self.db_path)
+        runner = MigrationRunner(connection, str(self.db_path), backup_enabled=False)
+
+        applied = runner.run()
+
+        self.assertIn(EXPECTED_LATEST_MIGRATION, applied)
+        self.assertFalse(
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'client_browser_devices'"
+            ).fetchone()
+        )
+        connection.close()
+
     def tearDown(self):
         for key, previous in self.previous_environment.items():
             if previous is None:

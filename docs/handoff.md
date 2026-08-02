@@ -573,3 +573,72 @@ Deployment and live-account behavior were verified on 2026-07-17; release gates 
 - Complete password-reset acceptance with two old sessions: verify the email code before entering a new password, consume the in-memory grant, confirm both old sessions are rejected, confirm replay and the old password fail, and verify the new password through both username and email login.
 - Keep Skill schedules default off and keep account-level scheduled Cookie refresh off unless an operator explicitly needs preventive renewal.
 - Keep monitoring official page, SMTP, AI-provider, and notification changes; do not weaken human verification, rate limits, or secret-handling boundaries to improve automation rates.
+
+## v1.10.3 Local Browser Login Deployment On 2026-08-01
+
+The main current-device browser button now performs the bridge handshake, device
+registration, session creation, and `XMC_START_LOGIN` in one flow. The extension
+opens the official login URL in the user's existing browser profile, focuses and
+reuses an active session tab when possible, and closes the official tab only after
+the backend import and frontend confirmation succeed. Extension detection remains
+diagnostic; web QR remains a separate fallback.
+
+Temporary probe, cookie persistence, and listener handoff failures now persist as
+retryable `failed` states with the original error code and login state retained.
+The refresh loop converts stale retryable `action_required` rows back to `failed`
+and continues on the next due probe; expiry, explicit human verification, and
+identity mismatch remain manual handling states.
+
+Local gates passed with 720 backend tests, 153 frontend tests, 11 extension
+tests, type checking, Ruff, production build and build verification, extension
+package verification, Python compilation, and `git diff --check`. The production
+LaunchAgent is a single worker on port 8091; local and public readiness both
+return HTTP 200 with migration `2026073101`. The deployed frontend entry and CSS
+match local/public responses byte-for-byte, and both versioned extension ZIPs
+return HTTP 200 with matching hashes.
+
+The complete rollback unit is outside the repository at
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/client-browser-login-20260801-011335`.
+It contains the pre-deploy source archive, SQLite and runtime data snapshots,
+browser profiles, prior static assets, patch/diff files, `verification.md`, and
+`rollback.sh`. The rollback script passed syntax and `--check`; no live account
+login was performed during deployment, so the remaining real-platform gate is a
+manual user canary after the one-time extension installation.
+
+After deployment, the existing HTTP/2 Cloudflare tunnel briefly returned 502/530
+while its edge connections cycled. A reversible LaunchAgent `kickstart` restored
+the two connections; the following low-frequency local/public readiness sample
+was 10/10 HTTP 200 with `ready` and migration `2026073101`. The application
+process, database, static files, and rollback unit were unchanged by this tunnel
+reload.
+
+## v1.10.4 User-Machine Native Helper Candidate On 2026-08-02
+
+The primary “本机 Chrome 登录” path now calls a loopback native helper on the
+user's own macOS or Windows computer. The helper creates and owns one official
+Chrome/Edge target, watches the resulting page and platform-domain Cookies, and
+submits them directly to the existing one-time P-256 device-proof protocol. The
+frontend never receives Cookie, password, verification-code, or Token material.
+Extension import and web QR remain independent entries.
+
+An existing remote-debugging browser keeps its prior pages and process. Without
+one, the helper starts an application-managed Profile on the user's computer and
+releases that browser after confirmation or cancellation. The server verifies a
+real message Token, Cookie identity, `unb`, and User-Agent before persistence. A
+temporary Token or persistence failure returns to `waiting_user` and retries with
+a fresh challenge; replayed, expired, transport-confused, and identity-mismatched
+submissions remain rejected.
+
+Final local gates passed with Ruff, 746 backend tests, 24 frontend files with 153
+tests, 11 extension tests, TypeScript, npm audit, production build, build/static
+verification, extension-package verification, and `git diff --check`. Real Chrome
+smokes covered both an application-managed Profile and an existing CDP endpoint.
+The standard macOS `.app` started in about 1.76 seconds, listened only on
+`127.0.0.1`, returned helper version `1.0.1`, and passed deep strict bundle
+verification.
+
+The macOS candidate is ad-hoc signed because this machine has no Developer ID or
+notarization credential. The Windows native workflow exists but its actual
+`.exe.zip` must be built and verified on a Windows runner. These signing gates,
+formal deployment, and a real user-account canary remain separate from the local
+automated evidence above.

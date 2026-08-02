@@ -1483,6 +1483,51 @@ def _client_browser_devices_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _client_browser_device_transport_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Track whether a device is the browser extension or native helper."""
+    columns = {
+        str(row[1])
+        for row in cursor.execute(
+            "PRAGMA table_info(client_browser_devices)"
+        ).fetchall()
+    }
+    if not columns:
+        return
+    if "client_type" not in columns:
+        cursor.execute(
+            "ALTER TABLE client_browser_devices ADD COLUMN "
+            "client_type TEXT NOT NULL DEFAULT 'extension'"
+        )
+    cursor.execute(
+        "UPDATE client_browser_devices SET client_type = 'extension' "
+        "WHERE client_type IS NULL OR client_type = ''"
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_client_browser_device_type_insert
+        BEFORE INSERT ON client_browser_devices
+        WHEN NEW.client_type NOT IN ('extension', 'native_helper')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid client browser device type');
+        END
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_client_browser_device_type_update
+        BEFORE UPDATE OF client_type ON client_browser_devices
+        WHEN NEW.client_type NOT IN ('extension', 'native_helper')
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid client browser device type');
+        END
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_client_browser_devices_type "
+        "ON client_browser_devices(user_id, client_type, revoked_at)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1579,6 +1624,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026073101",
         "client_browser_devices_v1",
         _client_browser_devices_v1,
+    ),
+    Migration(
+        "2026080101",
+        "client_browser_device_transport_v1",
+        _client_browser_device_transport_v1,
     ),
 )
 

@@ -8,7 +8,7 @@
 
 ## 安装
 
-1. 解压 `dist/xianyu-cookie-importer.zip`。
+1. 解压 `dist/xianyu-browser-bridge-1.2.1.zip`。
 2. 在 Chrome 打开 `chrome://extensions`，或在 Edge 打开 `edge://extensions`，开启开发者模式。
 3. 点击“加载已解压的扩展程序”，选择解压后的目录。
 4. 打开咸鱼监控台并保持登录；普通 QR、手机号和密码流程会自动通过扩展打开当前设备的官方标签页。
@@ -22,6 +22,6 @@ Token 和账号 `unb`，并在账号落库后等待控制台确认，确认完�
 ## 构建与校验
 
 在 `frontend/` 目录运行 `npm run build:extension`，会以固定文件顺序和时间戳生成
-`dist/xianyu-cookie-importer.zip`，并复制同一字节流到
+`dist/xianyu-browser-bridge-1.2.1.zip`，并复制同一字节流到版本化公开地址和兼容地址
 `static/downloads/xianyu-cookie-importer.zip`。随后运行 `npm run verify:extension`
-校验扩展源码与两个归档的 SHA-256 一致性。
+解包校验三个归档的 12 个必需文件、Manifest 版本和逐文件 SHA-256。

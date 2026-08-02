@@ -4,6 +4,52 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [1.10.4] - 2026-08-01
+
+### Added
+
+- Add the user-machine native browser helper for macOS and Windows. The
+  loopback helper starts or attaches to the user's Chrome/Edge, opens the
+  official login page, reads only the resulting browser session through CDP,
+  and submits the existing signed one-time proof flow.
+- Add `client_type` transport isolation and migration `2026080101`; existing
+  devices default to `extension`, while native-helper imports are recorded as
+  `native_helper`.
+- Add versioned native-helper source bundle and platform packaging specs.
+- Add strict loopback Origin checks, Chrome Local Network Access response headers,
+  macOS Keychain and Windows DPAPI device-key storage, and separate macOS/Windows
+  download artifacts.
+
+### Changed
+
+- Make “本机 Chrome 登录” the main console path. Extension import remains a
+  separate advanced entry, and web QR remains an independent fallback.
+- Native-helper login closes its official tab only after server persistence and
+  frontend account confirmation.
+- Create a helper-owned CDP target without navigating or closing an existing user
+  tab, filter imported Cookies to platform domains, and release a managed Chrome
+  process after its final helper-owned target closes.
+- Keep retryable Token probes and temporary account-persistence failures in the
+  same login session while requiring a fresh one-time device challenge.
+
+## [1.10.3] - 2026-07-31
+
+### Fixed
+
+- Distinguish an installed browser from the required current-device login
+  extension and report missing, outdated, uninjected, initialization, expired
+  authentication, registration-conflict, and connected states separately.
+- Reinject the idempotent console bridge into already-open production tabs on
+  extension install, update, or browser startup, then redetect automatically.
+- Publish a versioned extension archive and unpack-verify all 12 required files
+  so mutually matching stale archives cannot pass the release gate.
+
+### Changed
+
+- Keep current-device browser login and web QR as parallel primary choices;
+  the install guide now explains the unpacked-extension workflow and preserves
+  web QR when the extension is absent.
+
 ## [1.10.2] - 2026-07-31
 
 ### Added

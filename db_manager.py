@@ -57,6 +57,7 @@ from client_browser_login import (
     RENEWAL_TASK_TTL_SECONDS,
     ClientBrowserError,
     normalize_browser_family,
+    normalize_client_type,
     normalize_device_id,
     normalize_public_jwk,
     seal_renewal_credential,
@@ -2945,16 +2946,19 @@ class DBManager:
         display_name: str,
         signing_public_jwk: Dict[str, Any],
         encryption_public_jwk: Dict[str, Any],
+        client_type: str = "extension",
     ) -> Dict[str, Any]:
         normalized_device_id = normalize_device_id(device_id)
         normalized_family = normalize_browser_family(browser_family)
+        normalized_client_type = normalize_client_type(client_type)
         signing_jwk = normalize_public_jwk(signing_public_jwk)
         encryption_jwk = normalize_public_jwk(encryption_public_jwk)
         now = time.time()
         with self.lock:
             cursor = self.conn.cursor()
             existing = cursor.execute(
-                "SELECT user_id, signing_public_jwk, encryption_public_jwk, revoked_at "
+                "SELECT user_id, signing_public_jwk, encryption_public_jwk, "
+                "revoked_at, client_type "
                 "FROM client_browser_devices WHERE device_id = ?",
                 (normalized_device_id,),
             ).fetchone()
@@ -2979,16 +2983,24 @@ class DBManager:
                     error_code="device_key_mismatch",
                     http_status=409,
                 )
+            if existing and str(existing[4] or "extension") != normalized_client_type:
+                raise ClientBrowserError(
+                    "设备连接类型与已注册记录不匹配，请生成新的设备连接",
+                    error_code="device_type_mismatch",
+                    http_status=409,
+                )
             cursor.execute(
                 """
                 INSERT INTO client_browser_devices (
                     device_id, user_id, browser_family, display_name,
+                    client_type,
                     signing_public_jwk, encryption_public_jwk,
                     registered_at, last_seen_at, revoked_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(device_id) DO UPDATE SET
                     browser_family = excluded.browser_family,
                     display_name = excluded.display_name,
+                    client_type = excluded.client_type,
                     last_seen_at = excluded.last_seen_at,
                     revoked_at = NULL
                 WHERE client_browser_devices.user_id = excluded.user_id
@@ -2998,6 +3010,7 @@ class DBManager:
                     int(user_id),
                     normalized_family,
                     str(display_name or "当前设备").strip()[:80],
+                    normalized_client_type,
                     serialized_signing,
                     serialized_encryption,
                     now,
@@ -3008,6 +3021,7 @@ class DBManager:
         return {
             "device_id": normalized_device_id,
             "browser_family": normalized_family,
+            "client_type": normalized_client_type,
             "display_name": str(display_name or "当前设备").strip()[:80],
             "last_seen_at": now,
             "revoked": False,
@@ -3024,7 +3038,7 @@ class DBManager:
         with self.lock:
             row = self.conn.execute(
                 """
-                SELECT device_id, browser_family, display_name, registered_at,
+                SELECT device_id, browser_family, client_type, display_name, registered_at,
                        last_seen_at, revoked_at, signing_public_jwk,
                        encryption_public_jwk
                 FROM client_browser_devices
@@ -3037,22 +3051,23 @@ class DBManager:
         result = {
             "device_id": row[0],
             "browser_family": row[1],
-            "display_name": row[2],
-            "registered_at": row[3],
-            "last_seen_at": row[4],
-            "revoked_at": row[5],
-            "revoked": row[5] is not None,
+            "client_type": row[2],
+            "display_name": row[3],
+            "registered_at": row[4],
+            "last_seen_at": row[5],
+            "revoked_at": row[6],
+            "revoked": row[6] is not None,
         }
         if include_public_keys:
-            result["signing_public_jwk"] = json.loads(row[6])
-            result["encryption_public_jwk"] = json.loads(row[7])
+            result["signing_public_jwk"] = json.loads(row[7])
+            result["encryption_public_jwk"] = json.loads(row[8])
         return result
 
     def list_client_browser_devices(self, user_id: int) -> List[Dict[str, Any]]:
         with self.lock:
             rows = self.conn.execute(
                 """
-                SELECT device_id, browser_family, display_name, registered_at,
+                SELECT device_id, browser_family, client_type, display_name, registered_at,
                        last_seen_at, revoked_at
                 FROM client_browser_devices
                 WHERE user_id = ?
@@ -3064,11 +3079,12 @@ class DBManager:
             {
                 "device_id": row[0],
                 "browser_family": row[1],
-                "display_name": row[2],
-                "registered_at": row[3],
-                "last_seen_at": row[4],
-                "revoked_at": row[5],
-                "revoked": row[5] is not None,
+                "client_type": row[2],
+                "display_name": row[3],
+                "registered_at": row[4],
+                "last_seen_at": row[5],
+                "revoked_at": row[6],
+                "revoked": row[6] is not None,
             }
             for row in rows
         ]
@@ -3083,7 +3099,7 @@ class DBManager:
         with self.lock:
             row = self.conn.execute(
                 """
-                SELECT user_id, device_id, browser_family, display_name,
+                SELECT user_id, device_id, browser_family, client_type, display_name,
                        registered_at, last_seen_at, signing_public_jwk,
                        encryption_public_jwk
                 FROM client_browser_devices
@@ -3097,13 +3113,14 @@ class DBManager:
             "user_id": int(row[0]),
             "device_id": row[1],
             "browser_family": row[2],
-            "display_name": row[3],
-            "registered_at": row[4],
-            "last_seen_at": row[5],
+            "client_type": row[3],
+            "display_name": row[4],
+            "registered_at": row[5],
+            "last_seen_at": row[6],
         }
         if include_public_keys:
-            result["signing_public_jwk"] = json.loads(row[6])
-            result["encryption_public_jwk"] = json.loads(row[7])
+            result["signing_public_jwk"] = json.loads(row[7])
+            result["encryption_public_jwk"] = json.loads(row[8])
         return result
 
     def get_account_renewal_binding(
@@ -3116,7 +3133,7 @@ class DBManager:
             row = self.conn.execute(
                 """
                 SELECT b.device_id, b.credential_authorized_at, b.bound_at,
-                       d.browser_family, d.display_name, d.last_seen_at
+                       d.browser_family, d.client_type, d.display_name, d.last_seen_at
                 FROM account_renewal_bindings AS b
                 JOIN client_browser_devices AS d
                   ON d.device_id = b.device_id AND d.user_id = b.user_id
@@ -3132,8 +3149,9 @@ class DBManager:
             "credential_authorized_at": row[1],
             "bound_at": row[2],
             "browser_family": row[3],
-            "display_name": row[4],
-            "last_seen_at": row[5],
+            "client_type": row[4],
+            "display_name": row[5],
+            "last_seen_at": row[6],
         }
 
     def touch_client_browser_device(self, *, user_id: int, device_id: str) -> bool:
@@ -3204,7 +3222,8 @@ class DBManager:
             ).fetchone()
             device = cursor.execute(
                 "SELECT 1 FROM client_browser_devices WHERE device_id = ? "
-                "AND user_id = ? AND revoked_at IS NULL",
+                "AND user_id = ? AND revoked_at IS NULL "
+                "AND client_type = 'extension'",
                 (normalized_device_id, int(user_id)),
             ).fetchone()
             if not owned or not device:
@@ -3271,6 +3290,7 @@ class DBManager:
                   ON d.device_id = b.device_id AND d.user_id = b.user_id
                 WHERE c.id = ? AND c.user_id = ? AND c.cookie_refresh_enabled = 1
                   AND b.revoked_at IS NULL AND d.revoked_at IS NULL
+                  AND d.client_type = 'extension'
                 """,
                 (cookie_id, int(user_id)),
             ).fetchone()

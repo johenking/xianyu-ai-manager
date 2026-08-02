@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import shutil
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE_ARCHIVE = ROOT / "dist" / "xianyu-cookie-importer.zip"
-PUBLIC_ARCHIVE = ROOT.parent / "static" / "downloads" / SOURCE_ARCHIVE.name
+EXTENSION_VERSION = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))["version"]
+ARCHIVE_NAME = f"xianyu-browser-bridge-{EXTENSION_VERSION}.zip"
+SOURCE_ARCHIVE = ROOT / "dist" / ARCHIVE_NAME
+PUBLIC_ARCHIVE = ROOT.parent / "static" / "downloads" / ARCHIVE_NAME
+COMPATIBILITY_ARCHIVE = ROOT.parent / "static" / "downloads" / "xianyu-cookie-importer.zip"
 PACKAGE_FILES = (
     "manifest.json",
     "popup.html",
@@ -40,6 +44,7 @@ def build_archive() -> None:
             archive.writestr(info, source.read_bytes(), compresslevel=9)
 
     shutil.copyfile(SOURCE_ARCHIVE, PUBLIC_ARCHIVE)
+    shutil.copyfile(SOURCE_ARCHIVE, COMPATIBILITY_ARCHIVE)
 
 
 if __name__ == "__main__":

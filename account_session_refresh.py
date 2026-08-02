@@ -6,7 +6,7 @@ from utils.verification_images import remove_private_verification_image
 
 
 LOGIN_METHODS = {
-    "qr", "password", "sms_window", "chrome_extension",
+    "qr", "password", "sms_window", "chrome_extension", "native_helper",
     "manual_cookie", "unknown",
 }
 LOGIN_METHOD_LABELS = {
@@ -14,6 +14,7 @@ LOGIN_METHOD_LABELS = {
     "password": "账号密码",
     "sms_window": "手机号验证码",
     "chrome_extension": "当前设备浏览器",
+    "native_helper": "本机 Chrome",
     "manual_cookie": "手填 Cookie",
     "unknown": "历史登录",
 }
@@ -22,6 +23,7 @@ REAUTH_ACTIONS = {
     "password": "password_login",
     "sms_window": "sms_login",
     "chrome_extension": "chrome_extension_import",
+    "native_helper": "chrome_extension_import",
     "manual_cookie": "manual_cookie",
     "unknown": "choose_login",
 }
@@ -30,6 +32,7 @@ REAUTH_MESSAGES = {
     "password": "服务器续期已停用，绑定当前设备后恢复自动续期",
     "sms_window": "当前登录态需要重新完成手机号验证码登录",
     "chrome_extension": "当前登录态需要从本机 Chrome 重新导入",
+    "native_helper": "当前登录态需要从本机 Chrome 重新导入",
     "manual_cookie": "当前登录态需要重新填写 Cookie",
     "unknown": "当前登录态需要重新登录",
 }
@@ -63,6 +66,23 @@ OFFICIAL_LOGIN_ERROR_MESSAGES = {
     "session_probe_retryable": "平台状态检查出现临时异常，请稍后重试",
     "cancelled": "闲鱼官方登录会话已取消",
 }
+
+# These failures describe a transient provider or persistence problem. They
+# must remain retryable instead of being routed into the manual-verification
+# workflow, including after a process restart.
+RETRYABLE_SESSION_ERROR_CODES = {
+    "probe_retryable_error",
+    "session_probe_retryable",
+    "token_probe_failed",
+    "token_probe_exception",
+    "token_probe_retry_exception",
+    "cookie_persist_failed",
+    "listener_handoff_failed",
+}
+
+
+def is_retryable_session_error_code(error_code: Optional[str]) -> bool:
+    return str(error_code or "").strip() in RETRYABLE_SESSION_ERROR_CODES
 
 ACTIVE_STATES = {"refreshing", "verification_required"}
 PASSIVE_STATES = {"action_required"}

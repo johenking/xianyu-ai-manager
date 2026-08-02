@@ -7,3 +7,4 @@ export * from './api/ai';
 export * from './api/notifications';
 export * from './api/skills';
 export * from './api/defaults';
+export * from './api/nativeBrowser';

@@ -46,8 +46,9 @@ def _cookies(unb="account-1"):
 
 
 class FakeClientBrowserDatabase:
-    def __init__(self, signing_public_jwk):
+    def __init__(self, signing_public_jwk, client_type="extension"):
         self.signing_public_jwk = signing_public_jwk
+        self.client_type = client_type
         self.touch_calls = []
 
     def get_client_browser_device(
@@ -58,6 +59,7 @@ class FakeClientBrowserDatabase:
         device = {
             "device_id": DEVICE_ID,
             "browser_family": "chrome",
+            "client_type": self.client_type,
             "revoked": False,
         }
         if include_public_keys:
@@ -88,6 +90,7 @@ class ClientBrowserRouteTests(unittest.IsolatedAsyncioTestCase):
                 reply_server.ClientBrowserSessionIn(
                     device_id=DEVICE_ID,
                     mode=mode,
+                    client_type=self.database.client_type,
                 ),
                 current_user=self.user,
             )["data"]
@@ -256,7 +259,7 @@ class ClientBrowserRouteTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 "account-1",
                 RuntimeError("fixture persistence failure"),
-                "failed",
+                "waiting_user",
             ),
         )
         for mode, probe, unb, persist_error, expected_state in scenarios:
@@ -278,6 +281,82 @@ class ClientBrowserRouteTests(unittest.IsolatedAsyncioTestCase):
                     persist.assert_not_awaited()
                 else:
                     persist.assert_awaited_once()
+                    self.assertEqual(
+                        status["error_code"],
+                        "cookie_persist_failed",
+                    )
+
+    async def test_retryable_token_probe_keeps_session_open_for_another_challenge(self):
+        session = self._create_session("qr")
+        first_payload = self._signed_payload(session)
+        persist = AsyncMock()
+
+        with self.assertRaises(HTTPException) as retryable:
+            await self._import(
+                first_payload,
+                probe=SessionProbeResult(
+                    status="retryable_error",
+                    cookies={"unb": "account-1", "cookie2": "session-cookie"},
+                    error_code="token_probe_exception",
+                    message="消息 Token 探测出现临时异常",
+                ),
+                persist=persist,
+            )
+
+        self.assertEqual(retryable.exception.status_code, 503)
+        self.assertEqual(retryable.exception.detail["code"], "session_probe_retryable")
+        self.assertEqual(
+            self.sessions.get_for_owner(session["session_id"], 7)["state"],
+            "waiting_user",
+        )
+        persist.assert_not_awaited()
+
+        next_payload = self._signed_payload(session)
+        self.assertNotEqual(next_payload.challenge_id, first_payload.challenge_id)
+
+    async def test_retryable_persistence_failure_succeeds_with_a_fresh_proof(self):
+        session = self._create_session("qr")
+        first_payload = self._signed_payload(session)
+        persist = AsyncMock(side_effect=RuntimeError("fixture persistence failure"))
+        successful_probe = SessionProbeResult(
+            status="success",
+            cookies={"unb": "account-1", "cookie2": "session-cookie"},
+            access_token="validated-token",
+        )
+
+        with self.assertRaises(HTTPException) as retryable:
+            await self._import(first_payload, probe=successful_probe, persist=persist)
+        self.assertEqual(retryable.exception.status_code, 503)
+        self.assertEqual(retryable.exception.detail["code"], "cookie_persist_failed")
+
+        next_payload = self._signed_payload(session)
+        persist.reset_mock(side_effect=True)
+        persist.return_value = {"account_id": "account-1", "is_new_account": True}
+        imported = await self._import(next_payload, probe=successful_probe, persist=persist)
+
+        self.assertNotEqual(next_payload.challenge_id, first_payload.challenge_id)
+        self.assertEqual(imported["data"]["state"], "awaiting_confirmation")
+        self.assertEqual(imported["data"]["error_code"], "")
+        persist.assert_awaited_once()
+
+    async def test_native_helper_import_records_native_login_method(self):
+        self.database.client_type = "native_helper"
+        session = self._create_session("qr")
+        payload = self._signed_payload(session)
+        persist = AsyncMock(
+            return_value={"account_id": "account-1", "is_new_account": True}
+        )
+        imported = await self._import(
+            payload,
+            probe=SessionProbeResult(
+                status="success",
+                cookies={"unb": "account-1", "cookie2": "session-cookie"},
+                access_token="validated-token",
+            ),
+            persist=persist,
+        )
+        self.assertEqual(imported["data"]["state"], "awaiting_confirmation")
+        self.assertEqual(persist.await_args.kwargs["login_method"], "native_helper")
 
 
 class ClientRenewalRouteTests(unittest.IsolatedAsyncioTestCase):

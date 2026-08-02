@@ -680,7 +680,7 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
 
 app = FastAPI(
     title="Xianyu Auto Reply API",
-    version="1.10.2",
+    version="1.10.4",
     description="闲鱼自动回复系统API",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -1841,6 +1841,7 @@ class BrowserExtensionImportIn(BaseModel):
 class ClientBrowserDeviceIn(BaseModel):
     device_id: str = Field(..., min_length=16, max_length=80)
     browser_family: Literal["chrome", "edge"]
+    client_type: Literal["extension", "native_helper"] = "extension"
     display_name: str = Field("当前设备", min_length=1, max_length=80)
     signing_public_jwk: Dict[str, Any]
     encryption_public_jwk: Dict[str, Any]
@@ -1849,6 +1850,7 @@ class ClientBrowserDeviceIn(BaseModel):
 class ClientBrowserSessionIn(BaseModel):
     device_id: str = Field(..., min_length=16, max_length=80)
     mode: Literal["qr", "sms", "password"]
+    client_type: Literal["extension", "native_helper"] = "extension"
 
 
 class ClientBrowserChallengeIn(BaseModel):
@@ -2205,6 +2207,7 @@ def register_client_browser_device(
             user_id=current_user['user_id'],
             device_id=payload.device_id,
             browser_family=payload.browser_family,
+            client_type=payload.client_type,
             display_name=payload.display_name,
             signing_public_jwk=payload.signing_public_jwk,
             encryption_public_jwk=payload.encryption_public_jwk,
@@ -2257,10 +2260,17 @@ def create_client_browser_login_session(
                 error_code="client_device_missing",
                 http_status=409,
             )
+        if device.get("client_type") != payload.client_type:
+            raise ClientBrowserError(
+                "设备连接类型与登录入口不匹配",
+                error_code="client_type_mismatch",
+                http_status=409,
+            )
         status_info = client_login_sessions.create(
             owner_user_id=current_user['user_id'],
             device_id=payload.device_id,
             mode=payload.mode,
+            client_type=payload.client_type,
         )
     except ClientBrowserError as exc:
         _raise_client_browser_error(exc)
@@ -2364,6 +2374,12 @@ def create_client_browser_login_challenge(
                 error_code="client_device_revoked",
                 http_status=403,
             )
+        if device.get("client_type") != record.client_type:
+            raise ClientBrowserError(
+                "设备连接类型与登录会话不匹配",
+                error_code="client_type_mismatch",
+                http_status=403,
+            )
         challenge = device_challenges.create(
             device_id=payload.device_id,
             owner_user_id=record.owner_user_id,
@@ -2398,6 +2414,12 @@ async def import_client_browser_login(
                 error_code="client_device_revoked",
                 http_status=403,
             )
+        if device.get("client_type") != record.client_type:
+            raise ClientBrowserError(
+                "设备连接类型与登录会话不匹配",
+                error_code="client_type_mismatch",
+                http_status=403,
+            )
         binding = {
             "session_id": payload.session_id,
             "mode": payload.mode,
@@ -2422,6 +2444,12 @@ async def import_client_browser_login(
         )
         platform_unb = str((probe.cookies or {}).get("unb") or "").strip()
         if not probe.succeeded:
+            if probe.status == PROBE_RETRYABLE_ERROR:
+                raise ClientBrowserError(
+                    "平台连接暂时异常，保持官方页面开启并自动重试",
+                    error_code="session_probe_retryable",
+                    http_status=503,
+                )
             raise ClientBrowserError(
                 probe.message or "平台未确认有效登录状态",
                 error_code=probe.error_code or "session_validation_failed",
@@ -2435,6 +2463,7 @@ async def import_client_browser_login(
             session_id=payload.session_id,
             device_id=payload.device_id,
             mode=payload.mode,
+            client_type=device.get("client_type"),
         )
         consumed = True
         now = time.time()
@@ -2442,11 +2471,15 @@ async def import_client_browser_login(
             user_id=record.owner_user_id,
             cookies_str=session_cookies_to_string(probe.cookies),
             validated_unb=platform_unb,
-            login_method={
-                "qr": "chrome_extension",
-                "sms": "sms_window",
-                "password": "password",
-            }[payload.mode],
+            login_method=(
+                "native_helper"
+                if device.get("client_type") == "native_helper"
+                else {
+                    "qr": "chrome_extension",
+                    "sms": "sms_window",
+                    "password": "password",
+                }[payload.mode]
+            ),
             browser_user_agent=payload.user_agent,
             runtime_state={
                 "current_token": probe.access_token,
@@ -2471,13 +2504,25 @@ async def import_client_browser_login(
         _raise_client_browser_error(exc)
     except Exception as exc:
         if consumed:
-            client_login_sessions.fail(
+            client_login_sessions.retryable(
                 payload.session_id,
-                message="当前设备登录处理失败",
-                error_code="client_login_failed",
+                message="账号保存暂时异常，保持官方页面开启并自动重试",
+                error_code="cookie_persist_failed",
             )
         logger.error(f"当前设备登录导入失败: {type(exc).__name__}")
-        raise HTTPException(status_code=400, detail="当前设备登录处理失败") from exc
+        raise HTTPException(
+            status_code=503 if consumed else 400,
+            detail={
+                "code": (
+                    "cookie_persist_failed" if consumed else "client_login_failed"
+                ),
+                "message": (
+                    "账号保存暂时异常，保持官方页面开启并自动重试"
+                    if consumed
+                    else "当前设备登录处理失败"
+                ),
+            },
+        ) from exc
 
 
 @accounts_router.get("/api/browser-extension/pairings/{pairing_id}")
@@ -2722,6 +2767,12 @@ def create_client_renewal_challenge(payload: ClientBrowserChallengeIn):
                 "当前设备连接不存在",
                 error_code="client_device_missing",
                 http_status=404,
+            )
+        if device.get("client_type") != "extension":
+            raise ClientBrowserError(
+                "当前连接类型不支持扩展续期任务",
+                error_code="renewal_client_type_unsupported",
+                http_status=409,
             )
         challenge = device_challenges.create(
             device_id=payload.device_id,

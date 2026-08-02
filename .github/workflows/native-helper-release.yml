@@ -1,0 +1,54 @@
+name: Native Helper Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'native-helper-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: xianyu-native-browser-helper-macos-arm64-1.0.1
+            command: >-
+              python -m PyInstaller --clean --noconfirm
+              native_browser_helper/packaging/macos.spec
+            path: dist/xianyu-native-browser-helper-macos-arm64-1.0.1.zip
+          - os: windows-latest
+            artifact: xianyu-native-browser-helper-windows-x64-1.0.1
+            command: >-
+              python -m PyInstaller --clean --noconfirm
+              native_browser_helper/packaging/windows.spec
+            path: dist/xianyu-native-browser-helper-windows-x64-1.0.1.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pyinstaller -r native_browser_helper/requirements.txt
+      - shell: bash
+        run: ${{ matrix.command }}
+      - if: runner.os == 'macOS'
+        run: >-
+          python native_browser_helper/scripts/package_macos.py
+          --app dist/XianyuNativeHelper.app
+          --output dist/xianyu-native-browser-helper-macos-arm64-1.0.1.zip
+          --no-public-copy
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          Compress-Archive -Path dist/XianyuNativeHelper.exe
+          -DestinationPath dist/xianyu-native-browser-helper-windows-x64-1.0.1.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error

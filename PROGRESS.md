@@ -1,23 +1,13 @@
-# v1.10.2 当前设备浏览器登录候选
+# 用户本机 Chrome 登录链路重构进度
 
-- 目标：普通用户 QR、短信、密码和风控只在自己的 Chrome/Edge 完成，服务端 Chrome 启动数为 0。
-- 顺序：冻结入口边界测试 -> 客户设备桥接 -> 设备绑定/加密续期 -> 双入口 UI/QR 纠错 -> 完整门禁。
-- 基线：AccountList 34/34、登录后端 49/49、扩展 6/6，全部 skipped=0。
-- 当前：设备桥接、一次性续期、双入口 UI 与旧 UI 清理完成；第三轮后端全量门禁已通过，进入构建、安全与浏览器验收。
-- 决策：扫码页并列“当前设备浏览器登录”和“网页二维码”；扩展仅作隐藏桥接。
-- 最大风险：停用服务端自动续期时必须保留既有账号、Cookie 和加密密码，并让设备续期不可重放。
-- 发布边界：只做本地 main 候选提交，不推送、不部署、不打标签、不创建分支。
-- 证据：任务 1 红灯 24 项/8 failures；修复后 24/24，扩大集 76/76。
-- 新证据：协议/路由 11/11、聚焦修复 26/26、扩展 10/10、TypeScript 通过；OpenAPI 204 paths/243 methods。
-- UI 证据：AccountList 36/36、skipped=0；普通 QR/SMS/密码入口不创建服务器官方登录会话，服务器运维入口仅管理员+回环并双确认。
-- 授权证据：续期绑定必须消费已确认的 password 登录会话；任务首领后服务端密文为空，重复领取/授权均 409。
-- 完整门禁第 1 轮：前端 149/149；后端 717 项中 5 项旧契约失败，迁移边界和服务器刷新测试已按新契约修正。
-- 第 2 轮：后端仅剩完整迁移账本断言 1 项；第 3 轮恢复单一 MIGRATIONS 事实源，账本断言按真实起点推导，不改订单行为。
-- 第 3 轮：后端 717/717，耗时 189.530s，skipped=0；三轮全量修复上限结束。
-- 双构建：两个隔离目录各构建一次，77 个静态文件逐字节一致；两代资源各 36 项、孤立文件 0。
-- 扩展包：两个构建目录的源 ZIP 与公开 ZIP 共四份 SHA-256 一致（`e5ce8d…cfcfcf`）。
-- Edge 浏览器：全新 Profile 加载扩展成功；1440/390 两个视口均显示双 QR 入口，普通用户服务器运维入口为 0，客户端会话请求 1、服务器官方登录请求 0。
-- Chrome 浏览器：生产构建可在 Chrome 150 加载；此 Mac 的受管正式 Chrome 拦截自动加载未打包扩展，未把自动化结果记作 Chrome 扩展实测。
-- 安全扫描：Gitleaks 扫描 118 个提交、约 10.05 MB，无泄露；`git diff --check` 通过。
-- 最终回归：Ruff、Python 编译、TypeScript、npm audit 均通过；前端 149/149、扩展 10/10、登录/迁移聚焦 53/53，OpenAPI 204 paths/243 methods。
-- 生产隔离：生产 checkout 仍为 `8d6e78c`、PID `1100`、迁移 `2026072703`、runtime_sessions=0，未部署候选。
+- 候选版本：服务端/前端 `1.10.4`，本机助手 `1.0.1`，迁移 `2026080101`。
+- 主路径：Web 控制台通过用户电脑的 `127.0.0.1:17890` 连接本机助手；扩展导入和网页二维码保持独立入口，普通用户不启动服务端 Chrome。
+- 助手：macOS/Windows 源码与原生 PyInstaller 规格已实现；P-256 私钥严格保存到 macOS Keychain 或 Windows DPAPI；本地接口绑定回环并只接受允许的控制台 Origin。
+- Chrome：已有调试端口时新建并只关闭助手标签页；否则使用用户电脑上的应用管理 Profile。真实 Chrome 冒烟验证了官方页、UA、允许域 Cookie 过滤、标签页所有权和托管进程回收。
+- 服务端：设备与登录会话按 `native_helper` / `extension` 隔离；验证真实消息 Token、`unb`、Cookie 和 UA 后按稳定账号身份落库；临时 Token/持久化错误保留会话并使用新挑战自动重试。
+- 前端：状态机覆盖检测助手、打开 Chrome、等待用户、验证、确认账号和成功；成功确认后才调用助手关闭官方标签页；主路径不发送 `XMC_GET_DEVICE`。
+- 最终本地门禁：Ruff 通过；后端 `746 tests`；前端 `24 files / 153 tests`；扩展 `11 tests`；npm audit 0 vulnerabilities；TypeScript、生产构建、静态保留、扩展包和 `git diff --check` 均通过。
+- macOS 包：标准 `onedir` `.app` 启动约 1.76 秒，只监听 `127.0.0.1`；`codesign --verify --deep --strict` 通过，版本化 ZIP 已生成。当前仅 ad-hoc 签名，Developer ID 公证仍是大众分发门禁。
+- Windows 包：原生 Windows workflow、PyInstaller 规格和 DPAPI 测试已就绪；真实 `.exe.zip` 必须由 Windows runner 构建并下载验证后才进入正式静态下载目录。
+- 生产基线：单 worker ready，迁移 `2026073101`，SQLite integrity `ok`；部署前必须新建完整代码/数据库/静态/配置/助手回滚单元。
+- 剩余门禁：Windows 原生产物、完整回滚与正式部署、普通用户电脑真实登录金丝雀、macOS Developer ID/公证和 Windows Authenticode。

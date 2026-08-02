@@ -18,7 +18,13 @@ from skill_monitor_features import skill_monitor_feature_enabled
 from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
 from skill_monitor_retention_janitor import skill_monitor_retention_janitor
 from item_metric_scheduler import item_metric_scheduler
-from account_session_refresh import remove_verification_image
+from account_session_refresh import (
+    RETRYABLE_SESSION_ERROR_CODES,
+    remove_verification_image,
+)
+
+
+RETRYABLE_SESSION_MESSAGE = "平台连接暂时异常，系统将自动重试"
 
 
 def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
@@ -44,6 +50,20 @@ def _normalize_orphaned_refresh_states() -> int:
     normalized = 0
     for cookie_id in db_manager.get_all_cookies():
         status = db_manager.get_account_session_refresh(cookie_id) or {}
+        if (
+            status.get("state") == "action_required"
+            and str(status.get("error_code") or "").strip()
+            in RETRYABLE_SESSION_ERROR_CODES
+        ):
+            db_manager.update_account_session_refresh(
+                cookie_id,
+                state="failed",
+                trigger=status.get("trigger") or "session_probe",
+                message=RETRYABLE_SESSION_MESSAGE,
+                error_code=str(status.get("error_code") or "session_probe_retryable"),
+            )
+            normalized += 1
+            continue
         if status.get("state") not in {"refreshing", "verification_required"}:
             continue
         remove_verification_image(

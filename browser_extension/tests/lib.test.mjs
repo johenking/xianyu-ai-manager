@@ -111,6 +111,7 @@ test('manifest provides a strict MV3 current-device bridge', async () => {
   assert.deepEqual(manifest.background, { service_worker: 'background.js', type: 'module' });
   assert.deepEqual(manifest.content_scripts[0].matches, ['https://xianyu.cxywjx.top/*']);
   assert.deepEqual(manifest.content_scripts[0].js, ['content.js']);
+  assert.equal(manifest.version, '1.2.1');
   assert.equal(manifest.host_permissions.length, 5);
   for (const suffix of ALLOWED_SUFFIXES) {
     assert.equal(
@@ -142,6 +143,16 @@ test('background keeps secrets out of persistent extension storage', async () =>
   assert.match(background, /generateKey\([\s\S]*false/);
   assert.match(background, /requireConsoleSender\(sender\)/);
   assert.equal(content.includes('https://xianyu.cxywjx.top'), true);
+  assert.match(background, /injectConsoleBridgeIntoOpenTabs/);
+  assert.match(background, /extensionVersion: chrome\.runtime\.getManifest\(\)\.version/);
+  assert.match(background, /protocolVersion: BRIDGE_PROTOCOL_VERSION/);
+  assert.match(background, /const LOGIN_URL = 'https:\/\/www\.goofish\.com\/login'/);
+  assert.match(background, /chrome\.tabs\.create\(\{ url: LOGIN_URL, active: true \}\)/);
+  assert.match(background, /chrome\.tabs\.update\(existingTab\.id, \{ active: true \}\)/);
+  assert.match(background, /for \(const \[sessionId, session\] of Object\.entries\(sessions\)\)/);
+  assert.match(background, /startedAt: Date\.now\(\) \/ 1000/);
+  assert.match(content, /BRIDGE_INSTANCE_KEY/);
+  assert.match(content, /extensionVersion: chrome\.runtime\.getManifest\(\)\.version/);
   assert.equal(/console\.(log|debug|info|warn|error)/.test(background), false);
 });
 

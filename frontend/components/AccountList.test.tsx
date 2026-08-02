@@ -4,6 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AccountList from './AccountList';
+import { ApiRequestError } from '../services/request';
 import {
   getAccountDetails,
   getAllAISettings,
@@ -19,6 +20,11 @@ import {
   getClientBrowserLoginSession,
   confirmClientBrowserLoginSession,
   cancelClientBrowserLoginSession,
+  getNativeBrowserDevice,
+  startNativeBrowserLogin,
+  getNativeBrowserLoginStatus,
+  cancelNativeBrowserLogin,
+  closeNativeBrowserLogin,
   bindAccountRenewalDevice,
   addAccountCookie,
   cancelOfficialLoginSession,
@@ -51,6 +57,11 @@ vi.mock('../services/api', () => ({
   getClientBrowserLoginSession: vi.fn(),
   confirmClientBrowserLoginSession: vi.fn(),
   cancelClientBrowserLoginSession: vi.fn(),
+  getNativeBrowserDevice: vi.fn(),
+  startNativeBrowserLogin: vi.fn(),
+  getNativeBrowserLoginStatus: vi.fn(),
+  cancelNativeBrowserLogin: vi.fn(),
+  closeNativeBrowserLogin: vi.fn(),
   bindAccountRenewalDevice: vi.fn(),
   addAccountCookie: vi.fn(),
   passwordLogin: vi.fn(),
@@ -86,17 +97,22 @@ describe('AccountList session verification UI', () => {
   let localStorageValues: Map<string, string>;
   let clientBridgeEnabled: boolean;
   let clientBridgeListener: (event: MessageEvent) => void;
+  let clientBridgeRequests: string[];
 
   beforeEach(() => {
     vi.useRealTimers();
     clientBridgeEnabled = true;
+    clientBridgeRequests = [];
     clientBridgeListener = (event: MessageEvent) => {
       if (!clientBridgeEnabled || !event.data?.requestId) return;
       if (!['XMC_GET_DEVICE', 'XMC_START_LOGIN', 'XMC_CONFIRM_LOGIN', 'XMC_CANCEL_LOGIN'].includes(event.data.type)) return;
+      clientBridgeRequests.push(String(event.data.type));
       const data = event.data.type === 'XMC_GET_DEVICE'
         ? {
           deviceId: 'device_fixture_1234',
           browserFamily: 'chrome',
+          extensionVersion: '1.2.1',
+          protocolVersion: 1,
           signingPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-x', y: 'fixture-y' },
           encryptionPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-ex', y: 'fixture-ey' },
         }
@@ -238,9 +254,40 @@ describe('AccountList session verification UI', () => {
     vi.mocked(showOfficialLoginBrowser).mockResolvedValue({ success: true });
     vi.mocked(showAccountSessionRefreshBrowser).mockResolvedValue({ success: true });
     vi.mocked(registerClientBrowserDevice).mockResolvedValue();
+    vi.mocked(getNativeBrowserDevice).mockResolvedValue({
+      deviceId: 'helper_device_123456',
+      browserFamily: 'chrome',
+      clientType: 'native_helper',
+      helperVersion: '1.0.1',
+      protocolVersion: 1,
+      signingPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-x', y: 'fixture-y' },
+      encryptionPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-ex', y: 'fixture-ey' },
+    });
+    vi.mocked(startNativeBrowserLogin).mockResolvedValue({
+      session_id: 'native-login-session',
+      device_id: 'helper_device_123456',
+      state: 'opening_browser',
+      message: '正在打开本机 Chrome',
+      expires_at: 9_999_999_999,
+    });
+    vi.mocked(getNativeBrowserLoginStatus).mockResolvedValue({
+      session_id: 'native-login-session',
+      device_id: 'helper_device_123456',
+      state: 'waiting_user',
+      message: '请在本机 Chrome 完成登录',
+      expires_at: 9_999_999_999,
+    });
+    vi.mocked(cancelNativeBrowserLogin).mockResolvedValue({
+      session_id: 'native-login-session', device_id: 'helper_device_123456',
+      state: 'cancelled', message: '已取消', expires_at: 9_999_999_999,
+    });
+    vi.mocked(closeNativeBrowserLogin).mockResolvedValue({
+      session_id: 'native-login-session', device_id: 'helper_device_123456',
+      state: 'success', message: '成功', expires_at: 9_999_999_999,
+    });
     vi.mocked(createClientBrowserLoginSession).mockImplementation(async (_deviceId, mode) => ({
       session_id: `${mode}-client-session`,
-      device_id: 'device_fixture_1234',
+      device_id: 'helper_device_123456',
       mode,
       state: 'waiting_user',
       message: '请在当前设备浏览器继续',
@@ -454,9 +501,42 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '在当前设备浏览器继续' }));
 
     await waitFor(() => {
-      expect(createClientBrowserLoginSession).toHaveBeenCalledWith('device_fixture_1234', 'password');
+      expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
+        'helper_device_123456', 'password', 'native_helper',
+      );
     });
+    await waitFor(() => expect(startNativeBrowserLogin).toHaveBeenCalledWith(expect.objectContaining({
+      device_id: 'helper_device_123456',
+      mode: 'password',
+      server_origin: window.location.origin,
+    })));
+    expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
+    expect(clientBridgeRequests).not.toContain('XMC_START_LOGIN');
+    expect(registerClientBrowserDevice).toHaveBeenCalledTimes(1);
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
+  });
+
+  it('labels a transient message Token probe failure as retryable', async () => {
+    vi.mocked(getAccountSessionStatus).mockImplementation(async (accountId: string) => ({
+      state: accountId === 'account-1' ? 'failed' : 'idle',
+      trigger: 'message_token_probe',
+      message: accountId === 'account-1' ? '消息 Token 探测出现临时异常' : '',
+      error_code: accountId === 'account-1' ? 'token_probe_exception' : '',
+      verification_image_url: '',
+      browser_active: false,
+      started_at: null,
+      last_attempt_at: 1,
+      last_success_at: null,
+      expires_at: null,
+      updated_at: 1,
+    }));
+
+    render(<AccountList />);
+
+    expect((await screen.findAllByText('平台连接暂时异常')).length).toBeGreaterThan(0);
+    expect(screen.getByText('平台连接暂时异常，系统会自动重试；原登录态已保留。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '重新刷新' })).toBeInTheDocument();
+    expect(screen.queryByText('需要手动验证')).not.toBeInTheDocument();
   });
 
   it('confirms the persisted account before allowing the current-device tab to close', async () => {
@@ -480,14 +560,14 @@ describe('AccountList session verification UI', () => {
       'password-client-session',
       'account-1',
     ), { timeout: 3500 });
+    expect(closeNativeBrowserLogin).toHaveBeenCalledWith('password-client-session', 'account-1');
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
-    expect(await screen.findByText('是否在此设备启用自动续期')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '暂不保存' }));
+    expect(screen.queryByText('是否在此设备启用自动续期')).not.toBeInTheDocument();
     expect(bindAccountRenewalDevice).not.toHaveBeenCalled();
     expect(screen.queryByRole('dialog', { name: '添加账号' })).not.toBeInTheDocument();
   });
 
-  it('stores renewal credentials only after post-login explicit authorization', async () => {
+  it('stores extension renewal credentials only after post-login explicit authorization', async () => {
     vi.mocked(getClientBrowserLoginSession).mockResolvedValue({
       session_id: 'password-client-session',
       device_id: 'device_fixture_1234',
@@ -501,8 +581,9 @@ describe('AccountList session verification UI', () => {
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
-    fireEvent.click(screen.getByRole('button', { name: '在当前设备浏览器继续' }));
+    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
+    fireEvent.click(screen.getByRole('button', { name: '你的 Chrome' }));
+    fireEvent.click(screen.getByRole('button', { name: '用扩展打开官方登录页' }));
 
     await screen.findByText('是否在此设备启用自动续期', {}, { timeout: 3500 });
     fireEvent.change(screen.getByPlaceholderText('闲鱼账号或手机号'), {
@@ -527,23 +608,77 @@ describe('AccountList session verification UI', () => {
     }));
   });
 
-  it('does not create any server login session when the current-device bridge is missing', async () => {
-    clientBridgeEnabled = false;
+  it('does not create any server login session when the native helper is missing', async () => {
+    vi.mocked(getNativeBrowserDevice).mockRejectedValue(Object.assign(
+      new Error('未启动本机浏览器助手'),
+      { code: 'helper_unavailable', status: 0 },
+    ));
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '当前设备浏览器登录' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
 
-    expect(await screen.findByText(
-      '未检测到浏览器连接，请安装或刷新扩展，也可改用网页二维码',
+    expect((await screen.findAllByText(
+      '首次使用安装并启动一次本机助手；后续点击本机 Chrome 登录即可打开你电脑上的官方页面。',
       {},
-      { timeout: 5000 },
-    )).toBeInTheDocument();
-    expect(screen.getByText('未检测到浏览器连接')).toBeInTheDocument();
+      { timeout: 4500 },
+    )).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('未启动本机浏览器助手').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: '安装本机助手' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '改用网页二维码' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '安装本机助手' }));
+    expect(screen.getByRole('link', { name: '下载 macOS 助手（Apple 芯片）' })).toHaveAttribute(
+      'href',
+      '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.1.zip',
+    );
+    expect(screen.getByRole('link', { name: '下载 Windows 助手（x64）' })).toHaveAttribute(
+      'href',
+      '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.1.zip',
+    );
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
     expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
+  });
+
+  it('classifies an outdated native helper without creating a login session', async () => {
+    vi.mocked(getNativeBrowserDevice).mockResolvedValue({
+      deviceId: 'helper_device_123456',
+      browserFamily: 'chrome',
+      clientType: 'native_helper',
+      helperVersion: '0.9.0',
+      protocolVersion: 1,
+      signingPublicJwk: {},
+      encryptionPublicJwk: {},
+    });
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    expect(await screen.findByText('本机浏览器助手需要更新')).toBeInTheDocument();
+    expect(screen.getAllByText(/当前 0.9.0，需要 1.0.1/).length).toBeGreaterThan(0);
+    expect(registerClientBrowserDevice).not.toHaveBeenCalled();
+    expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [401, 'auth_expired', '账号登录已失效'],
+    [409, 'device_key_mismatch', '设备注册冲突'],
+  ])('classifies device registration status %s', async (status, code, title) => {
+    vi.mocked(registerClientBrowserDevice).mockRejectedValue(new ApiRequestError(
+      status === 401 ? '请重新登录' : '设备密钥不匹配',
+      { status, code },
+    ));
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    expect(await screen.findByText(title === '账号登录已失效' ? '监控台登录已失效' : '浏览器设备注册冲突')).toBeInTheDocument();
+    expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
   });
 
   it('offers SMS login in the current device without collecting the code', async () => {
@@ -559,7 +694,9 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '在当前设备浏览器继续' }));
 
     await waitFor(() => {
-      expect(createClientBrowserLoginSession).toHaveBeenCalledWith('device_fixture_1234', 'sms');
+    expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
+      'helper_device_123456', 'sms', 'native_helper',
+    );
     });
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
   });
@@ -621,7 +758,7 @@ describe('AccountList session verification UI', () => {
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
     expect(await screen.findByRole('button', { name: '手机号验证码' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '当前设备浏览器登录' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '网页二维码' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '服务器运维登录' })).not.toBeInTheDocument();
     expect(generateQRLogin).not.toHaveBeenCalled();
@@ -630,9 +767,9 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
     fireEvent.click(screen.getByRole('button', { name: '你的 Chrome' }));
     expect(await screen.findByText('从你的 Chrome 导入')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '下载扩展 ZIP' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: '下载扩展 1.2.1' })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-cookie-importer.zip',
+      '/static/downloads/xianyu-browser-bridge-1.2.1.zip',
     );
     fireEvent.click(screen.getByRole('button', { name: '创建一次性配对' }));
 
@@ -942,7 +1079,14 @@ describe('AccountList session verification UI', () => {
         'qr-session',
         'switched_to_extension',
       ));
-      expect(createClientBrowserLoginSession).toHaveBeenCalledWith('device_fixture_1234', 'qr');
+      await waitFor(() => expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
+        'helper_device_123456',
+        'qr',
+        'native_helper',
+      ), { timeout: 5000 });
+      expect(startNativeBrowserLogin).toHaveBeenCalledWith(expect.objectContaining({ mode: 'qr' }));
+      expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
+      expect(clientBridgeRequests).not.toContain('XMC_START_LOGIN');
       expect(interactWithQRLogin).not.toHaveBeenCalled();
       expect(createOfficialLoginSession).not.toHaveBeenCalled();
       expect(createBrowserExtensionPairing).not.toHaveBeenCalled();

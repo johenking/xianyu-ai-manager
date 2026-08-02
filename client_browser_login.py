@@ -31,6 +31,7 @@ ALLOWED_DEVICE_PURPOSES = {
 }
 ALLOWED_LOGIN_MODES = {"qr", "sms", "password"}
 ALLOWED_BROWSER_FAMILIES = {"chrome", "edge"}
+ALLOWED_CLIENT_TYPES = {"extension", "native_helper"}
 
 
 class ClientBrowserError(ValueError):
@@ -88,6 +89,15 @@ def normalize_browser_family(value: str) -> str:
             "仅支持 Chrome 或 Edge", error_code="unsupported_browser"
         )
     return family
+
+
+def normalize_client_type(value: str) -> str:
+    client_type = str(value or "extension").strip().lower()
+    if client_type not in ALLOWED_CLIENT_TYPES:
+        raise ClientBrowserError(
+            "设备连接类型无效", error_code="unsupported_client_type"
+        )
+    return client_type
 
 
 def load_p256_public_key(jwk: Mapping[str, Any]) -> ec.EllipticCurvePublicKey:
@@ -333,6 +343,7 @@ class ClientLoginSession:
     owner_user_id: int
     device_id: str
     mode: str
+    client_type: str
     state: str
     message: str
     created_at: float
@@ -358,6 +369,7 @@ class ClientLoginSessionManager:
         owner_user_id: int,
         device_id: str,
         mode: str,
+        client_type: str = "extension",
     ) -> dict[str, Any]:
         now = time.time()
         record = ClientLoginSession(
@@ -365,6 +377,7 @@ class ClientLoginSessionManager:
             owner_user_id=int(owner_user_id),
             device_id=normalize_device_id(device_id),
             mode=normalize_login_mode(mode),
+            client_type=normalize_client_type(client_type),
             state="waiting_device",
             message="等待当前设备浏览器打开官方登录页",
             created_at=now,
@@ -393,6 +406,7 @@ class ClientLoginSessionManager:
         session_id: str,
         device_id: str,
         mode: str,
+        client_type: Optional[str] = None,
     ) -> ClientLoginSession:
         with self._lock:
             record = self._record_locked(session_id)
@@ -412,6 +426,10 @@ class ClientLoginSessionManager:
             if (
                 record.device_id != normalize_device_id(device_id)
                 or record.mode != normalize_login_mode(mode)
+                or (
+                    client_type is not None
+                    and record.client_type != normalize_client_type(client_type)
+                )
             ):
                 raise ClientBrowserError(
                     "当前设备登录会话绑定不匹配",
@@ -449,6 +467,7 @@ class ClientLoginSessionManager:
         session_id: str,
         device_id: str,
         mode: str,
+        client_type: Optional[str] = None,
     ) -> ClientLoginSession:
         with self._lock:
             current = self._record_locked(session_id)
@@ -465,11 +484,38 @@ class ClientLoginSessionManager:
                 session_id=session_id,
                 device_id=device_id,
                 mode=mode,
+                client_type=client_type,
             )
             record.consumed_at = time.time()
             record.state = "validating"
             record.message = "正在验证平台 Token 和账号身份"
+            record.error_code = ""
             return record
+
+    def retryable(
+        self,
+        session_id: str,
+        *,
+        message: str,
+        error_code: str,
+    ) -> dict[str, Any]:
+        """Release one failed import so the device can use a fresh challenge."""
+        with self._lock:
+            record = self._record_locked(session_id)
+            if record.state != "validating":
+                raise ClientBrowserError(
+                    "当前设备登录状态无效",
+                    error_code="client_login_state_invalid",
+                    http_status=409,
+                )
+            record.consumed_at = None
+            record.state = "waiting_user"
+            record.message = str(
+                message or "平台连接暂时异常，保持页面开启并自动重试"
+            )[:200]
+            record.error_code = str(error_code or "client_login_retryable")[:80]
+            record.ended_by = ""
+            return self._safe_status(record)
 
     def persisted(self, session_id: str, *, account_id: str) -> dict[str, Any]:
         with self._lock:
@@ -483,6 +529,7 @@ class ClientLoginSessionManager:
             record.state = "awaiting_confirmation"
             record.message = "账号已验证并落库，等待页面确认账号列表"
             record.account_id = str(account_id or "")
+            record.error_code = ""
             return self._safe_status(record)
 
     def confirm(
@@ -546,6 +593,7 @@ class ClientLoginSessionManager:
             if (
                 record.state != "success"
                 or record.mode != "password"
+                or record.client_type != "extension"
                 or record.device_id != normalize_device_id(device_id)
                 or record.account_id != str(account_id or "")
             ):
@@ -613,6 +661,7 @@ class ClientLoginSessionManager:
             "session_id": record.session_id,
             "device_id": record.device_id,
             "mode": record.mode,
+            "client_type": record.client_type,
             "state": record.state,
             "message": record.message,
             "error_code": record.error_code,
@@ -638,6 +687,7 @@ __all__ = [
     "client_login_sessions",
     "load_p256_public_key",
     "normalize_browser_family",
+    "normalize_client_type",
     "normalize_device_id",
     "normalize_login_mode",
     "normalize_public_jwk",

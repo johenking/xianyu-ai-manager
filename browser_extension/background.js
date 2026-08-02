@@ -16,6 +16,7 @@ const DEVICE_KEY = 'primary';
 const LOGIN_URL = 'https://www.goofish.com/login';
 const SESSION_KEY = 'clientLoginSessions';
 const RENEWAL_KEY = 'clientRenewalSessions';
+const BRIDGE_PROTOCOL_VERSION = 1;
 const importDebounce = new Map();
 
 const decodeB64url = (value) => {
@@ -236,18 +237,37 @@ async function reportRenewalResult(taskId, outcome, errorCode, cookies, userAgen
 async function startLogin(command, sender) {
   const identity = await deviceIdentity();
   if (command.deviceId !== identity.deviceId) throw new Error('当前页面绑定的不是此浏览器设备');
+  const sessions = await sessionMap();
+  const existing = sessions[command.sessionId];
+  if (existing && existing.expiresAt > Date.now() / 1000 && !existing.imported) {
+    const existingTab = await chrome.tabs.get(existing.officialTabId).catch(() => null);
+    if (existingTab?.id) {
+      await chrome.tabs.update(existingTab.id, { active: true }).catch(() => undefined);
+      if (existingTab.windowId) {
+        await chrome.windows.update(existingTab.windowId, { focused: true }).catch(() => undefined);
+      }
+      return { started: true, reused: true, sessionId: command.sessionId };
+    }
+    delete sessions[command.sessionId];
+  }
+  const consoleTabId = sender.tab?.id || null;
+  for (const [sessionId, session] of Object.entries(sessions)) {
+    if (sessionId === command.sessionId || session.consoleTabId !== consoleTabId || session.imported) continue;
+    await chrome.tabs.remove(session.officialTabId).catch(() => undefined);
+    delete sessions[sessionId];
+  }
   const tab = await chrome.tabs.create({ url: LOGIN_URL, active: true });
   if (!tab.id) throw new Error('当前浏览器未能打开登录页');
   const storeId = await cookieStoreForTab(tab.id);
-  const sessions = await sessionMap();
   sessions[command.sessionId] = {
     sessionId: command.sessionId,
     mode: command.mode,
     officialTabId: tab.id,
-    consoleTabId: sender.tab?.id || null,
+    consoleTabId,
     storeId,
     expiresAt: command.expiresAt,
     imported: false,
+    startedAt: Date.now() / 1000,
   };
   await saveSessionMap(sessions);
   return { started: true, sessionId: command.sessionId };
@@ -428,12 +448,25 @@ chrome.cookies.onChanged.addListener(async (changeInfo) => {
   Object.values(renewals).forEach((task) => setTimeout(() => checkRenewalTask(task.taskId), 500));
 });
 
+async function injectConsoleBridgeIntoOpenTabs() {
+  const tabs = await chrome.tabs.query({ url: `${CONSOLE_ORIGIN}/*` });
+  await Promise.all(tabs.map(async (tab) => {
+    if (!tab.id) return;
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content.js'],
+    }).catch(() => undefined);
+  }));
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create('client-renewal-poll', { periodInMinutes: 1 });
+  injectConsoleBridgeIntoOpenTabs().catch(() => undefined);
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create('client-renewal-poll', { periodInMinutes: 1 });
+  injectConsoleBridgeIntoOpenTabs().catch(() => undefined);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -449,6 +482,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return {
         deviceId: identity.deviceId,
         browserFamily: identity.browserFamily,
+        extensionVersion: chrome.runtime.getManifest().version,
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
         signingPublicJwk: identity.signingPublicJwk,
         encryptionPublicJwk: identity.encryptionPublicJwk,
       };
@@ -474,7 +509,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     throw new Error('未知当前设备浏览器命令');
   })().then(
     (data) => sendResponse({ ok: true, data }),
-    (error) => sendResponse({ ok: false, error: error instanceof Error ? error.message : '命令失败' }),
+    (error) => sendResponse({
+      ok: false,
+      code: message?.type === 'XMC_GET_DEVICE'
+        ? 'device_initialization_failed'
+        : 'browser_command_failed',
+      error: error instanceof Error ? error.message : '命令失败',
+    }),
   );
   return true;
 });

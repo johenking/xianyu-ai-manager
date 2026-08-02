@@ -132,6 +132,10 @@ export interface BrowserExtensionPairing {
 export interface ClientBrowserDevicePublic {
   deviceId: string;
   browserFamily: 'chrome' | 'edge';
+  clientType?: 'extension' | 'native_helper';
+  extensionVersion?: string;
+  helperVersion?: string;
+  protocolVersion: number;
   signingPublicJwk: Record<string, unknown>;
   encryptionPublicJwk: Record<string, unknown>;
 }
@@ -140,6 +144,7 @@ export interface ClientBrowserLoginSession {
   session_id: string;
   device_id: string;
   mode: 'qr' | 'sms' | 'password';
+  client_type?: 'extension' | 'native_helper';
   state:
     | 'waiting_device'
     | 'waiting_user'
@@ -162,6 +167,7 @@ export const registerClientBrowserDevice = async (
   await post('/api/client-browser/devices', {
     device_id: device.deviceId,
     browser_family: device.browserFamily,
+    client_type: device.clientType || 'extension',
     display_name: device.browserFamily === 'edge' ? '当前 Edge' : '当前 Chrome',
     signing_public_jwk: device.signingPublicJwk,
     encryption_public_jwk: device.encryptionPublicJwk,
@@ -171,10 +177,11 @@ export const registerClientBrowserDevice = async (
 export const createClientBrowserLoginSession = async (
   deviceId: string,
   mode: 'qr' | 'sms' | 'password',
+  clientType: 'extension' | 'native_helper' = 'extension',
 ): Promise<ClientBrowserLoginSession> => {
   const response = await post<{ success: boolean; data: ClientBrowserLoginSession }>(
     '/api/client-browser/sessions',
-    { device_id: deviceId, mode },
+    { device_id: deviceId, mode, client_type: clientType },
   );
   return response.data;
 };

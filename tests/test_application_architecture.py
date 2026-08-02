@@ -11,7 +11,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
     def test_all_legacy_routes_are_registered_through_domain_routers(self):
         app = create_app()
         openapi = app.openapi()
-        self.assertEqual(openapi["info"]["version"], "1.10.2")
+        self.assertEqual(openapi["info"]["version"], "1.10.4")
         paths = openapi["paths"]
         signatures = {
             (method.upper(), path)

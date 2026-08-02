@@ -427,6 +427,85 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.cas_calls, 1)
         self.assertIn("x5sec=verification-cookie", database.details["value"])
 
+    async def test_transient_message_token_probe_failure_is_retryable_and_does_not_require_human_action(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.current_token = None
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
+        transient = SessionProbeResult(
+            status=PROBE_RETRYABLE_ERROR,
+            cookies=dict(live.cookies),
+            error_code="token_probe_exception",
+            message="消息 Token 探测出现临时异常",
+        )
+        recovered = SessionProbeResult(
+            status=PROBE_SUCCESS,
+            cookies={
+                "unb": "9988",
+                "cookie2": "renewed",
+                "_m_h5_tk": "token_2",
+            },
+            access_token="message-access-token",
+        )
+        probe = AsyncMock(side_effect=[transient, recovered])
+
+        with patch("db_manager.db_manager", database), patch(
+            "XianyuAutoAsync.probe_message_session_async", probe
+        ):
+            first = await live.refresh_token()
+            self.assertIsNone(first)
+            self.assertEqual(database.status["state"], "failed")
+            self.assertEqual(database.status["error_code"], "token_probe_exception")
+            self.assertEqual(live.last_token_refresh_status, "retryable_error")
+            live.current_token = None
+            second = await live.refresh_token()
+
+        self.assertEqual(second, "message-access-token")
+        self.assertEqual(probe.await_count, 2)
+        live.send_token_refresh_notification.assert_not_awaited()
+
+    async def test_message_token_probe_exception_keeps_session_retryable(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        probe = AsyncMock(side_effect=RuntimeError("synthetic network failure"))
+
+        with patch("db_manager.db_manager", database), patch(
+            "XianyuAutoAsync.probe_message_session_async", probe
+        ):
+            token = await live.refresh_token()
+
+        self.assertIsNone(token)
+        self.assertEqual(database.status["state"], "failed")
+        self.assertEqual(database.status["error_code"], "token_probe_exception")
+        self.assertEqual(live.last_token_refresh_status, "retryable_error")
+        live.send_token_refresh_notification.assert_not_awaited()
+
     async def test_validated_cookie_ua_and_token_install_one_listener_generation(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"

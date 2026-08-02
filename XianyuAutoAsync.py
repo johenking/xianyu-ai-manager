@@ -26,6 +26,10 @@ import sys
 import aiohttp
 from collections import defaultdict
 from db_manager import db_manager
+from account_session_refresh import (
+    RETRYABLE_SESSION_ERROR_CODES,
+    is_retryable_session_error_code,
+)
 from session_registry import sanitize_log_record, sanitize_runtime_error
 from utils.xianyu_session_probe import (
     PROBE_EXPIRED,
@@ -2035,6 +2039,12 @@ class XianyuLive:
                     ):
                         self.last_token_refresh_status = "manual_reauth_required"
                         return None
+                if probe.status == PROBE_RETRYABLE_ERROR:
+                    await self._mark_retryable_token_probe_failure(
+                        probe,
+                        trigger="消息 Token 探测",
+                    )
+                    return None
                 await self._mark_human_verification_required(
                     probe,
                     trigger="消息 Token 探测",
@@ -2096,7 +2106,7 @@ class XianyuLive:
                     error_code="cookie_persist_failed",
                     message="消息 Token 已返回，但 Cookie 保存失败",
                 )
-                await self._mark_human_verification_required(
+                await self._mark_retryable_token_probe_failure(
                     persistence_failure,
                     trigger="消息 Token 探测",
                 )
@@ -2121,11 +2131,38 @@ class XianyuLive:
                 error_code="token_probe_exception",
                 message="消息 Token 探测出现临时异常",
             )
-            await self._mark_human_verification_required(
+            await self._mark_retryable_token_probe_failure(
                 failure,
                 trigger="消息 Token 探测",
             )
             return None
+
+    async def _mark_retryable_token_probe_failure(
+        self,
+        probe: SessionProbeResult = None,
+        *,
+        trigger: str = "消息会话异常",
+    ) -> None:
+        """Persist a transient probe failure without pausing for human action."""
+        from db_manager import db_manager
+
+        error_code = str(
+            getattr(probe, "error_code", "") or "session_probe_retryable"
+        )[:80]
+        message = str(
+            getattr(probe, "message", "") or "平台状态检查出现临时异常，系统将自动重试"
+        )[:240]
+        db_manager.update_account_session_refresh(
+            self.cookie_id,
+            state="failed",
+            trigger=trigger,
+            message=message,
+            error_code=error_code,
+        )
+        self.last_token_refresh_status = "retryable_error"
+        logger.warning(
+            f"【{self.cookie_id}】消息 Token 探测暂时失败，保留原会话并自动重试: {error_code}"
+        )
 
     async def _mark_human_verification_required(
         self,
@@ -5478,9 +5515,21 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止Token刷新循环")
                         break
 
-                    refresh_state = (
-                        db_manager.get_account_session_refresh(self.cookie_id) or {}
-                    ).get("state")
+                    refresh_status = db_manager.get_account_session_refresh(self.cookie_id) or {}
+                    refresh_state = refresh_status.get("state")
+                    refresh_error_code = str(refresh_status.get("error_code") or "").strip()
+                    if (
+                        refresh_state == "action_required"
+                        and refresh_error_code in RETRYABLE_SESSION_ERROR_CODES
+                    ):
+                        db_manager.update_account_session_refresh(
+                            self.cookie_id,
+                            state="failed",
+                            trigger=refresh_status.get("trigger") or "session_probe",
+                            message="平台连接暂时异常，系统将自动重试",
+                            error_code=refresh_error_code,
+                        )
+                        refresh_state = "failed"
                     if refresh_state in {
                         "action_required",
                         "refreshing",
@@ -5525,6 +5574,15 @@ class XianyuLive:
                                     "等待手动开始验证"
                                 )
                                 await self._interruptible_sleep(60)
+                                continue
+                            if is_retryable_session_error_code(
+                                refresh_status.get("error_code")
+                            ) or getattr(self, "last_token_refresh_status", None) == "retryable_error":
+                                logger.info(
+                                    f"【{self.cookie_id}】平台连接暂时异常，Token 探测将自动重试"
+                                )
+                                self.current_token = None
+                                await self._interruptible_sleep(self.token_retry_interval)
                                 continue
                             # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
                             if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):

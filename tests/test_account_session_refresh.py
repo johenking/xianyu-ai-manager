@@ -355,6 +355,37 @@ class RuntimeRefreshRecoveryTests(unittest.TestCase):
         self.assertEqual(updates[0][1]["state"], "action_required")
         self.assertEqual(updates[0][1]["error_code"], "browser_session_missing")
 
+    def test_startup_releases_retryable_action_required_state(self):
+        import application_runtime
+
+        updates = []
+        database = type(
+            "Database",
+            (),
+            {
+                "get_all_cookies": lambda self: {"account-1": "unb=account-1"},
+                "get_account_session_refresh": lambda self, _cookie_id: {
+                    "state": "action_required",
+                    "trigger": "message_token_probe",
+                    "message": "消息 Token 探测出现临时异常",
+                    "error_code": "token_probe_exception",
+                },
+                "update_account_session_refresh": (
+                    lambda self, cookie_id, **kwargs: updates.append(
+                        (cookie_id, kwargs)
+                    )
+                ),
+            },
+        )()
+
+        with patch.object(application_runtime, "db_manager", database):
+            count = application_runtime._normalize_orphaned_refresh_states()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(updates[0][1]["state"], "failed")
+        self.assertEqual(updates[0][1]["error_code"], "token_probe_exception")
+        self.assertEqual(updates[0][1]["message"], "平台连接暂时异常，系统将自动重试")
+
 
 if __name__ == "__main__":
     unittest.main()

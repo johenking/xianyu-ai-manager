@@ -85,6 +85,24 @@ class ClientLoginSessionTests(unittest.TestCase):
         )
         self.assertEqual(completed["state"], "success")
 
+    def test_session_rejects_transport_type_confusion(self):
+        manager = ClientLoginSessionManager()
+        status = manager.create(
+            owner_user_id=7,
+            device_id="device_fixture_1234",
+            mode="qr",
+            client_type="native_helper",
+        )
+        self.assertEqual(status["client_type"], "native_helper")
+        with self.assertRaises(ClientBrowserError) as mismatch:
+            manager.get_for_device(
+                session_id=status["session_id"],
+                device_id="device_fixture_1234",
+                mode="qr",
+                client_type="extension",
+            )
+        self.assertEqual(mismatch.exception.error_code, "client_login_binding_mismatch")
+
 
 class ClientDeviceProofTests(unittest.TestCase):
     def test_challenge_is_signed_bound_and_not_replayable(self):
@@ -159,7 +177,7 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
         self.assertEqual(encrypted, "")
         self.assertEqual(enabled, 0)
         self.assertEqual(count, 0)
-        self.assertEqual(MIGRATIONS[-1].version, "2026073101")
+        self.assertEqual(MIGRATIONS[-1].version, "2026080101")
 
     def test_registered_device_keys_are_immutable(self):
         replacement = ec.generate_private_key(ec.SECP256R1())
@@ -174,6 +192,68 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
             )
         self.assertEqual(mismatch.exception.http_status, 409)
         self.assertEqual(mismatch.exception.error_code, "device_key_mismatch")
+        with self.assertRaises(ClientBrowserError) as transport_mismatch:
+            self.db.register_client_browser_device(
+                user_id=1,
+                device_id="device_fixture_1234",
+                browser_family="chrome",
+                client_type="native_helper",
+                display_name="Fixture Chrome",
+                signing_public_jwk=public_jwk_from_key(self.signing.public_key()),
+                encryption_public_jwk=public_jwk_from_key(self.encryption.public_key()),
+            )
+        self.assertEqual(transport_mismatch.exception.error_code, "device_type_mismatch")
+
+    def test_device_transport_type_is_persisted_and_old_devices_default_to_extension(self):
+        native = ec.generate_private_key(ec.SECP256R1())
+        native_encryption = ec.generate_private_key(ec.SECP256R1())
+        registered = self.db.register_client_browser_device(
+            user_id=1,
+            device_id="native_helper_fixture_1",
+            browser_family="chrome",
+            client_type="native_helper",
+            display_name="Native helper",
+            signing_public_jwk=public_jwk_from_key(native.public_key()),
+            encryption_public_jwk=public_jwk_from_key(native_encryption.public_key()),
+        )
+        self.assertEqual(registered["client_type"], "native_helper")
+        self.assertEqual(
+            self.db.get_client_browser_device(
+                user_id=1, device_id="native_helper_fixture_1"
+            )["client_type"],
+            "native_helper",
+        )
+        self.assertEqual(
+            self.db.get_client_browser_device(
+                user_id=1, device_id="device_fixture_1234"
+            )["client_type"],
+            "extension",
+        )
+        with self.db.lock, self.assertRaises(Exception):
+            self.db.conn.execute(
+                "UPDATE client_browser_devices SET client_type = 'invalid' "
+                "WHERE device_id = 'native_helper_fixture_1'"
+            )
+        self.db.conn.rollback()
+
+    def test_native_helper_is_isolated_from_extension_renewal_credentials(self):
+        native = ec.generate_private_key(ec.SECP256R1())
+        native_encryption = ec.generate_private_key(ec.SECP256R1())
+        self.db.register_client_browser_device(
+            user_id=1, device_id="native_helper_fixture_2",
+            browser_family="chrome", client_type="native_helper",
+            display_name="Native helper",
+            signing_public_jwk=public_jwk_from_key(native.public_key()),
+            encryption_public_jwk=public_jwk_from_key(native_encryption.public_key()),
+        )
+        with self.assertRaises(ClientBrowserError) as isolated:
+            self.db.bind_account_renewal_device(
+                user_id=1, cookie_id="account-1",
+                device_id="native_helper_fixture_2",
+                username="seller@example.com", password="secret",
+                authorized_at=time.time(),
+            )
+        self.assertEqual(isolated.exception.error_code, "renewal_binding_mismatch")
 
     def test_task_is_device_bound_expires_and_ciphertext_is_single_claim(self):
         authorized_at = time.time()
