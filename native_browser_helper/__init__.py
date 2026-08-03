@@ -1,6 +1,6 @@
 """User-machine Chrome/Edge login helper."""
 
-HELPER_VERSION = "1.0.1"
+HELPER_VERSION = "1.0.2"
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 17890
 

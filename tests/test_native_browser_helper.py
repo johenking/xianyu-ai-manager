@@ -1,4 +1,7 @@
 import json
+import plistlib
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,9 +16,12 @@ from native_browser_helper.helper import (
     NativeHelperError,
     _cookies_for_import,
 )
+from native_browser_helper.__main__ import _emit_result
+from native_browser_helper.installer import NativeHelperInstaller
 from native_browser_helper.cdp import BrowserLauncher, CDPClient
 from native_browser_helper.keystore import IdentityStore
 from native_browser_helper.protocol import DeviceIdentity
+from native_browser_helper.runtime import ServiceAlreadyRunning, ServicePidFile
 from native_browser_helper.server import HelperHTTPServer
 
 
@@ -83,6 +89,200 @@ class FakeLauncher:
         client.closed = True
 
 
+class NativeHelperInstallerTests(unittest.TestCase):
+    @staticmethod
+    def _mac_app(root: Path) -> Path:
+        app = root / "DownloadedHelper.app"
+        executable = app / "Contents" / "MacOS" / "XianyuNativeHelper"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"fixture-macos-executable")
+        executable.chmod(0o755)
+        return app
+
+    def test_macos_first_open_installs_registers_startup_and_starts_service(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = self._mac_app(root)
+            install_root = root / "Applications"
+            launch_agent = root / "LaunchAgents" / "helper.plist"
+            state_dir = root / "state"
+            installer = NativeHelperInstaller(
+                system="Darwin",
+                executable=source / "Contents" / "MacOS" / "XianyuNativeHelper",
+                environ={
+                    "XMC_HELPER_INSTALL_ROOT": str(install_root),
+                    "XMC_HELPER_LAUNCH_AGENT_PATH": str(launch_agent),
+                    "XMC_HELPER_ALLOW_SOURCE_INSTALL": "1",
+                    "XMC_HELPER_KEYCHAIN_SERVICE": "fixture-helper-service",
+                    "XMC_HELPER_KEYCHAIN_ACCOUNT": "fixture-helper-account",
+                },
+                port=17891,
+                state_dir=state_dir,
+            )
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            with (
+                patch("native_browser_helper.installer.subprocess.run", return_value=completed) as run,
+                patch("native_browser_helper.installer.wait_for_helper", return_value=True),
+                patch.object(installer, "_wait_until_stopped") as wait_until_stopped,
+                patch("native_browser_helper.installer._helper_health", return_value={
+                    "service": "xianyu-native-browser-helper",
+                    "version": "1.0.2",
+                }),
+            ):
+                status = installer.install_and_start()
+
+            installed = install_root / "XianyuNativeHelper.app" / "Contents" / "MacOS" / "XianyuNativeHelper"
+            self.assertEqual(installed.read_bytes(), b"fixture-macos-executable")
+            payload = plistlib.loads(launch_agent.read_bytes())
+            self.assertEqual(payload["ProgramArguments"], [
+                str(installed),
+                "--serve",
+                "--port",
+                "17891",
+                "--state-dir",
+                str(state_dir),
+            ])
+            self.assertTrue(payload["RunAtLoad"])
+            self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(payload["EnvironmentVariables"], {
+                "XMC_HELPER_KEYCHAIN_ACCOUNT": "fixture-helper-account",
+                "XMC_HELPER_KEYCHAIN_SERVICE": "fixture-helper-service",
+            })
+            self.assertTrue(status.installed)
+            self.assertTrue(status.startup_registered)
+            self.assertTrue(status.running)
+            wait_until_stopped.assert_called_once_with()
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertTrue(any(command[:2] == ["launchctl", "bootstrap"] for command in commands))
+            self.assertTrue(any(command[:3] == ["launchctl", "kickstart", "-k"] for command in commands))
+
+    def test_lifecycle_result_file_is_written_without_stdout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "status.json"
+            with patch.object(sys, "stdout", None):
+                _emit_result({"running": True, "version": "1.0.2"}, target)
+            self.assertEqual(
+                json.loads(target.read_text()),
+                {"running": True, "version": "1.0.2"},
+            )
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_service_pid_file_rejects_a_second_live_instance_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            with ServicePidFile(state_dir) as first:
+                original = first.path.read_bytes()
+                with self.assertRaises(ServiceAlreadyRunning):
+                    ServicePidFile(state_dir).__enter__()
+                self.assertEqual(first.path.read_bytes(), original)
+            self.assertFalse((state_dir / "helper.pid").exists())
+
+    def test_service_pid_file_replaces_a_stale_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_dir = Path(temp)
+            pid_file = state_dir / "helper.pid"
+            pid_file.write_text(json.dumps({"pid": 999999999, "version": "old"}))
+            with ServicePidFile(state_dir):
+                record = json.loads(pid_file.read_text())
+                self.assertEqual(record["pid"], __import__("os").getpid())
+            self.assertFalse(pid_file.exists())
+
+    def test_windows_pid_liveness_probe_never_sends_a_signal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / "helper.pid"
+            pid_file.write_text(json.dumps({"pid": 4321, "version": "1.0.2"}))
+            record = ServicePidFile(Path(temp))
+            with (
+                patch("native_browser_helper.runtime.platform.system", return_value="Windows"),
+                patch("native_browser_helper.runtime._windows_process_alive", return_value=True) as probe,
+                patch("native_browser_helper.runtime.os.kill") as kill,
+            ):
+                self.assertTrue(record._existing_process_alive())
+            probe.assert_called_once_with(4321)
+            kill.assert_not_called()
+
+    def test_macos_uninstall_removes_user_install_and_startup_registration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "Applications" / "XianyuNativeHelper.app"
+            (target / "Contents" / "MacOS").mkdir(parents=True)
+            (target / "Contents" / "MacOS" / "XianyuNativeHelper").write_bytes(b"fixture")
+            launch_agent = root / "LaunchAgents" / "helper.plist"
+            launch_agent.parent.mkdir(parents=True)
+            launch_agent.write_text("fixture")
+            installer = NativeHelperInstaller(
+                system="Darwin",
+                executable=target / "Contents" / "MacOS" / "XianyuNativeHelper",
+                environ={
+                    "XMC_HELPER_INSTALL_ROOT": str(root / "Applications"),
+                    "XMC_HELPER_LAUNCH_AGENT_PATH": str(launch_agent),
+                },
+            )
+            with (
+                patch("native_browser_helper.installer.subprocess.run"),
+                patch("native_browser_helper.installer._helper_health", return_value=None),
+            ):
+                status = installer.uninstall()
+            self.assertFalse(target.exists())
+            self.assertFalse(launch_agent.exists())
+            self.assertFalse(status.installed)
+            self.assertFalse(status.startup_registered)
+
+    def test_windows_first_open_copies_versioned_executable_and_registers_user_startup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "download" / "XianyuNativeHelper.exe"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"fixture-windows-executable")
+            installer = NativeHelperInstaller(
+                system="Windows",
+                executable=source,
+                environ={
+                    "LOCALAPPDATA": str(root / "localappdata"),
+                    "XMC_HELPER_STATE_DIR": str(root / "state"),
+                    "XMC_HELPER_ALLOW_SOURCE_INSTALL": "1",
+                },
+            )
+            run_values: dict[str, str] = {}
+            with (
+                patch.object(installer, "_set_windows_run_value", side_effect=lambda value: run_values.update(value=value)),
+                patch.object(installer, "_windows_run_value", side_effect=lambda: run_values.get("value", "")),
+                patch("native_browser_helper.installer.subprocess.Popen") as popen,
+                patch("native_browser_helper.installer.wait_for_helper", return_value=True),
+                patch("native_browser_helper.installer._helper_health", side_effect=lambda *_args, **_kwargs: (
+                    {
+                        "service": "xianyu-native-browser-helper",
+                        "version": "1.0.2",
+                    }
+                    if popen.called
+                    else None
+                )),
+            ):
+                status = installer.install_and_start()
+
+            installed = (
+                root
+                / "localappdata"
+                / "XianyuNativeHelper"
+                / "XianyuNativeHelper-1.0.2.exe"
+            )
+            self.assertEqual(installed.read_bytes(), b"fixture-windows-executable")
+            command = [
+                str(installed),
+                "--serve",
+                "--port",
+                "17890",
+                "--state-dir",
+                str(root / "state"),
+            ]
+            self.assertEqual(run_values["value"], subprocess.list2cmdline(command))
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0], command)
+            self.assertTrue(status.installed)
+            self.assertTrue(status.startup_registered)
+            self.assertTrue(status.running)
+
+
 class BrowserLauncherPlatformTests(unittest.TestCase):
     def test_macos_and_windows_browser_commands_use_the_helper_profile(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -108,6 +308,29 @@ class BrowserLauncherPlatformTests(unittest.TestCase):
             ):
                 windows_path = launcher._executable("chrome")
             self.assertTrue(windows_path.endswith("Google/Chrome/Application/chrome.exe"))
+
+    def test_windows_browser_lookup_includes_program_files_x86(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = BrowserLauncher(Path(temp))
+            environment = {
+                "LOCALAPPDATA": "C:/Users/Fixture/AppData/Local",
+                "PROGRAMFILES": "C:/Program Files",
+                "PROGRAMFILES(X86)": "C:/Program Files (x86)",
+            }
+            with (
+                patch("native_browser_helper.cdp.platform.system", return_value="Windows"),
+                patch.dict("native_browser_helper.cdp.os.environ", environment, clear=False),
+                patch(
+                    "native_browser_helper.cdp.Path.exists",
+                    autospec=True,
+                    side_effect=lambda path: "Program Files (x86)" in str(path),
+                ),
+            ):
+                windows_path = launcher._executable("edge")
+            self.assertEqual(
+                windows_path,
+                "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+            )
 
     def test_managed_profile_creates_an_owned_official_page_and_closes_initial_blank(self):
         client = FakeClient()
@@ -147,6 +370,21 @@ class BrowserLauncherPlatformTests(unittest.TestCase):
         create_target.assert_called_once_with(9222, "https://www.goofish.com/")
         connect.assert_not_called()
         executable.assert_not_called()
+
+    def test_auto_browser_prefers_existing_chrome_then_installed_edge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = BrowserLauncher(Path(temp))
+            with (
+                patch.object(launcher, "_existing_endpoint", side_effect=lambda family: 9222 if family == "chrome" else None),
+                patch.object(launcher, "_executable") as executable,
+            ):
+                self.assertEqual(launcher.resolve_browser_family("auto"), "chrome")
+                executable.assert_not_called()
+            with (
+                patch.object(launcher, "_existing_endpoint", return_value=None),
+                patch.object(launcher, "_executable", side_effect=lambda family: "edge.exe" if family == "edge" else None),
+            ):
+                self.assertEqual(launcher.resolve_browser_family("auto"), "edge")
 
     def test_close_only_closes_a_helper_owned_target(self):
         owned = FakeClient()
@@ -327,7 +565,7 @@ class NativeBrowserHelperTests(unittest.TestCase):
         self.assertEqual(status["state"], "awaiting_confirmation")
         self.assertEqual(status["account_id"], "account-1")
         self.assertNotIn("fixture-session", json.dumps(status))
-        self.assertEqual(self.launcher.open_calls[0][1], "https://www.goofish.com/")
+        self.assertEqual(self.launcher.open_calls[0][1], "https://www.goofish.com/login")
         import_payload = self.requests[-1][2]
         self.assertEqual(import_payload["device_id"], self.identity.device_id)
         self.assertEqual(import_payload["cookies"][0]["name"], "unb")
@@ -377,7 +615,7 @@ class NativeBrowserHelperTests(unittest.TestCase):
             with urlopen(device_request, timeout=2) as response:
                 device = json.loads(response.read())
             self.assertTrue(health["ok"])
-            self.assertEqual(health["version"], "1.0.1")
+            self.assertEqual(health["version"], "1.0.2")
             self.assertEqual(device["data"]["clientType"], "native_helper")
             self.assertNotIn("private", json.dumps(device))
         finally:

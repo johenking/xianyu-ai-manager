@@ -11,7 +11,7 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = ROOT.parent
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 ARCHIVE_NAME = f"xianyu-native-browser-helper-macos-arm64-{VERSION}.zip"
 
 

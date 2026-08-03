@@ -7,7 +7,7 @@ from PyInstaller.building.osx import BUNDLE
 
 
 ROOT = Path(SPECPATH).parent
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 analysis = Analysis(
     [str(ROOT / "packaging" / "entry.py")],
     pathex=[str(ROOT.parent)],
@@ -47,6 +47,8 @@ BUNDLE(
     version=VERSION,
     bundle_identifier="com.cxywjx.xianyu-native-helper",
     info_plist={
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "LSUIElement": True,
         "NSLocalNetworkUsageDescription": "连接本机 Chrome 以完成官方账号登录。",
     },

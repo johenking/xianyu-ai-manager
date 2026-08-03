@@ -9,7 +9,7 @@ import shutil
 
 ROOT = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = ROOT.parent
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 ARCHIVE_NAME = f"xianyu-native-browser-helper-source-{VERSION}.zip"
 SOURCE_ARCHIVE = ROOT / "dist" / ARCHIVE_NAME
 PUBLIC_ARCHIVE = PROJECT_ROOT / "static" / "downloads" / ARCHIVE_NAME
@@ -18,8 +18,10 @@ FILES = (
     "__main__.py",
     "cdp.py",
     "helper.py",
+    "installer.py",
     "keystore.py",
     "protocol.py",
+    "runtime.py",
     "server.py",
     "README.md",
     "requirements.txt",
@@ -31,6 +33,7 @@ FILES = (
     "packaging/build-windows.ps1",
     "scripts/build_package.py",
     "scripts/package_macos.py",
+    "scripts/verify_package.py",
 )
 
 

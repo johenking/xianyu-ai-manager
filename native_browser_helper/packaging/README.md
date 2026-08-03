@@ -14,3 +14,9 @@ or unsigned artifact as notarized or production-signed.
 
 The helper itself still binds only to loopback. Packaging does not change its
 origin allow-list or device-proof protocol.
+
+Opening a packaged helper without arguments performs a per-user install and
+startup registration. macOS installs the app under `~/Applications` and creates
+a user LaunchAgent. Windows installs a versioned executable under `%LOCALAPPDATA%`
+and registers the current-user `Run` value. The service child always runs with
+`--serve`; `--status` and `--uninstall` are available for lifecycle management.

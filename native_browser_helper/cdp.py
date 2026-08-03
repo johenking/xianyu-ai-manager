@@ -147,6 +147,20 @@ class BrowserLauncher:
         self._owned_clients.add(client.target_id)
         return client
 
+    def resolve_browser_family(self, preferred: str = "auto") -> str:
+        normalized = str(preferred or "auto").strip().lower()
+        if normalized in {"chrome", "edge"}:
+            return normalized
+        if normalized != "auto":
+            raise CDPError("仅支持 Chrome 或 Edge")
+        for family in ("chrome", "edge"):
+            if self._existing_endpoint(family):
+                return family
+        for family in ("chrome", "edge"):
+            if self._executable(family):
+                return family
+        return "chrome"
+
     def close(self, client: Optional[CDPClient]) -> None:
         if client and client.target_id in self._owned_clients:
             try:
@@ -250,12 +264,14 @@ class BrowserLauncher:
         candidates: list[Path] = []
         if system == "Darwin":
             app = "Google Chrome" if browser_family == "chrome" else "Microsoft Edge"
-            candidates.append(Path(f"/Applications/{app}.app/Contents/MacOS/{app}"))
+            relative = Path(f"{app}.app/Contents/MacOS/{app}")
+            candidates.extend([Path("/Applications") / relative, Path.home() / "Applications" / relative])
         elif system == "Windows":
             local = Path(os.environ.get("LOCALAPPDATA", ""))
             program = Path(os.environ.get("PROGRAMFILES", "C:/Program Files"))
+            program_x86 = Path(os.environ.get("PROGRAMFILES(X86)", "C:/Program Files (x86)"))
             folder = "Google/Chrome/Application/chrome.exe" if browser_family == "chrome" else "Microsoft/Edge/Application/msedge.exe"
-            candidates.extend([local / folder, program / folder])
+            candidates.extend([local / folder, program / folder, program_x86 / folder])
         else:
             candidates.extend([Path("/usr/bin/google-chrome"), Path("/usr/bin/microsoft-edge")])
         return next((str(path) for path in candidates if path.exists()), None)

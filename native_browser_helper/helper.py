@@ -28,7 +28,7 @@ DEFAULT_SERVER_ORIGINS = {
     "http://127.0.0.1:8091",
     "http://localhost:8091",
 }
-DEFAULT_LOGIN_URL = "https://www.goofish.com/"
+DEFAULT_LOGIN_URL = "https://www.goofish.com/login"
 ALLOWED_COOKIE_SUFFIXES = ("goofish.com", "taobao.com")
 RETRYABLE_IMPORT_CODES = {
     "probe_timeout",

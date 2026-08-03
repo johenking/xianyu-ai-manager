@@ -35,6 +35,12 @@ class IdentityStore:
         self.state_dir = Path(state_dir or default_state_dir())
         self.state_file = self.state_dir / "device.json"
         self.secret_file = self.state_dir / "device.secret"
+        self.keychain_service = (
+            os.environ.get("XMC_HELPER_KEYCHAIN_SERVICE") or SERVICE_NAME
+        )
+        self.keychain_account = (
+            os.environ.get("XMC_HELPER_KEYCHAIN_ACCOUNT") or ACCOUNT_NAME
+        )
 
     def load_or_create(self, browser_family: str) -> DeviceIdentity:
         record = self._read_record()
@@ -103,7 +109,15 @@ class IdentityStore:
     def _read_keychain(self) -> Optional[str]:
         try:
             result = subprocess.run(
-                ["security", "find-generic-password", "-a", ACCOUNT_NAME, "-s", SERVICE_NAME, "-w"],
+                [
+                    "security",
+                    "find-generic-password",
+                    "-a",
+                    self.keychain_account,
+                    "-s",
+                    self.keychain_service,
+                    "-w",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -116,8 +130,15 @@ class IdentityStore:
         try:
             subprocess.run(
                 [
-                    "security", "add-generic-password", "-a", ACCOUNT_NAME,
-                    "-s", SERVICE_NAME, "-w", value, "-U",
+                    "security",
+                    "add-generic-password",
+                    "-a",
+                    self.keychain_account,
+                    "-s",
+                    self.keychain_service,
+                    "-w",
+                    value,
+                    "-U",
                 ],
                 check=True,
                 capture_output=True,
