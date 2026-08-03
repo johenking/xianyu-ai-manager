@@ -670,3 +670,40 @@ The remaining live-provider gate is a real ordinary-user login from that user's
 computer: start the downloaded helper, let it open that user's Chrome, complete
 the platform verification, verify Token and `unb`, confirm the persisted account
 in the frontend, and confirm only the helper-owned tab closes.
+
+## Native Helper 1.0.2 Persistence Release On 2026-08-03
+
+Helper `1.0.2` closes the remaining install-once gap. The first packaged launch
+installs the helper for the current user and registers a macOS LaunchAgent or
+Windows current-user startup entry. Later console clicks can reach the loopback
+service after login or reboot without an extension and without manually starting
+the helper. Chrome remains the first choice and Edge the fallback; extension
+import and web QR remain separate paths.
+
+Local gates passed with 757 backend tests, 30 focused helper/package tests, 24
+frontend files with 153 tests, 11 extension tests, Ruff, TypeScript, npm audit,
+Actionlint, Gitleaks, production build and package verification. Native package
+run `30774220706` executed install, startup registration, health, single-instance,
+restart, status, and uninstall on both macOS and Windows runners. Final CI run
+`30774536869` passed for `0d32354`.
+
+The deployed macOS arm64 ZIP SHA-256 is
+`c4e9b9be03816738859933ff68ae1f68e92c2b71838b065e7fcc69e55919e305`;
+the Windows x64 ZIP SHA-256 is
+`95a548fd739a37d015dea77a00910930d89f15c17952bb092eac8a7b5438e67e`.
+Production merge `ed42def` has the same source tree as `origin/main@0d32354`.
+Local and public readiness passed five repeated samples, SQLite remained at
+`2026080101` with integrity `ok`, one Uvicorn listener remained, and public HTML,
+JS, OpenAPI, extension, and both helper downloads matched the deployed bytes.
+
+Two early deployment attempts intentionally exercised the rollback gate after
+release assertions were found to be wrong: one searched only the main chunk for
+a lazy-loaded account link, and one used an incorrect session route name. Both
+restored the prior source, static files, database, and readiness. The corrected
+third attempt passed. The complete record and executable rollback are in
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`.
+
+The macOS package is still ad-hoc signed and the Windows package has no
+Authenticode signature. The ordinary-user-machine live login canary remains
+pending and must prove real platform verification, message Token and `unb`,
+account persistence, frontend confirmation, and helper-owned tab closure.

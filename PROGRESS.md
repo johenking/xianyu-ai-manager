@@ -1,14 +1,14 @@
 # 用户本机 Chrome 登录链路重构进度
 
-- 候选版本：服务端/前端 `1.10.4`，本机助手 `1.0.1`，迁移 `2026080101`。
+- 正式版本：服务端/前端 `1.10.4`，本机助手 `1.0.2`，迁移 `2026080101`。
 - 主路径：Web 控制台通过用户电脑的 `127.0.0.1:17890` 连接本机助手；扩展导入和网页二维码保持独立入口，普通用户不启动服务端 Chrome。
-- 助手：macOS/Windows 源码与原生 PyInstaller 规格已实现；P-256 私钥严格保存到 macOS Keychain 或 Windows DPAPI；本地接口绑定回环并只接受允许的控制台 Origin。
+- 助手：macOS/Windows 原生包首次运行后安装到当前用户并注册开机启动；后续点击登录无需扩展或手动重启助手。P-256 私钥严格保存到 macOS Keychain 或 Windows DPAPI；本地接口绑定回环并只接受允许的控制台 Origin。
 - Chrome：已有调试端口时新建并只关闭助手标签页；否则使用用户电脑上的应用管理 Profile。真实 Chrome 冒烟验证了官方页、UA、允许域 Cookie 过滤、标签页所有权和托管进程回收。
 - 服务端：设备与登录会话按 `native_helper` / `extension` 隔离；验证真实消息 Token、`unb`、Cookie 和 UA 后按稳定账号身份落库；临时 Token/持久化错误保留会话并使用新挑战自动重试。
 - 前端：状态机覆盖检测助手、打开 Chrome、等待用户、验证、确认账号和成功；成功确认后才调用助手关闭官方标签页；主路径不发送 `XMC_GET_DEVICE`。
-- 最终本地门禁：Ruff 通过；后端 `746 tests`；前端 `24 files / 153 tests`；扩展 `11 tests`；npm audit 0 vulnerabilities；TypeScript、生产构建、静态保留、扩展包和 `git diff --check` 均通过。
-- macOS 包：标准 `onedir` `.app` 启动约 1.76 秒，只监听 `127.0.0.1`；`codesign --verify --deep --strict` 通过，版本化 ZIP 已生成。当前仅 ad-hoc 签名，Developer ID 公证仍是大众分发门禁。
-- Windows 包：GitHub Windows runner 已构建真实 x64 `.exe.zip`；ZIP、PE32+/COFF 和 PyInstaller 归档结构均已验证，SHA-256 为 `8c492863e1d74c86e34f38ba4f20fe6eab60ef38136468c7e81323765bc3d50a`。
-- 正式部署：`1.10.4` 已部署到正式单 worker，迁移 `2026080101`、SQLite integrity `ok`；本地与公网 HTTP/2 readiness、OpenAPI、HTML 入口、静态资源、macOS/Windows 助手包和扩展包均已验证。
-- 回滚：完整原子回滚单元位于 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146`；应用和隧道两份脚本的语法与 `--check` 均通过。
+- 最终门禁：Ruff 通过；后端 `757 tests`；助手/包 `30 tests`；前端 `24 files / 153 tests`；扩展 `11 tests`；npm audit 0 vulnerabilities；TypeScript、生产构建、静态保留、扩展包、Actionlint、Gitleaks 和 `git diff --check` 均通过。
+- macOS `1.0.2` 包：arm64 Mach-O、双版本字段、安装/单实例/重启恢复/卸载和 `codesign --verify --deep --strict` 均通过；SHA-256 为 `c4e9b9be03816738859933ff68ae1f68e92c2b71838b065e7fcc69e55919e305`。当前仅 ad-hoc 签名，Developer ID 公证仍是大众分发门禁。
+- Windows `1.0.2` 包：原生 runner 上完成安装、启动项、健康、单实例、停止/重启、状态和卸载；PE32+ x64 校验通过，SHA-256 为 `95a548fd739a37d015dea77a00910930d89f15c17952bb092eac8a7b5438e67e`。
+- 正式部署：生产合并 `ed42def`，源码树与 `origin/main@0d32354` 一致；单 worker、迁移 `2026080101`、SQLite `ok`，本地/公网连续 `5/5` readiness、HTML/JS、OpenAPI 和三个公开下载哈希均通过。
+- 回滚：完整原子回滚单元位于 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`；包含三份停服数据库证据，最终使用 `xianyu_data.final-stopped.db`，脚本语法与 `--check` 已通过。两次错误验收断言均真实触发并验证了完整回滚，第三次部署成功。
 - 剩余门禁：普通用户电脑真实登录金丝雀、macOS Developer ID/公证和 Windows Authenticode。
