@@ -685,13 +685,16 @@ frontend files with 153 tests, 11 extension tests, Ruff, TypeScript, npm audit,
 Actionlint, Gitleaks, production build and package verification. Native package
 run `30774220706` executed install, startup registration, health, single-instance,
 restart, status, and uninstall on both macOS and Windows runners. Final CI run
-`30774536869` passed for `0d32354`.
+`30774536869` passed for `0d32354`; release-evidence CI run `30775493735`
+passed for `0e290b4`.
 
 The deployed macOS arm64 ZIP SHA-256 is
 `c4e9b9be03816738859933ff68ae1f68e92c2b71838b065e7fcc69e55919e305`;
 the Windows x64 ZIP SHA-256 is
 `95a548fd739a37d015dea77a00910930d89f15c17952bb092eac8a7b5438e67e`.
-Production merge `ed42def` has the same source tree as `origin/main@0d32354`.
+Production functional merge `ed42def` first matched `origin/main@0d32354`.
+Evidence-only merge `61a15a3` then synchronized the production source tree to
+`origin/main@0e290b4` without restarting PID `82448`.
 Local and public readiness passed five repeated samples, SQLite remained at
 `2026080101` with integrity `ok`, one Uvicorn listener remained, and public HTML,
 JS, OpenAPI, extension, and both helper downloads matched the deployed bytes.
@@ -702,6 +705,15 @@ a lazy-loaded account link, and one used an incorrect session route name. Both
 restored the prior source, static files, database, and readiness. The corrected
 third attempt passed. The complete record and executable rollback are in
 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`.
+
+A final browser-level loopback gate started the published macOS `1.0.2` helper
+from an isolated state directory and loaded the production console Origin in
+real headless Chrome. Page JavaScript fetched the helper health endpoint on
+`127.0.0.1:17890` and received HTTP 200 with version `1.0.2`; the private-network
+preflight returned 204 and an unexpected Origin returned 403. The temporary
+listener, state directory, and test Keychain record were removed afterward.
+This proves the browser transport and Origin/PNA boundary, not a real account
+login.
 
 The macOS package is still ad-hoc signed and the Windows package has no
 Authenticode signature. The ordinary-user-machine live login canary remains

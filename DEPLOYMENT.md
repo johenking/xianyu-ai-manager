@@ -106,7 +106,9 @@ docker run --rm -p 8091:8080 \
 
 Then open `http://localhost:8091`.
 
-The official Goofish login flow requires the installed system Chrome in headed mode; the current container command does not start a virtual display. Automatic renewal is profile-only and never submits a stored password. Treat QR login, explicit password login, and profile renewal as unsupported in Docker or cloud environments until system Chrome, a display/Xvfb setup, and the human-verification path have been tested there. Persisting `browser_data/` is required once that support exists.
+Ordinary-user login does not require Chrome inside the container: the console connects to the helper installed on each user's macOS or Windows computer, and that helper opens the user's local Chrome/Edge. The helper must allow the deployed console Origin, remain bound to loopback, and pass browser Local Network Access/PNA checks. The separate extension and web-QR entries remain available.
+
+Administrator server-maintenance login and legacy server-side renewal still require an installed headed system Chrome; the current container command does not start a virtual display. Treat those server-browser paths as unsupported in Docker or cloud environments until system Chrome, a display/Xvfb setup, and the human-verification path have been tested there. Persist `browser_data/` when those paths are enabled. Extension-bound automatic renewal runs on the user's extension device and remains separate from the native-helper login path.
 
 ## Direct Registration
 

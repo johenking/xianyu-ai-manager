@@ -2,22 +2,22 @@
 
 ## 最终结论
 
-扫码面板有两个并列的主要入口。`当前设备浏览器登录` 通过 Chrome/Edge 扩展桥接，在用户自己的浏览器中打开官方页面；QR、短信、密码、滑块、人脸和未知交互验证都在该浏览器中完成，普通用户路径在服务 Mac 上启动零个 Chrome。`网页二维码` 只调用官方二维码接口并在控制台渲染；扫码后的 `mobile_scan` 或其他交互风控会提示用户回到当前设备浏览器，不启动服务端浏览器。
+新增账号流程包含三条独立路径。`本机 Chrome 登录` 通过用户电脑上安装一次的本机助手连接 `127.0.0.1:17890`，在该用户自己的 Chrome/Edge 中打开官方页面；QR、短信、密码、滑块、人脸和未知交互验证都在该浏览器中完成，普通用户路径在服务 Mac 上启动零个 Chrome。`浏览器扩展导入` 使用当前浏览器 Profile，扩展检测只属于这一入口。`网页二维码` 只调用官方二维码接口并在控制台渲染；扫码后的 `mobile_scan` 或其他交互风控会提示用户选择本机助手或扩展，不启动服务端浏览器。
 
-只有平台 Token 真实验证、`unb` 身份匹配、Cookie 持久化和账号列表确认全部完成后，当前设备扩展才关闭官方标签页并显示成功。隐藏或关闭添加账号弹窗不会终止轮询，也不会把页面关闭当作成功。扩展缺失、来源不匹配或设备注册失败时，不创建服务端登录会话，并提供安装/刷新和网页二维码回退。
+只有平台 Token 真实验证、`unb` 身份匹配、Cookie 持久化和账号列表确认全部完成后，发起登录的本机助手或扩展才关闭自己创建的官方标签页并显示成功。隐藏或关闭添加账号弹窗不会把页面关闭当作成功。本机助手缺失或版本过旧时显示一次安装引导，不检测扩展，也不阻断扩展导入和网页二维码。
 
 服务器 Chrome 只保留为“服务器运维登录”高级入口。它要求管理员身份、服务 Mac 回环请求和两次确认，使用隔离 Profile，不复用管理员日常 Chrome；普通用户和公网请求不能调用它。手动 Cookie 与手动配对仍是高级人工导入方式。
 
-账号密码成功登录后，自动续期必须由用户再次明确授权并绑定一个当前设备。账号密码、验证码和风控输入不经过控制台，也不会自动保存。
+账号密码成功登录后，自动续期必须由用户再次明确授权并绑定一个扩展设备。本机助手主路径只负责交互登录和账号导入，不接收续期密码。账号密码、验证码和风控输入不经过控制台，也不会自动保存。
 
 ## 登录方式
 
 | 登录来源 | 实现 | 自动续期 | 到期后的操作 | 主要限制 |
 |---|---|---:|---|---|
-| `qr` | 当前设备扩展桥接打开官方页面；网页二维码作为独立入口 | 否 | 重新扫码或回当前设备浏览器 | 所有扫码后风控在用户浏览器完成；网页二维码本身不启动服务端 Chrome |
-| `password` | 当前设备 Chrome/Edge 官方页面完成登录，成功后可单独授权续期 | 仅显式绑定设备后 | 当前设备重新登录 | 密码、短信、人脸和页面交互不进入控制台 |
-| `sms_window` | 当前设备 Chrome/Edge 官方页面完成手机号验证码登录 | 否 | 当前设备重新登录 | 验证码只留在用户浏览器 |
-| `chrome_extension` | 当前设备桥接或高级手动配对导入固定正式 HTTPS 控制台 | 仅显式绑定设备后 | 重新桥接或导入 | P-256 设备证明；手动配对 Token 五分钟、单次使用 |
+| `qr` | 本机助手打开用户电脑的官方页面；网页二维码独立显示 | 否 | 重新扫码或选择本机助手/扩展 | 所有扫码后风控在用户浏览器完成；网页二维码本身不启动服务端 Chrome |
+| `password` | 本机助手在用户 Chrome/Edge 官方页面完成登录 | 否 | 本机助手重新登录 | 密码、短信、人脸和页面交互不进入控制台 |
+| `sms_window` | 本机助手在用户 Chrome/Edge 官方页面完成手机号验证码登录 | 否 | 本机助手重新登录 | 验证码只留在用户浏览器 |
+| `chrome_extension` | 独立扩展入口使用当前 Profile 登录或手动配对导入 | 仅扩展密码登录后显式绑定 | 重新桥接或导入 | P-256 设备证明；手动配对 Token 五分钟、单次使用 |
 | `server_maintenance` | 管理员回环控制台显式打开隔离服务器 Chrome | 否 | 仅管理员运维重试 | 双确认；普通用户与公网请求拒绝 |
 | `manual_cookie` | 用户手动粘贴 Cookie | 否 | 重新填写 | 格式容易出错，生命周期不可预测 |
 | `unknown` | 迁移前保存的历史账号 | 否 | 选择一种登录方式 | 缺少可信来源，不能推断续期能力 |
@@ -47,13 +47,15 @@
 
 ## 官方窗口登录
 
-普通用户使用 `/api/client-browser/devices` 注册或撤销当前浏览器设备，使用 `/api/client-browser/sessions` 创建 `qr`、`sms` 或 `password` 会话，再由扩展请求挑战、提交 P-256 签名和结构化 Cookie 到 `/api/client-browser/import`。服务端会调用真实平台 Token 接口，校验 `unb` 身份并完成账号落库；`/api/client-browser/sessions/{session_id}/confirm` 只有在账号列表确认后才允许扩展关闭标签页。挑战最长 60 秒、登录会话最长 5 分钟，挑战单次使用。
+普通用户的本机助手先通过回环接口 `GET /v1/device` 提供公开设备信息，前端把设备以 `client_type=native_helper` 注册到 `/api/client-browser/devices`，再通过 `/api/client-browser/sessions` 创建 `qr`、`sms` 或 `password` 会话，并调用助手 `POST /v1/login/start`。助手在用户电脑打开官方页，通过 CDP 监听登录态，向服务端请求挑战并把 P-256 签名及结构化 Cookie 直接提交到 `/api/client-browser/import`；Cookie、Token、密码和验证码不经过前端页面。
 
-网页二维码使用 `/qr-login/generate`、`/qr-login/check/{session_id}` 和 `/qr-login/cancel/{session_id}`。二维码状态进入 `continue_in_client_browser` 时，控制台显示当前设备浏览器入口；`/qr-login/continue/{session_id}` 仅保留兼容状态更新，不再为普通用户启动服务器 Chrome。取消原因限定为 `user_cancelled`、`switched_method` 或 `switched_to_extension`。
+扩展使用同一组服务端接口，但设备和会话标记为 `client_type=extension`，与本机助手隔离。服务端调用真实平台 Token 接口，校验 `unb` 身份并完成账号落库；`/api/client-browser/sessions/{session_id}/confirm` 只有在账号列表确认后才允许对应客户端关闭自己拥有的标签页。挑战最长 60 秒、登录会话最长 5 分钟，挑战单次使用。
+
+网页二维码使用 `/qr-login/generate`、`/qr-login/check/{session_id}` 和 `/qr-login/cancel/{session_id}`。二维码状态进入 `continue_in_client_browser` 时，控制台显示本机助手和扩展入口；`/qr-login/continue/{session_id}` 仅保留兼容状态更新，不再为普通用户启动服务器 Chrome。取消原因限定为 `user_cancelled`、`switched_method` 或兼容值 `switched_to_extension`。
 
 服务器运维登录仍使用 `/api/official-login/sessions` 及其状态、交互、显示和取消接口，但每个入口都检查管理员身份与回环来源；`show_browser:true` 只在该维护面可用。旧兼容接口遇到普通用户请求时返回 `client_browser_required`，不创建协调器会话。隐藏账号弹窗只隐藏界面，当前设备和网页二维码轮询继续。
 
-当前设备流程不依赖服务器 Page 或 Profile。扩展跟踪用户浏览器中官方标签页的跳转，只有真实 Token 验证、身份匹配、Cookie 落库和前端确认全部完成后才关闭标签页。
+本机助手和扩展流程都不依赖服务器 Page 或 Profile。本机助手优先连接已开启远程调试的 Chrome，否则启动用户电脑上的应用管理 Profile；扩展使用当前浏览器 Profile。两者都只关闭自己创建的标签页，并且只有真实 Token 验证、身份匹配、Cookie 落库和前端确认全部完成后才关闭。
 
 统一 Session Probe 在首次响应明确表示 H5 Token 过期、且响应 Cookie 提供了不同的 `_m_h5_tk` 时，会先合并全部 `Set-Cookie`（包括 `x5sec`、`cookie2` 等），再用新时间戳和新签名在同一 HTTP 客户端中重试一次。没有新 Token、人工验证、身份过期或普通临时错误不重试，也不因此启动浏览器。成功合并的 Cookie 仍由调用方通过现有 compare-and-swap 保存。
 
@@ -82,7 +84,7 @@ QR 会话进入 `expired` 后至少保留 5 分钟。保留期内重复轮询稳
 - `POST /qr-login/reset-cooldown/{cookie_id}`
 - `GET /qr-login/cooldown-status/{cookie_id}`
 
-登录续期只保留当前设备扩展路径；`XianyuOfficialLoginService` 的 headed Chrome 仅供管理员回环运维入口使用。商品、订单等非认证用途的浏览器逻辑不受此限制。
+登录续期只保留扩展设备路径；本机助手不领取续期凭据。`XianyuOfficialLoginService` 的 headed Chrome 仅供管理员回环运维入口使用。商品、订单等非认证用途的浏览器逻辑不受此限制。
 
 官方浏览器、档案归档、QR 交接和二次验证失败只记录异常类型和固定摘要。API、日志和运行时会话注册表不得包含完整 Cookie、Token、二维码内容、密码、密码密文、短信验证码、交互文字或官方验证 URL。交互帧只保存在内存中，限制大小、队列深度和提交速率，并在会话结束时清空。
 

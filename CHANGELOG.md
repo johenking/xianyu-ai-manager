@@ -19,11 +19,16 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Add strict loopback Origin checks, Chrome Local Network Access response headers,
   macOS Keychain and Windows DPAPI device-key storage, and separate macOS/Windows
   download artifacts.
+- Add native-helper `1.0.2` per-user installation and startup persistence: a
+  macOS LaunchAgent under the current user or a Windows current-user Run entry,
+  with install, status, single-instance, restart, and uninstall lifecycle gates.
 
 ### Changed
 
 - Make “本机 Chrome 登录” the main console path. Extension import remains a
   separate advanced entry, and web QR remains an independent fallback.
+- Detect only the loopback helper on the main path; extension detection remains
+  inside the separate extension entry and never blocks helper or web-QR use.
 - Native-helper login closes its official tab only after server persistence and
   frontend account confirmation.
 - Create a helper-owned CDP target without navigating or closing an existing user
@@ -31,6 +36,8 @@ All notable changes are documented here. This project follows Semantic Versionin
   process after its final helper-owned target closes.
 - Keep retryable Token probes and temporary account-persistence failures in the
   same login session while requiring a fresh one-time device challenge.
+- Verify the production page Origin can reach helper `1.0.2` through real Chrome
+  Local Network Access, while rejecting non-allowlisted Origins.
 
 ## [1.10.3] - 2026-07-31
 

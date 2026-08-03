@@ -290,10 +290,10 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- Current-device browser: register the extension device through `/api/client-browser/devices`, create a five-minute `qr`, `sms`, or `password` session through `/api/client-browser/sessions`, then let the extension open and track the official tab in the user's Chrome/Edge. Device proof, Token validation, `unb` identity, persistence, and frontend confirmation are all required before the tab closes.
+- User-machine helper: read the public device record from the user's loopback helper at `GET http://127.0.0.1:17890/v1/device`, register it through `/api/client-browser/devices` with `client_type=native_helper`, create a five-minute `qr`, `sms`, or `password` session through `/api/client-browser/sessions`, then call the helper's `POST /v1/login/start`. The helper opens and tracks an official tab in that user's Chrome/Edge and submits its signed login state directly to `/api/client-browser/import`. Device proof, Token validation, `unb` identity, persistence, and frontend confirmation are all required before the helper closes its tab.
 - Web QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; `mobile_scan` keeps a scannable image while slider, face, SMS, interactive, and unknown verification hand off to a current-device session.
 - Server maintenance: `/api/official-login/sessions` is reserved for an administrator on the service Mac loopback console. It is not an ordinary-user login path, and showing a physical server window requires `show_browser:true`.
-- Advanced extension import: create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings`, then import from the user's Chrome/Edge to the fixed production HTTPS endpoint.
+- Browser extension import: register an `extension` client-browser device for the signed session flow, or create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings` for manual import. Extension detection is isolated from the user-machine helper path.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
 Start a server-maintenance Chrome QR session from an administrator loopback console:
@@ -314,11 +314,11 @@ curl -sS -X POST "$BASE_URL/qr-login/generate" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Poll `GET /qr-login/check/{session_id}`. Generation and scanning never start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification return `continue_in_client_browser`; end the web QR with `switched_to_extension` and create a current-device `qr` session. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
+Poll `GET /qr-login/check/{session_id}`. Generation and scanning never start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification return `continue_in_client_browser`; end the web QR with the compatibility reason `switched_to_extension`, then start either the user-machine helper or extension path. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
 
 The old remote SMS example below is server-maintenance-only. Ordinary SMS login
-is started by the console's current-device bridge and the code is entered only
-in the user's Chrome/Edge.
+is started by the console through the user-machine helper and the code is entered
+only in the user's Chrome/Edge.
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
@@ -380,7 +380,7 @@ A `verification_required` state means the platform requires human verification i
 
 An active refresh is account-scoped and single-flight. Repeated `POST .../session-refresh` requests return the current persisted status and do not queue another browser session. Listener restarts restore the latest attempt or success as the scheduled-refresh anchor and set a fresh item-sync anchor, so a successful manual refresh cannot immediately trigger scheduled renewal or item-detail browser work.
 
-The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. QR, SMS, Chrome extension, and manual Cookie binding remain human recovery options. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes have been removed and are intentionally absent from OpenAPI.
+The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. The user-machine helper, web QR, Chrome extension, and manual Cookie binding remain human recovery options. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes have been removed and are intentionally absent from OpenAPI.
 
 ## Recent Order Sync
 
