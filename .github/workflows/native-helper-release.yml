@@ -212,7 +212,10 @@ jobs:
               -ArgumentList @(
                 '--install', '--no-ui', '--port', '17891',
                 '--result-file', (Join-Path $env:RUNNER_TEMP 'native-helper-install.json')
-              ) -Wait -PassThru
+              ) -PassThru
+            # Start-Process -Wait also waits for the persistent helper child process.
+            # Wait only for the one-shot installer process itself.
+            $install.WaitForExit()
             if ($install.ExitCode -ne 0) { throw 'Windows native helper install failed' }
             if (-not (Test-Path -LiteralPath $installedExecutable -PathType Leaf)) {
               throw 'Windows native helper installed executable is missing'
