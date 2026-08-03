@@ -258,7 +258,7 @@ describe('AccountList session verification UI', () => {
       deviceId: 'helper_device_123456',
       browserFamily: 'chrome',
       clientType: 'native_helper',
-      helperVersion: '1.0.1',
+      helperVersion: '1.0.2',
       protocolVersion: 1,
       signingPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-x', y: 'fixture-y' },
       encryptionPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-ex', y: 'fixture-ey' },
@@ -509,6 +509,7 @@ describe('AccountList session verification UI', () => {
       device_id: 'helper_device_123456',
       mode: 'password',
       server_origin: window.location.origin,
+      official_url: 'https://www.goofish.com/login',
     })));
     expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
     expect(clientBridgeRequests).not.toContain('XMC_START_LOGIN');
@@ -630,11 +631,11 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '安装本机助手' }));
     expect(screen.getByRole('link', { name: '下载 macOS 助手（Apple 芯片）' })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.1.zip',
+      '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.2.zip',
     );
     expect(screen.getByRole('link', { name: '下载 Windows 助手（x64）' })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.1.zip',
+      '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.2.zip',
     );
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
@@ -658,7 +659,7 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
 
     expect(await screen.findByText('本机浏览器助手需要更新')).toBeInTheDocument();
-    expect(screen.getAllByText(/当前 0.9.0，需要 1.0.1/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/当前 0.9.0，需要 1.0.2/).length).toBeGreaterThan(0);
     expect(registerClientBrowserDevice).not.toHaveBeenCalled();
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
   });

@@ -90,9 +90,9 @@ const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
 const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.1';
 const CLIENT_BROWSER_PROTOCOL_VERSION = 1;
 const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.1.zip';
-const NATIVE_HELPER_VERSION = '1.0.1';
-const NATIVE_HELPER_MACOS_URL = '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.1.zip';
-const NATIVE_HELPER_WINDOWS_URL = '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.1.zip';
+const NATIVE_HELPER_VERSION = '1.0.2';
+const NATIVE_HELPER_MACOS_URL = '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.2.zip';
+const NATIVE_HELPER_WINDOWS_URL = '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.2.zip';
 
 type ClientBrowserConnectionState = {
   state:
@@ -944,7 +944,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
         mode: session.mode,
         server_origin: window.location.origin,
         expires_at: session.expires_at,
-        official_url: 'https://www.goofish.com/',
+        official_url: 'https://www.goofish.com/login',
       });
       setClientBrowserStep('waiting_user');
       setClientBrowserConnection((current) => ({
@@ -3532,9 +3532,9 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
             </div>
             <div className="modal-body space-y-4">
               <ol className="list-decimal space-y-3 pl-5 text-sm leading-6 text-gray-700">
-                <li>下载并安装本机助手，保持助手运行在你的电脑上。</li>
+                <li>下载并解压后打开本机助手；首次打开会安装到当前用户并注册开机启动。</li>
                 <li>助手只绑定本机回环地址，不会把密码或验证码放进监控台页面。</li>
-                <li>回到此页面，关闭引导后再次点击“本机 Chrome 登录”；系统会打开你电脑上的官方页面。</li>
+                <li>看到“安装完成”后回到此页面，再次点击“本机 Chrome 登录”；以后重启电脑也会自动运行。</li>
               </ol>
               <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
                 <p className="font-bold text-gray-900">当前状态：{clientBrowserConnection.title}</p>
