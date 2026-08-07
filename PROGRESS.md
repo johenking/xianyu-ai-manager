@@ -11,5 +11,6 @@
 - Windows `1.0.2` 包：原生 runner 上完成安装、启动项、健康、单实例、停止/重启、状态和卸载；PE32+ x64 校验通过，SHA-256 为 `95a548fd739a37d015dea77a00910930d89f15c17952bb092eac8a7b5438e67e`。
 - 浏览器回环：使用正式 macOS `1.0.2` 包临时启动助手后，真实 Chrome 从正式页面 Origin 成功读取 `127.0.0.1:17890/health`；PNA 预检返回 `204`，非允许 Origin 返回 `403`。测试后的监听、隔离状态和钥匙串记录均已清除。这是浏览器传输证据，不是真实账号金丝雀。
 - 正式部署：生产功能和证据提交均已同步，生产源码树与当前 `origin/main` 一致。单 worker、迁移 `2026080101`、SQLite `ok`，本地/公网连续 `5/5` readiness、HTML/JS、OpenAPI 和三个公开下载哈希均通过；最新复核仍为 PID `82448`、单监听、本地/公网 `200/ready`。精确提交链记录在 `docs/handoff.md` 和完整回滚单元。
+- Cloudflare 隧道复发修复（2026-08-07）：确认应用本地保持 `200`，而长驻 `cloudflared` 进程进入 `readyConnections=0` 并触发公网 `530/1033`；日志显示 QUIC/边缘地址重连循环。LaunchAgent 保留原代理/DNS 参数，仅使用 `--protocol auto`；新增 `cloudflared_watchdog.py` 与用户级 watchdog 模板，连续两次零连接才 kickstart 隧道，冷却 180 秒，不重启应用。首次恢复和复发后的第二次恢复均验证公网 `200`、应用 PID `82448` 未变；看门程序部署后的长时稳定窗口仍在进行。
 - 回滚：完整原子回滚单元位于 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`；包含三份停服数据库证据，最终使用 `xianyu_data.final-stopped.db`，脚本语法与 `--check` 已通过。两次错误验收断言均真实触发并验证了完整回滚，第三次部署成功。
 - 剩余门禁：普通用户电脑真实登录金丝雀、macOS Developer ID/公证和 Windows Authenticode。

@@ -719,3 +719,21 @@ The macOS package is still ad-hoc signed and the Windows package has no
 Authenticode signature. The ordinary-user-machine live login canary remains
 pending and must prove real platform verification, message Token and `unb`,
 account persistence, frontend confirmation, and helper-owned tab closure.
+
+## Cloudflare Tunnel 1033 Recurrence And Watchdog On 2026-08-07
+
+The application origin remained healthy (`127.0.0.1:8091/health/ready` HTTP 200,
+PID `82448`) while the user-level `cloudflared` process remained alive with
+`readyConnections=0`. The public readiness endpoint returned HTTP 530 and the
+connector log repeatedly recorded QUIC timeouts and exhausted edge addresses.
+The current LaunchAgent still uses the existing local resolver argument; no DNS,
+proxy, or origin configuration was changed. A controlled restart with the same
+token and `--protocol auto` restored an edge connection and public HTTP 200.
+
+The repository now includes `cloudflared_watchdog.py`, focused tests, and
+`ops/launchd/com.cxywjx.cloudflared-watchdog.plist.template`. The watchdog only
+reads `127.0.0.1:20241/ready`; after two consecutive zero-connection samples it
+kickstarts `com.sub2api.cloudflared`, waits for a ready connection, and applies a
+180-second cooldown. It never restarts the application worker or edits the local
+proxy/DNS process. Production installation and its rollback are recorded in the
+dated rollback unit for this incident after the live stability window completes.

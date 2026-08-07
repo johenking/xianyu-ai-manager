@@ -30,6 +30,35 @@ Inspect the command line of the process listening on port `8091` to identify the
 
 The official-login stability change adds migration `2026071701` for `cookies.browser_user_agent`. The migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, official-login status endpoints, account listeners, Cookie schedules, and Skill scheduler. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
 
+### Tunnel 1033 / Zero Connections
+
+Cloudflare `1033` means the edge cannot find a healthy connector. Separate the
+origin and tunnel checks before changing application code:
+
+```bash
+curl -sS http://127.0.0.1:8091/health/ready
+curl -sS http://127.0.0.1:20241/ready
+curl -sS -o /dev/null -w '%{http_code}\n' https://xianyu.cxywjx.top/health/ready
+```
+
+The user-level `com.sub2api.cloudflared` LaunchAgent uses `--protocol auto` so
+cloudflared can fall back between QUIC and HTTP/2 when the network changes. The
+separate `com.cxywjx.cloudflared-watchdog` LaunchAgent samples the loopback
+readiness endpoint every 60 seconds. After two consecutive zero-connection
+samples it kickstarts only the cloudflared job, with a 180-second cooldown; it
+never restarts Uvicorn or touches the local DNS/proxy listener.
+
+Keep the existing `--dns-resolver-addrs` setting only while its local resolver
+is running and forwarding Cloudflare traffic. If it is absent or unhealthy,
+fix that resolver or remove only the flag and its address, preserving the
+token-file arguments. Verify outbound TCP/UDP port `7844`; inbound port
+forwarding is not part of the Tunnel path.
+
+When changing the LaunchAgent, back up the plist, wait for the old process to
+exit after `launchctl bootout`, then run `launchctl bootstrap` and verify both
+the loopback readiness JSON and the public HTTP status. Do not run a second
+cloudflared instance through Homebrew services while this LaunchAgent is loaded.
+
 ## Backup Before Risky Changes
 
 Back up the live SQLite database before migrations, account identity changes, authentication deployments, or bulk data operations:
@@ -49,7 +78,7 @@ Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.syst
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py cloudflared_watchdog.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 ruff check .
 
