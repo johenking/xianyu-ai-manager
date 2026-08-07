@@ -37,7 +37,7 @@ jobs:
           ADMIN_PASSWORD: ci-placeholder
           JWT_SECRET_KEY: ci-placeholder
       - run: python -m unittest discover -s tests -v
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
