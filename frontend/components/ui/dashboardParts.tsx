@@ -1,9 +1,10 @@
 import React from 'react';
+import type { OrderStatus } from '../../types';
 
 /**
- * 仪表盘「深色驾驶舱」方案的共享展示部件与工具。
- * 供 Dashboard / DashboardCharts / BusinessInsights 复用，保证面板语言一致：
- * 中圆角白面板、语义状态色、水平占比条替代饼图、HTML 排行列表替代纵向柱图。
+ * 「深色驾驶舱」方案的共享展示部件与工具。
+ * 供 Dashboard / DashboardCharts / BusinessInsights / OrderList / Keywords 复用，保证面板语言一致：
+ * 中圆角面板、语义状态色、水平占比条替代饼图、HTML 排行列表替代纵向柱图。
  */
 
 /* ---------------- 数字格式 ---------------- */
@@ -18,23 +19,31 @@ export const formatCount = (value: number): string => Number(value || 0).toLocal
 
 export interface StatusMeta {
   label: string;
-  /** 徽章样式：未知状态用虚线边框，与「已取消」的实灰底区分 */
+  /** 徽章样式 */
   chip: string;
   /** 占比条填充色 */
   bar: string;
 }
 
-export const STATUS_META: Record<string, StatusMeta> = {
+/**
+ * 订单状态语义色：全站唯一真源，覆盖 OrderStatus 的全部 9 个取值。
+ * 退款中/已退款、已取消/退款已关闭 这两组语义相近，用同色系深浅区分而不共用一个色值。
+ */
+export const STATUS_META: Record<OrderStatus, StatusMeta> = {
   processing: { label: '处理中', chip: 'bg-amber-100 text-amber-800', bar: '#F59E0B' },
   pending_ship: { label: '待发货', chip: 'bg-[#FFE815] text-black', bar: '#FFE815' },
   shipped: { label: '已发货', chip: 'bg-blue-100 text-blue-700', bar: '#3B82F6' },
   completed: { label: '已完成', chip: 'bg-emerald-100 text-emerald-700', bar: '#10B981' },
   refunding: { label: '退款中', chip: 'bg-red-100 text-red-600', bar: '#EF4444' },
+  refunded: { label: '已退款', chip: 'bg-red-100 text-red-700', bar: '#B91C1C' },
+  refund_cancelled: { label: '退款已关闭', chip: 'bg-gray-100 text-gray-600', bar: '#6B7280' },
   cancelled: { label: '已取消', chip: 'bg-gray-100 text-gray-500', bar: '#9CA3AF' },
-  unknown: { label: '未知', chip: 'border border-dashed border-gray-300 bg-white text-gray-400', bar: '#D1D5DB' },
+  // 徽章用琥珀色提示「需要人工核对」，虚线边框再与实底的「处理中」区分；
+  // 占比条则保持中性灰，避免在状态分布图里与「处理中」的琥珀色混淆。
+  unknown: { label: '待核对', chip: 'border border-dashed border-amber-300 bg-amber-50 text-amber-700', bar: '#D1D5DB' },
 };
 
-export const statusMetaOf = (status: string): StatusMeta => STATUS_META[status] || STATUS_META.unknown;
+export const statusMetaOf = (status: string): StatusMeta => STATUS_META[status as OrderStatus] || STATUS_META.unknown;
 
 export const StatusBadge: React.FC<{ status: string }> = ({ status }) => {
   const meta = statusMetaOf(status);

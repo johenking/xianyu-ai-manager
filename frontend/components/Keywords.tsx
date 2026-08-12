@@ -4,6 +4,7 @@ import { AccountDetail, ShippingRule, ReplyRule, DefaultReply } from '../types';
 import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot, AlertCircle } from 'lucide-react';
 import { InlineNotice, ToggleControl } from './ui/StatusControls';
+import { PANEL_CLASS } from './ui/dashboardParts';
 
 type TabType = 'reply' | 'delivery' | 'default';
 
@@ -15,23 +16,73 @@ const loadErrorText = (error: unknown, fallback: string): string => (
   error instanceof Error && error.message ? error.message : fallback
 );
 
+/** 表单控件统一样式：细边、连续表面，聚焦时描边加深 */
+const FIELD_CLASS = 'w-full rounded-lg border border-gray-200 bg-white px-3 py-2.5 text-sm font-medium text-gray-700 outline-none transition-colors focus:border-gray-900';
+
+/** 行内状态徽章：与仪表盘徽章同一套语法（小圆角 + 语义底色） */
+const RowChip: React.FC<{ tone?: 'neutral' | 'good'; children: React.ReactNode }> = ({ tone = 'neutral', children }) => (
+  <span className={`rounded-md px-2 py-0.5 text-[11px] font-bold ${tone === 'good' ? 'bg-emerald-50 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>
+    {children}
+  </span>
+);
+
+/** 行尾图标操作按钮：默认中性，删除态才用红色 */
+const RowAction: React.FC<{
+  title: string;
+  tone?: 'neutral' | 'danger';
+  onClick: () => void;
+  children: React.ReactNode;
+}> = ({ title, tone = 'neutral', onClick, children }) => (
+  <button
+    type="button"
+    title={title}
+    onClick={onClick}
+    className={`inline-flex h-9 w-9 items-center justify-center rounded-lg text-gray-400 transition-colors ${
+      tone === 'danger' ? 'hover:bg-red-50 hover:text-red-600' : 'hover:bg-gray-100 hover:text-gray-900'
+    }`}
+  >
+    {children}
+  </button>
+);
+
+/** 面板内的居中状态块：空态与错误态共用，避免再堆一层虚线大卡 */
+const PanelState: React.FC<{
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+  tone?: 'neutral' | 'error';
+  action?: React.ReactNode;
+  role?: string;
+}> = ({ icon, title, description, tone = 'neutral', action, role }) => (
+  <div role={role} className="flex flex-col items-center justify-center gap-3 px-6 py-20 text-center">
+    <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${tone === 'error' ? 'bg-red-50 text-red-500' : 'bg-gray-100 text-gray-400'}`}>
+      {icon}
+    </div>
+    <h3 className="text-[15px] font-bold text-gray-900">{title}</h3>
+    <p className="max-w-md text-sm text-gray-500">{description}</p>
+    {action}
+  </div>
+);
+
 /** 读路径失败的可见错误态：与保存路径一样诚实，提供重试入口而不是静默空列表 */
 const LoadErrorState: React.FC<{ title: string; message: string; onRetry: () => void }> = ({ title, message, onRetry }) => (
-  <div role="alert" className="py-20 text-center bg-gradient-to-br from-white to-red-50/40 rounded-[2.5rem] border-3 border-dashed border-red-200 shadow-xl">
-    <div className="w-24 h-24 bg-gradient-to-br from-red-100/70 to-red-200/40 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-      <AlertCircle className="w-12 h-12 text-red-400" />
-    </div>
-    <h3 className="text-2xl font-bold text-gray-900 mb-2">{title}</h3>
-    <p className="text-gray-500 text-lg mb-8">{message}</p>
-    <button
-      type="button"
-      onClick={onRetry}
-      className="inline-flex items-center gap-2 px-8 py-3 rounded-2xl font-bold bg-gray-900 text-white hover:bg-gray-800 shadow-lg transition-colors"
-    >
-      <RefreshCw className="w-5 h-5" />
-      重试
-    </button>
-  </div>
+  <PanelState
+    role="alert"
+    tone="error"
+    icon={<AlertCircle className="h-6 w-6" />}
+    title={title}
+    description={message}
+    action={(
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-1 inline-flex min-h-11 items-center gap-2 rounded-xl bg-gray-900 px-5 text-sm font-bold text-white transition-colors hover:bg-gray-800"
+      >
+        <RefreshCw className="h-4 w-4" />
+        重试
+      </button>
+    )}
+  />
 );
 
 interface Keyword {
@@ -401,420 +452,263 @@ const Keywords: React.FC = () => {
     }
   };
 
+  const tabs: Array<{ key: TabType; label: string; icon: React.ReactNode; count: number }> = [
+    { key: 'reply', label: '关键词回复', icon: <MessageSquare className="h-4 w-4" />, count: keywords.length },
+    { key: 'delivery', label: '关键词发货', icon: <Truck className="h-4 w-4" />, count: shippingRules.length },
+    {
+      key: 'default',
+      label: '账号默认回复',
+      icon: <Bot className="h-4 w-4" />,
+      count: Object.values(defaultReplies).filter((reply: DefaultReply) => reply.enabled).length,
+    },
+  ];
+
   return (
-    <div className="space-y-8 animate-fade-in">
+    <div className="space-y-5 animate-fade-in">
       {pageNotice && <div className="fixed right-4 top-4 z-[120] w-[calc(100%-2rem)] max-w-sm"><InlineNotice tone={pageNotice.tone}>{pageNotice.text}</InlineNotice></div>}
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
         <div>
           <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">关键词管理</h2>
-          <p className="text-gray-500 mt-2 font-medium">配置自动回复和关键词发货规则</p>
+          <p className="mt-1.5 text-sm text-gray-500">配置自动回复和关键词发货规则</p>
         </div>
       </div>
 
-      {/* Tab 切换 - 精美设计 */}
-      <div className="max-w-full overflow-x-auto">
-        <div className="flex min-w-max bg-gray-100 p-1 rounded-2xl border border-gray-200">
-          <button
-            onClick={() => setActiveTab('reply')}
-            className={`flex items-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-colors ${
-              activeTab === 'reply'
-                ? 'bg-gradient-to-r from-[#FFE815] to-[#FFD700] text-gray-900 shadow-2xl scale-105'
-                : 'text-gray-500 hover:text-gray-700 hover:bg-white/50'
-            }`}
-          >
-            <MessageSquare className="w-6 h-6" />
-            关键词回复
-            {activeTab === 'reply' && (
-              <span className="ml-2 px-3 py-1 bg-white/30 rounded-full text-sm">{keywords.length}</span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('delivery')}
-            className={`flex items-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-colors ${
-              activeTab === 'delivery'
-                ? 'bg-gradient-to-r from-[#FFE815] to-[#FFD700] text-gray-900 shadow-2xl scale-105'
-                : 'text-gray-500 hover:text-gray-700 hover:bg-white/50'
-            }`}
-          >
-            <Truck className="w-6 h-6" />
-            关键词发货
-            {activeTab === 'delivery' && (
-              <span className="ml-2 px-3 py-1 bg-white/30 rounded-full text-sm">{shippingRules.length}</span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('default')}
-            className={`flex items-center gap-2 px-4 py-3 rounded-xl font-bold text-sm transition-colors ${
-              activeTab === 'default'
-                ? 'bg-gradient-to-r from-[#FFE815] to-[#FFD700] text-gray-900 shadow-2xl scale-105'
-                : 'text-gray-500 hover:text-gray-700 hover:bg-white/50'
-            }`}
-          >
-            <Bot className="w-6 h-6" />
-            账号默认回复
-            {activeTab === 'default' && (
-              <span className="ml-2 px-3 py-1 bg-white/30 rounded-full text-sm">
-                {Object.values(defaultReplies).filter((reply: DefaultReply) => reply.enabled).length}
-              </span>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* 操作栏 */}
-      <div className="bg-white rounded-3xl shadow-xl p-6">
-        <div className="flex flex-col sm:flex-row gap-4 items-center justify-between">
-          <div className="flex items-center gap-4 w-full sm:w-auto">
-            <label className="text-sm font-bold text-gray-700 whitespace-nowrap">选择账号</label>
-            <select
-              className="flex-1 sm:w-64 ios-input px-5 py-3 rounded-2xl font-medium border-2 border-gray-200 focus:border-[#FFE815] focus:ring-4 focus:ring-[#FFE815]/20 transition-all"
-              value={selectedAccount}
-              onChange={(e) => setSelectedAccount(e.target.value)}
-            >
-              <option value="">请选择账号</option>
-              {accounts.map((acc) => (
-                <option key={acc.id} value={acc.id}>
-                  {acc.nickname}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-3 w-full sm:w-auto">
-            <button
-              onClick={() => {
-                if (activeTab === 'reply') loadKeywords();
-                else if (activeTab === 'delivery') loadShippingRules();
-                else loadDefaultReplies();
-              }}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-3 rounded-2xl font-bold bg-gradient-to-br from-gray-100 to-gray-200 hover:from-gray-200 hover:to-gray-300 transition-all shadow-lg"
-            >
-              <RefreshCw className="w-5 h-5" />
-              刷新
-            </button>
-            <button
-              onClick={handleAdd}
-              disabled={!selectedAccount}
-              className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 sm:px-8 py-3 rounded-2xl font-bold whitespace-nowrap bg-gradient-to-r from-[#FFE815] to-[#FFD700] hover:from-[#FFD700] hover:to-[#FFC800] text-gray-900 shadow-xl hover:shadow-2xl hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Plus className="w-5 h-5" />
-              {activeTab === 'reply' ? '添加关键词' : activeTab === 'delivery' ? '添加发货规则' : '编辑默认回复'}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* 内容区域 */}
-      {!selectedAccount ? (
-        loadErrors.accounts ? (
-          <LoadErrorState title="账号列表加载失败" message={loadErrors.accounts} onRetry={() => { loadAccounts(); }} />
-        ) : (
-          <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
-            <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-              <MessageSquare className="w-12 h-12 text-[#FFE815]" />
-            </div>
-            <h3 className="text-2xl font-bold text-gray-900 mb-2">请选择账号</h3>
-            <p className="text-gray-500 text-lg">选择一个账号以管理其关键词规则</p>
-          </div>
-        )
-      ) : activeTab === 'reply' ? (
-        // 关键词回复列表
-        loading ? (
-          <div className="py-24 flex justify-center">
-            <div className="flex flex-col items-center gap-4">
-              <Loader2 className="w-16 h-16 text-[#FFE815] animate-spin" />
-              <p className="text-gray-500 font-medium">加载中...</p>
-            </div>
-          </div>
-        ) : loadErrors.keywords ? (
-          <LoadErrorState title="关键词加载失败" message={loadErrors.keywords} onRetry={() => { loadKeywords(); }} />
-        ) : (
-          <div className="space-y-4">
-            {keywords.map((keyword, index) => (
-              <div
-                key={keyword.id}
-                className="group relative bg-gradient-to-br from-white to-gray-50 rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 border-transparent hover:border-[#FFE815]/30 overflow-hidden"
+      {/* 单一面板：分段控件 + 账号筛选 + 连续列表，避免多层漂浮卡片堆叠 */}
+      <section className={`${PANEL_CLASS} overflow-hidden`}>
+        <div className="space-y-3 border-b border-gray-100 bg-gray-50/70 p-4">
+          <div className="flex max-w-full gap-1 overflow-x-auto rounded-xl bg-gray-100 p-1">
+            {tabs.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setActiveTab(tab.key)}
+                className={`flex items-center gap-2 whitespace-nowrap rounded-lg px-4 py-2 text-[13px] font-bold transition-colors ${
+                  activeTab === tab.key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-800'
+                }`}
               >
-                {/* 背景装饰 */}
-                <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-[#FFE815]/10 to-transparent rounded-full -translate-y-1/2 translate-x-1/2 group-hover:scale-150 transition-transform duration-500"></div>
+                {tab.icon}
+                {tab.label}
+                {activeTab === tab.key && (
+                  <span className="rounded-md bg-gray-100 px-1.5 py-0.5 text-[11px] font-bold text-gray-500">{tab.count}</span>
+                )}
+              </button>
+            ))}
+          </div>
 
-                <div className="relative flex items-center gap-6">
-                  {/* 图标 */}
-                  <div className="flex-shrink-0">
-                    <div className="w-16 h-16 bg-gradient-to-br from-[#FFF9C4] to-[#FFE815] rounded-2xl flex items-center justify-center shadow-lg group-hover:scale-110 group-hover:rotate-12 transition-all duration-300">
-                      <Key className="w-8 h-8 text-yellow-800" />
-                    </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2">
+              <label htmlFor="keyword-account" className="whitespace-nowrap text-sm font-bold text-gray-700">选择账号</label>
+              <select
+                id="keyword-account"
+                className={`${FIELD_CLASS} min-h-11 sm:w-56`}
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+              >
+                <option value="">请选择账号</option>
+                {accounts.map((acc) => (
+                  <option key={acc.id} value={acc.id}>
+                    {acc.nickname}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  if (activeTab === 'reply') loadKeywords();
+                  else if (activeTab === 'delivery') loadShippingRules();
+                  else loadDefaultReplies();
+                }}
+                className="inline-flex min-h-11 flex-1 items-center justify-center gap-2 rounded-xl border border-gray-200 bg-white px-4 text-sm font-bold text-gray-700 transition-colors hover:bg-gray-50 sm:flex-none"
+              >
+                <RefreshCw className="h-4 w-4" />
+                刷新
+              </button>
+              <button
+                onClick={handleAdd}
+                disabled={!selectedAccount}
+                className="ios-btn-primary inline-flex min-h-11 flex-1 items-center justify-center gap-2 whitespace-nowrap rounded-xl px-4 text-sm font-bold disabled:cursor-not-allowed disabled:opacity-50 sm:flex-none"
+              >
+                <Plus className="h-4 w-4" />
+                {activeTab === 'reply' ? '添加关键词' : activeTab === 'delivery' ? '添加发货规则' : '编辑默认回复'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* 内容区域 */}
+        {!selectedAccount ? (
+          loadErrors.accounts ? (
+            <LoadErrorState title="账号列表加载失败" message={loadErrors.accounts} onRetry={() => { loadAccounts(); }} />
+          ) : (
+            <PanelState
+              icon={<MessageSquare className="h-6 w-6" />}
+              title="请选择账号"
+              description="选择一个账号以管理其关键词规则"
+            />
+          )
+        ) : activeTab === 'reply' ? (
+          // 关键词回复列表
+          loading ? (
+            <div className="flex flex-col items-center justify-center gap-3 px-6 py-20 text-center">
+              <Loader2 className="h-8 w-8 animate-spin text-gray-300" />
+              <p className="text-sm text-gray-500">加载中...</p>
+            </div>
+          ) : loadErrors.keywords ? (
+            <LoadErrorState title="关键词加载失败" message={loadErrors.keywords} onRetry={() => { loadKeywords(); }} />
+          ) : keywords.length === 0 ? (
+            <PanelState
+              icon={<MessageSquare className="h-6 w-6" />}
+              title="暂无关键词"
+              description="点击右上角添加新的关键词规则"
+            />
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {keywords.map((keyword) => (
+                <div key={keyword.id} className="flex items-start gap-4 px-5 py-4 transition-colors hover:bg-gray-50/60">
+                  <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-100 text-gray-500">
+                    <Key className="h-5 w-5" />
                   </div>
-
-                  {/* 内容 */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-3">
-                      <h3 className="text-xl font-black text-gray-900">{keyword.keyword}</h3>
-                      <span className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-green-400 to-green-500 text-white text-xs font-bold shadow-md">
-                        精确匹配
-                      </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-[15px] font-bold text-gray-900">{keyword.keyword}</h3>
+                      <RowChip>精确匹配</RowChip>
                     </div>
-                    <p className="text-gray-600 bg-white/70 backdrop-blur-sm rounded-2xl px-4 py-3 line-clamp-2 shadow-inner border border-gray-100">
-                      💬 {keyword.reply_content || '无回复内容'}
+                    <p className="mt-1 line-clamp-2 text-sm text-gray-500">{keyword.reply_content || '无回复内容'}</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <RowAction title="编辑" onClick={() => handleEdit(keyword)}>
+                      <Edit2 className="h-4 w-4" />
+                    </RowAction>
+                    <RowAction title="删除" tone="danger" onClick={() => handleDelete(keyword.id)}>
+                      <Trash2 className="h-4 w-4" />
+                    </RowAction>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        ) : activeTab === 'delivery' ? (
+          // 关键词发货列表
+          loadErrors.shipping ? (
+            <LoadErrorState title="发货规则加载失败" message={loadErrors.shipping} onRetry={() => { loadShippingRules(); }} />
+          ) : shippingRules.length === 0 ? (
+            <PanelState
+              icon={<Truck className="h-6 w-6" />}
+              title="暂无发货规则"
+              description="点击右上角添加新的发货规则"
+            />
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {shippingRules.map((rule) => (
+                <div key={rule.id} className="flex items-start gap-4 px-5 py-4 transition-colors hover:bg-gray-50/60">
+                  <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-100 text-gray-500">
+                    <Truck className="h-5 w-5" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className={`text-[15px] font-bold ${rule.enabled ? 'text-gray-900' : 'text-gray-500'}`}>{rule.item_keyword}</h3>
+                      <RowChip tone={rule.enabled ? 'good' : 'neutral'}>{rule.enabled ? '已启用' : '已禁用'}</RowChip>
+                    </div>
+                    <p className="mt-1 text-sm text-gray-500">
+                      卡券：{rule.card_group_name || `ID: ${rule.card_group_id}`}
+                      {rule.name && (
+                        <>
+                          <span className="mx-2 text-gray-300">|</span>
+                          {rule.name}
+                        </>
+                      )}
                     </p>
                   </div>
-
-                  {/* 操作按钮 */}
-                  <div className="flex gap-2 flex-shrink-0">
-                    <button
-                      onClick={() => handleEdit(keyword)}
-                      className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                      title="编辑"
-                    >
-                      <Edit2 className="w-5 h-5" />
-                    </button>
-                    <button
-                      onClick={() => handleDelete(keyword.id)}
-                      className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                      title="删除"
-                    >
-                      <Trash2 className="w-5 h-5" />
-                    </button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <RowAction title={rule.enabled ? '禁用' : '启用'} onClick={() => handleToggleDelivery(rule)}>
+                      {rule.enabled ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
+                    </RowAction>
+                    <RowAction title="编辑" onClick={() => handleEditDelivery(rule)}>
+                      <Edit2 className="h-4 w-4" />
+                    </RowAction>
+                    <RowAction title="删除" tone="danger" onClick={() => handleDeleteDelivery(rule.id)}>
+                      <Trash2 className="h-4 w-4" />
+                    </RowAction>
                   </div>
                 </div>
-              </div>
-            ))}
-
-            {keywords.length === 0 && (
-              <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
-                <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-                  <MessageSquare className="w-12 h-12 text-[#FFE815]" />
-                </div>
-                <h3 className="text-2xl font-bold text-gray-900 mb-2">暂无关键词</h3>
-                <p className="text-gray-500 text-lg">点击右上角添加新的关键词规则</p>
-              </div>
-            )}
-          </div>
-        )
-      ) : activeTab === 'delivery' ? (
-        // 关键词发货列表
-        loadErrors.shipping ? (
-          <LoadErrorState title="发货规则加载失败" message={loadErrors.shipping} onRetry={() => { loadShippingRules(); }} />
-        ) : (
-        <div className="space-y-4">
-          {shippingRules.map((rule) => (
-            <div
-              key={rule.id}
-              className={`group relative bg-gradient-to-br ${rule.enabled ? 'from-white to-blue-50/30' : 'from-gray-100 to-gray-150'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${rule.enabled ? 'border-transparent hover:border-blue-400/30' : 'border-gray-200'} overflow-hidden`}
-            >
-              {/* 背景装饰 */}
-              {rule.enabled && (
-                <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-blue-400/10 to-transparent rounded-full -translate-y-1/2 translate-x-1/2 group-hover:scale-150 transition-transform duration-500"></div>
-              )}
-
-              <div className="relative flex items-center gap-6">
-                {/* 图标 */}
-                <div className="flex-shrink-0">
-                  <div className={`w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg group-hover:scale-110 transition-all duration-300 ${
-                    rule.enabled
-                      ? 'bg-gradient-to-br from-blue-400 to-blue-500 group-hover:rotate-12'
-                      : 'bg-gradient-to-br from-gray-300 to-gray-400'
-                  }`}>
-                    <Truck className="w-8 h-8 text-white" />
-                  </div>
-                </div>
-
-                {/* 内容 */}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-3 mb-3">
-                    <h3 className="text-xl font-black text-gray-900">{rule.item_keyword}</h3>
-                    <span className={`px-3 py-1.5 rounded-xl text-xs font-bold shadow-md ${
-                      rule.enabled
-                        ? 'bg-gradient-to-r from-green-400 to-green-500 text-white'
-                        : 'bg-gradient-to-r from-gray-400 to-gray-500 text-white'
-                    }`}>
-                      {rule.enabled ? '已启用' : '已禁用'}
-                    </span>
-                  </div>
-                  <p className="text-gray-600 bg-white/70 backdrop-blur-sm rounded-2xl px-4 py-3 shadow-inner border border-gray-100">
-                    🎁 卡券：{rule.card_group_name || `ID: ${rule.card_group_id}`}
-                    {rule.name && (
-                      <>
-                        <span className="mx-2 text-gray-300">|</span>
-                        📝 {rule.name}
-                      </>
-                    )}
-                  </p>
-                </div>
-
-                {/* 操作按钮 */}
-                <div className="flex gap-2 flex-shrink-0">
-                  <button
-                    onClick={() => handleToggleDelivery(rule)}
-                    className={`p-3.5 rounded-2xl transition-all shadow-md hover:shadow-lg hover:scale-110 ${
-                      rule.enabled
-                        ? 'bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 hover:from-amber-100 hover:to-amber-200'
-                        : 'bg-gradient-to-br from-green-50 to-green-100 text-green-600 hover:from-green-100 hover:to-green-200'
-                    }`}
-                    title={rule.enabled ? '禁用' : '启用'}
-                  >
-                    {rule.enabled ? <PowerOff className="w-5 h-5" /> : <Power className="w-5 h-5" />}
-                  </button>
-                  <button
-                    onClick={() => handleEditDelivery(rule)}
-                    className="p-3.5 bg-gradient-to-br from-amber-50 to-amber-100 text-amber-600 rounded-2xl hover:from-amber-100 hover:to-amber-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                    title="编辑"
-                  >
-                    <Edit2 className="w-5 h-5" />
-                  </button>
-                  <button
-                    onClick={() => handleDeleteDelivery(rule.id)}
-                    className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                    title="删除"
-                  >
-                    <Trash2 className="w-5 h-5" />
-                  </button>
-                </div>
-              </div>
+              ))}
             </div>
-          ))}
-
-          {shippingRules.length === 0 && (
-            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
-              <div className="w-24 h-24 bg-gradient-to-br from-blue-400/20 to-blue-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-                <Truck className="w-12 h-12 text-blue-400" />
-              </div>
-              <h3 className="text-2xl font-bold text-gray-900 mb-2">暂无发货规则</h3>
-              <p className="text-gray-500 text-lg">点击右上角添加新的发货规则</p>
-            </div>
-          )}
-        </div>
-        )
-      ) : activeTab === 'default' ? (
-        // 账号默认回复列表
-        loadErrors.defaults ? (
-          <LoadErrorState title="默认回复加载失败" message={loadErrors.defaults} onRetry={() => { loadDefaultReplies(); }} />
-        ) : (
-        <div className="space-y-4">
-          {accounts.map((account) => {
-            const defaultReply = defaultReplies[account.id];
-            const hasDefaultReply = defaultReply && defaultReply.enabled;
-            return (
-              <div
-                key={account.id}
-                className={`group relative bg-gradient-to-br ${hasDefaultReply ? 'from-white to-purple-50/30' : 'from-gray-100 to-gray-150'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${hasDefaultReply ? 'border-transparent hover:border-purple-400/30' : 'border-gray-200'} overflow-hidden`}
-              >
-                {/* 背景装饰 */}
-                {hasDefaultReply && (
-                  <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-purple-400/10 to-transparent rounded-full -translate-y-1/2 translate-x-1/2 group-hover:scale-150 transition-transform duration-500"></div>
-                )}
-
-                <div className="relative flex items-center gap-6">
-                  {/* 图标 */}
-                  <div className="flex-shrink-0">
-                    <div className={`w-16 h-16 rounded-2xl flex items-center justify-center shadow-lg group-hover:scale-110 transition-all duration-300 ${
-                      hasDefaultReply
-                        ? 'bg-gradient-to-br from-purple-400 to-purple-500 group-hover:rotate-12'
-                        : 'bg-gradient-to-br from-gray-300 to-gray-400'
-                    }`}>
-                      <Bot className="w-8 h-8 text-white" />
+          )
+        ) : activeTab === 'default' ? (
+          // 账号默认回复列表
+          loadErrors.defaults ? (
+            <LoadErrorState title="默认回复加载失败" message={loadErrors.defaults} onRetry={() => { loadDefaultReplies(); }} />
+          ) : accounts.length === 0 ? (
+            <PanelState
+              icon={<Bot className="h-6 w-6" />}
+              title="暂无账号"
+              description="请先添加账号"
+            />
+          ) : (
+            <div className="divide-y divide-gray-100">
+              {accounts.map((account) => {
+                const defaultReply = defaultReplies[account.id];
+                const hasDefaultReply = defaultReply && defaultReply.enabled;
+                return (
+                  <div key={account.id} className="flex items-start gap-4 px-5 py-4 transition-colors hover:bg-gray-50/60">
+                    <div className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gray-100 text-gray-500">
+                      <Bot className="h-5 w-5" />
                     </div>
-                  </div>
-
-                  {/* 内容 */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-3 mb-3">
-                      <h3 className="text-xl font-black text-gray-900">{account.nickname}</h3>
-                      <span className={`px-3 py-1.5 rounded-xl text-xs font-bold shadow-md ${
-                        hasDefaultReply
-                          ? 'bg-gradient-to-r from-green-400 to-green-500 text-white'
-                          : 'bg-gradient-to-r from-gray-400 to-gray-500 text-white'
-                      }`}>
-                        {hasDefaultReply ? '已启用' : '未设置'}
-                      </span>
-                      {defaultReply?.reply_once && (
-                        <span className="px-3 py-1.5 rounded-xl bg-purple-100 text-purple-700 text-xs font-bold shadow-md">
-                          只回复一次
-                        </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className={`text-[15px] font-bold ${hasDefaultReply ? 'text-gray-900' : 'text-gray-500'}`}>{account.nickname}</h3>
+                        <RowChip tone={hasDefaultReply ? 'good' : 'neutral'}>{hasDefaultReply ? '已启用' : '未设置'}</RowChip>
+                        {defaultReply?.reply_once && <RowChip>只回复一次</RowChip>}
+                      </div>
+                      {hasDefaultReply && (
+                        <p className="mt-1 line-clamp-2 text-sm text-gray-500">{defaultReply.reply_content || '无回复内容'}</p>
                       )}
                     </div>
-                    {hasDefaultReply && (
-                      <p className="text-gray-600 bg-white/70 backdrop-blur-sm rounded-2xl px-4 py-3 line-clamp-2 shadow-inner border border-gray-100">
-                        💬 {defaultReply.reply_content || '无回复内容'}
-                      </p>
-                    )}
+                    <div className="flex shrink-0 items-center gap-1">
+                      <RowAction title="编辑" onClick={() => loadDefaultReplyForEdit(account.id)}>
+                        <Edit2 className="h-4 w-4" />
+                      </RowAction>
+                      {hasDefaultReply && (
+                        <>
+                          <RowAction title="清空回复记录" onClick={() => handleClearRecords(account.id)}>
+                            <RefreshCw className="h-4 w-4" />
+                          </RowAction>
+                          <RowAction title="删除" tone="danger" onClick={() => handleDeleteDefault(account.id)}>
+                            <Trash2 className="h-4 w-4" />
+                          </RowAction>
+                        </>
+                      )}
+                    </div>
                   </div>
-
-                  {/* 操作按钮 */}
-                  <div className="flex gap-2 flex-shrink-0">
-                    <button
-                      onClick={() => loadDefaultReplyForEdit(account.id)}
-                      className="p-3.5 bg-gradient-to-br from-purple-50 to-purple-100 text-purple-600 rounded-2xl hover:from-purple-100 hover:to-purple-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                      title="编辑"
-                    >
-                      <Edit2 className="w-5 h-5" />
-                    </button>
-                    {hasDefaultReply && (
-                      <>
-                        <button
-                          onClick={() => handleClearRecords(account.id)}
-                          className="p-3.5 bg-gradient-to-br from-blue-50 to-blue-100 text-blue-600 rounded-2xl hover:from-blue-100 hover:to-blue-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                          title="清空回复记录"
-                        >
-                          <RefreshCw className="w-5 h-5" />
-                        </button>
-                        <button
-                          onClick={() => handleDeleteDefault(account.id)}
-                          className="p-3.5 bg-gradient-to-br from-red-50 to-red-100 text-red-500 rounded-2xl hover:from-red-100 hover:to-red-200 transition-all shadow-md hover:shadow-lg hover:scale-110"
-                          title="删除"
-                        >
-                          <Trash2 className="w-5 h-5" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-
-          {accounts.length === 0 && (
-            <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
-              <div className="w-24 h-24 bg-gradient-to-br from-purple-400/20 to-purple-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-                <Bot className="w-12 h-12 text-purple-400" />
-              </div>
-              <h3 className="text-2xl font-bold text-gray-900 mb-2">暂无账号</h3>
-              <p className="text-gray-500 text-lg">请先添加账号</p>
+                );
+              })}
             </div>
-          )}
-        </div>
-        )
-      ) : null}
+          )
+        ) : null}
+      </section>
 
       {/* 关键词回复弹窗 */}
       {showReplyModal && createPortal(
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-fade-in">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden animate-scale-in">
-            {/* Header */}
-            <div className="bg-[#FFE815] p-5 sm:p-6">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 bg-white/30 backdrop-blur-sm rounded-2xl flex items-center justify-center">
-                    <MessageSquare className="w-7 h-7 text-gray-900" />
-                  </div>
-                  <h3 className="text-xl sm:text-2xl font-black text-gray-900">
-                    {editingKeyword ? '编辑关键词' : '添加关键词'}
-                  </h3>
-                </div>
-                <button
-                  onClick={() => setShowReplyModal(false)}
-                  className="p-3 bg-white/30 backdrop-blur-sm rounded-2xl hover:bg-white/40 transition-colors"
-                >
-                  <X className="w-6 h-6 text-gray-900" />
-                </button>
-              </div>
+        <div className="modal-overlay-centered">
+          <div className="modal-container">
+            <div className="modal-header">
+              <h3 className="text-xl font-extrabold text-gray-900">
+                {editingKeyword ? '编辑关键词' : '添加关键词'}
+              </h3>
+              <button
+                onClick={() => setShowReplyModal(false)}
+                className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-900"
+              >
+                <X className="h-5 w-5" />
+              </button>
             </div>
 
-            {/* Body */}
-            <div className="p-5 sm:p-6 space-y-6 overflow-y-auto max-h-[60vh]">
+            <div className="modal-body space-y-5">
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <Key className="w-5 h-5 text-[#FFE815]" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Key className="h-4 w-4 text-gray-400" />
                   触发关键词
                 </label>
                 <input
@@ -822,14 +716,14 @@ const Keywords: React.FC = () => {
                   value={replyForm.keyword}
                   onChange={(e) => setReplyForm({ ...replyForm, keyword: e.target.value })}
                   placeholder="例如：价格、包邮、怎么样"
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-[#FFE815] focus:ring-4 focus:ring-[#FFE815]/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💡 买家消息中包含此关键词时自动回复</p>
+                <p className="mt-2 text-xs text-gray-500">买家消息中包含此关键词时自动回复</p>
               </div>
 
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <MessageSquare className="w-5 h-5 text-[#FFE815]" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <MessageSquare className="h-4 w-4 text-gray-400" />
                   回复内容
                 </label>
                 <textarea
@@ -837,26 +731,25 @@ const Keywords: React.FC = () => {
                   onChange={(e) => setReplyForm({ ...replyForm, reply_content: e.target.value })}
                   placeholder="输入自动回复的内容..."
                   rows={6}
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-[#FFE815] focus:ring-4 focus:ring-[#FFE815]/20 transition-all bg-gray-50 resize-none"
+                  className={`${FIELD_CLASS} resize-none py-3`}
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💬 支持换行，系统将自动发送此内容给买家</p>
+                <p className="mt-2 text-xs text-gray-500">支持换行，系统将自动发送此内容给买家</p>
               </div>
             </div>
 
-            {/* Footer */}
-            <div className="p-5 sm:p-6 bg-gray-50 border-t border-gray-100">
-              <div className="flex gap-4">
+            <div className="modal-footer">
+              <div className="flex w-full gap-3">
                 <button
                   onClick={() => setShowReplyModal(false)}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-white border-2 border-gray-200 hover:bg-gray-50 hover:border-gray-300 text-gray-700 transition-all shadow-lg hover:shadow-xl"
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-6 py-3 font-bold text-gray-700 transition-colors hover:bg-gray-50"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleSave}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-gradient-to-r from-[#FFE815] to-[#FFD700] hover:from-[#FFD700] hover:to-[#FFC800] text-gray-900 shadow-xl hover:shadow-2xl hover:scale-105 transition-all flex items-center justify-center gap-2"
+                  className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-xl px-6 py-3 font-bold"
                 >
-                  <Save className="w-5 h-5" />
+                  <Save className="h-4 w-4" />
                   保存关键词
                 </button>
               </div>
@@ -868,33 +761,24 @@ const Keywords: React.FC = () => {
 
       {/* 关键词发货弹窗 */}
       {showDeliveryModal && createPortal(
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-fade-in">
-          <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden animate-scale-in">
-            {/* Header */}
-            <div className="bg-gradient-to-r from-blue-400 to-blue-500 p-8">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 bg-white/30 backdrop-blur-sm rounded-2xl flex items-center justify-center">
-                    <Truck className="w-7 h-7 text-white" />
-                  </div>
-                  <h3 className="text-3xl font-black text-white">
-                    {editingDeliveryRule ? '编辑发货规则' : '添加发货规则'}
-                  </h3>
-                </div>
-                <button
-                  onClick={() => setShowDeliveryModal(false)}
-                  className="p-3 bg-white/30 backdrop-blur-sm rounded-2xl hover:bg-white/40 transition-colors"
-                >
-                  <X className="w-6 h-6 text-white" />
-                </button>
-              </div>
+        <div className="modal-overlay-centered">
+          <div className="modal-container">
+            <div className="modal-header">
+              <h3 className="text-xl font-extrabold text-gray-900">
+                {editingDeliveryRule ? '编辑发货规则' : '添加发货规则'}
+              </h3>
+              <button
+                onClick={() => setShowDeliveryModal(false)}
+                className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-900"
+              >
+                <X className="h-5 w-5" />
+              </button>
             </div>
 
-            {/* Body */}
-            <div className="p-8 space-y-6 overflow-y-auto max-h-[60vh]">
+            <div className="modal-body space-y-5">
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <Key className="w-5 h-5 text-blue-500" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Key className="h-4 w-4 text-gray-400" />
                   触发关键词
                 </label>
                 <input
@@ -902,20 +786,20 @@ const Keywords: React.FC = () => {
                   value={deliveryForm.keyword}
                   onChange={(e) => setDeliveryForm({ ...deliveryForm, keyword: e.target.value })}
                   placeholder="例如：发货卡密、自动发货"
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💡 买家消息中包含此关键词时自动发货</p>
+                <p className="mt-2 text-xs text-gray-500">买家消息中包含此关键词时自动发货</p>
               </div>
 
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <Sparkles className="w-5 h-5 text-blue-500" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Sparkles className="h-4 w-4 text-gray-400" />
                   关联卡券
                 </label>
                 <select
                   value={deliveryForm.card_id}
                   onChange={(e) => setDeliveryForm({ ...deliveryForm, card_id: e.target.value })}
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 >
                   <option value="">请选择卡券</option>
                   {cards.map((card) => (
@@ -935,13 +819,13 @@ const Keywords: React.FC = () => {
                     </InlineNotice>
                   </div>
                 ) : (
-                  <p className="text-sm text-gray-500 mt-2 ml-1">🎁 选择触发关键词时发送的卡券</p>
+                  <p className="mt-2 text-xs text-gray-500">选择触发关键词时发送的卡券</p>
                 )}
               </div>
 
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <MessageSquare className="w-5 h-5 text-blue-500" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <MessageSquare className="h-4 w-4 text-gray-400" />
                   描述（可选）
                 </label>
                 <input
@@ -949,45 +833,36 @@ const Keywords: React.FC = () => {
                   value={deliveryForm.description}
                   onChange={(e) => setDeliveryForm({ ...deliveryForm, description: e.target.value })}
                   placeholder="规则描述，方便识别"
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 />
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-blue-50 to-blue-100/50 rounded-2xl border-2 border-blue-200">
-                <div className="flex items-center gap-3">
-                  <Power className="w-6 h-6 text-blue-500" />
-                  <span className="text-base font-black text-gray-900">启用此规则</span>
+              <div className="flex items-center justify-between gap-3 border-t border-gray-100 pt-5">
+                <div className="flex items-center gap-2">
+                  <Power className="h-4 w-4 text-gray-400" />
+                  <span className="text-sm font-bold text-gray-700">启用此规则</span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setDeliveryForm({ ...deliveryForm, enabled: !deliveryForm.enabled })}
-                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-all duration-300 ${
-                    deliveryForm.enabled ? 'bg-blue-500' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-lg transition-transform duration-300 ${
-                      deliveryForm.enabled ? 'translate-x-8' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={deliveryForm.enabled}
+                  onChange={(checked) => setDeliveryForm({ ...deliveryForm, enabled: checked })}
+                  label="启用此规则"
+                />
               </div>
             </div>
 
-            {/* Footer */}
-            <div className="p-8 bg-gray-50 border-t border-gray-100">
-              <div className="flex gap-4">
+            <div className="modal-footer">
+              <div className="flex w-full gap-3">
                 <button
                   onClick={() => setShowDeliveryModal(false)}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-white border-2 border-gray-200 hover:bg-gray-50 hover:border-gray-300 text-gray-700 transition-all shadow-lg hover:shadow-xl"
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-6 py-3 font-bold text-gray-700 transition-colors hover:bg-gray-50"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleSaveDelivery}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-500 hover:to-blue-600 text-white shadow-xl hover:shadow-2xl hover:scale-105 transition-all flex items-center justify-center gap-2"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 px-6 py-3 font-bold text-white transition-colors hover:bg-gray-800"
                 >
-                  <Save className="w-5 h-5" />
+                  <Save className="h-4 w-4" />
                   保存发货规则
                 </button>
               </div>
@@ -999,39 +874,28 @@ const Keywords: React.FC = () => {
 
       {/* 账号默认回复弹窗 */}
       {showDefaultModal && createPortal(
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-fade-in">
-          <div className="bg-white rounded-[2.5rem] shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden animate-scale-in">
-            {/* Header */}
-            <div className="bg-gradient-to-r from-purple-400 to-purple-500 p-8">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 bg-white/30 backdrop-blur-sm rounded-2xl flex items-center justify-center">
-                    <Bot className="w-7 h-7 text-white" />
-                  </div>
-                  <h3 className="text-3xl font-black text-white">
-                    账号默认回复
-                  </h3>
-                </div>
-                <button
-                  onClick={() => setShowDefaultModal(false)}
-                  className="p-3 bg-white/30 backdrop-blur-sm rounded-2xl hover:bg-white/40 transition-colors"
-                >
-                  <X className="w-6 h-6 text-white" />
-                </button>
-              </div>
+        <div className="modal-overlay-centered">
+          <div className="modal-container">
+            <div className="modal-header">
+              <h3 className="text-xl font-extrabold text-gray-900">账号默认回复</h3>
+              <button
+                onClick={() => setShowDefaultModal(false)}
+                className="rounded-lg p-2 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-900"
+              >
+                <X className="h-5 w-5" />
+              </button>
             </div>
 
-            {/* Body */}
-            <div className="p-8 space-y-6 overflow-y-auto max-h-[60vh]">
+            <div className="modal-body space-y-5">
               <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <Bot className="w-5 h-5 text-purple-500" />
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Bot className="h-4 w-4 text-gray-400" />
                   账号
                 </label>
                 <select
                   value={defaultForm.cookie_id}
                   onChange={(e) => setDefaultForm({ ...defaultForm, cookie_id: e.target.value })}
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-purple-400 focus:ring-4 focus:ring-purple-400/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 >
                   <option value="">请选择账号</option>
                   {accounts.map((acc) => (
@@ -1040,32 +904,24 @@ const Keywords: React.FC = () => {
                     </option>
                   ))}
                 </select>
-                <p className="text-sm text-gray-500 mt-2 ml-1">🤖 为此账号设置默认回复内容</p>
+                <p className="mt-2 text-xs text-gray-500">为此账号设置默认回复内容</p>
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-purple-50 to-purple-100/50 rounded-2xl border-2 border-purple-200">
-                <div className="flex items-center gap-3">
-                  <Power className="w-6 h-6 text-purple-500" />
-                  <span className="text-base font-black text-gray-900">启用默认回复</span>
+              <div className="flex items-center justify-between gap-3 border-t border-gray-100 pt-5">
+                <div className="flex items-center gap-2">
+                  <Power className="h-4 w-4 text-gray-400" />
+                  <span className="text-sm font-bold text-gray-700">启用默认回复</span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setDefaultForm({ ...defaultForm, enabled: !defaultForm.enabled })}
-                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-all duration-300 ${
-                    defaultForm.enabled ? 'bg-purple-500' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-lg transition-transform duration-300 ${
-                      defaultForm.enabled ? 'translate-x-8' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={defaultForm.enabled}
+                  onChange={(checked) => setDefaultForm({ ...defaultForm, enabled: checked })}
+                  label="启用默认回复"
+                />
               </div>
 
-              <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <MessageSquare className="w-5 h-5 text-purple-500" />
+              <div className="border-t border-gray-100 pt-5">
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <MessageSquare className="h-4 w-4 text-gray-400" />
                   回复内容
                 </label>
                 <textarea
@@ -1073,34 +929,26 @@ const Keywords: React.FC = () => {
                   onChange={(e) => setDefaultForm({ ...defaultForm, reply_content: e.target.value })}
                   placeholder="输入默认回复的内容..."
                   rows={6}
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-purple-400 focus:ring-4 focus:ring-purple-400/20 transition-all bg-gray-50 resize-none"
+                  className={`${FIELD_CLASS} resize-none py-3`}
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💬 当没有匹配的关键词时，系统将自动发送此内容</p>
+                <p className="mt-2 text-xs text-gray-500">当没有匹配的关键词时，系统将自动发送此内容</p>
               </div>
 
-              <div className="flex items-center justify-between p-5 bg-gradient-to-r from-amber-50 to-amber-100/50 rounded-2xl border-2 border-amber-200">
-                <div className="flex items-center gap-3">
-                  <span className="text-base font-black text-gray-900">🔁 只回复一次</span>
-                  <span className="text-xs text-gray-500">启用后，每个对话只使用一次默认回复</span>
+              <div className="flex items-center justify-between gap-3 border-t border-gray-100 pt-5">
+                <div className="min-w-0">
+                  <div className="text-sm font-bold text-gray-700">只回复一次</div>
+                  <div className="mt-0.5 text-xs text-gray-500">启用后，每个对话只使用一次默认回复</div>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setDefaultForm({ ...defaultForm, reply_once: !defaultForm.reply_once })}
-                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-all duration-300 ${
-                    defaultForm.reply_once ? 'bg-amber-500' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-lg transition-transform duration-300 ${
-                      defaultForm.reply_once ? 'translate-x-8' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
+                <ToggleControl
+                  checked={defaultForm.reply_once}
+                  onChange={(checked) => setDefaultForm({ ...defaultForm, reply_once: checked })}
+                  label="只回复一次"
+                />
               </div>
 
-              <div>
-                <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
-                  <Sparkles className="w-5 h-5 text-purple-500" />
+              <div className="border-t border-gray-100 pt-5">
+                <label className="mb-2 flex items-center gap-2 text-sm font-bold text-gray-700">
+                  <Sparkles className="h-4 w-4 text-gray-400" />
                   回复图片URL（可选）
                 </label>
                 <input
@@ -1108,26 +956,25 @@ const Keywords: React.FC = () => {
                   value={defaultForm.reply_image_url}
                   onChange={(e) => setDefaultForm({ ...defaultForm, reply_image_url: e.target.value })}
                   placeholder="https://example.com/image.jpg"
-                  className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-purple-400 focus:ring-4 focus:ring-purple-400/20 transition-all bg-gray-50"
+                  className={`${FIELD_CLASS} py-3`}
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">🖼️ 可选：添加图片URL一起发送</p>
+                <p className="mt-2 text-xs text-gray-500">可选：添加图片URL一起发送</p>
               </div>
             </div>
 
-            {/* Footer */}
-            <div className="p-8 bg-gray-50 border-t border-gray-100">
-              <div className="flex gap-4">
+            <div className="modal-footer">
+              <div className="flex w-full gap-3">
                 <button
                   onClick={() => setShowDefaultModal(false)}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-white border-2 border-gray-200 hover:bg-gray-50 hover:border-gray-300 text-gray-700 transition-all shadow-lg hover:shadow-xl"
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-6 py-3 font-bold text-gray-700 transition-colors hover:bg-gray-50"
                 >
                   取消
                 </button>
                 <button
                   onClick={handleSaveDefault}
-                  className="flex-1 px-8 py-4 rounded-2xl font-bold bg-gradient-to-r from-purple-400 to-purple-500 hover:from-purple-500 hover:to-purple-600 text-white shadow-xl hover:shadow-2xl hover:scale-105 transition-all flex items-center justify-center gap-2"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 px-6 py-3 font-bold text-white transition-colors hover:bg-gray-800"
                 >
-                  <Save className="w-5 h-5" />
+                  <Save className="h-4 w-4" />
                   保存默认回复
                 </button>
               </div>
