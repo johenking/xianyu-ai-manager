@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import path from 'path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
@@ -148,5 +149,10 @@ export default defineConfig({
       },
     },
     emptyOutDir: false,
+  },
+  test: {
+    // 高负载下避免异步 waitFor 被资源竞争击穿
+    testTimeout: 15000,
+    hookTimeout: 15000,
   },
 });
