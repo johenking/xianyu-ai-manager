@@ -2,6 +2,8 @@
 
 from fastapi import APIRouter, FastAPI
 
+from invite_bridge import invite_bridge_router
+
 
 auth_router = APIRouter(tags=["auth"])
 accounts_router = APIRouter(tags=["accounts"])
@@ -26,6 +28,7 @@ DOMAIN_ROUTERS = {
     "admin": admin_router,
     "system": system_router,
     "frontend": frontend_router,
+    "invite_bridge": invite_bridge_router,
 }
 
 
@@ -42,9 +45,9 @@ def include_domain_routers(app: FastAPI) -> None:
         "content",
         "admin",
         "system",
+        "invite_bridge",
         "frontend",
     ):
         app.include_router(DOMAIN_ROUTERS[name])
     app.state.domain_routers = DOMAIN_ROUTERS
     app.state.domain_routers_included = True
-

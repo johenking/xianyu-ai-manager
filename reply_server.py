@@ -11335,6 +11335,35 @@ def update_item_multi_quantity_delivery(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ItemInviteAutoFulfillmentUpdate(BaseModel):
+    invite_auto_fulfillment: bool
+
+
+@content_router.put("/items/{cookie_id}/{item_id}/invite-auto-fulfillment")
+def update_item_invite_auto_fulfillment(
+    cookie_id: str,
+    item_id: str,
+    update_data: ItemInviteAutoFulfillmentUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Toggle the invite bridge for one item owned by the current user."""
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该账号商品")
+
+    enabled = update_data.invite_auto_fulfillment
+    if not db_manager.update_item_invite_auto_fulfillment_status(
+        cookie_id,
+        item_id,
+        enabled,
+    ):
+        raise HTTPException(status_code=404, detail="商品不存在")
+    return {
+        "message": f"邀请自动发货已{'开启' if enabled else '关闭'}",
+        "invite_auto_fulfillment": enabled,
+    }
+
+
 
 
 
@@ -12758,7 +12787,7 @@ async def import_orders(
 # 然后由 React Router 在客户端处理路由
 
 # 定义不需要返回前端页面的路径前缀（API 路径）
-API_PREFIXES = ['/api/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
+API_PREFIXES = ['/api/', '/internal/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
 
 @frontend_router.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):

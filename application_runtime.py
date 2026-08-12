@@ -18,6 +18,7 @@ from skill_monitor_features import skill_monitor_feature_enabled
 from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
 from skill_monitor_retention_janitor import skill_monitor_retention_janitor
 from item_metric_scheduler import item_metric_scheduler
+from invite_bridge_poller import invite_bridge_poller
 from account_session_refresh import (
     RETRYABLE_SESSION_ERROR_CODES,
     remove_verification_image,
@@ -130,12 +131,14 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     else:
         logger.info("技能监控通知 dispatcher 保持关闭（全局/通知开关未启用）")
     await item_metric_scheduler.start()
+    await invite_bridge_poller.start()
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
     await item_metric_scheduler.stop()
+    await invite_bridge_poller.stop()
     await skill_monitor_scheduler.stop()
     await skill_monitor_delivery_dispatcher.stop()
     await skill_monitor_retention_janitor.stop()

@@ -115,6 +115,7 @@ SYSTEM_BACKUP_TABLES = (
     "item_metric_collection_states",
     "fulfillment_attempts",
     "fulfillment_card_reservations",
+    "invite_bridge_operations",
 )
 BACKUP_INSERT_ORDER = (
     "cookies",
@@ -135,6 +136,7 @@ BACKUP_INSERT_ORDER = (
     "item_metric_collection_states",
     "fulfillment_attempts",
     "fulfillment_card_reservations",
+    "invite_bridge_operations",
     "delivery_rules",
     "message_notifications",
 )
@@ -744,6 +746,7 @@ class DBManager:
                 catalog_active BOOLEAN NOT NULL DEFAULT FALSE,
                 catalog_last_seen_at TIMESTAMP,
                 catalog_metadata TEXT NOT NULL DEFAULT '{}',
+                invite_auto_fulfillment BOOLEAN NOT NULL DEFAULT FALSE,
                 is_multi_spec BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -7556,6 +7559,9 @@ class DBManager:
     def _decode_item_row(columns: List[str], row: tuple) -> Dict[str, Any]:
         item_info = dict(zip(columns, row))
         item_info['catalog_active'] = bool(item_info.get('catalog_active'))
+        item_info['invite_auto_fulfillment'] = bool(
+            item_info.get('invite_auto_fulfillment')
+        )
         for source_key, target_key in (
             ('item_detail', 'item_detail_parsed'),
             ('catalog_metadata', 'catalog_metadata_parsed'),
@@ -7874,6 +7880,86 @@ class DBManager:
         except Exception as e:
             logger.error(f"获取商品多数量发货状态失败: {e}")
             return False
+
+    def update_item_invite_auto_fulfillment_status(
+        self,
+        cookie_id: str,
+        item_id: str,
+        enabled: bool,
+    ) -> bool:
+        """Enable or disable the invite bridge for one account-owned item."""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE item_info
+                    SET invite_auto_fulfillment = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ? AND item_id = ?
+                    """,
+                    (bool(enabled), cookie_id, item_id),
+                )
+                if cursor.rowcount <= 0:
+                    return False
+                self.conn.commit()
+                logger.info(
+                    "更新邀请自动发货状态成功: item_id={} enabled={}",
+                    item_id,
+                    bool(enabled),
+                )
+                return True
+        except Exception as exc:
+            logger.error("更新邀请自动发货状态失败: {}", type(exc).__name__)
+            self.conn.rollback()
+            return False
+
+    def is_invite_auto_fulfillment_enabled(
+        self,
+        cookie_id: str,
+        item_id: str,
+    ) -> bool:
+        """Return the exact account/item invite-fulfillment selection."""
+        try:
+            with self.lock:
+                row = self.conn.execute(
+                    """
+                    SELECT invite_auto_fulfillment
+                    FROM item_info
+                    WHERE cookie_id = ? AND item_id = ?
+                    """,
+                    (cookie_id, item_id),
+                ).fetchone()
+                return bool(row and row[0])
+        except Exception as exc:
+            logger.error("读取邀请自动发货状态失败: {}", type(exc).__name__)
+            return False
+
+    def get_invite_auto_fulfillment_item_ids(
+        self,
+        cookie_id: Optional[str] = None,
+    ) -> set[str]:
+        """List selected item IDs, optionally scoped to one Xianyu account."""
+        try:
+            with self.lock:
+                if cookie_id:
+                    rows = self.conn.execute(
+                        """
+                        SELECT item_id FROM item_info
+                        WHERE cookie_id = ? AND invite_auto_fulfillment = TRUE
+                        """,
+                        (cookie_id,),
+                    ).fetchall()
+                else:
+                    rows = self.conn.execute(
+                        """
+                        SELECT DISTINCT item_id FROM item_info
+                        WHERE invite_auto_fulfillment = TRUE
+                        """
+                    ).fetchall()
+                return {str(row[0]) for row in rows if str(row[0] or "").strip()}
+        except Exception as exc:
+            logger.error("读取邀请自动发货商品失败: {}", type(exc).__name__)
+            return set()
 
     def get_items_by_cookie(self, cookie_id: str, include_inactive: bool = True) -> List[Dict]:
         """获取指定Cookie的所有商品信息

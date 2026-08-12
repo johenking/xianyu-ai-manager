@@ -111,6 +111,9 @@
   "/analytics/traffic": [
     "GET"
   ],
+  "/api/accounts/{cid}/renewal-binding": [
+    "POST"
+  ],
   "/api/accounts/{cookie_id}/session-refresh": [
     "POST"
   ],
@@ -122,9 +125,6 @@
   ],
   "/api/accounts/{cookie_id}/session-status": [
     "GET"
-  ],
-  "/api/accounts/{cid}/renewal-binding": [
-    "POST"
   ],
   "/api/admin/registration/enabled": [
     "PUT"
@@ -193,6 +193,9 @@
   "/api/browser-extension/pairings/{pairing_id}": [
     "GET"
   ],
+  "/api/check-default-password": [
+    "GET"
+  ],
   "/api/client-browser/challenges": [
     "POST"
   ],
@@ -230,9 +233,6 @@
   "/api/client-browser/sessions/{session_id}/confirm": [
     "POST"
   ],
-  "/api/check-default-password": [
-    "GET"
-  ],
   "/api/dashboard/summary": [
     "GET"
   ],
@@ -253,13 +253,13 @@
   "/api/official-login/sessions/{session_id}": [
     "GET"
   ],
+  "/api/official-login/sessions/{session_id}/cancel": [
+    "POST"
+  ],
   "/api/official-login/sessions/{session_id}/image": [
     "GET"
   ],
   "/api/official-login/sessions/{session_id}/interact": [
-    "POST"
-  ],
-  "/api/official-login/sessions/{session_id}/cancel": [
     "POST"
   ],
   "/api/official-login/sessions/{session_id}/show-browser": [
@@ -453,6 +453,18 @@
   "/health/ready": [
     "GET"
   ],
+  "/internal/invite/mark-fulfilled": [
+    "POST"
+  ],
+  "/internal/invite/operations/{operation_key}": [
+    "GET"
+  ],
+  "/internal/invite/order-events": [
+    "POST"
+  ],
+  "/internal/invite/send-message": [
+    "POST"
+  ],
   "/item-reply/batch": [
     "DELETE"
   ],
@@ -494,6 +506,9 @@
   "/items/{cookie_id}/{item_id}": [
     "DELETE",
     "GET",
+    "PUT"
+  ],
+  "/items/{cookie_id}/{item_id}/invite-auto-fulfillment": [
     "PUT"
   ],
   "/items/{cookie_id}/{item_id}/multi-quantity-delivery": [
@@ -583,11 +598,11 @@
   "/password-login/check/{session_id}": [
     "GET"
   ],
-  "/qr-login/check/{session_id}": [
-    "GET"
-  ],
   "/qr-login/cancel/{session_id}": [
     "POST"
+  ],
+  "/qr-login/check/{session_id}": [
+    "GET"
   ],
   "/qr-login/continue/{session_id}": [
     "POST"
