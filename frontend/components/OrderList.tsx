@@ -338,13 +338,6 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
       if (editingOrder.receiver_address !== undefined) {
         updateData.receiver_address = editingOrder.receiver_address;
       }
-      if (editingOrder.item_id !== undefined) {
-        updateData.item_id = editingOrder.item_id;
-      }
-      if (editingOrder.quantity !== undefined) {
-        updateData.quantity = editingOrder.quantity;
-      }
-
       await updateOrder(editingOrder.order_id, updateData);
       setShowEditModal(false);
       setEditingOrder(null);
@@ -1250,16 +1243,6 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
                   onChange={(e) => setEditingOrder({ ...editingOrder, receiver_address: e.target.value })}
                   rows={2}
                   className={`${FIELD_CLASS} w-full resize-none py-3`}
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-bold text-gray-700 mb-2">商品标题</label>
-                <input
-                  type="text"
-                  value={editingOrder.item_title || ''}
-                  onChange={(e) => setEditingOrder({ ...editingOrder, item_title: e.target.value })}
-                  className={`${FIELD_CLASS} w-full py-3`}
                 />
               </div>
             </div>

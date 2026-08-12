@@ -84,12 +84,36 @@ export const updateShippingRule = async (rule: Partial<ShippingRule>): Promise<a
 export const deleteShippingRule = async (id: string): Promise<any> => del(`/delivery-rules/${id}`);
 
 // Rules - 关键词回复规则 (使用关键词API)
+// 后端 keywords 是“整表数组”契约、没有稳定行 ID。历史实现用数组下标定位删改，
+// 在多标签页/多设备/管理端并发下会删错或改错另一条，并把他端修改整表覆盖。
+// 这里改用“关键词+回复”内容作为稳定身份：id 由内容编码而来，删改前按内容在
+// 最新列表里精确定位，命中数 ≠ 1 就抛错让用户刷新，绝不按陈旧下标盲改。
+const REPLY_RULE_ID_SEPARATOR = '\u0000';
+
+const encodeReplyRuleId = (keyword: string, reply: string): string =>
+    `${keyword}${REPLY_RULE_ID_SEPARATOR}${reply}`;
+
+const decodeReplyRuleId = (id: string): { keyword: string; reply: string } | null => {
+    const separatorIndex = id.indexOf(REPLY_RULE_ID_SEPARATOR);
+    if (separatorIndex < 0) return null;
+    return {
+        keyword: id.slice(0, separatorIndex),
+        reply: id.slice(separatorIndex + REPLY_RULE_ID_SEPARATOR.length),
+    };
+};
+
+const matchesReplyRule = (
+    item: any,
+    identity: { keyword: string; reply: string },
+): boolean =>
+    (item?.keyword || '') === identity.keyword && (item?.reply || '') === identity.reply;
+
 export const getReplyRules = async (cookieId?: string): Promise<ReplyRule[]> => {
     if (!cookieId) return [];
     const res = await get<any>(`/keywords-with-item-id/${cookieId}`);
     const keywords = Array.isArray(res) ? res : [];
-    return keywords.map((item: any, index: number) => ({
-        id: String(index),
+    return keywords.map((item: any) => ({
+        id: encodeReplyRuleId(item.keyword || '', item.reply || ''),
         keyword: item.keyword || '',
         reply_content: item.reply || '',
         match_type: 'exact' as const,
@@ -98,20 +122,22 @@ export const getReplyRules = async (cookieId?: string): Promise<ReplyRule[]> => 
 }
 
 export const updateReplyRule = async (rule: Partial<ReplyRule>, cookieId: string): Promise<any> => {
-    // 获取现有关键词
     const existing = await get<any>(`/keywords-with-item-id/${cookieId}`);
     const keywords = Array.isArray(existing) ? existing : [];
 
-    // 更新或添加关键词
     if (rule.id) {
-        const index = parseInt(rule.id);
-        if (index >= 0 && index < keywords.length) {
-            keywords[index] = {
-                keyword: rule.keyword,
-                reply: rule.reply_content,
-                item_id: ''
-            };
+        // 编辑：按“原始关键词+回复”内容精确定位，杜绝用陈旧下标改错行
+        const identity = decodeReplyRuleId(rule.id);
+        if (!identity) {
+            throw new Error('关键词标识无效，请刷新后重试');
         }
+        const matched = keywords.filter((item: any) => matchesReplyRule(item, identity));
+        if (matched.length !== 1) {
+            throw new Error('关键词列表已变化，请刷新后重试');
+        }
+        // 原地改写命中项，保留其 item_id 等既有字段
+        matched[0].keyword = rule.keyword;
+        matched[0].reply = rule.reply_content;
     } else {
         keywords.push({
             keyword: rule.keyword,
@@ -126,9 +152,14 @@ export const updateReplyRule = async (rule: Partial<ReplyRule>, cookieId: string
 export const deleteReplyRule = async (id: string, cookieId: string): Promise<any> => {
     const existing = await get<any>(`/keywords-with-item-id/${cookieId}`);
     const keywords = Array.isArray(existing) ? existing : [];
-    const index = parseInt(id);
-    if (index >= 0 && index < keywords.length) {
-        keywords.splice(index, 1);
+    const identity = decodeReplyRuleId(id);
+    if (!identity) {
+        throw new Error('关键词标识无效，请刷新后重试');
     }
-    return post(`/keywords-with-item-id/${cookieId}`, { keywords });
+    const matched = keywords.filter((item: any) => matchesReplyRule(item, identity));
+    if (matched.length !== 1) {
+        throw new Error('关键词列表已变化，请刷新后重试');
+    }
+    const remaining = keywords.filter((item: any) => !matchesReplyRule(item, identity));
+    return post(`/keywords-with-item-id/${cookieId}`, { keywords: remaining });
 }

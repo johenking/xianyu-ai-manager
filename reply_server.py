@@ -35,7 +35,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 import cookie_manager
-from db_manager import AccountIdentityMismatchError, db_manager
+from db_manager import AccountIdentityMismatchError, db_manager, mask_secret_preview
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from ai_provider_service import (
@@ -1663,8 +1663,12 @@ async def reset_user_password(request: PasswordResetRequest):
 # 兼容旧接口的后备秘钥，仅允许通过环境变量注入。
 API_SECRET_KEY = os.getenv("XIANYU_REPLY_API_SECRET", "")
 
+# 旧秘钥调用方必须显式绑定到一个用户，未绑定时该通道保持关闭。
+SEND_MESSAGE_SECRET_OWNER_SETTING = 'qq_reply_secret_user_id'
+
+
 class SendMessageRequest(BaseModel):
-    api_key: str
+    api_key: str = ''
     cookie_id: str
     chat_id: str
     to_user_id: str
@@ -1677,26 +1681,62 @@ class SendMessageResponse(BaseModel):
 
 
 def verify_api_key(api_key: str) -> bool:
-    """验证API秘钥"""
+    """验证API秘钥；秘钥未配置或校验异常一律判定失败（失败关闭）"""
+    if not api_key:
+        return False
     try:
         # 从系统设置中获取QQ回复消息秘钥
-        from db_manager import db_manager
         qq_secret_key = db_manager.get_system_setting('qq_reply_secret_key')
 
-        # 如果系统设置中没有配置，使用默认值
+        # 系统设置未配置时才回落到环境变量注入的后备秘钥
         if not qq_secret_key:
             qq_secret_key = API_SECRET_KEY
 
-        return api_key == qq_secret_key
+        if not qq_secret_key:
+            return False
+
+        return secrets.compare_digest(str(api_key), str(qq_secret_key))
     except Exception as e:
-        logger.error(f"验证API秘钥时发生异常: {e}")
-        # 异常情况下使用默认秘钥验证
-        return api_key == API_SECRET_KEY
+        logger.error(f"验证API秘钥时发生异常: {type(e).__name__}")
+        return False
+
+
+def resolve_send_message_caller(api_key: str,
+                                current_user: Optional[Dict[str, Any]]) -> Optional[int]:
+    """解析发信调用方的用户身份
+
+    优先使用登录态；没有登录态时才走旧的共享秘钥通道，且该秘钥必须已在系统设置里
+    绑定到一个存在且启用的用户。任何一步不成立都返回 None（失败关闭）。
+    """
+    if current_user and current_user.get('user_id') is not None:
+        return int(current_user['user_id'])
+
+    if not verify_api_key(api_key):
+        return None
+
+    try:
+        bound_raw = db_manager.get_system_setting(SEND_MESSAGE_SECRET_OWNER_SETTING) or ''
+        bound_user_id = int(str(bound_raw).strip())
+    except (TypeError, ValueError):
+        logger.warning("发信秘钥未绑定用户，已拒绝该调用")
+        return None
+    except Exception as e:
+        logger.error(f"读取发信秘钥绑定用户失败: {type(e).__name__}")
+        return None
+
+    bound_user = db_manager.get_user_by_id(bound_user_id)
+    if not bound_user or not bound_user.get('is_active'):
+        logger.warning("发信秘钥绑定的用户不存在或已停用，已拒绝该调用")
+        return None
+    return bound_user_id
 
 
 @system_router.post('/send-message', response_model=SendMessageResponse)
-async def send_message_api(request: SendMessageRequest):
-    """发送消息API接口（使用秘钥验证）"""
+async def send_message_api(
+    request: SendMessageRequest,
+    current_user: Optional[Dict[str, Any]] = Depends(get_current_user_optional),
+):
+    """发送消息API接口（登录态优先，兼容已绑定用户的旧秘钥）"""
     try:
         # 清理所有参数中的换行符
         def clean_param(param_str):
@@ -1712,28 +1752,13 @@ async def send_message_api(request: SendMessageRequest):
         cleaned_to_user_id = clean_param(request.to_user_id)
         cleaned_message = clean_param(request.message)
 
-        # 验证API秘钥不能为空
-        if not cleaned_api_key:
-            logger.warning("API秘钥为空")
+        # 解析调用方身份：登录态优先，其次是已绑定用户的旧秘钥
+        caller_user_id = resolve_send_message_caller(cleaned_api_key, current_user)
+        if caller_user_id is None:
+            logger.warning("发信调用方身份验证失败")
             return SendMessageResponse(
                 success=False,
-                message="API秘钥不能为空"
-            )
-
-        # 特殊测试秘钥处理
-        if cleaned_api_key == "zhinina_test_key":
-            logger.info("使用测试秘钥，直接返回成功")
-            return SendMessageResponse(
-                success=True,
-                message="接口验证成功"
-            )
-
-        # 验证API秘钥
-        if not verify_api_key(cleaned_api_key):
-            logger.warning("API秘钥验证失败")
-            return SendMessageResponse(
-                success=False,
-                message="API秘钥验证失败"
+                message="身份验证失败"
             )
 
         # 验证必需参数不能为空
@@ -1752,23 +1777,25 @@ async def send_message_api(request: SendMessageRequest):
                     message=f"参数 {param_name} 不能为空"
                 )
 
+        # 账号归属校验：只允许对调用方名下的闲鱼账号发信
+        caller_cookies = db_manager.get_all_cookies(caller_user_id)
+        if cleaned_cookie_id not in caller_cookies:
+            logger.warning("发信目标账号不属于调用方，已拒绝")
+            return SendMessageResponse(
+                success=False,
+                message="账号不存在或无权操作"
+            )
+
         # 直接获取XianyuLive实例，跳过cookie_manager检查
         from XianyuAutoAsync import XianyuLive
         live_instance = XianyuLive.get_instance(cleaned_cookie_id)
 
-        if not live_instance:
-            logger.warning(f"账号实例不存在或未连接: {cleaned_cookie_id}")
+        # 实例缺失与连接断开对外统一为“账号当前不可发信”，不暴露运行态细节
+        if not live_instance or not live_instance.ws or live_instance.ws.closed:
+            logger.warning(f"账号当前不可发信: {cleaned_cookie_id}")
             return SendMessageResponse(
                 success=False,
-                message="账号实例不存在或未连接，请检查账号状态"
-            )
-
-        # 检查WebSocket连接状态
-        if not live_instance.ws or live_instance.ws.closed:
-            logger.warning(f"账号WebSocket连接已断开: {cleaned_cookie_id}")
-            return SendMessageResponse(
-                success=False,
-                message="账号WebSocket连接已断开，请等待重连"
+                message="账号当前不可发送消息，请稍后重试"
             )
 
         # 发送消息（使用清理后的所有参数）
@@ -1790,13 +1817,7 @@ async def send_message_api(request: SendMessageRequest):
         )
 
     except Exception as e:
-        # 使用清理后的参数记录日志
-        cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
-        to_user_id_for_log = clean_param(request.to_user_id) if 'clean_param' in locals() else request.to_user_id
-        logger.error(
-            f"API发送消息异常: account={cookie_id_for_log}, "
-            f"error_type={type(e).__name__}"
-        )
+        logger.error(f"API发送消息异常: error_type={type(e).__name__}")
         return SendMessageResponse(
             success=False,
             message="发送消息失败，请稍后重试"
@@ -5490,9 +5511,9 @@ async def import_keywords(cid: str, file: UploadFile = File(...), current_user: 
         raise HTTPException(status_code=400, detail="请上传Excel文件(.xlsx或.xls)")
 
     try:
-        # 读取Excel文件
+        # 读取Excel文件（解析是纯 CPU 阻塞，放到线程里跑，避免占住事件循环）
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        df = await asyncio.to_thread(pd.read_excel, io.BytesIO(contents))
 
         # 检查必要的列
         required_columns = ['关键词', '商品ID', '关键词内容']
@@ -5501,7 +5522,7 @@ async def import_keywords(cid: str, file: UploadFile = File(...), current_user: 
             raise HTTPException(status_code=400, detail=f"Excel文件缺少必要的列: {', '.join(missing_columns)}")
 
         # 获取现有的文本类型关键词（用于比较更新/新增）
-        existing_keywords = db_manager.get_keywords_with_type(cid)
+        existing_keywords = await asyncio.to_thread(db_manager.get_keywords_with_type, cid)
         existing_dict = {}
         for keyword_data in existing_keywords:
             # 只考虑文本类型的关键词
@@ -5549,7 +5570,10 @@ async def import_keywords(cid: str, file: UploadFile = File(...), current_user: 
             raise HTTPException(status_code=400, detail="Excel文件中没有有效的关键词数据")
 
         # 保存到数据库（只影响文本关键词，保留图片关键词）
-        success = db_manager.save_text_keywords_only(cid, import_data)
+        # 整批写入会长时间持有库锁，放到线程里执行，不阻塞事件循环
+        success = await asyncio.to_thread(
+            db_manager.save_text_keywords_only, cid, import_data
+        )
         if not success:
             raise HTTPException(status_code=500, detail="保存关键词到数据库失败")
 
@@ -6695,11 +6719,7 @@ class SkillAgentTestIn(BaseModel):
 
 def _mask_secret(value: str) -> str:
     """Return a display-safe secret preview without exposing the stored value."""
-    if not value:
-        return ""
-    if len(value) <= 8:
-        return "***"
-    return f"{value[:3]}***{value[-4:]}"
+    return mask_secret_preview(value)
 
 
 @content_router.delete("/items/batch")
@@ -7285,34 +7305,14 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
 
 @ai_router.get("/ai-reply-settings")
 def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """获取当前用户所有账号的AI回复设置"""
-    try:
-        # 只返回当前用户的AI回复设置
-        user_id = current_user['user_id']
-        from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-        db_manager.ensure_legacy_ai_provider_profiles(user_id)
+    """获取当前用户所有账号的AI回复设置
 
-        all_settings = db_manager.get_all_ai_reply_settings()
-        # 过滤只属于当前用户的设置
-        user_settings = {}
-        system_api_key = db_manager.get_system_setting('ai_api_key') or ''
-        for cid, raw_settings in all_settings.items():
-            if cid not in user_cookies:
-                continue
-            settings = db_manager.get_ai_reply_settings(cid)
-            account_api_key = raw_settings.get('api_key') or ''
-            effective_key = account_api_key or system_api_key
-            profile = db_manager.get_ai_provider_profile(settings.get('provider_profile_id'), user_id)
-            settings = dict(settings)
-            settings.update({
-                'api_key': '',
-                'api_key_source': 'provider' if profile else ('account' if account_api_key else ('global' if system_api_key else 'missing')),
-                'api_key_masked': profile.get('api_key_masked', '') if profile else _mask_secret(effective_key),
-                'has_effective_api_key': bool(profile.get('api_key_configured')) if profile else bool(effective_key),
-            })
-            user_settings[cid] = settings
-        return user_settings
+    归属过滤在 SQL 层完成，设置解析一次性批量完成，循环内不再逐账号查库。
+    """
+    try:
+        user_id = current_user['user_id']
+        db_manager.ensure_legacy_ai_provider_profiles(user_id)
+        return db_manager.get_ai_reply_settings_for_user(user_id)
     except Exception as e:
         logger.error(f"获取所有AI回复设置异常: {type(e).__name__}")
         raise HTTPException(status_code=500, detail="获取AI回复设置失败")
@@ -11369,6 +11369,35 @@ def update_item_invite_auto_fulfillment(
 
 # ==================== 订单管理接口 ====================
 
+# 平台事实字段：只允许订单同步与发货/履约路径写入，人工编辑接口一律不接受。
+ORDER_PLATFORM_STATE_FIELDS = frozenset({'order_status', 'system_shipped'})
+
+# 人工可改的本地字段（导入订单的补录与收货信息更正）。
+ORDER_MANUAL_EDITABLE_FIELDS = frozenset({
+    'item_id', 'buyer_id', 'spec_name', 'spec_value',
+    'quantity', 'amount', 'created_at',
+    'receiver_name', 'receiver_phone', 'receiver_address',
+})
+
+
+def _forged_order_state_fields(order: Dict[str, Any],
+                               update_data: Optional[Dict[str, Any]]) -> List[str]:
+    """找出试图把平台态改成与当前存量不同值的字段；原样回显不算改写。"""
+    forged: List[str] = []
+    for field in sorted(ORDER_PLATFORM_STATE_FIELDS):
+        if field not in (update_data or {}):
+            continue
+        submitted = (update_data or {})[field]
+        stored = (order or {}).get(field)
+        if field == 'system_shipped':
+            changed = bool(submitted) != bool(stored)
+        else:
+            changed = str(submitted or '').strip() != str(stored or '').strip()
+        if changed:
+            forged.append(field)
+    return forged
+
+
 def get_orders_db() -> Any:
     """订单路由统一的可替换数据库依赖。"""
     return db_manager
@@ -11689,7 +11718,7 @@ def get_order_detail(
         log_with_user('info', f"查询订单详情: {order_id}", current_user)
 
         user_cookies = orders_db.get_all_cookies(user_id)
-        order = orders_db.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
         if not order or order.get('cookie_id') not in user_cookies:
             log_with_user('warning', f"订单不存在或无权访问: {order_id}", current_user)
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
@@ -11929,7 +11958,7 @@ async def get_order_item_image(order_id: str,
 
     user_id = current_user['user_id']
     user_cookies = orders_db.get_all_cookies(user_id)
-    order = orders_db.get_order_by_id(order_id)
+    order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
     if not order or order.get('cookie_id') not in user_cookies:
         raise HTTPException(status_code=404, detail={"reason": "not_found"})
 
@@ -12000,15 +12029,15 @@ def delete_order(
         user_cookies = orders_db.get_all_cookies(user_id)
 
         # 验证订单属于当前用户
-        order = orders_db.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
         if not order:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
         if order.get('cookie_id') not in user_cookies:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
-        # 删除订单
-        success = orders_db.delete_order(order_id)
+        # 删除时把归属条件带进 WHERE，先查后删之间的归属变化不会导致越权删除
+        success = orders_db.delete_order(order_id, cookie_ids=list(user_cookies))
         if success:
             log_with_user('info', f"订单删除成功: {order_id}", current_user)
             return {"success": True, "message": "删除成功"}
@@ -12037,7 +12066,7 @@ async def refresh_single_order(
         user_cookies = orders_db.get_all_cookies(user_id)
 
         # 验证订单存在且属于当前用户
-        order = orders_db.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
         if not order:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
@@ -12096,7 +12125,7 @@ async def refresh_single_order(
                 "message": "本轮订单列表未返回该订单，已保留原状态",
             }
 
-        refreshed = orders_db.get_order_by_id(order_id) or order
+        refreshed = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies)) or order
         error_code = str(result.get("error_code") or "")
         if error_code == "status_unconfirmed":
             message = "订单已获取部分字段，但平台状态仍待确认"
@@ -12153,23 +12182,39 @@ async def update_order(
         )
 
         user_cookies = orders_db.get_all_cookies(user_id)
-        order = orders_db.get_order_by_id(order_id)
+        order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
         if not order:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
         if order.get('cookie_id') not in user_cookies:
             raise HTTPException(status_code=404, detail="订单不存在或无权访问")
 
-        allowed_fields = {
-            'item_id', 'buyer_id', 'spec_name', 'spec_value',
-            'quantity', 'amount', 'order_status',
-            'receiver_name', 'receiver_phone', 'receiver_address',
-            'system_shipped', 'created_at'
-        }
+        # 平台态（order_status）与发货态（system_shipped）只能由订单同步与履约路径写入。
+        # 原样回显不报错，只忽略；一旦试图改成别的值就显式拒绝，不做静默丢弃。
+        forged_fields = _forged_order_state_fields(order, update_data)
+        if forged_fields:
+            log_with_user(
+                'warning',
+                f"拒绝本地改写订单平台状态: {order_id}, 字段={forged_fields}",
+                current_user,
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "platform_state_readonly",
+                    "message": "发货与支付状态只能由订单同步或发货流程写入",
+                    "fields": forged_fields,
+                },
+            )
+
         filtered_data = {
             key: value
             for key, value in (update_data or {}).items()
-            if key in allowed_fields
+            if key in ORDER_MANUAL_EDITABLE_FIELDS
         }
+        ignored_fields = sorted(
+            key for key in (update_data or {})
+            if key not in ORDER_MANUAL_EDITABLE_FIELDS
+        )
 
         if not filtered_data:
             return {
@@ -12177,6 +12222,7 @@ async def update_order(
                 "message": "没有可更新字段",
                 "data": order,
                 "refreshed": False,
+                "ignored_fields": ignored_fields,
             }
 
         success = orders_db.insert_or_update_order(
@@ -12186,12 +12232,13 @@ async def update_order(
 
         if success:
             log_with_user('info', f"订单更新成功: {order_id}", current_user)
-            updated_order = orders_db.get_order_by_id(order_id)
+            updated_order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
             return {
                 "success": True,
                 "message": "更新成功",
                 "data": updated_order,
                 "refreshed": False,
+                "ignored_fields": ignored_fields,
             }
         raise HTTPException(status_code=500, detail="更新失败")
 
@@ -12257,8 +12304,8 @@ async def manual_ship_orders(
         # 遍历每个订单
         for order_id in order_ids:
             try:
-                # 获取订单信息
-                order = orders_db.get_order_by_id(order_id)
+                # 获取订单信息（归属条件直接进 WHERE）
+                order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
                 if not order:
                     results.append({
                         'order_id': order_id,
@@ -12655,7 +12702,10 @@ async def _parse_order_import_request(request: Request) -> List[Dict[str, Any]]:
         raw = await upload.read(_ORDER_IMPORT_MAX_BYTES + 1)
         if len(raw) > _ORDER_IMPORT_MAX_BYTES:
             raise HTTPException(status_code=413, detail="Excel 文件超过 5MB")
-        return _orders_from_xlsx(raw, str(getattr(upload, 'filename', '') or ''))
+        # 最多 5MB 的工作簿解析是纯 CPU 阻塞，放到线程里跑
+        return await asyncio.to_thread(
+            _orders_from_xlsx, raw, str(getattr(upload, 'filename', '') or '')
+        )
     raise HTTPException(
         status_code=415,
         detail="仅支持程序化 JSON 数组或 multipart .xlsx 文件",
@@ -12710,8 +12760,10 @@ async def import_orders(
                     failed_count += 1
                     continue
 
-                # 检查订单是否已存在
-                existing_order = orders_db.get_order_by_id(order_id)
+                # 检查订单是否已存在（这里必须不带归属条件：越权订单要能被看见并拒绝）
+                existing_order = await asyncio.to_thread(
+                    orders_db.get_order_by_id, order_id
+                )
 
                 # 已存在订单必须归属当前用户名下的账号：
                 # 归属其他账号（含 cookie_id 为 NULL 的历史孤儿订单）一律拒绝，
@@ -12733,8 +12785,12 @@ async def import_orders(
                     **mapped_params,
                 }
 
-                # 使用 insert_or_update_order 统一处理
-                if not orders_db.insert_or_update_order(**insert_params):
+                # 使用 insert_or_update_order 统一处理；整批导入逐行写入会长时间
+                # 独占库锁，放到线程里执行让事件循环在行之间保持可用
+                written = await asyncio.to_thread(
+                    orders_db.insert_or_update_order, **insert_params
+                )
+                if not written:
                     results.append({
                         'order_id': order_id,
                         'success': False,

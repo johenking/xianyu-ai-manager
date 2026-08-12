@@ -290,6 +290,119 @@ class DatabaseHardeningTests(unittest.TestCase):
             "https://gw.alicdn.com/synthetic.jpg",
         )
 
+    def test_zero_row_delete_order_does_not_leak_transaction(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO orders (order_id, order_status, cookie_id) VALUES (?, ?, ?)",
+                ("order-a", "completed", "account-a"),
+            )
+            self.db.conn.commit()
+
+        # 跨租户删除命中 0 行，是归属下推后的常规失败路径
+        self.assertFalse(self.db.delete_order("order-a", cookie_ids=["account-b"]))
+        # 关键断言：0 行 DML 后共享连接不能停留在打开的隐式事务里
+        self.assertFalse(
+            self.db.conn.in_transaction,
+            "delete_order 0 行后连接仍停留在打开的事务里",
+        )
+        # 目标订单未被误删
+        self.assertIsNotNone(
+            self.db.get_order_by_id("order-a", cookie_ids=["account-a"])
+        )
+        # 端到端：随后走显式 BEGIN IMMEDIATE 的写入不被悬挂事务击穿
+        self.assertTrue(self.db.delete_cookie("account-b"))
+
+    def test_zero_row_dml_methods_leave_no_open_transaction(self):
+        # 这些 0 行分支历史上会把共享连接停在打开的隐式事务里，
+        # 击穿后续其它方法的显式 BEGIN IMMEDIATE。逐一断言事务已收尾。
+        cases = (
+            (
+                "update_item_multi_spec_status",
+                lambda: self.db.update_item_multi_spec_status(
+                    "account-a", "ghost-item", True
+                ),
+            ),
+            (
+                "update_item_multi_quantity_delivery_status",
+                lambda: self.db.update_item_multi_quantity_delivery_status(
+                    "account-a", "ghost-item", True
+                ),
+            ),
+            (
+                "update_item_invite_auto_fulfillment_status",
+                lambda: self.db.update_item_invite_auto_fulfillment_status(
+                    "account-a", "ghost-item", True
+                ),
+            ),
+            (
+                "update_item_detail",
+                lambda: self.db.update_item_detail("account-a", "ghost-item", "{}"),
+            ),
+            (
+                "delete_item_info",
+                lambda: self.db.delete_item_info("account-a", "ghost-item"),
+            ),
+            (
+                "delete_order",
+                lambda: self.db.delete_order("ghost-order", cookie_ids=["account-a"]),
+            ),
+            (
+                "delete_table_record",
+                lambda: self.db.delete_table_record("orders", "ghost-order"),
+            ),
+        )
+        for name, action in cases:
+            with self.subTest(method=name):
+                self.assertFalse(action())
+                self.assertFalse(
+                    self.db.conn.in_transaction,
+                    f"{name} 0 行后连接仍停留在打开的事务里",
+                )
+
+    def test_admin_table_export_redacts_sensitive_columns(self):
+        # cookies：平台会话明文与账号密码不得经 /admin/data 导出
+        data, columns = self.db.get_table_data("cookies")
+        for hidden in ("value", "xianyu_unb", "password", "password_encrypted"):
+            self.assertNotIn(hidden, columns)
+        self.assertTrue(data)
+        for row in data:
+            self.assertNotIn("value", row)
+            self.assertNotIn("password", row)
+        # 非敏感列保留，接口仍可用
+        self.assertIn("id", columns)
+        self.assertIn("user_id", columns)
+
+        # ai_reply_settings：AI Key 明文不得导出
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO ai_reply_settings (cookie_id, api_key) VALUES (?, ?)",
+                ("account-a", "synthetic-key-should-not-leak"),
+            )
+            self.db.conn.commit()
+        ai_data, ai_columns = self.db.get_table_data("ai_reply_settings")
+        self.assertNotIn("api_key", ai_columns)
+        for row in ai_data:
+            self.assertNotIn("api_key", row)
+
+        # orders：买家 PII 不得导出
+        with self.db.lock:
+            self.db.conn.execute(
+                "INSERT INTO orders "
+                "(order_id, cookie_id, receiver_name, receiver_phone, receiver_address) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("order-pii", "account-a", "synthetic-name", "13800000000", "synthetic-addr"),
+            )
+            self.db.conn.commit()
+        order_data, order_columns = self.db.get_table_data("orders")
+        for hidden in ("receiver_name", "receiver_phone", "receiver_address"):
+            self.assertNotIn(hidden, order_columns)
+        for row in order_data:
+            self.assertNotIn("receiver_phone", row)
+
+        # users：口令哈希不得导出
+        _, user_columns = self.db.get_table_data("users")
+        self.assertNotIn("password_hash", user_columns)
+
 
 if __name__ == "__main__":
     unittest.main()

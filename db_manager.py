@@ -79,6 +79,37 @@ BACKUP_MAX_SERIALIZED_BYTES = 128 * 1024 * 1024
 BACKUP_MAX_TOTAL_ROWS = 1_000_000
 BACKUP_MAX_TABLES = 32
 
+# AI 账号级配置回落到系统全局配置时使用的默认值。历史版本会把通义千问默认值写进
+# 账号级配置，这些旧默认值不应覆盖当前的全局配置。
+AI_DEFAULT_BASE_URL = 'https://api.deepseek.com'
+AI_DEFAULT_MODEL = 'deepseek-v4-flash'
+AI_LEGACY_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+AI_LEGACY_MODEL = 'qwen-plus'
+
+
+def mask_secret_preview(value: str) -> str:
+    """返回可展示的密钥预览，不暴露存量值。"""
+    value = str(value or '')
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:3]}***{value[-4:]}"
+
+
+def resolve_ai_model_and_base_url(account_model: str, account_base_url: str,
+                                  system_model: str, system_base_url: str
+                                  ) -> Tuple[str, str]:
+    """账号级值为空或仍是历史硬编码默认值时，回落到系统全局配置。"""
+    use_model = account_model if (
+        account_model and account_model not in {AI_DEFAULT_MODEL, AI_LEGACY_MODEL}
+    ) else system_model
+    use_base_url = account_base_url if (
+        account_base_url and account_base_url not in {AI_DEFAULT_BASE_URL, AI_LEGACY_BASE_URL}
+    ) else system_base_url
+    return use_model, use_base_url
+
+
 USER_BACKUP_TABLES = (
     "cookies",
     "keywords",
@@ -199,6 +230,25 @@ SKILL_MONITOR_MTOP_BREAKER_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
+
+    # 管理端只读导出（/admin/data）必须剔除的敏感列：明文平台凭据、账号密码、
+    # AI Key、买家 PII、验证码与会话 token。口径与 /cookie/{id}/details 主动剥离一致，
+    # 避免 /admin/data 成为绕过“凭据不进 API”边界的后门。
+    SENSITIVE_EXPORT_COLUMNS = {
+        "cookies": {"value", "xianyu_unb", "password", "password_encrypted"},
+        "ai_reply_settings": {"api_key"},
+        "ai_provider_profiles": {"api_key", "api_key_encrypted"},
+        "orders": {
+            "receiver_name",
+            "receiver_phone",
+            "receiver_address",
+            "receiver_city",
+        },
+        "users": {"password_hash"},
+        "email_verifications": {"code"},
+        "captcha_codes": {"code"},
+        "auth_sessions": {"token"},
+    }
 
     @staticmethod
     def _connect(db_path: str) -> sqlite3.Connection:
@@ -943,6 +993,7 @@ class DBManager:
             ('smtp_verified_at', '', 'SMTP配置验证时间'),
             ('auth_trusted_proxies', '', '认证可信代理列表'),
             ('qq_reply_secret_key', '', 'QQ回复消息API秘钥'),
+            ('qq_reply_secret_user_id', '', 'QQ回复消息API秘钥绑定的用户ID（留空则该秘钥通道关闭）'),
             ('item_sync_enabled', 'true', '是否启用定时自动同步商品'),
             ('item_sync_interval', '600', '商品同步间隔时间（秒）'),
             ('item_sync_max_pages', '5', '每次最多同步的页数')
@@ -3933,12 +3984,9 @@ class DBManager:
         优先使用账号级别的设置，如果账号没有配置api_key/base_url/model_name，
         则从系统设置中读取全局AI配置作为默认值
         """
-        # 默认值常量，用于判断是否使用系统设置。历史版本会把通义千问默认值写入账号级配置，
-        # 这些旧默认值不应覆盖当前的全局 DeepSeek 配置。
-        DEFAULT_BASE_URL = 'https://api.deepseek.com'
-        DEFAULT_MODEL = 'deepseek-v4-flash'
-        LEGACY_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-        LEGACY_MODEL = 'qwen-plus'
+        # 默认值常量与批量查询共用同一份（模块级），避免两处判定漂移。
+        DEFAULT_BASE_URL = AI_DEFAULT_BASE_URL
+        DEFAULT_MODEL = AI_DEFAULT_MODEL
 
         with self.lock:
             try:
@@ -3985,9 +4033,10 @@ class DBManager:
                     account_base_url = result[3]
 
                     # 如果账号值为空或等于硬编码默认值，则使用系统设置
-                    use_model = account_model if (account_model and account_model not in {DEFAULT_MODEL, LEGACY_MODEL}) else system_model
+                    use_model, use_base_url = resolve_ai_model_and_base_url(
+                        account_model, account_base_url, system_model, system_base_url
+                    )
                     use_api_key = account_api_key if account_api_key else system_api_key
-                    use_base_url = account_base_url if (account_base_url and account_base_url not in {DEFAULT_BASE_URL, LEGACY_BASE_URL}) else system_base_url
 
                     return {
                         'ai_enabled': bool(result[0]),
@@ -4030,26 +4079,38 @@ class DBManager:
                     'custom_prompts': ''
                 }
 
-    def get_all_ai_reply_settings(self) -> Dict[str, dict]:
-        """获取所有账号的AI回复设置"""
+    def get_all_ai_reply_settings(self, user_id: Optional[int] = None) -> Dict[str, dict]:
+        """获取账号级AI回复设置原始行
+
+        传入 user_id 时归属过滤直接进 SQL，不再全表取出后在 Python 里筛。
+        任何情况下都不返回明文 api_key，只返回“是否已配置”与掩码。
+        """
+        sql = '''
+        SELECT s.cookie_id, s.ai_enabled, s.model_name, s.api_key, s.base_url,
+               s.max_discount_percent, s.max_discount_amount, s.max_bargain_rounds,
+               s.custom_prompts, s.provider_profile_id
+        FROM ai_reply_settings s
+        '''
+        params: List[Any] = []
+        if user_id is not None:
+            sql += ' JOIN cookies c ON c.id = s.cookie_id WHERE c.user_id = ?'
+            params.append(int(user_id))
+
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT cookie_id, ai_enabled, model_name, api_key, base_url,
-                       max_discount_percent, max_discount_amount, max_bargain_rounds,
-                       custom_prompts, provider_profile_id
-                FROM ai_reply_settings
-                ''')
+                cursor.execute(sql, params)
 
                 result = {}
                 for row in cursor.fetchall():
                     cookie_id = row[0]
+                    account_api_key = row[3] or ''
                     result[cookie_id] = {
                         'ai_enabled': bool(row[1]),
                         'provider_profile_id': row[9],
                         'model_name': row[2],
-                        'api_key': row[3],
+                        'api_key_configured': bool(account_api_key),
+                        'api_key_masked': mask_secret_preview(account_api_key),
                         'base_url': row[4],
                         'max_discount_percent': row[5],
                         'max_discount_amount': row[6],
@@ -4061,6 +4122,75 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取所有AI回复设置失败: {e}")
                 return {}
+
+    def get_ai_reply_settings_for_user(self, user_id: int) -> Dict[str, dict]:
+        """批量返回某用户全部账号的AI回复展示设置
+
+        查询数固定（账号行 1 次 + 系统设置 3 次 + 平台配置 1 次），不随账号数增长，
+        且全程不返回明文密钥。
+        """
+        rows = self.get_all_ai_reply_settings(user_id)
+        if not rows:
+            return {}
+
+        system_api_key = self.get_system_setting('ai_api_key') or ''
+        system_base_url = self.get_system_setting('ai_api_url') or AI_DEFAULT_BASE_URL
+        system_model = self.get_system_setting('ai_model') or AI_DEFAULT_MODEL
+        profiles = {
+            profile['id']: profile
+            for profile in self.list_ai_provider_profiles(user_id)
+        }
+
+        resolved: Dict[str, dict] = {}
+        for cookie_id, row in rows.items():
+            profile = profiles.get(row.get('provider_profile_id'))
+            settings = {
+                'ai_enabled': row['ai_enabled'],
+                'max_discount_percent': row['max_discount_percent'],
+                'max_discount_amount': row['max_discount_amount'],
+                'max_bargain_rounds': row['max_bargain_rounds'],
+                'custom_prompts': row['custom_prompts'],
+            }
+            if profile:
+                settings.update({
+                    'provider_profile_id': row['provider_profile_id'],
+                    'provider_name': profile['name'],
+                    'provider_type': profile['provider_type'],
+                    'provider_status': profile['verification_status'],
+                    'model_name': row['model_name'] or profile['default_model'],
+                    'base_url': profile['base_url'],
+                    'api_key_source': 'provider',
+                    'api_key_masked': profile.get('api_key_masked', ''),
+                    'has_effective_api_key': bool(profile.get('api_key_configured')),
+                })
+            else:
+                use_model, use_base_url = resolve_ai_model_and_base_url(
+                    row['model_name'], row['base_url'], system_model, system_base_url
+                )
+                if row['api_key_configured']:
+                    api_key_source = 'account'
+                    api_key_masked = row['api_key_masked']
+                elif system_api_key:
+                    api_key_source = 'global'
+                    api_key_masked = mask_secret_preview(system_api_key)
+                else:
+                    api_key_source = 'missing'
+                    api_key_masked = ''
+                settings.update({
+                    'provider_profile_id': None,
+                    'provider_type': 'gemini' if 'gemini' in use_model.lower() else 'openai_compatible',
+                    'model_name': use_model,
+                    'base_url': use_base_url,
+                    'api_key_source': api_key_source,
+                    'api_key_masked': api_key_masked,
+                    'has_effective_api_key': bool(
+                        row['api_key_configured'] or system_api_key
+                    ),
+                })
+            settings['api_key'] = ''
+            resolved[cookie_id] = settings
+
+        return resolved
 
     # -------------------- AI平台配置 --------------------
     def _serialize_ai_provider_profile(self, row, include_secret: bool = False) -> dict:
@@ -7812,6 +7942,8 @@ class DBManager:
                     return True
                 else:
                     logger.warning(f"商品不存在，无法更新多规格状态: {item_id}")
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
 
         except Exception as e:
@@ -7855,6 +7987,8 @@ class DBManager:
                     return True
                 else:
                     logger.warning(f"未找到要更新的商品: {item_id}")
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
 
         except Exception as e:
@@ -7900,6 +8034,8 @@ class DBManager:
                     (bool(enabled), cookie_id, item_id),
                 )
                 if cursor.rowcount <= 0:
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
                 self.conn.commit()
                 logger.info(
@@ -8046,6 +8182,8 @@ class DBManager:
                     return True
                 else:
                     logger.warning(f"未找到要更新的商品: {item_id}")
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
 
         except Exception as e:
@@ -8363,6 +8501,8 @@ class DBManager:
                     return True
                 else:
                     logger.warning(f"未找到要删除的商品信息: {cookie_id} - {item_id}")
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
 
         except Exception as e:
@@ -8672,7 +8812,7 @@ class DBManager:
                 return False
 
     def get_table_data(self, table_name: str):
-        """获取指定表的所有数据"""
+        """获取指定表的所有数据（管理端只读导出，自动剔除敏感列）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -8680,18 +8820,25 @@ class DBManager:
                 # 获取表结构
                 cursor.execute(f"PRAGMA table_info({table_name})")
                 columns_info = cursor.fetchall()
-                columns = [col[1] for col in columns_info]  # 列名
+                all_columns = [col[1] for col in columns_info]  # 全部列名
+
+                # 剔除该表的敏感列，避免明文凭据/PII 经 /admin/data 泄露给管理员
+                redacted = self.SENSITIVE_EXPORT_COLUMNS.get(table_name, set())
+                columns = [name for name in all_columns if name not in redacted]
 
                 # 获取表数据
                 cursor.execute(f"SELECT * FROM {table_name}")
                 rows = cursor.fetchall()
 
-                # 转换为字典列表
+                # 转换为字典列表，敏感列在此一并跳过
                 data = []
                 for row in rows:
                     row_dict = {}
                     for i, value in enumerate(row):
-                        row_dict[columns[i]] = value
+                        column_name = all_columns[i]
+                        if column_name in redacted:
+                            continue
+                        row_dict[column_name] = value
                     data.append(row_dict)
 
                 return data, columns
@@ -9463,14 +9610,47 @@ class DBManager:
         'system_shipped',
     )
 
-    def get_order_by_id(self, order_id: str):
-        """根据订单ID获取订单详情（含收货信息与成交快照全字段）"""
+    @staticmethod
+    def _order_owner_scope(user_id: Optional[int] = None,
+                           cookie_ids: Optional[Iterable[str]] = None
+                           ) -> Tuple[str, List[Any]]:
+        """把订单归属条件拼成 SQL 片段，避免路由层“先查后判”留下 TOCTOU 窗口。
+
+        两个参数都为 None 表示不限制归属（同步、履约等系统路径）。
+        显式传入空的 owned cookie 集合表示调用方名下没有任何账号，此时必须匹配不到
+        任何订单（失败关闭），而不是退化成无归属条件的裸查。
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if user_id is not None:
+            clauses.append("cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)")
+            params.append(int(user_id))
+        if cookie_ids is not None:
+            normalized = [str(cookie_id) for cookie_id in cookie_ids]
+            if not normalized:
+                return " AND 1 = 0", []
+            placeholders = ', '.join('?' for _ in normalized)
+            clauses.append(f"cookie_id IN ({placeholders})")
+            params.extend(normalized)
+        if not clauses:
+            return "", []
+        return " AND " + " AND ".join(clauses), params
+
+    def get_order_by_id(self, order_id: str, user_id: Optional[int] = None,
+                        cookie_ids: Optional[Iterable[str]] = None):
+        """根据订单ID获取订单详情（含收货信息与成交快照全字段）
+
+        传入 user_id 或 owned cookie 集合时，归属条件直接进 WHERE；不归属的订单
+        与不存在的订单一样返回 None。
+        """
+        scope_sql, scope_params = self._order_owner_scope(user_id, cookie_ids)
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute(
-                    f"SELECT {', '.join(self._ORDER_DETAIL_COLUMNS)} FROM orders WHERE order_id = ?",
-                    (order_id,),
+                    f"SELECT {', '.join(self._ORDER_DETAIL_COLUMNS)} FROM orders"
+                    f" WHERE order_id = ?{scope_sql}",
+                    (order_id, *scope_params),
                 )
                 row = cursor.fetchone()
                 if not row:
@@ -9507,16 +9687,24 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
-    def delete_order(self, order_id: str):
-        """删除订单"""
+    def delete_order(self, order_id: str, user_id: Optional[int] = None,
+                     cookie_ids: Optional[Iterable[str]] = None):
+        """删除订单；归属条件与删除同属一条语句，杜绝先查后删的竞态窗口"""
+        scope_sql, scope_params = self._order_owner_scope(user_id, cookie_ids)
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('DELETE FROM orders WHERE order_id = ?', (order_id,))
+                cursor.execute(
+                    f'DELETE FROM orders WHERE order_id = ?{scope_sql}',
+                    (order_id, *scope_params),
+                )
                 if cursor.rowcount > 0:
                     self.conn.commit()
                     logger.info(f"删除订单成功: {order_id}")
                     return True
+                # 归属拒绝/空集合会走到这里；0 行删除也已隐式开启事务，
+                # 必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                self.conn.rollback()
                 return False
             except Exception as e:
                 logger.error(f"删除订单失败: {order_id} - {e}")
@@ -9787,6 +9975,8 @@ class DBManager:
                     return True
                 else:
                     logger.warning(f"删除表记录失败，记录不存在: {table_name}.{record_id}")
+                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
+                    self.conn.rollback()
                     return False
 
             except Exception as e:
