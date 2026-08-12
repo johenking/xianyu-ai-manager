@@ -1,11 +1,38 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, ShippingRule, ReplyRule, DefaultReply } from '../types';
 import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
-import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
+import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot, AlertCircle } from 'lucide-react';
 import { InlineNotice, ToggleControl } from './ui/StatusControls';
 
 type TabType = 'reply' | 'delivery' | 'default';
+
+/** 各读取路径的错误信息按资源分开保存，避免互相覆盖 */
+type LoadErrorKey = 'accounts' | 'keywords' | 'shipping' | 'cards' | 'defaults';
+
+/** 读取失败时优先展示后端返回的 message，否则退回资源级默认文案 */
+const loadErrorText = (error: unknown, fallback: string): string => (
+  error instanceof Error && error.message ? error.message : fallback
+);
+
+/** 读路径失败的可见错误态：与保存路径一样诚实，提供重试入口而不是静默空列表 */
+const LoadErrorState: React.FC<{ title: string; message: string; onRetry: () => void }> = ({ title, message, onRetry }) => (
+  <div role="alert" className="py-20 text-center bg-gradient-to-br from-white to-red-50/40 rounded-[2.5rem] border-3 border-dashed border-red-200 shadow-xl">
+    <div className="w-24 h-24 bg-gradient-to-br from-red-100/70 to-red-200/40 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
+      <AlertCircle className="w-12 h-12 text-red-400" />
+    </div>
+    <h3 className="text-2xl font-bold text-gray-900 mb-2">{title}</h3>
+    <p className="text-gray-500 text-lg mb-8">{message}</p>
+    <button
+      type="button"
+      onClick={onRetry}
+      className="inline-flex items-center gap-2 px-8 py-3 rounded-2xl font-bold bg-gray-900 text-white hover:bg-gray-800 shadow-lg transition-colors"
+    >
+      <RefreshCw className="w-5 h-5" />
+      重试
+    </button>
+  </div>
+);
 
 interface Keyword {
   id: string;
@@ -70,15 +97,37 @@ const Keywords: React.FC = () => {
 
   const [loading, setLoading] = useState(false);
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+  // 各读取路径的错误态：读失败不再静默呈现空列表，而是展示可见错误并提供重试
+  const [loadErrors, setLoadErrors] = useState<Partial<Record<LoadErrorKey, string>>>({});
+  // 各读取路径的请求代际号：快速切换账号或连续刷新时只允许最新一次请求写入视图（同 Dashboard 的做法）
+  const requestGenerations = useRef<Record<LoadErrorKey, number>>({ accounts: 0, keywords: 0, shipping: 0, cards: 0, defaults: 0 });
+  // 默认回复编辑弹窗的请求代际号：连续点击不同账号时只允许最新一次响应填充表单
+  const defaultReplyEditGeneration = useRef(0);
+
+  const setLoadError = (key: LoadErrorKey, message?: string) => {
+    setLoadErrors((prev) => ({ ...prev, [key]: message }));
+  };
+
+  const loadAccounts = async () => {
+    const generation = ++requestGenerations.current.accounts;
+    try {
+      const data = await getAccountDetails();
+      if (requestGenerations.current.accounts !== generation) return;
+      setAccounts(data);
+      setLoadError('accounts', undefined);
+      // 默认选择第一个账号
+      if (data && data.length > 0) {
+        setSelectedAccount((prev) => prev || data[0].id);
+      }
+    } catch (e) {
+      if (requestGenerations.current.accounts !== generation) return;
+      console.error('加载账号列表失败', e);
+      setLoadError('accounts', loadErrorText(e, '账号列表加载失败'));
+    }
+  };
 
   useEffect(() => {
-    getAccountDetails().then((data) => {
-      setAccounts(data);
-      // 默认选择第一个账号
-      if (data && data.length > 0 && !selectedAccount) {
-        setSelectedAccount(data[0].id);
-      }
-    });
+    loadAccounts();
   }, []);
 
   useEffect(() => {
@@ -91,42 +140,66 @@ const Keywords: React.FC = () => {
   }, [selectedAccount]);
 
   const loadDefaultReplies = async () => {
+    const generation = ++requestGenerations.current.defaults;
     try {
       const data = await getDefaultReplies();
+      if (requestGenerations.current.defaults !== generation) return;
       setDefaultReplies(data);
+      setLoadError('defaults', undefined);
     } catch (e) {
+      if (requestGenerations.current.defaults !== generation) return;
       console.error('加载默认回复失败', e);
+      setDefaultReplies({});
+      setLoadError('defaults', loadErrorText(e, '默认回复加载失败'));
     }
   };
 
   const loadShippingRules = async () => {
+    const generation = ++requestGenerations.current.shipping;
     try {
       const data = await getShippingRules();
+      if (requestGenerations.current.shipping !== generation) return;
       setShippingRules(data);
+      setLoadError('shipping', undefined);
     } catch (e) {
+      if (requestGenerations.current.shipping !== generation) return;
       console.error('加载发货规则失败', e);
+      setShippingRules([]);
+      setLoadError('shipping', loadErrorText(e, '发货规则加载失败'));
     }
   };
 
   const loadCards = async () => {
+    const generation = ++requestGenerations.current.cards;
     try {
       const data = await getCards();
+      if (requestGenerations.current.cards !== generation) return;
       setCards(data);
+      setLoadError('cards', undefined);
     } catch (e) {
+      if (requestGenerations.current.cards !== generation) return;
       console.error('加载卡券失败', e);
+      setCards([]);
+      setLoadError('cards', loadErrorText(e, '卡券列表加载失败'));
     }
   };
 
   const loadKeywords = async () => {
     if (!selectedAccount) return;
+    const generation = ++requestGenerations.current.keywords;
     setLoading(true);
     try {
       const data = await getReplyRules(selectedAccount);
+      if (requestGenerations.current.keywords !== generation) return;
       setKeywords(data as Keyword[]);
+      setLoadError('keywords', undefined);
     } catch (e) {
+      if (requestGenerations.current.keywords !== generation) return;
       console.error('加载关键词失败', e);
+      setKeywords([]);
+      setLoadError('keywords', loadErrorText(e, '关键词加载失败'));
     } finally {
-      setLoading(false);
+      if (requestGenerations.current.keywords === generation) setLoading(false);
     }
   };
 
@@ -147,8 +220,10 @@ const Keywords: React.FC = () => {
   };
 
   const loadDefaultReplyForEdit = async (cookieId: string) => {
+    const generation = ++defaultReplyEditGeneration.current;
     try {
       const data = await getDefaultReply(cookieId);
+      if (defaultReplyEditGeneration.current !== generation) return;
       setEditingDefaultReply(data);
       setDefaultForm({
         cookie_id: cookieId,
@@ -159,17 +234,11 @@ const Keywords: React.FC = () => {
       });
       setShowDefaultModal(true);
     } catch (e) {
+      if (defaultReplyEditGeneration.current !== generation) return;
+      // 后端对「未设置」返回 200 和默认值，走到这里必然是请求失败；
+      // 不能再当作「没有设置」打开空表单，否则保存会把已有配置覆盖为空
       console.error('加载默认回复失败', e);
-      // 如果没有设置，创建新的
-      setEditingDefaultReply(null);
-      setDefaultForm({
-        cookie_id: cookieId,
-        enabled: false,
-        reply_content: '',
-        reply_once: false,
-        reply_image_url: ''
-      });
-      setShowDefaultModal(true);
+      setPageNotice({ tone: 'error', text: `加载默认回复失败：${loadErrorText(e, '请求失败')}，请重试` });
     }
   };
 
@@ -437,13 +506,17 @@ const Keywords: React.FC = () => {
 
       {/* 内容区域 */}
       {!selectedAccount ? (
-        <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
-          <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
-            <MessageSquare className="w-12 h-12 text-[#FFE815]" />
+        loadErrors.accounts ? (
+          <LoadErrorState title="账号列表加载失败" message={loadErrors.accounts} onRetry={() => { loadAccounts(); }} />
+        ) : (
+          <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
+            <div className="w-24 h-24 bg-gradient-to-br from-[#FFE815]/20 to-[#FFD700]/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
+              <MessageSquare className="w-12 h-12 text-[#FFE815]" />
+            </div>
+            <h3 className="text-2xl font-bold text-gray-900 mb-2">请选择账号</h3>
+            <p className="text-gray-500 text-lg">选择一个账号以管理其关键词规则</p>
           </div>
-          <h3 className="text-2xl font-bold text-gray-900 mb-2">请选择账号</h3>
-          <p className="text-gray-500 text-lg">选择一个账号以管理其关键词规则</p>
-        </div>
+        )
       ) : activeTab === 'reply' ? (
         // 关键词回复列表
         loading ? (
@@ -453,6 +526,8 @@ const Keywords: React.FC = () => {
               <p className="text-gray-500 font-medium">加载中...</p>
             </div>
           </div>
+        ) : loadErrors.keywords ? (
+          <LoadErrorState title="关键词加载失败" message={loadErrors.keywords} onRetry={() => { loadKeywords(); }} />
         ) : (
           <div className="space-y-4">
             {keywords.map((keyword, index) => (
@@ -518,6 +593,9 @@ const Keywords: React.FC = () => {
         )
       ) : activeTab === 'delivery' ? (
         // 关键词发货列表
+        loadErrors.shipping ? (
+          <LoadErrorState title="发货规则加载失败" message={loadErrors.shipping} onRetry={() => { loadShippingRules(); }} />
+        ) : (
         <div className="space-y-4">
           {shippingRules.map((rule) => (
             <div
@@ -606,8 +684,12 @@ const Keywords: React.FC = () => {
             </div>
           )}
         </div>
+        )
       ) : activeTab === 'default' ? (
         // 账号默认回复列表
+        loadErrors.defaults ? (
+          <LoadErrorState title="默认回复加载失败" message={loadErrors.defaults} onRetry={() => { loadDefaultReplies(); }} />
+        ) : (
         <div className="space-y-4">
           {accounts.map((account) => {
             const defaultReply = defaultReplies[account.id];
@@ -701,6 +783,7 @@ const Keywords: React.FC = () => {
             </div>
           )}
         </div>
+        )
       ) : null}
 
       {/* 关键词回复弹窗 */}
@@ -842,7 +925,18 @@ const Keywords: React.FC = () => {
                     </option>
                   ))}
                 </select>
-                <p className="text-sm text-gray-500 mt-2 ml-1">🎁 选择触发关键词时发送的卡券</p>
+                {loadErrors.cards ? (
+                  <div className="mt-2">
+                    <InlineNotice tone="error">
+                      <span className="min-w-0 flex-1">卡券列表加载失败：{loadErrors.cards}</span>
+                      <button type="button" onClick={() => { loadCards(); }} className="shrink-0 font-bold underline underline-offset-2">
+                        重试
+                      </button>
+                    </InlineNotice>
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500 mt-2 ml-1">🎁 选择触发关键词时发送的卡券</p>
+                )}
               </div>
 
               <div>

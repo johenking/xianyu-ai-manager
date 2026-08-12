@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Card } from '../types';
 import { getCards, createCard, updateCard, deleteCard } from '../services/api';
-import { Plus, CreditCard, Clock, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Eye, EyeOff, Package } from 'lucide-react';
+import { Plus, CreditCard, Clock, FileText, Image as ImageIcon, Code, Edit, Trash2, Save, X, Eye, EyeOff, Package, AlertCircle, RefreshCw } from 'lucide-react';
 import { InlineNotice, ToggleControl } from './ui/StatusControls';
 
 const CardList: React.FC = () => {
@@ -20,10 +20,30 @@ const CardList: React.FC = () => {
     delay_seconds: 0
   });
   const [pageNotice, setPageNotice] = useState<{ tone: 'success' | 'error' | 'info'; text: string } | null>(null);
+  // 列表读取失败的可见错误态：不再把请求失败静默呈现为「暂无卡密」
+  const [listError, setListError] = useState<string | null>(null);
+  // 列表请求代际号：连续操作触发的多次刷新只允许最新一次响应写入视图（同 Dashboard 的做法）
+  const listGeneration = useRef(0);
+
+  // 列表读取统一入口：初始加载、重试与增删改后的刷新都走这里
+  const refreshCards = useCallback(async () => {
+    const generation = ++listGeneration.current;
+    try {
+      const data = await getCards();
+      if (listGeneration.current !== generation) return;
+      setCards(data);
+      setListError(null);
+    } catch (error) {
+      if (listGeneration.current !== generation) return;
+      console.error('加载卡密列表失败:', error);
+      setCards([]);
+      setListError(error instanceof Error && error.message ? error.message : '卡密列表加载失败');
+    }
+  }, []);
 
   useEffect(() => {
-    getCards().then(setCards);
-  }, []);
+    refreshCards();
+  }, [refreshCards]);
 
   const CardIcon = ({ type }: { type: string }) => {
       switch(type) {
@@ -108,7 +128,7 @@ const CardList: React.FC = () => {
 
       await updateCard(selectedCard.id, updateData);
       setShowEditModal(false);
-      setCards(await getCards());
+      await refreshCards();
       setPageNotice({ tone: 'success', text: '卡密修改已保存' });
     } catch (error) {
       console.error('更新卡密失败:', error);
@@ -120,7 +140,7 @@ const CardList: React.FC = () => {
     if (confirm('确认删除该卡密吗？')) {
       try {
         await deleteCard(id);
-        setCards(await getCards());
+        await refreshCards();
         setPageNotice({ tone: 'success', text: '卡密已删除' });
       } catch (error) {
         console.error('删除卡密失败:', error);
@@ -141,7 +161,7 @@ const CardList: React.FC = () => {
         enabled: true,
         delay_seconds: 0
       });
-      setCards(await getCards());
+      await refreshCards();
       setPageNotice({ tone: 'success', text: '卡密已添加' });
     } catch (error) {
       console.error('添加卡密失败:', error);
@@ -152,7 +172,7 @@ const CardList: React.FC = () => {
   const toggleCardStatus = async (card: Card) => {
     try {
       await updateCard(card.id, { ...card, enabled: !card.enabled });
-      setCards(await getCards());
+      await refreshCards();
       setPageNotice({ tone: 'success', text: `卡密已${card.enabled ? '停用' : '启用'}` });
     } catch (error) {
       console.error('切换状态失败:', error);
@@ -178,6 +198,23 @@ const CardList: React.FC = () => {
       </div>
 
       <div className="ios-card rounded-[2rem] overflow-hidden shadow-lg border-0 bg-white">
+        {listError ? (
+          // 读路径失败与写路径一样诚实：可见错误 + 重试入口，而不是伪装成「暂无卡密」
+          <div role="alert" className="py-20 text-center">
+            <AlertCircle className="w-12 h-12 mx-auto mb-4 text-red-400" />
+            <p className="font-bold text-gray-900 mb-1">卡密列表加载失败</p>
+            <p className="text-sm text-gray-500 mb-6">{listError}</p>
+            <button
+              type="button"
+              onClick={() => { refreshCards(); }}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-xl font-bold bg-gray-900 text-white hover:bg-gray-800 transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" />
+              重试
+            </button>
+          </div>
+        ) : (
+        <>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[820px] text-left border-collapse">
             <thead>
@@ -264,6 +301,7 @@ const CardList: React.FC = () => {
                         <button
                           onClick={() => handleDelete(card.id)}
                           className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors"
+                          title="删除"
                         >
                           <Trash2 className="w-5 h-5" />
                         </button>
@@ -281,6 +319,8 @@ const CardList: React.FC = () => {
             <Package className="w-12 h-12 mx-auto mb-4 opacity-30" />
             <p>暂无卡密配置，请点击右上角添加。</p>
           </div>
+        )}
+        </>
         )}
       </div>
 
