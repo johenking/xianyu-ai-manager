@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=1440" />
+<title>方案 A · 连续工作台 — 咸鱼监控台仪表盘 Demo</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: { brand: '#FFE815' },
+      },
+    },
+  };
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<!-- Recharts 2.15.3 UMD 将 prop-types 视为外部依赖，需先提供全局 PropTypes -->
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://unpkg.com/recharts@2.15.3/umd/Recharts.js"></script>
+<style>
+  html { -webkit-font-smoothing: antialiased; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #F4F5F7;
+    font-variant-numeric: tabular-nums;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #D7DAE0; border-radius: 6px; border: 2px solid #F4F5F7; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+const {
+  ResponsiveContainer, ComposedChart, AreaChart, BarChart,
+  Area, Line, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, ReferenceDot, LabelList,
+} = Recharts;
+
+/* ---------------- 工具 ---------------- */
+const fmtMoney = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInt = (n) => Number(n).toLocaleString('en-US');
+const pctOf = (v, total) => (total > 0 ? ((v / total) * 100).toFixed(1) : '0.0');
+
+const WK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+const mkDaily = (rows) => rows.map(([full, amt, ord]) => {
+  const dt = new Date(full + 'T00:00:00');
+  return { full, d: full.slice(5), wk: WK[dt.getDay()], amt, ord };
+});
+const mkHours = (obj) => Array.from({ length: 24 }, (_, h) => ({ h, label: h + '时', raw: obj[h] || 0 }));
+const mkWeek = (arr) => ['周一', '周二', '周三', '周四', '周五', '周六', '周日'].map((w, i) => ({ w, raw: arr[i] }));
+
+/* ---------------- 图标（手写线性 SVG） ---------------- */
+const ICON_PATHS = {
+  dash: 'M3.5 3.5h5.2v5.2H3.5zM11.3 3.5h5.2v5.2h-5.2zM3.5 11.3h5.2v5.2H3.5zM11.3 11.3h5.2v5.2h-5.2z',
+  user: 'M10 9.5a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4zM3.8 16.8c.9-3 3.3-4.8 6.2-4.8s5.3 1.8 6.2 4.8',
+  order: 'M5 3.5h10a1 1 0 011 1v11a1 1 0 01-1 1H5a1 1 0 01-1-1v-11a1 1 0 011-1zM7.5 7.5h5M7.5 10.5h5M7.5 13.5h3',
+  key: 'M7 16.3a3.3 3.3 0 110-6.6 3.3 3.3 0 010 6.6zM9.4 10.6l7.1-7.1M14.3 5.7l2 2M12 8l1.6 1.6',
+  tag: 'M3.5 4.5a1 1 0 011-1h4.6a1 1 0 01.7.3l6.7 6.7a1 1 0 010 1.4l-4.6 4.6a1 1 0 01-1.4 0L3.8 9.8a1 1 0 01-.3-.7zM7.6 7.6h.01',
+  gear: 'M10 12.8a2.8 2.8 0 100-5.6 2.8 2.8 0 000 5.6zM10 2.8v2.4M10 14.8v2.4M2.8 10h2.4M14.8 10h2.4M4.9 4.9l1.7 1.7M13.4 13.4l1.7 1.7M15.1 4.9l-1.7 1.7M6.6 13.4l-1.7 1.7',
+  yen: 'M10 17.5a7.5 7.5 0 100-15 7.5 7.5 0 000 15zM7.2 6.8l2.8 3.7 2.8-3.7M10 10.5V14M7.9 11.7h4.2',
+  trend: 'M3 14.5l4.2-5.2 3.4 2.9L16.8 6M13.2 5.7l3.7-.3.3 3.7',
+  clock: 'M10 17a7 7 0 100-14 7 7 0 000 14zM10 6.2V10l2.8 1.9',
+  pin: 'M10 17.2S4.7 12.6 4.7 8.6A5.3 5.3 0 0110 3.3a5.3 5.3 0 015.3 5.3c0 4-5.3 8.6-5.3 8.6zM10 10.6a2 2 0 100-4 2 2 0 000 4z',
+  ratio: 'M3.5 5.5H16M3.5 10h8.5M3.5 14.5h11.5',
+  bars: 'M4.5 16.5v-6.3M10 16.5V4.5M15.5 16.5v-4',
+  users: 'M7.5 9.2a2.9 2.9 0 100-5.8 2.9 2.9 0 000 5.8zM2.5 16.4c.7-2.7 2.7-4.3 5-4.3s4.3 1.6 5 4.3M13.2 9a2.6 2.6 0 10-1.6-4.6M14.4 12.3c1.7.5 2.8 2 3.2 4.1',
+  eye: 'M2.5 10S5.4 4.9 10 4.9 17.5 10 17.5 10 14.6 15.1 10 15.1 2.5 10 2.5 10zM10 12.3a2.3 2.3 0 100-4.6 2.3 2.3 0 000 4.6z',
+  eyeOff: 'M4.2 5.6C3 6.9 2.5 10 2.5 10s2.9 5.1 7.5 5.1c1.5 0 2.8-.5 3.9-1.2M8.6 5.1c.5-.1.9-.2 1.4-.2 4.6 0 7.5 5.1 7.5 5.1s-.7 1.2-1.9 2.4M8.4 8.4a2.3 2.3 0 003.2 3.2M3.5 3.5l13 13',
+  fire: 'M10.2 3c.3 1.9-.4 3.3-1.6 4.7-1 1.2-2.1 2.4-2.1 4.2A3.9 3.9 0 0010.4 16a4.1 4.1 0 004.1-4.2c0-1.5-.6-2.9-1.6-4-.2.7-.6 1.3-1.1 1.6.1-2.4-.6-4.6-1.6-6.4z',
+  list: 'M6.5 5.5h10M6.5 10h10M6.5 14.5h10M3.3 5.5h.01M3.3 10h.01M3.3 14.5h.01',
+  search: 'M9 14.2a5.2 5.2 0 100-10.4 5.2 5.2 0 000 10.4zM12.9 12.9l3.6 3.6',
+  cal: 'M4.5 5.5h11a1 1 0 011 1v9a1 1 0 01-1 1h-11a1 1 0 01-1-1v-9a1 1 0 011-1zM3.5 9h13M7 3.5v3M13 3.5v3',
+  info: 'M10 17a7 7 0 100-14 7 7 0 000 14zM10 9.3v4.2M10 6.6h.01',
+  up: 'M10 15.5v-11M5.5 9L10 4.5 14.5 9',
+  down: 'M10 4.5v11M5.5 11L10 15.5 14.5 11',
+};
+function Icon({ name, size = 16, className = '', strokeWidth = 1.6 }) {
+  return (
+    <svg viewBox="0 0 20 20" width={size} height={size} fill="none" stroke="currentColor"
+      strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round"
+      className={'shrink-0 ' + className} aria-hidden="true">
+      <path d={ICON_PATHS[name] || ''} />
+    </svg>
+  );
+}
+function FishLogo() {
+  return (
+    <svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="#111827"
+      strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 10c1.9-3 4.5-4.5 7.3-4.5 2.6 0 4.8 1.3 6.2 4.5-1.4 3.2-3.6 4.5-6.2 4.5-2.8 0-5.4-1.5-7.3-4.5z" />
+      <path d="M4 10L2 7.2M4 10l-2 2.8" />
+      <circle cx="14" cy="9.4" r="0.5" fill="#111827" stroke="none" />
+    </svg>
+  );
+}
+
+/* ---------------- 数据集 ---------------- */
+const DS = {
+  current: {
+    key: 'current',
+    range: '2026-08-06 ~ 2026-08-12',
+    rangeKey: '7天内',
+    revenue: 61.04,
+    mom: { type: 'new' },
+    acct: [1, 1],
+    kpiOrders: 9,
+    ordersHint: '近 7 天 · 日均 1.3 单',
+    cards: 0,
+    cardsHint: '暂无可用库存，需补充卡密',
+    cardsTone: 'warn',
+    daily: mkDaily([
+      ['2026-08-06', 0, 0], ['2026-08-07', 0, 0], ['2026-08-08', 0, 0], ['2026-08-09', 0, 0],
+      ['2026-08-10', 33.28, 5], ['2026-08-11', 27.76, 4], ['2026-08-12', 0, 0],
+    ]),
+    status: [
+      { label: '已完成', v: 5, c: '#10B981' },
+      { label: '已发货', v: 4, c: '#3B82F6' },
+    ],
+    prods: [
+      { n: 'codex助力邀请送积分', o: 4, a: 31.04, avg: 7.76 },
+      { n: 'codex邀请重置额度服务', o: 4, a: 26.20, avg: 6.55 },
+      { n: 'codex邀请重置额度服务·新链接', o: 1, a: 3.80, avg: 3.80 },
+    ],
+    cities: null,
+    cityCovered: 0,
+    cityUncovered: 9,
+    hours: mkHours({ 12: 1, 13: 1, 15: 2, 17: 1, 18: 3, 21: 1 }),
+    week: mkWeek([5, 4, 0, 0, 0, 0, 0]),
+    advice: { tone: 'muted', text: '时段建议待补充：至少需要 20 笔有效成交订单' },
+    traffic: null,
+    buyers: {
+      total: 6, repeat: 3, rate: '50.0',
+      freq: [{ l: '1 单', v: 3 }, { l: '2 单', v: 3 }],
+      top: [
+        { n: '星河小铺', o: 2, a: 13.30 },
+        { n: '稳重的橙子', o: 2, a: 12.90 },
+        { n: 'NOVA_AI', o: 1, a: 11.64 },
+        { n: '晚风信箱', o: 1, a: 11.64 },
+        { n: '青柠不加冰', o: 2, a: 7.76 },
+      ],
+      rest: '其余 1 位买家贡献 ¥3.88',
+    },
+    hot: [
+      { n: 'codex助力邀请送积分', o: 4, a: 31.04, avg: 7.76, mom: { type: 'new' } },
+      { n: 'codex邀请重置额度服务', o: 4, a: 26.20, avg: 6.55, mom: { type: 'new' } },
+    ],
+    orderRows: [
+      { no: '512749****6108', buyer: '买家·尾号2232', prod: 'codex邀请重置额度服务·新链接', amt: 3.80, st: '已发货', t: '08-11 21:11' },
+      { no: '512748****9375', buyer: '晚风信箱', prod: 'codex助力邀请送积分', amt: 9.00, st: '已发货', t: '08-11 18:48' },
+      { no: '512747****2217', buyer: '青柠不加冰', prod: 'codex邀请重置额度服务', amt: 4.30, st: '已完成', t: '08-11 15:26' },
+      { no: '512746****8854', buyer: '稳重的橙子', prod: 'codex邀请重置额度服务', amt: 8.60, st: '已完成', t: '08-11 13:39' },
+      { no: '512745****0032', buyer: '星河小铺', prod: 'codex助力邀请送积分', amt: 5.40, st: '已发货', t: '08-10 18:56' },
+      { no: '512744****7761', buyer: '青柠不加冰', prod: 'codex邀请重置额度服务', amt: 3.88, st: '已发货', t: '08-10 18:15' },
+      { no: '512743****3305', buyer: 'NOVA_AI', prod: 'codex助力邀请送积分', amt: 11.64, st: '已完成', t: '08-10 17:42' },
+      { no: '512742****5580', buyer: '稳重的橙子', prod: 'codex邀请重置额度服务', amt: 6.66, st: '已完成', t: '08-10 15:07' },
+      { no: '512741****2049', buyer: '星河小铺', prod: 'codex助力邀请送积分', amt: 7.76, st: '已完成', t: '08-10 12:24' },
+    ],
+    ordersNote: '共 9 笔 · 全部展示',
+  },
+
+  grown: {
+    key: 'grown',
+    range: '2026-07-14 ~ 2026-08-12',
+    rangeKey: '一个月内',
+    revenue: 1286.40,
+    mom: { type: 'up', text: '+38.6%' },
+    acct: [3, 3],
+    kpiOrders: 186,
+    ordersHint: '近 30 天 · 日均 6.2 单',
+    cards: 42,
+    cardsHint: '库存充足 · 可自动发货',
+    cardsTone: 'ok',
+    daily: mkDaily([
+      ['2026-07-14', 24.60, 4], ['2026-07-15', 18.80, 3], ['2026-07-16', 30.40, 5],
+      ['2026-07-17', 55.20, 8], ['2026-07-18', 72.40, 10], ['2026-07-19', 48.60, 7],
+      ['2026-07-20', 16.40, 2], ['2026-07-21', 28.60, 4], ['2026-07-22', 16.40, 3],
+      ['2026-07-23', 35.20, 5], ['2026-07-24', 58.80, 8], ['2026-07-25', 79.60, 11],
+      ['2026-07-26', 46.40, 7], ['2026-07-27', 26.80, 4], ['2026-07-28', 31.20, 5],
+      ['2026-07-29', 24.40, 3], ['2026-07-30', 38.60, 6], ['2026-07-31', 66.20, 9],
+      ['2026-08-01', 82.40, 12], ['2026-08-02', 48.80, 7], ['2026-08-03', 29.40, 4],
+      ['2026-08-04', 33.60, 5], ['2026-08-05', 21.80, 3], ['2026-08-06', 41.20, 6],
+      ['2026-08-07', 89.00, 13], ['2026-08-08', 86.40, 12], ['2026-08-09', 61.20, 9],
+      ['2026-08-10', 33.28, 5], ['2026-08-11', 27.76, 4], ['2026-08-12', 12.96, 2],
+    ]),
+    status: [
+      { label: '已完成', v: 128, c: '#10B981' },
+      { label: '已发货', v: 45, c: '#3B82F6' },
+      { label: '待发货', v: 6, c: '#FFE815' },
+      { label: '退款中', v: 4, c: '#EF4444' },
+      { label: '已取消', v: 3, c: '#9CA3AF' },
+    ],
+    prods: [
+      { n: 'codex助力邀请送积分', o: 52, a: 403.52, avg: 7.76 },
+      { n: 'codex邀请重置额度服务', o: 38, a: 248.90, avg: 6.55 },
+      { n: 'codex邀请重置额度服务·新链接', o: 24, a: 91.20, avg: 3.80 },
+      { n: 'GPT团队席位月卡', o: 21, a: 138.60, avg: 6.60 },
+      { n: 'Claude额度补充包', o: 18, a: 115.20, avg: 6.40 },
+      { n: 'Gemini会员代充', o: 14, a: 81.20, avg: 5.80 },
+      { n: 'API中转月卡', o: 11, a: 59.40, avg: 5.40 },
+      { n: '模型评测报告定制', o: 8, a: 148.38, avg: 18.55 },
+    ],
+    cities: [
+      { n: '上海', v: 32 }, { n: '杭州', v: 28 }, { n: '深圳', v: 24 }, { n: '北京', v: 21 },
+      { n: '广州', v: 17 }, { n: '成都', v: 12 }, { n: '南京', v: 9 }, { n: '武汉', v: 7 },
+    ],
+    cityCovered: 150,
+    cityUncovered: 36,
+    hours: mkHours({ 0: 1, 6: 1, 7: 2, 8: 3, 9: 5, 10: 7, 11: 8, 12: 12, 13: 11, 14: 8, 15: 8, 16: 7, 17: 8, 18: 10, 19: 12, 20: 19, 21: 24, 22: 22, 23: 18 }),
+    week: mkWeek([20, 22, 21, 22, 38, 35, 28]),
+    advice: { tone: 'warm', text: '每周五 20:00-23:00 是你的成交高峰，建议保持在线并优先补货热销商品' },
+    traffic: {
+      expo: 12480, views: 3215, wants: 486, windows: 42, days: 14,
+      series: [
+        { label: '07-30', expo: 1420, views: 360, wants: 52 },
+        { label: '08-02', expo: 1880, views: 480, wants: 68 },
+        { label: '08-04', expo: 2140, views: 545, wants: 85 },
+        { label: '08-06', expo: 1960, views: 510, wants: 78 },
+        { label: '08-09', expo: 2480, views: 640, wants: 96 },
+        { label: '08-12', expo: 2600, views: 680, wants: 107 },
+      ],
+      rank: [
+        { n: 'codex助力邀请送积分', v: 4280 },
+        { n: 'GPT团队席位月卡', v: 2860 },
+        { n: 'codex邀请重置额度服务', v: 2150 },
+        { n: 'Claude额度补充包', v: 1690 },
+        { n: 'Gemini会员代充', v: 940 },
+      ],
+    },
+    buyers: {
+      total: 132, repeat: 41, rate: '31.1',
+      freq: [{ l: '1 单', v: 91 }, { l: '2 单', v: 27 }, { l: '3 单', v: 9 }, { l: '4 单+', v: 5 }],
+      top: [
+        { n: '星河小铺', o: 9, a: 86.40 },
+        { n: 'NOVA_AI', o: 7, a: 64.20 },
+        { n: '稳重的橙子', o: 6, a: 58.80 },
+        { n: '晚风信箱', o: 5, a: 47.60 },
+        { n: '青柠不加冰', o: 5, a: 42.30 },
+      ],
+      rest: '其余 127 位买家贡献 ¥987.10',
+    },
+    hot: [
+      { n: 'codex助力邀请送积分', o: 52, a: 403.52, avg: 7.76, mom: { type: 'up', text: '+150%' } },
+      { n: 'codex邀请重置额度服务', o: 38, a: 248.90, avg: 6.55, mom: { type: 'up', text: '+40%' } },
+      { n: 'codex邀请重置额度服务·新链接', o: 24, a: 91.20, avg: 3.80, mom: { type: 'down', text: '-25%' } },
+      { n: 'GPT团队席位月卡', o: 21, a: 138.60, avg: 6.60, mom: { type: 'new' } },
+    ],
+    orderRows: [
+      { no: '512788****3341', buyer: '蓝山咖啡豆', prod: 'GPT团队席位月卡', amt: 6.60, st: '待发货', t: '08-12 09:14' },
+      { no: '512788****1102', buyer: '星河小铺', prod: 'codex助力邀请送积分', amt: 7.76, st: '待发货', t: '08-12 08:02' },
+      { no: '512787****6520', buyer: 'NOVA_AI', prod: '模型评测报告定制', amt: 18.55, st: '已发货', t: '08-11 22:41' },
+      { no: '512787****0918', buyer: '青柠不加冰', prod: 'codex邀请重置额度服务', amt: 6.55, st: '已完成', t: '08-11 21:36' },
+      { no: '512787****4477', buyer: '晚风信箱', prod: 'Claude额度补充包', amt: 6.40, st: '已完成', t: '08-11 21:02' },
+      { no: '512786****8093', buyer: '稳重的橙子', prod: 'codex助力邀请送积分', amt: 7.76, st: '已完成', t: '08-11 20:18' },
+      { no: '512786****2251', buyer: '买家·尾号2232', prod: 'API中转月卡', amt: 5.40, st: '退款中', t: '08-11 13:27' },
+      { no: '512785****7764', buyer: '星河小铺', prod: 'Gemini会员代充', amt: 5.80, st: '已完成', t: '08-10 21:55' },
+      { no: '512785****3308', buyer: 'NOVA_AI', prod: 'codex邀请重置额度服务·新链接', amt: 3.80, st: '已取消', t: '08-10 20:12' },
+      { no: '512784****9926', buyer: '晚风信箱', prod: 'codex助力邀请送积分', amt: 7.76, st: '已完成', t: '08-10 12:33' },
+    ],
+    ordersNote: '共 186 笔 · 展示最近 10 笔',
+  },
+};
+
+const RANGES = ['今天', '昨天', '三天内', '7天内', '一个月内', '自定义'];
+const RANGE_TO_DS = { '7天内': 'current', '一个月内': 'grown' };
+
+/* 状态语义色（固定）：待发货黄底黑字 / 已发货蓝 / 已完成绿 / 退款中红 / 已取消灰 / 未知虚线 */
+const STATUS_BADGE = {
+  '待发货': 'bg-[#FFE815] text-gray-900 border border-[#E8D200]',
+  '已发货': 'bg-blue-50 text-blue-700 border border-blue-100',
+  '已完成': 'bg-emerald-50 text-emerald-700 border border-emerald-100',
+  '退款中': 'bg-red-50 text-red-600 border border-red-100',
+  '已取消': 'bg-gray-100 text-gray-500 border border-gray-200',
+};
+const statusBadgeCls = (st) => STATUS_BADGE[st] || 'bg-white text-gray-400 border border-dashed border-gray-300';
+
+/* ---------------- 通用小组件 ---------------- */
+function SecHead({ icon, title, extra }) {
+  return (
+    <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center gap-2">
+        <Icon name={icon} size={16} className="text-gray-400" />
+        <h3 className="text-[14px] font-semibold text-gray-900">{title}</h3>
+      </div>
+      {extra ? <div className="text-xs text-gray-400">{extra}</div> : null}
+    </div>
+  );
+}
+
+function Hint({ tone = 'muted', icon = 'info', children }) {
+  const cls = tone === 'warm'
+    ? 'border-[#EFE08D] bg-[#FFFBE6] text-[#7C6A16]'
+    : 'border-gray-200 bg-gray-50/80 text-gray-500';
+  return (
+    <div className={'flex items-start gap-2 rounded-[10px] border px-3 py-2.5 text-xs leading-relaxed ' + cls}>
+      <Icon name={icon} size={14} className="mt-[1px] opacity-70" />
+      <span>{children}</span>
+    </div>
+  );
+}
+
+function MomBadge({ mom }) {
+  if (!mom) return null;
+  if (mom.type === 'new') {
+    return (
+      <span className="inline-flex items-center h-[22px] px-2 rounded-full border border-gray-200 bg-gray-50 text-[11px] font-medium text-gray-500">
+        较上期 新增
+      </span>
+    );
+  }
+  if (mom.type === 'up') {
+    return (
+      <span className="inline-flex items-center gap-0.5 h-[22px] px-2 rounded-full bg-emerald-50 text-[11px] font-semibold text-emerald-600">
+        <Icon name="up" size={12} strokeWidth={2} />{mom.text}
+        <span className="font-normal text-emerald-500/80 ml-0.5">较上期</span>
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-0.5 h-[22px] px-2 rounded-full bg-red-50 text-[11px] font-semibold text-red-500">
+      <Icon name="down" size={12} strokeWidth={2} />{mom.text}
+      <span className="font-normal text-red-400/90 ml-0.5">较上期</span>
+    </span>
+  );
+}
+
+/* 水平占比条列表（类目占比统一形式，不用饼图） */
+function RatioBarList({ rows, total, unit = '笔' }) {
+  return (
+    <div className="space-y-3">
+      {rows.map((r) => {
+        const pct = pctOf(r.v, total);
+        return (
+          <div key={r.label}>
+            <div className="flex items-center justify-between gap-3 mb-1.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="w-2 h-2 rounded-[3px] shrink-0" style={{ background: r.c }} />
+                <span className="truncate text-[13px] text-gray-700" title={r.label}>{r.label}</span>
+              </div>
+              <div className="shrink-0 text-[13px] text-gray-900 font-medium">
+                {fmtInt(r.v)} {unit}
+                <span className="text-gray-400 font-normal ml-1.5">{pct}%</span>
+              </div>
+            </div>
+            <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
+              <div className="h-full rounded-full" style={{ width: pct + '%', background: r.c }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------------- 自定义 Tooltip ---------------- */
+function TipBox({ title, rows }) {
+  return (
+    <div className="rounded-[10px] border border-gray-200 bg-white px-3.5 py-2.5 shadow-lg min-w-[150px]">
+      {title ? <div className="text-xs font-semibold text-gray-900 mb-1.5">{title}</div> : null}
+      <div className="space-y-1">
+        {rows.map((r, i) => (
+          <div key={i} className="flex items-center justify-between gap-4 text-xs">
+            <span className="flex items-center gap-1.5 text-gray-500">
+              {r.c ? <span className="w-2 h-2 rounded-[3px]" style={{ background: r.c }} /> : null}
+              {r.k}
+            </span>
+            <span className="font-semibold text-gray-900">{r.v}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+function RevTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  return (
+    <TipBox
+      title={p.full + ' · ' + p.wk}
+      rows={[
+        { k: '营收', v: '¥' + fmtMoney(p.amt), c: '#111827' },
+        { k: '订单', v: p.ord + ' 笔', c: '#3B82F6' },
+      ]}
+    />
+  );
+}
+function HourTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  if (p.raw === 0) return null;
+  return <TipBox title={p.h + ':00 – ' + p.h + ':59'} rows={[{ k: '成交', v: p.raw + ' 笔', c: '#111827' }]} />;
+}
+function WeekTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  if (p.raw === 0) return null;
+  return <TipBox title={p.w} rows={[{ k: '成交', v: p.raw + ' 笔', c: '#111827' }]} />;
+}
+function TrafficTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  return (
+    <TipBox
+      title={'观测窗口 · ' + p.label}
+      rows={[
+        { k: '曝光增量', v: '+' + fmtInt(p.expo), c: '#3B82F6' },
+        { k: '浏览增量', v: '+' + fmtInt(p.views), c: '#10B981' },
+        { k: '想要增量', v: '+' + fmtInt(p.wants), c: '#111827' },
+      ]}
+    />
+  );
+}
+
+/* ---------------- 压噪柱状图（0 值极浅底座 + 峰值黄柱顶标数值） ---------------- */
+function PressureBar({ data, height = 168, xKey, xInterval = 0, TipComp }) {
+  const peakIdx = data.reduce((m, r, i, arr) => (r.raw > arr[m].raw ? i : m), 0);
+  const peakVal = data[peakIdx].raw;
+  const disp = data.map((r) => ({ ...r, disp: r.raw === 0 ? Math.max(peakVal * 0.045, 0.001) : r.raw }));
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <BarChart data={disp} margin={{ top: 20, right: 4, left: 4, bottom: 0 }} barCategoryGap="26%">
+        <XAxis dataKey={xKey} tick={{ fontSize: 11, fill: '#9CA3AF' }} axisLine={{ stroke: '#F3F4F6' }} tickLine={false} interval={xInterval} dy={4} />
+        <YAxis hide domain={[0, (max) => Math.ceil(max * 1.12)]} />
+        <Tooltip content={<TipComp />} cursor={{ fill: 'rgba(17,24,39,0.04)' }} />
+        <Bar dataKey="disp" radius={[3, 3, 0, 0]}>
+          {disp.map((r, i) => (
+            <Cell key={i} fill={r.raw === 0 ? '#F1F3F6' : i === peakIdx ? '#FFE815' : '#C9D1DC'} />
+          ))}
+          <LabelList dataKey="raw" content={(props) => (
+            props.index === peakIdx && peakVal > 0
+              ? <text x={props.x + props.width / 2} y={props.y - 7} textAnchor="middle" fontSize="11" fontWeight="600" fill="#111827">{peakVal}</text>
+              : null
+          )} />
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+
+/* ---------------- 侧边栏 ---------------- */
+const MENU = [
+  { label: '仪表盘', icon: 'dash', active: true },
+  { label: '账号管理', icon: 'user' },
+  { label: '订单中心', icon: 'order' },
+  { label: '卡密库存', icon: 'key' },
+  { label: '商品列表', icon: 'tag' },
+  { label: '系统设置', icon: 'gear' },
+];
+function Sidebar() {
+  return (
+    <aside className="w-[220px] shrink-0 bg-[#12161C] rounded-l-[24px] text-gray-400">
+      <div className="sticky top-6 px-4 py-6 flex flex-col" style={{ minHeight: '640px' }}>
+        <div className="flex items-center gap-2.5 px-2 mb-8">
+          <span className="w-8 h-8 rounded-[9px] bg-[#FFE815] flex items-center justify-center shrink-0">
+            <FishLogo />
+          </span>
+          <span className="text-[15px] font-semibold text-white tracking-wide">闲鱼监控台</span>
+        </div>
+        <nav className="space-y-1">
+          {MENU.map((m) => (
+            <a key={m.label} href="#" onClick={(e) => e.preventDefault()}
+              className={'relative flex items-center gap-2.5 px-3 h-10 rounded-[10px] text-[13.5px] transition-colors ' +
+                (m.active
+                  ? 'bg-white/[0.07] text-[#FFE815] font-medium'
+                  : 'hover:bg-white/[0.04] hover:text-gray-200')}>
+              {m.active ? <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-[#FFE815]" /> : null}
+              <Icon name={m.icon} size={16} className={m.active ? 'text-[#FFE815]' : 'text-gray-500'} />
+              {m.label}
+            </a>
+          ))}
+        </nav>
+        <div className="mt-auto pt-8 px-2">
+          <div className="border-t border-white/[0.06] pt-4 text-[11px] leading-relaxed text-gray-600">
+            v1.10.4 · 演示环境<br />页面数据已脱敏
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+/* ---------------- 页头 ---------------- */
+function Header({ data, dsKey, setDsKey }) {
+  return (
+    <header className="px-7 pt-6 pb-5 border-b border-gray-100 flex items-center gap-4 flex-wrap">
+      <div className="flex items-center gap-3 min-w-0">
+        <h1 className="text-[20px] font-bold text-gray-900 tracking-tight">运营概览</h1>
+        <span className="inline-flex items-center gap-1.5 h-7 px-3 rounded-full bg-gray-50 border border-gray-100 text-xs text-gray-500">
+          <Icon name="cal" size={13} className="text-gray-400" />
+          {data.range}
+        </span>
+      </div>
+      <div className="ml-auto flex items-center gap-3">
+        <div className="flex items-center bg-gray-100 rounded-[10px] p-0.5">
+          {RANGES.map((r) => {
+            const target = RANGE_TO_DS[r];
+            const active = r === data.rangeKey;
+            return (
+              <button key={r} type="button"
+                disabled={!target}
+                title={target ? undefined : '演示数据未覆盖该范围'}
+                onClick={() => target && setDsKey(target)}
+                className={'px-3 h-7 text-xs rounded-[8px] transition-colors ' +
+                  (active
+                    ? 'bg-white text-gray-900 font-medium shadow-sm'
+                    : target
+                      ? 'text-gray-500 hover:text-gray-800'
+                      : 'text-gray-300 cursor-not-allowed')}>
+                {r}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center bg-gray-100 rounded-[10px] p-0.5" title="演示专用：切换两套数据规模">
+          {[['current', '当前规模'], ['grown', '成长后规模']].map(([k, l]) => (
+            <button key={k} type="button" onClick={() => setDsKey(k)}
+              className={'px-3.5 h-7 text-xs rounded-[8px] transition-colors ' +
+                (dsKey === k
+                  ? 'bg-[#FFE815] text-gray-900 font-semibold shadow-sm'
+                  : 'text-gray-500 hover:text-gray-800')}>
+              {l}
+            </button>
+          ))}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+/* ---------------- KPI 横条 ---------------- */
+function Kpi({ icon, label, main, badge, tail }) {
+  return (
+    <div className="px-7 py-5 min-h-[152px] flex flex-col">
+      <div className="flex items-center gap-2 text-[13px] text-gray-500">
+        <Icon name={icon} size={16} className="text-gray-400" />
+        {label}
+      </div>
+      <div className="mt-2 flex items-baseline gap-2 flex-wrap">
+        <span className="text-[26px] leading-8 font-bold text-gray-900">{main}</span>
+        {badge}
+      </div>
+      <div className="mt-auto pt-2">{tail}</div>
+    </div>
+  );
+}
+function DotNote({ color, ring, children }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
+      <span className={'w-1.5 h-1.5 rounded-full ' + ring} style={{ background: color }} />
+      {children}
+    </span>
+  );
+}
+function KpiStrip({ data }) {
+  return (
+    <div className="grid grid-cols-4 divide-x divide-gray-100 border-b border-gray-100">
+      <Kpi icon="yen" label="累计营收"
+        main={<span>¥{fmtMoney(data.revenue)}</span>}
+        badge={<MomBadge mom={data.mom} />}
+        tail={
+          <div className="h-[56px] -mx-1.5">
+            <ResponsiveContainer width="100%" height={56}>
+              <AreaChart data={data.daily} margin={{ top: 4, right: 2, left: 2, bottom: 2 }}>
+                <defs>
+                  <linearGradient id="sparkG" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#111827" stopOpacity="0.14" />
+                    <stop offset="100%" stopColor="#111827" stopOpacity="0" />
+                  </linearGradient>
+                </defs>
+                <Area dataKey="amt" type="monotone" stroke="#111827" strokeWidth={1.5}
+                  fill="url(#sparkG)" isAnimationActive={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        } />
+      <Kpi icon="user" label="活跃账号"
+        main={<span>{data.acct[0]}<span className="text-gray-300 font-medium text-[20px] mx-0.5">/</span>{data.acct[1]}</span>}
+        tail={<DotNote color="#10B981">全部在线运行</DotNote>} />
+      <Kpi icon="order" label="订单数"
+        main={<span>{fmtInt(data.kpiOrders)}</span>}
+        tail={<span className="text-xs text-gray-400">{data.ordersHint}</span>} />
+      <Kpi icon="key" label="库存卡密"
+        main={<span>{fmtInt(data.cards)}</span>}
+        tail={
+          data.cardsTone === 'warn'
+            ? <DotNote color="#FFE815" ring="ring-1 ring-[#E8D200]">{data.cardsHint}</DotNote>
+            : <DotNote color="#10B981">{data.cardsHint}</DotNote>
+        } />
+    </div>
+  );
+}
+
+/* ---------------- 左栏：营收趋势 ---------------- */
+function RevenueSection({ data }) {
+  const daily = data.daily;
+  const isCur = data.key === 'current';
+  const peakIdx = daily.reduce((m, r, i, arr) => (r.amt > arr[m].amt ? i : m), 0);
+  const peak = daily[peakIdx];
+  return (
+    <section className="px-7 py-6 border-b border-gray-100">
+      <SecHead icon="trend" title="营收趋势"
+        extra={
+          <div className="flex items-center gap-4">
+            <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-[3px] bg-gray-900 inline-block" />营收（¥）</span>
+            <span className="flex items-center gap-1.5"><span className="w-3.5 h-[2px] bg-[#3B82F6] inline-block rounded-full" />订单（笔）</span>
+          </div>
+        } />
+      <div className="h-[320px]">
+        <ResponsiveContainer width="100%" height={320}>
+          <ComposedChart data={daily} margin={{ top: 16, right: 4, left: 0, bottom: 0 }}>
+            <defs>
+              <linearGradient id="revG" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#111827" stopOpacity="0.10" />
+                <stop offset="100%" stopColor="#111827" stopOpacity="0" />
+              </linearGradient>
+            </defs>
+            <CartesianGrid vertical={false} stroke="#F3F4F6" />
+            <XAxis dataKey="d" tick={{ fontSize: 11, fill: '#9CA3AF' }} axisLine={{ stroke: '#F3F4F6' }} tickLine={false}
+              interval={isCur ? 0 : 4} dy={6} />
+            <YAxis yAxisId="l" tick={{ fontSize: 11, fill: '#9CA3AF' }} axisLine={false} tickLine={false}
+              width={54} tickFormatter={(v) => '¥' + v} />
+            <YAxis yAxisId="r" orientation="right" allowDecimals={false}
+              tick={{ fontSize: 11, fill: '#93C5FD' }} axisLine={false} tickLine={false} width={34} />
+            <Tooltip content={<RevTip />} cursor={{ stroke: '#E5E7EB', strokeWidth: 1 }} />
+            <Area yAxisId="l" dataKey="amt" type="monotone" stroke="#111827" strokeWidth={2} fill="url(#revG)" />
+            <Line yAxisId="r" dataKey="ord" type="monotone" stroke="#3B82F6" strokeWidth={2}
+              dot={{ r: 2.2, fill: '#3B82F6', strokeWidth: 0 }} activeDot={{ r: 3.5 }} />
+            {peak.amt > 0
+              ? <ReferenceDot yAxisId="l" x={peak.d} y={peak.amt} r={5} fill="#FFE815" stroke="#111827" strokeWidth={1.5} />
+              : null}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="mt-2 text-[11px] text-gray-400">
+        按所选范围逐日统计，无成交日按 0 计入；黄点为范围内营收峰值（{peak.full} · ¥{fmtMoney(peak.amt)}）。
+      </p>
+    </section>
+  );
+}
+
+/* ---------------- 左栏：时段分析 ---------------- */
+function TimeSection({ data }) {
+  return (
+    <section className="px-7 py-6 border-b border-gray-100">
+      <SecHead icon="clock" title="订单时段分析" extra="按订单创建时间统计" />
+      <div className="grid grid-cols-2 gap-8">
+        <div>
+          <div className="text-xs text-gray-400 mb-1">按小时分布</div>
+          <PressureBar data={data.hours} xKey="label" xInterval={2} TipComp={HourTip} />
+        </div>
+        <div>
+          <div className="text-xs text-gray-400 mb-1">按星期分布</div>
+          <PressureBar data={data.week} xKey="w" xInterval={0} TipComp={WeekTip} />
+        </div>
+      </div>
+      <div className="mt-4">
+        <Hint tone={data.advice.tone} icon={data.advice.tone === 'warm' ? 'clock' : 'info'}>
+          {data.advice.text}
+        </Hint>
+      </div>
+    </section>
+  );
+}
+
+/* ---------------- 左栏：收货城市 ---------------- */
+function CitySection({ data }) {
+  return (
+    <section className="px-7 py-6 border-b border-gray-100">
+      <SecHead icon="pin" title="收货城市 Top 8"
+        extra={data.cities ? '已采集 ' + fmtInt(data.cityCovered) + ' 笔' : null} />
+      {data.cities ? (
+        <div>
+          <RatioBarList
+            rows={data.cities.map((c) => ({ label: c.n, v: c.v, c: '#3B82F6' }))}
+            total={data.cityCovered} />
+          <div className="mt-4">
+            <Hint>其余 {data.cityUncovered} 笔订单暂未采集到收货城市，占比按已采集订单计算。</Hint>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-[12px] bg-gray-50/60 border border-gray-100 py-10 flex flex-col items-center gap-2.5">
+          <Icon name="pin" size={22} className="text-gray-300" />
+          <span className="text-[13px] text-gray-400">暂无收货城市数据</span>
+          <span className="text-[11px] text-gray-300">成交订单回填收货地址后自动生成</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------- 左栏：统计口径 ---------------- */
+function CaliberSection() {
+  return (
+    <section className="px-7 py-6 flex-1">
+      <SecHead icon="info" title="统计口径" />
+      <ul className="space-y-2 text-xs leading-relaxed text-gray-400 list-disc pl-4 marker:text-gray-300">
+        <li>营收与订单统计包含待发货、已发货、已完成订单；退款中与已取消订单不计入。</li>
+        <li>环比对比区间为上一个等长周期；上期无数据时按「较上期 新增」标注，不折算百分比。</li>
+        <li>复购率 = 所选范围内成交 2 单及以上的买家 ÷ 全部下单买家。</li>
+      </ul>
+    </section>
+  );
+}
+
+/* ---------------- 右栏：订单状态 ---------------- */
+function StatusSection({ data }) {
+  const total = data.status.reduce((s, r) => s + r.v, 0);
+  return (
+    <section className="px-6 py-6 border-b border-gray-100">
+      <SecHead icon="ratio" title="订单状态分布" extra={'共 ' + fmtInt(total) + ' 笔'} />
+      <RatioBarList rows={data.status} total={total} />
+    </section>
+  );
+}
+
+/* ---------------- 右栏：商品销量排行 ---------------- */
+function RankSection({ data }) {
+  const max = Math.max(...data.prods.map((p) => p.o));
+  const total = data.prods.reduce((s, p) => s + p.o, 0);
+  return (
+    <section className="px-6 py-6 border-b border-gray-100">
+      <SecHead icon="bars" title="商品销量排行" extra={data.prods.length + ' 款商品'} />
+      <div className="space-y-4">
+        {data.prods.map((p, i) => (
+          <div key={p.n}>
+            <div className="flex items-center gap-2.5 mb-1.5">
+              <span className={'w-5 h-5 rounded-[6px] flex items-center justify-center text-[11px] font-semibold shrink-0 ' +
+                (i === 0 ? 'bg-[#FFE815] text-gray-900' : i < 3 ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-500')}>
+                {i + 1}
+              </span>
+              <span className="flex-1 min-w-0 truncate text-[13px] text-gray-700" title={p.n}>{p.n}</span>
+              <span className="shrink-0 text-[13px] font-medium text-gray-900">
+                {p.o} 单<span className="text-gray-400 font-normal ml-1">{pctOf(p.o, total)}%</span>
+              </span>
+            </div>
+            <div className="ml-[30px] flex items-center gap-2.5">
+              <div className="flex-1 h-1.5 rounded-full bg-gray-100 overflow-hidden">
+                <div className="h-full rounded-full bg-gray-900" style={{ width: (p.o / max) * 100 + '%' }} />
+              </div>
+              <span className="shrink-0 w-[76px] text-right text-[11px] text-gray-400">¥{fmtMoney(p.a)}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/* ---------------- 右栏：买家概览 ---------------- */
+function BuyerSection({ data }) {
+  const b = data.buyers;
+  const freqMax = Math.max(...b.freq.map((f) => f.v));
+  return (
+    <section className="px-6 py-6 border-b border-gray-100">
+      <SecHead icon="users" title="买家概览" extra="范围内下单买家" />
+      <div className="grid grid-cols-3 divide-x divide-gray-100 mb-5">
+        <div className="pr-3">
+          <div className="text-[20px] font-bold text-gray-900">{fmtInt(b.total)}</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">下单买家</div>
+        </div>
+        <div className="px-3">
+          <div className="text-[20px] font-bold text-gray-900">{fmtInt(b.repeat)}</div>
+          <div className="text-[11px] text-gray-400 mt-0.5">复购买家</div>
+        </div>
+        <div className="pl-3">
+          <div className="text-[20px] font-bold text-gray-900">
+            <span className="bg-[#FFE815] rounded-[5px] px-1 -mx-0.5">{b.rate}%</span>
+          </div>
+          <div className="text-[11px] text-gray-400 mt-0.5">复购率</div>
+        </div>
+      </div>
+      <div className="text-xs text-gray-400 mb-2">购买频次分布</div>
+      <div className={'grid gap-2 mb-5 ' + (b.freq.length > 2 ? 'grid-cols-4' : 'grid-cols-2')}>
+        {b.freq.map((f) => (
+          <div key={f.l} className="rounded-[10px] bg-gray-50/70 border border-gray-100 px-3 pt-2 pb-2.5">
+            <div className="text-[15px] font-semibold text-gray-900">{fmtInt(f.v)}<span className="text-[11px] font-normal text-gray-400 ml-0.5">人</span></div>
+            <div className="text-[11px] text-gray-400 mb-1.5">{f.l}</div>
+            <div className="h-1 rounded-full bg-gray-200/70 overflow-hidden">
+              <div className="h-full rounded-full bg-gray-900" style={{ width: (f.v / freqMax) * 100 + '%' }} />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="text-xs text-gray-400 mb-1">买家贡献榜 · 前 5</div>
+      <div className="divide-y divide-gray-50">
+        {b.top.map((t, i) => (
+          <div key={t.n} className="flex items-center gap-2.5 py-2">
+            <span className="w-4 text-center text-[11px] text-gray-400">{i + 1}</span>
+            <span className="flex-1 min-w-0 truncate text-[13px] text-gray-700" title={t.n}>{t.n}</span>
+            <span className="shrink-0 text-[11px] text-gray-400">{t.o} 单</span>
+            <span className="shrink-0 w-[64px] text-right text-[13px] font-medium text-gray-900">¥{fmtMoney(t.a)}</span>
+          </div>
+        ))}
+      </div>
+      <div className="pt-2 text-[11px] text-gray-400 border-t border-gray-50">{b.rest}</div>
+    </section>
+  );
+}
+
+/* ---------------- 右栏：商品流量 ---------------- */
+function TrafficSection({ data }) {
+  const t = data.traffic;
+  return (
+    <section className="px-6 py-6">
+      <SecHead icon="eye" title="商品流量"
+        extra={
+          t
+            ? <span className="inline-flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />采集中</span>
+            : <span className="inline-flex items-center gap-1.5"><span className="w-1.5 h-1.5 rounded-full bg-gray-300" />未启用</span>
+        } />
+      {t ? (
+        <div>
+          <div className="grid grid-cols-3 divide-x divide-gray-100 mb-3">
+            <div className="pr-3">
+              <div className="text-[18px] font-bold text-gray-900">{fmtInt(t.expo)}</div>
+              <div className="text-[11px] text-gray-400 mt-0.5">曝光增量</div>
+            </div>
+            <div className="px-3">
+              <div className="text-[18px] font-bold text-gray-900">{fmtInt(t.views)}</div>
+              <div className="text-[11px] text-gray-400 mt-0.5">浏览增量</div>
+            </div>
+            <div className="pl-3">
+              <div className="text-[18px] font-bold text-gray-900">{fmtInt(t.wants)}</div>
+              <div className="text-[11px] text-gray-400 mt-0.5">想要增量</div>
+            </div>
+          </div>
+          <div className="mb-4">
+            <Hint>可比观测窗口 {t.windows} 个 · 覆盖 {t.days} 天，增量为相邻窗口差值汇总。</Hint>
+          </div>
+          <div className="text-xs text-gray-400 mb-1">近 6 个观测窗口 · 曝光增量</div>
+          <div className="h-[112px]">
+            <ResponsiveContainer width="100%" height={112}>
+              <BarChart data={t.series} margin={{ top: 6, right: 2, left: 2, bottom: 0 }}>
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#9CA3AF' }} axisLine={{ stroke: '#F3F4F6' }} tickLine={false} interval={0} dy={3} />
+                <YAxis hide />
+                <Tooltip content={<TrafficTip />} cursor={{ fill: 'rgba(17,24,39,0.04)' }} />
+                <Bar dataKey="expo" fill="#3B82F6" radius={[3, 3, 0, 0]} barSize={22} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="text-xs text-gray-400 mt-4 mb-2">商品流量排行 · 曝光前 5</div>
+          <div className="space-y-2.5">
+            {t.rank.map((r, i) => {
+              const max = t.rank[0].v;
+              return (
+                <div key={r.n} className="flex items-center gap-2.5">
+                  <span className="w-4 text-center text-[11px] text-gray-400">{i + 1}</span>
+                  <span className="flex-1 min-w-0 truncate text-[12.5px] text-gray-700" title={r.n}>{r.n}</span>
+                  <div className="w-[72px] h-1 rounded-full bg-gray-100 overflow-hidden shrink-0">
+                    <div className="h-full rounded-full bg-blue-500" style={{ width: (r.v / max) * 100 + '%' }} />
+                  </div>
+                  <span className="shrink-0 w-[46px] text-right text-[12px] font-medium text-gray-900">{fmtInt(r.v)}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-[12px] bg-gray-50/60 border border-gray-100 px-5 py-8 flex flex-col items-center gap-2.5 text-center">
+          <Icon name="eyeOff" size={22} className="text-gray-300" />
+          <span className="text-[13px] text-gray-400">商品流量采集尚未启用</span>
+          <span className="text-[11px] leading-relaxed text-gray-300 max-w-[240px]">
+            真实商品流量采集尚未启用——卖家后台适配器完成真实账号验收前，系统不会生成或推测流量数据
+          </span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------- 底部：成交爆品榜 ---------------- */
+function HotSection({ data }) {
+  return (
+    <section className="px-7 py-6 border-b border-gray-100">
+      <SecHead icon="fire" title="成交爆品榜" extra="按所选范围成交单数排序" />
+      <table className="w-full text-[13px]">
+        <thead>
+          <tr className="text-left text-xs text-gray-400 bg-gray-50/60">
+            <th className="font-normal py-2.5 pl-3 pr-2 w-[56px] rounded-l-[8px]">排名</th>
+            <th className="font-normal py-2.5 px-2">商品</th>
+            <th className="font-normal py-2.5 px-2 w-[110px] text-right">成交单数</th>
+            <th className="font-normal py-2.5 px-2 w-[130px] text-right">成交金额</th>
+            <th className="font-normal py-2.5 px-2 w-[110px] text-right">客单价</th>
+            <th className="font-normal py-2.5 pl-2 pr-3 w-[130px] text-right rounded-r-[8px]">较上期</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.hot.map((h, i) => (
+            <tr key={h.n} className="border-b border-gray-50 last:border-b-0">
+              <td className="py-3 pl-3 pr-2">
+                <span className={'w-6 h-6 rounded-[7px] inline-flex items-center justify-center text-[12px] font-semibold ' +
+                  (i === 0 ? 'bg-[#FFE815] text-gray-900' : i < 3 ? 'bg-gray-900 text-white' : 'bg-gray-100 text-gray-500')}>
+                  {i + 1}
+                </span>
+              </td>
+              <td className="py-3 px-2 max-w-0">
+                <span className="block truncate text-gray-800" title={h.n}>{h.n}</span>
+              </td>
+              <td className="py-3 px-2 text-right font-medium text-gray-900">{fmtInt(h.o)} 单</td>
+              <td className="py-3 px-2 text-right font-medium text-gray-900">¥{fmtMoney(h.a)}</td>
+              <td className="py-3 px-2 text-right text-gray-500">¥{fmtMoney(h.avg)}</td>
+              <td className="py-3 pl-2 pr-3 text-right">
+                {h.mom.type === 'new'
+                  ? <span className="inline-flex items-center h-[22px] px-2 rounded-full border border-gray-200 bg-gray-50 text-[11px] font-medium text-gray-500">新品</span>
+                  : <MomBadge mom={h.mom} />}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+/* ---------------- 底部：订单明细 ---------------- */
+function OrdersSection({ data }) {
+  const [q, setQ] = useState('');
+  const rows = useMemo(() => {
+    const kw = q.trim().toLowerCase();
+    if (!kw) return data.orderRows;
+    return data.orderRows.filter((r) =>
+      (r.no + r.buyer + r.prod).toLowerCase().includes(kw));
+  }, [q, data]);
+  return (
+    <section className="px-7 py-6 pb-8">
+      <div className="flex items-center justify-between mb-4 gap-4">
+        <div className="flex items-center gap-2">
+          <Icon name="list" size={16} className="text-gray-400" />
+          <h3 className="text-[14px] font-semibold text-gray-900">参与统计的订单</h3>
+          <span className="text-xs text-gray-400 ml-1">{data.ordersNote}</span>
+        </div>
+        <div className="relative w-[280px]">
+          <Icon name="search" size={15} className="text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="搜索订单号 / 买家 / 商品"
+            className="w-full h-9 pl-9 pr-3 rounded-[10px] border border-gray-200 bg-gray-50 text-[13px] text-gray-800 placeholder:text-gray-400 outline-none transition-colors focus:bg-white focus:border-gray-300" />
+        </div>
+      </div>
+      <table className="w-full text-[13px]">
+        <thead>
+          <tr className="text-left text-xs text-gray-400 bg-gray-50/60">
+            <th className="font-normal py-2.5 pl-3 pr-2 w-[170px] rounded-l-[8px]">订单号</th>
+            <th className="font-normal py-2.5 px-2 w-[140px]">买家</th>
+            <th className="font-normal py-2.5 px-2">商品</th>
+            <th className="font-normal py-2.5 px-2 w-[100px] text-right">金额</th>
+            <th className="font-normal py-2.5 px-2 w-[100px] text-center">状态</th>
+            <th className="font-normal py-2.5 pl-2 pr-3 w-[120px] text-right rounded-r-[8px]">时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.no} className="border-b border-gray-50 last:border-b-0 hover:bg-gray-50/50 transition-colors">
+              <td className="py-3 pl-3 pr-2 text-gray-500">{r.no}</td>
+              <td className="py-3 px-2 text-gray-800">{r.buyer}</td>
+              <td className="py-3 px-2 max-w-0">
+                <span className="block truncate text-gray-600" title={r.prod}>{r.prod}</span>
+              </td>
+              <td className="py-3 px-2 text-right font-medium text-gray-900">¥{fmtMoney(r.amt)}</td>
+              <td className="py-3 px-2 text-center">
+                <span className={'inline-flex items-center h-[22px] px-2.5 rounded-full text-[11px] font-medium ' + statusBadgeCls(r.st)}>
+                  {r.st}
+                </span>
+              </td>
+              <td className="py-3 pl-2 pr-3 text-right text-gray-400">{r.t}</td>
+            </tr>
+          ))}
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan="6" className="py-10 text-center text-xs text-gray-400">未找到匹配「{q}」的订单</td>
+            </tr>
+          ) : null}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+/* ---------------- 应用 ---------------- */
+function App() {
+  const [dsKey, setDsKey] = useState('current');
+  const data = DS[dsKey];
+  return (
+    <div className="min-h-screen py-6 px-5">
+      {/* 方案徽章 */}
+      <div className="fixed top-3 right-3 z-50 flex items-center gap-1.5 bg-gray-900/95 text-white text-xs pl-2.5 pr-3 h-7 rounded-full shadow-lg">
+        <span className="w-1.5 h-1.5 rounded-full bg-[#FFE815]" />
+        方案 A · 连续工作台
+      </div>
+
+      <div className="max-w-[1400px] mx-auto">
+        {/* 应用壳：一体圆角，一层柔和阴影 */}
+        <div className="flex items-stretch rounded-[24px]"
+          style={{ boxShadow: '0 18px 50px -18px rgba(17,24,39,0.14), 0 2px 6px rgba(17,24,39,0.04)' }}>
+          <Sidebar />
+          {/* 连续白色表面：内部只用分隔线与浅灰分区组织 */}
+          <main className="flex-1 min-w-0 bg-white rounded-r-[24px]">
+            <Header data={data} dsKey={dsKey} setDsKey={setDsKey} />
+            <KpiStrip data={data} />
+            <div className="grid grid-cols-3 border-b border-gray-100">
+              <div className="col-span-2 border-r border-gray-100 flex flex-col min-w-0">
+                <RevenueSection data={data} />
+                <TimeSection data={data} />
+                <CitySection data={data} />
+                <CaliberSection />
+              </div>
+              <div className="flex flex-col min-w-0">
+                <StatusSection data={data} />
+                <RankSection data={data} />
+                <BuyerSection data={data} />
+                <TrafficSection data={data} />
+              </div>
+            </div>
+            <HotSection data={data} />
+            <OrdersSection data={data} />
+          </main>
+        </div>
+        <p className="text-center text-xs text-gray-400 mt-5">
+          仪表盘重构候选 · 方案 A「连续工作台」 — 页面展示的均为脱敏或虚构的演示数据
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

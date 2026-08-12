@@ -398,20 +398,68 @@ describe('OrderList request races and media failures', () => {
     expect(screen.queryByText('迟到的第一位收货人')).toBeNull();
   });
 
-  it('shows a machine-readable image reason and lets the user retry', async () => {
+  it('shows a machine-readable image reason and lets the user retry when no direct link exists', async () => {
     localStorage.setItem('auth_token', 'test-token');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,
       status: 404,
       json: vi.fn().mockResolvedValue({ detail: { reason: 'not_saved' } }),
     }));
-    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    // 订单没有 item_image 直链可降级：端点失败时仍显示对应占位与重试
+    vi.mocked(getOrders).mockResolvedValue(pageOf([{ ...refundOrder, item_image: '' }]) as any);
     render(<OrderList />);
 
     const retries = await screen.findAllByRole('button', { name: /图片未保存.*重试/ });
     expect(retries.length).toBeGreaterThan(0);
     const callsBeforeRetry = vi.mocked(fetch).mock.calls.length;
     fireEvent.click(retries[0]);
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(callsBeforeRetry));
+  });
+
+  it('falls back to the CDN direct link instead of a placeholder when the endpoint fails', async () => {
+    localStorage.setItem('auth_token', 'test-token');
+    const jsonMock = vi.fn().mockResolvedValue({ detail: { reason: 'source_expired' } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: jsonMock,
+    }));
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    render(<OrderList />);
+
+    // 移动卡片与桌面表格双 DOM 各自请求端点；等两次失败响应解析并落定
+    await waitFor(() => expect(jsonMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const images = screen.getAllByRole('img', { name: '退款商品' });
+    expect(images.length).toBeGreaterThanOrEqual(2);
+    images.forEach((img) => expect(img).toHaveAttribute('src', 'https://img.alicdn.com/refund.jpg'));
+    // 端点失败但直链可用时不显示失效占位
+    expect(screen.queryByText(/图片源已失效/)).toBeNull();
+  });
+
+  it('surfaces the endpoint reason with retry when the fallback direct link also fails', async () => {
+    localStorage.setItem('auth_token', 'test-token');
+    const jsonMock = vi.fn().mockResolvedValue({ detail: { reason: 'not_saved' } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: jsonMock,
+    }));
+    vi.mocked(getOrders).mockResolvedValue(pageOf([refundOrder]) as any);
+    render(<OrderList />);
+
+    // 先等端点失败落定，确保占位原因取自端点返回值而非兜底值
+    await waitFor(() => expect(jsonMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const images = screen.getAllByRole('img', { name: '退款商品' });
+    expect(images.length).toBeGreaterThanOrEqual(2);
+    // 降级直链真实加载失败：按端点当初返回的原因显示占位并可重试
+    fireEvent.error(images[0]);
+    const retry = await screen.findByRole('button', { name: /图片未保存.*重试/ });
+    const callsBeforeRetry = vi.mocked(fetch).mock.calls.length;
+    fireEvent.click(retry);
     await waitFor(() => expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThan(callsBeforeRetry));
   });
 

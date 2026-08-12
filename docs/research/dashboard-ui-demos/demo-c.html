@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=1440" />
+<title>方案 C · 经营报告流 — 咸鱼监控台仪表盘 Demo</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: { brand: '#FFE815' },
+      },
+    },
+  };
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<!-- Recharts 2.15.3 UMD 将 prop-types 视为外部依赖，需先提供全局 PropTypes -->
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://unpkg.com/recharts@2.15.3/umd/Recharts.js"></script>
+<style>
+  html { -webkit-font-smoothing: antialiased; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #F4F5F7;
+    font-variant-numeric: tabular-nums;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #D7DAE0; border-radius: 6px; border: 2px solid #F4F5F7; }
+  /* 报告标题里的荧光笔强调 */
+  .hl {
+    background: linear-gradient(transparent 58%, rgba(255, 232, 21, 0.85) 58%);
+    padding: 0 2px;
+    border-radius: 2px;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+const {
+  ResponsiveContainer, ComposedChart, Bar, Line, XAxis, YAxis,
+  CartesianGrid, Tooltip, Cell, LabelList,
+} = Recharts;
+
+/* ---------------- 工具 ---------------- */
+const fmtMoney = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInt = (n) => Number(n).toLocaleString('en-US');
+const pct = (v, total) => (total > 0 ? ((v / total) * 100).toFixed(1) : '0.0');
+
+/* ---------------- 图标（手写线性 SVG） ---------------- */
+const ICON_PATHS = {
+  dash: 'M3.5 3.5h5.2v5.2H3.5zM11.3 3.5h5.2v5.2h-5.2zM3.5 11.3h5.2v5.2H3.5zM11.3 11.3h5.2v5.2h-5.2z',
+  user: 'M10 9.5a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4zM3.8 16.8c.9-3 3.3-4.8 6.2-4.8s5.3 1.8 6.2 4.8',
+  order: 'M5 3.5h10a1 1 0 011 1v11a1 1 0 01-1 1H5a1 1 0 01-1-1v-11a1 1 0 011-1zM7.5 7.5h5M7.5 10.5h5M7.5 13.5h3',
+  key: 'M7 16.3a3.3 3.3 0 110-6.6 3.3 3.3 0 010 6.6zM9.4 10.6l7.1-7.1M14.3 5.7l2 2M12 8l1.6 1.6',
+  tag: 'M3.5 4.5a1 1 0 011-1h4.6a1 1 0 01.7.3l6.7 6.7a1 1 0 010 1.4l-4.6 4.6a1 1 0 01-1.4 0L3.8 9.8a1 1 0 01-.3-.7zM7.6 7.6h.01',
+  gear: 'M10 12.8a2.8 2.8 0 100-5.6 2.8 2.8 0 000 5.6zM10 2.8v2.4M10 14.8v2.4M2.8 10h2.4M14.8 10h2.4M4.9 4.9l1.7 1.7M13.4 13.4l1.7 1.7M15.1 4.9l-1.7 1.7M6.6 13.4l-1.7 1.7',
+  search: 'M9 14.2a5.2 5.2 0 100-10.4 5.2 5.2 0 000 10.4zM12.9 12.9l3.6 3.6',
+  up: 'M10 15.5v-11M5.5 9L10 4.5 14.5 9',
+  down: 'M10 4.5v11M5.5 11L10 15.5 14.5 11',
+  fish: 'M2.8 10s2.6-4.6 7.2-4.6c3.4 0 5.8 2.2 7.2 4.6-1.4 2.4-3.8 4.6-7.2 4.6C5.4 14.6 2.8 10 2.8 10zM13.2 8.9h.01M17.2 10l-2.6-2.2M17.2 10l-2.6 2.2',
+};
+const Icon = ({ name, size = 16, className = '', sw = 1.6 }) => (
+  <svg viewBox="0 0 20 20" width={size} height={size} fill="none"
+       stroke="currentColor" strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round"
+       className={className} aria-hidden="true">
+    <path d={ICON_PATHS[name]} />
+  </svg>
+);
+
+/* ---------------- 状态语义色 ---------------- */
+const STATUS_META = {
+  pending_ship: { label: '待发货', chip: 'bg-brand text-black', bar: '#FFE815' },
+  shipped:      { label: '已发货', chip: 'bg-blue-100 text-blue-700', bar: '#3B82F6' },
+  completed:    { label: '已完成', chip: 'bg-emerald-100 text-emerald-700', bar: '#10B981' },
+  refunding:    { label: '退款中', chip: 'bg-red-100 text-red-600', bar: '#EF4444' },
+  cancelled:    { label: '已取消', chip: 'bg-gray-100 text-gray-500', bar: '#9CA3AF' },
+  unknown:      { label: '未知', chip: 'border border-dashed border-gray-300 text-gray-400 bg-white', bar: '#D1D5DB' },
+};
+const StatusChip = ({ status }) => {
+  const meta = STATUS_META[status] || STATUS_META.unknown;
+  return <span className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-bold ${meta.chip}`}>{meta.label}</span>;
+};
+
+/* ---------------- 数据：当前规模（与真实店铺一致的脱敏数据） ---------------- */
+const NOW = {
+  key: 'now',
+  rangeKey: '7days',
+  rangeLabel: '2026-08-06 至 2026-08-12',
+  headline: (
+    <>本周营收 <span className="hl">¥61.04</span>，全部来自两款 codex 邀请服务</>
+  ),
+  compare: { type: 'new', label: '较上期 新增' },
+  kpi: { revenue: 61.04, accounts: '1 / 1', orders: 9, cards: 0 },
+  daily: [
+    { d: '08-06', amt: 0, ord: 0 }, { d: '08-07', amt: 0, ord: 0 },
+    { d: '08-08', amt: 0, ord: 0 }, { d: '08-09', amt: 0, ord: 0 },
+    { d: '08-10', amt: 33.63, ord: 5 }, { d: '08-11', amt: 27.41, ord: 4 },
+    { d: '08-12', amt: 0, ord: 0 },
+  ],
+  revenueConclusion: '成交集中在 08-10 与 08-11 两天，其余日期没有订单。',
+  items: [
+    { name: 'codex助力邀请送积分', count: 4, amount: 31.04, avg: 7.76 },
+    { name: 'codex邀请重置额度服务', count: 4, amount: 26.20, avg: 6.55 },
+    { name: 'codex邀请重置额度服务·新链接', count: 1, amount: 3.80, avg: 3.80 },
+  ],
+  itemConclusion: (
+    <>两款主力商品贡献 <span className="hl">93.8%</span> 的营收，客单价稳定在 ¥6.55–7.76。</>
+  ),
+  hotItems: [
+    { name: 'codex助力邀请送积分', count: 4, growth: 'new', amount: 31.04, avg: 7.76 },
+    { name: 'codex邀请重置额度服务', count: 4, growth: 'new', amount: 26.20, avg: 6.55 },
+  ],
+  hotNote: '本期为首个统计周期，两款成交商品均按「新品」记录，暂无环比。',
+  status: [ { key: 'completed', count: 5 }, { key: 'shipped', count: 4 } ],
+  statusConclusion: '9 笔订单中 5 笔已完成、4 笔已发货，没有退款与取消。',
+  cities: null,
+  cityNote: '暂无收货城市数据（虚拟商品订单通常不含收货地址）。',
+  hours: { 12: 1, 13: 1, 15: 2, 17: 1, 18: 3, 21: 1 },
+  week: [5, 4, 0, 0, 0, 0, 0],
+  timingConclusion: '样本不足 20 单，时段规律还不足以下结论。',
+  timingSub: '现有 9 单集中在午后与晚间：15–18 时成交 6 笔，占三分之二。',
+  timingTip: '时段建议待补充：至少需要 20 笔有效成交订单。',
+  buyers: {
+    total: 6, repeat: 3, rate: '50.0',
+    freq: [ { label: '下单 1 次', count: 3 }, { label: '下单 2 次', count: 3 } ],
+    top: [
+      { name: '星河小铺', orders: 2, amount: 15.52 },
+      { name: '稳重的橙子', orders: 2, amount: 14.31 },
+      { name: '晚风信箱', orders: 2, amount: 13.10 },
+      { name: 'NOVA_AI', orders: 1, amount: 7.76 },
+      { name: '青柠不加冰', orders: 1, amount: 6.55 },
+      { name: '买家·尾号2232', orders: 1, amount: 3.80 },
+    ],
+  },
+  buyerConclusion: (
+    <>6 位买家中 3 位复购，复购率 <span className="hl">50.0%</span>。</>
+  ),
+  traffic: null,
+  trafficConclusion: '真实流量采集尚未启用，系统不生成推测数据。',
+  trafficNote: '卖家后台适配器完成真实账号验收前，这一节保持空白，不显示任何推测数值。',
+  orders: [
+    { id: '512736****0032', buyer: '星河小铺', item: 'codex助力邀请送积分', amount: 7.76, time: '08-10 12:34', status: 'completed' },
+    { id: '331679****8689', buyer: '稳重的橙子', item: 'codex助力邀请送积分', amount: 7.76, time: '08-10 13:08', status: 'completed' },
+    { id: '331636****0890', buyer: 'NOVA_AI', item: 'codex助力邀请送积分', amount: 7.76, time: '08-10 15:21', status: 'completed' },
+    { id: '331697****4883', buyer: '青柠不加冰', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-10 15:47', status: 'completed' },
+    { id: '331668****6497', buyer: '买家·尾号2232', item: 'codex邀请重置额度服务·新链接', amount: 3.80, time: '08-10 17:52', status: 'completed' },
+    { id: '331702****3315', buyer: '星河小铺', item: 'codex助力邀请送积分', amount: 7.76, time: '08-11 18:03', status: 'shipped' },
+    { id: '331708****9024', buyer: '稳重的橙子', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-11 18:26', status: 'shipped' },
+    { id: '331713****5561', buyer: '晚风信箱', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-11 18:49', status: 'shipped' },
+    { id: '331720****7708', buyer: '晚风信箱', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-11 21:15', status: 'shipped' },
+  ],
+  ordersConclusion: '本期 9 笔订单全部参与统计。',
+};
+
+/* ---------------- 数据：成长后规模（30 天假想，检验扩展性） ---------------- */
+const GROWN_DAILY = [
+  ['07-14', 28, 4], ['07-15', 22, 3], ['07-16', 31, 4], ['07-17', 62, 9], ['07-18', 75, 11],
+  ['07-19', 55, 7], ['07-20', 30, 4], ['07-21', 26, 4], ['07-22', 18, 2], ['07-23', 35, 5],
+  ['07-24', 68, 10], ['07-25', 79, 12], ['07-26', 50, 8], ['07-27', 32, 4], ['07-28', 28, 4],
+  ['07-29', 24, 3], ['07-30', 38, 5], ['07-31', 65, 10], ['08-01', 76, 12], ['08-02', 48, 8],
+  ['08-03', 30, 4], ['08-04', 27, 4], ['08-05', 22, 3], ['08-06', 36, 5], ['08-07', 72, 11],
+  ['08-08', 74, 11], ['08-09', 51, 7], ['08-10', 34, 5], ['08-11', 29, 4], ['08-12', 21.40, 3],
+].map(([d, amt, ord]) => ({ d, amt, ord }));
+
+const GROWN = {
+  key: 'grown',
+  rangeKey: '30days',
+  rangeLabel: '2026-07-14 至 2026-08-12',
+  headline: (
+    <>本月营收 <span className="hl">¥1,286.40</span>，较上期增长 <span className="hl">38.6%</span></>
+  ),
+  compare: { type: 'up', label: '+38.6%' },
+  kpi: { revenue: 1286.40, accounts: '3 / 3', orders: 186, cards: 42 },
+  daily: GROWN_DAILY,
+  revenueConclusion: '营收呈周期性波动，周五、周六为高峰，单日最高 ¥79.00（07-25）。',
+  items: [
+    { name: 'codex助力邀请送积分', count: 52, amount: 403.52, avg: 7.76 },
+    { name: 'codex邀请重置额度服务', count: 38, amount: 248.90, avg: 6.55 },
+    { name: 'GPT团队席位月卡', count: 24, amount: 237.60, avg: 9.90 },
+    { name: 'Claude额度补充包', count: 21, amount: 142.80, avg: 6.80 },
+    { name: 'Gemini会员代充', count: 18, amount: 99.00, avg: 5.50 },
+    { name: 'API中转月卡', count: 14, amount: 84.00, avg: 6.00 },
+    { name: '模型评测报告定制', count: 11, amount: 49.50, avg: 4.50 },
+    { name: 'codex邀请重置额度服务·新链接', count: 8, amount: 21.08, avg: 2.64 },
+  ],
+  itemConclusion: (
+    <>SKU 扩充至 8 个，前三款商品贡献 <span className="hl">69.2%</span> 的营收；「GPT团队席位月卡」客单价最高（¥9.90）。</>
+  ),
+  hotItems: [
+    { name: 'GPT团队席位月卡', count: 24, growth: 'new', amount: 237.60, avg: 9.90 },
+    { name: 'codex助力邀请送积分', count: 52, growth: 1.5, amount: 403.52, avg: 7.76 },
+    { name: 'codex邀请重置额度服务', count: 38, growth: 0.4, amount: 248.90, avg: 6.55 },
+    { name: 'Claude额度补充包', count: 21, growth: -0.25, amount: 142.80, avg: 6.80 },
+  ],
+  hotNote: '当期订单量 ≥ 2 的商品按环比增长排序，新品优先。',
+  status: [
+    { key: 'completed', count: 128 }, { key: 'shipped', count: 45 },
+    { key: 'pending_ship', count: 6 }, { key: 'refunding', count: 4 }, { key: 'cancelled', count: 3 },
+  ],
+  statusConclusion: '186 笔订单中 128 笔已完成；6 笔待发货需要优先处理，退款率保持在 2.2%。',
+  cities: [
+    { name: '上海', count: 32 }, { name: '杭州', count: 28 }, { name: '深圳', count: 24 },
+    { name: '北京', count: 21 }, { name: '广州', count: 17 }, { name: '成都', count: 12 },
+    { name: '南京', count: 9 }, { name: '武汉', count: 7 },
+  ],
+  cityNote: '150/186 笔订单含城市信息，占比按有城市信息的订单计算。',
+  hours: { 0: 2, 1: 1, 6: 1, 7: 2, 8: 3, 9: 4, 10: 5, 11: 6, 12: 11, 13: 8, 14: 6, 15: 7, 16: 6, 17: 7, 18: 8, 19: 12, 20: 24, 21: 30, 22: 26, 23: 17 },
+  week: [24, 22, 20, 26, 38, 35, 21],
+  timingConclusion: (
+    <>成交集中在晚间：20–23 时贡献 <span className="hl">52.2%</span> 的订单，周五、周六是一周高峰。</>
+  ),
+  timingSub: '午间 12–13 时为次峰（19 单），凌晨 2–5 时没有成交。',
+  timingTip: '建议：每周五 20:00–23:00 保持在线并优先补货热销商品。',
+  buyers: {
+    total: 132, repeat: 41, rate: '31.1',
+    freq: [
+      { label: '下单 1 次', count: 91 }, { label: '下单 2 次', count: 31 },
+      { label: '下单 3 次', count: 7 }, { label: '下单 4 次及以上', count: 3 },
+    ],
+    top: [
+      { name: '白桦AI严选', orders: 6, amount: 52.20 },
+      { name: '星河小铺', orders: 5, amount: 38.80 },
+      { name: '数字游民老王', orders: 4, amount: 39.60 },
+      { name: '稳重的橙子', orders: 4, amount: 26.20 },
+      { name: 'NOVA_AI', orders: 3, amount: 29.70 },
+      { name: '晚风信箱', orders: 3, amount: 19.65 },
+    ],
+  },
+  buyerConclusion: (
+    <>132 位买家中 41 位复购，复购率 <span className="hl">31.1%</span>；头部 6 位买家贡献了 16.0% 的营收。</>
+  ),
+  traffic: {
+    kpi: { exposure: 12480, view: 3215, want: 486, windows: '42 / 14' },
+    windows: [
+      { label: '08-07 08→12时', exposure: 1450, view: 372 },
+      { label: '08-07 12→16时', exposure: 1720, view: 451 },
+      { label: '08-07 16→20时', exposure: 2080, view: 540 },
+      { label: '08-07 20→24时', exposure: 2650, view: 689 },
+      { label: '08-08 00→04时', exposure: 2260, view: 571 },
+      { label: '08-08 04→08时', exposure: 2320, view: 592 },
+    ],
+    top: [
+      { name: 'codex助力邀请送积分', exposure: 4200, view: 1080, want: 168 },
+      { name: 'GPT团队席位月卡', exposure: 2900, view: 760, want: 112 },
+      { name: 'codex邀请重置额度服务', exposure: 2400, view: 620, want: 94 },
+      { name: 'Claude额度补充包', exposure: 1500, view: 385, want: 58 },
+      { name: 'Gemini会员代充', exposure: 900, view: 230, want: 33 },
+    ],
+  },
+  trafficConclusion: (
+    <>近两周曝光累计 <span className="hl">12,480</span>，浏览→想要转化率 15.1%，晚间窗口曝光最高。</>
+  ),
+  trafficNote: '数据来自卖家后台已验证快照，相邻快照间的累计增量，定时采样约每 4 小时一次。',
+  orders: [
+    { id: '338102****2210', buyer: '白桦AI严选', item: 'GPT团队席位月卡', amount: 9.90, time: '08-12 21:42', status: 'pending_ship' },
+    { id: '338099****8804', buyer: '星河小铺', item: 'codex助力邀请送积分', amount: 7.76, time: '08-12 21:18', status: 'pending_ship' },
+    { id: '338096****1573', buyer: '数字游民老王', item: 'Claude额度补充包', amount: 6.80, time: '08-12 20:55', status: 'pending_ship' },
+    { id: '338090****6420', buyer: '青柠不加冰', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-12 20:31', status: 'pending_ship' },
+    { id: '338084****3389', buyer: '稳重的橙子', item: 'Gemini会员代充', amount: 5.50, time: '08-12 19:47', status: 'pending_ship' },
+    { id: '338078****9917', buyer: '晚风信箱', item: 'API中转月卡', amount: 6.00, time: '08-12 13:02', status: 'pending_ship' },
+    { id: '338061****4452', buyer: 'NOVA_AI', item: 'codex助力邀请送积分', amount: 7.76, time: '08-11 22:36', status: 'shipped' },
+    { id: '338055****7126', buyer: '白桦AI严选', item: 'codex邀请重置额度服务', amount: 6.55, time: '08-11 21:54', status: 'shipped' },
+    { id: '338049****8843', buyer: '拾光杂货铺', item: 'GPT团队席位月卡', amount: 9.90, time: '08-11 21:20', status: 'shipped' },
+    { id: '338042****5230', buyer: '折纸飞机的鲸', item: '模型评测报告定制', amount: 4.50, time: '08-11 20:41', status: 'completed' },
+  ],
+  ordersConclusion: '共 186 笔订单参与统计，此处展示最近 10 笔。',
+};
+
+const DATA = { now: NOW, grown: GROWN };
+
+/* ---------------- 通用小组件 ---------------- */
+
+// 自定义 Tooltip：白底细边圆角阴影，中文标签
+const ChartTip = ({ active, payload, label, money }) => {
+  if (!active || !payload || !payload.length) return null;
+  return (
+    <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 shadow-lg">
+      <p className="mb-1 text-xs font-bold text-gray-900">{label}</p>
+      {payload.map((entry) => (
+        <p key={entry.dataKey} className="text-xs text-gray-600">
+          {entry.name}：
+          <span className="font-bold text-gray-900">
+            {money && entry.dataKey === 'amt' ? `¥${fmtMoney(entry.value)}` : `${fmtInt(entry.value)}${entry.dataKey === 'amt' ? '' : ' 单'}`}
+          </span>
+        </p>
+      ))}
+    </div>
+  );
+};
+
+// 报告节骨架：编号 + 标题 + 结论句 + 内容
+const Section = ({ no, title, conclusion, children, note }) => (
+  <section className="border-t border-gray-100 pt-9 mt-9 first:border-t-0 first:pt-0 first:mt-0">
+    <div className="flex items-baseline gap-3">
+      <span className="text-xs font-bold tracking-widest text-gray-300">{no}</span>
+      <h2 className="text-lg font-extrabold text-gray-900">{title}</h2>
+    </div>
+    <p className="mt-2.5 text-[15px] font-bold leading-relaxed text-gray-800">{conclusion}</p>
+    {note && <p className="mt-1 text-xs leading-relaxed text-gray-400">{note}</p>}
+    <div className="mt-5">{children}</div>
+  </section>
+);
+
+// 低调 inline 提示（数据不足/覆盖率说明）
+const InlineNote = ({ children }) => (
+  <div className="mt-4 inline-flex items-start gap-1.5 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs leading-relaxed text-gray-500">
+    {children}
+  </div>
+);
+
+// 水平占比条列表（替代饼图）
+const ShareBars = ({ rows, colorOf, unit = '单', totalLabel }) => {
+  const total = rows.reduce((s, r) => s + r.count, 0);
+  return (
+    <div className="space-y-2.5">
+      {rows.map((row) => (
+        <div key={row.label} className="flex items-center gap-3">
+          <div className="w-40 shrink-0 truncate text-[13px] font-medium text-gray-700" title={row.label}>{row.label}</div>
+          <div className="h-4 flex-1 overflow-hidden rounded bg-gray-100">
+            <div className="h-full rounded" style={{ width: `${Math.max(2, (row.count / total) * 100)}%`, background: colorOf(row) }} />
+          </div>
+          <div className="w-24 shrink-0 text-right text-[13px] text-gray-600">
+            {fmtInt(row.count)} {unit}
+          </div>
+          <div className="w-14 shrink-0 text-right text-xs text-gray-400">{pct(row.count, total)}%</div>
+        </div>
+      ))}
+      {totalLabel && <p className="pt-1 text-right text-xs text-gray-400">{totalLabel}</p>}
+    </div>
+  );
+};
+
+// HTML 条形排行列表（替代 recharts 纵向柱图，商品名永不截断开头）
+const RankList = ({ rows, valueOf, valueLabel, maxOf, extra }) => {
+  const max = Math.max(...rows.map(maxOf));
+  return (
+    <div className="space-y-1">
+      {rows.map((row, i) => (
+        <div key={row.name} className="flex items-center gap-3 rounded-lg px-2 py-1.5 hover:bg-gray-50">
+          <span className={`w-5 shrink-0 text-center text-xs font-bold ${i < 3 ? 'text-gray-900' : 'text-gray-300'}`}>{i + 1}</span>
+          <div className="min-w-0 flex-[2]">
+            <div className="truncate text-[13px] font-medium text-gray-800" title={row.name}>{row.name}</div>
+            <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-gray-100">
+              <div className="h-full rounded bg-gray-900" style={{ width: `${Math.max(2, (maxOf(row) / max) * 100)}%` }} />
+            </div>
+          </div>
+          <div className="w-24 shrink-0 text-right text-[13px] font-bold text-gray-900">{valueOf(row)}</div>
+          {extra && <div className="w-28 shrink-0 text-right text-xs text-gray-400">{extra(row)}</div>}
+        </div>
+      ))}
+      {valueLabel && <p className="pt-1 text-right text-xs text-gray-400">{valueLabel}</p>}
+    </div>
+  );
+};
+
+// 环比徽章：正=绿升、负=红降、新品=中性
+const GrowthBadge = ({ growth }) => {
+  if (growth === 'new') {
+    return <span className="inline-flex items-center rounded-md bg-gray-900 px-2 py-0.5 text-xs font-bold text-white">新品</span>;
+  }
+  const upward = growth >= 0;
+  return (
+    <span className={`inline-flex items-center gap-0.5 text-[13px] font-bold ${upward ? 'text-emerald-600' : 'text-red-500'}`}>
+      <Icon name={upward ? 'up' : 'down'} size={12} sw={2.4} />
+      {upward ? '+' : ''}{Math.round(growth * 100)}%
+    </span>
+  );
+};
+
+/* ---------------- 图表：营收走势（补零 + 金额柱 + 订单数线） ---------------- */
+const RevenueChart = ({ daily, dense }) => (
+  <div className="h-[250px]">
+    <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 720, height: 250 }}>
+      <ComposedChart data={daily} margin={{ top: 10, right: 4, left: -14, bottom: 0 }}>
+        <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+        <XAxis dataKey="d" axisLine={false} tickLine={false}
+               tick={{ fill: '#9CA3AF', fontSize: 11 }} interval={dense ? 4 : 0} />
+        <YAxis yAxisId="amt" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} />
+        <YAxis yAxisId="ord" orientation="right" hide />
+        <Tooltip content={<ChartTip money />} cursor={{ fill: 'rgba(17, 24, 39, 0.03)' }} />
+        <Bar yAxisId="amt" dataKey="amt" name="销售额" radius={[4, 4, 0, 0]} maxBarSize={dense ? 14 : 36}>
+          {daily.map((entry) => (
+            <Cell key={entry.d} fill={entry.amt > 0 ? '#111827' : '#E5E7EB'} />
+          ))}
+        </Bar>
+        <Line yAxisId="ord" type="monotone" dataKey="ord" name="订单数"
+              stroke="#3B82F6" strokeWidth={2} dot={dense ? false : { r: 3, fill: '#3B82F6', strokeWidth: 0 }} />
+      </ComposedChart>
+    </ResponsiveContainer>
+  </div>
+);
+
+/* ---------------- 图表：24 小时分布（0 值弱化为浅底座，峰值黄+数值） ---------------- */
+const HourChart = ({ hours }) => {
+  const rows = Array.from({ length: 24 }, (_, h) => ({ label: `${h}时`, raw: hours[h] || 0 }));
+  const max = Math.max(...rows.map((r) => r.raw), 1);
+  const floor = max * 0.04; // 0 值画极浅短底座，避免一排空柱
+  const data = rows.map((r) => ({ ...r, v: r.raw === 0 ? floor : r.raw }));
+  return (
+    <div className="h-[210px]">
+      <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 720, height: 210 }}>
+        <ComposedChart data={data} margin={{ top: 18, right: 4, left: -20, bottom: 0 }}>
+          <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+          <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 10 }} interval={2} />
+          <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} domain={[0, Math.ceil(max * 1.15)]} />
+          <Tooltip content={({ active, payload, label }) => {
+            if (!active || !payload || !payload.length) return null;
+            const raw = payload[0].payload.raw;
+            return (
+              <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 shadow-lg">
+                <p className="text-xs font-bold text-gray-900">{label}</p>
+                <p className="text-xs text-gray-600">订单数：<span className="font-bold text-gray-900">{raw} 单</span></p>
+              </div>
+            );
+          }} cursor={{ fill: 'rgba(17, 24, 39, 0.03)' }} />
+          <Bar dataKey="v" radius={[3, 3, 0, 0]} maxBarSize={20}>
+            {data.map((entry) => (
+              <Cell key={entry.label}
+                    fill={entry.raw === 0 ? '#F3F4F6' : entry.raw === max ? '#FFE815' : '#111827'} />
+            ))}
+            <LabelList dataKey="raw" position="top"
+                       content={({ x, y, width, value }) => (
+                         value === max && value > 0
+                           ? <text x={x + width / 2} y={y - 6} textAnchor="middle" fontSize="11" fontWeight="700" fill="#111827">{value}</text>
+                           : null
+                       )} />
+          </Bar>
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+};
+
+/* ---------------- 图表：星期分布（最高黄） ---------------- */
+const WeekChart = ({ week }) => {
+  const labels = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const max = Math.max(...week, 1);
+  const data = labels.map((w, i) => ({ w, v: week[i] }));
+  return (
+    <div className="h-[210px]">
+      <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 210 }}>
+        <ComposedChart data={data} margin={{ top: 18, right: 4, left: -20, bottom: 0 }}>
+          <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+          <XAxis dataKey="w" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} />
+          <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} />
+          <Tooltip content={<ChartTip />} cursor={{ fill: 'rgba(17, 24, 39, 0.03)' }} />
+          <Bar dataKey="v" name="订单数" radius={[4, 4, 0, 0]} maxBarSize={30}>
+            {data.map((entry) => (
+              <Cell key={entry.w} fill={entry.v === 0 ? '#F3F4F6' : entry.v === max ? '#FFE815' : '#111827'} />
+            ))}
+            <LabelList dataKey="v" position="top"
+                       content={({ x, y, width, value }) => (
+                         value === max && value > 0
+                           ? <text x={x + width / 2} y={y - 6} textAnchor="middle" fontSize="11" fontWeight="700" fill="#111827">{value}</text>
+                           : null
+                       )} />
+          </Bar>
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+};
+
+/* ---------------- 侧边栏（应用壳示意） ---------------- */
+const MENU = [
+  { icon: 'dash', label: '仪表盘', active: true },
+  { icon: 'user', label: '账号管理' },
+  { icon: 'order', label: '订单中心' },
+  { icon: 'key', label: '卡密库存' },
+  { icon: 'tag', label: '商品列表' },
+  { icon: 'gear', label: '系统设置' },
+];
+const Sidebar = () => (
+  <aside className="sticky top-0 flex h-screen w-[220px] shrink-0 flex-col border-r border-gray-200/70 bg-white px-4 py-6">
+    <div className="flex items-center gap-2.5 px-2">
+      <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand text-black">
+        <Icon name="fish" size={20} sw={1.7} />
+      </span>
+      <div>
+        <p className="text-[15px] font-extrabold leading-tight text-gray-900">闲鱼监控台</p>
+        <p className="text-[11px] text-gray-400">多账号运营台</p>
+      </div>
+    </div>
+    <nav className="mt-8 space-y-1">
+      {MENU.map((item) => (
+        <a key={item.label} href="#"
+           className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-[13.5px] font-bold ${
+             item.active ? 'bg-brand text-black' : 'text-gray-500 hover:bg-gray-50 hover:text-gray-900'
+           }`}>
+          <Icon name={item.icon} size={17} />
+          {item.label}
+        </a>
+      ))}
+    </nav>
+    <p className="mt-auto px-2 text-[11px] text-gray-300">v1.10.4 · 仪表盘重构 Demo</p>
+  </aside>
+);
+
+/* ---------------- 报告头 ---------------- */
+const RANGE_OPTIONS = [
+  { key: 'today', label: '今天', disabled: true },
+  { key: 'yesterday', label: '昨天', disabled: true },
+  { key: '3days', label: '三天内', disabled: true },
+  { key: '7days', label: '7天内', scale: 'now' },
+  { key: '30days', label: '一个月内', scale: 'grown' },
+  { key: 'custom', label: '自定义', disabled: true },
+];
+
+const ReportHeader = ({ data, scale, onScale }) => (
+  <header>
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <p className="text-xs font-bold tracking-wide text-gray-400">运营概览 · {data.rangeLabel}</p>
+      {/* 数据规模切换（Demo 专用） */}
+      <div className="flex rounded-lg bg-gray-100 p-0.5 text-xs font-bold">
+        {[['now', '当前规模'], ['grown', '成长后规模']].map(([key, label]) => (
+          <button key={key} type="button" onClick={() => onScale(key)}
+                  className={`rounded-md px-3 py-1.5 ${scale === key ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+
+    <h1 className="mt-4 text-[26px] font-extrabold leading-snug text-gray-900">{data.headline}</h1>
+
+    {/* 关键数字摘要行（行内点分隔，非卡片） */}
+    <p className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px] text-gray-600">
+      <span>营收 <b className="text-gray-900">¥{fmtMoney(data.kpi.revenue)}</b></span>
+      {data.compare.type === 'new' && (
+        <span className="rounded-md bg-gray-100 px-1.5 py-0.5 text-xs font-bold text-gray-500">{data.compare.label}</span>
+      )}
+      {data.compare.type === 'up' && (
+        <span className="inline-flex items-center gap-0.5 rounded-md bg-emerald-50 px-1.5 py-0.5 text-xs font-bold text-emerald-600">
+          <Icon name="up" size={11} sw={2.4} />{data.compare.label}
+        </span>
+      )}
+      <span className="text-gray-300">·</span>
+      <span>活跃账号 <b className="text-gray-900">{data.kpi.accounts}</b></span>
+      <span className="text-gray-300">·</span>
+      <span>订单 <b className="text-gray-900">{fmtInt(data.kpi.orders)}</b></span>
+      <span className="text-gray-300">·</span>
+      <span>库存卡密 <b className="text-gray-900">{fmtInt(data.kpi.cards)}</b></span>
+    </p>
+
+    {/* 时间范围分段控件（7天内/一个月内 与数据规模联动，其余仅示意） */}
+    <div className="mt-5 flex flex-wrap gap-1.5">
+      {RANGE_OPTIONS.map((opt) => (
+        <button key={opt.key} type="button"
+                disabled={opt.disabled}
+                title={opt.disabled ? 'Demo 未包含此范围的数据' : undefined}
+                onClick={() => opt.scale && onScale(opt.scale)}
+                className={`rounded-lg px-3.5 py-1.5 text-[13px] font-bold ${
+                  data.rangeKey === opt.key
+                    ? 'bg-brand text-black shadow-sm'
+                    : opt.disabled
+                      ? 'cursor-not-allowed bg-gray-50 text-gray-300'
+                      : 'bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-800'
+                }`}>
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  </header>
+);
+
+/* ---------------- 各报告节 ---------------- */
+
+const SectionRevenue = ({ data }) => (
+  <Section no="01" title="营收走势" conclusion={data.revenueConclusion}
+           note="按所选范围逐日统计，无成交日期计为 0。深色柱为销售额，蓝线为订单数。">
+    <RevenueChart daily={data.daily} dense={data.daily.length > 10} />
+  </Section>
+);
+
+const SectionItems = ({ data }) => {
+  const totalAmt = data.items.reduce((s, r) => s + r.amount, 0);
+  return (
+    <Section no="02" title="商品结构" conclusion={data.itemConclusion}
+             note="销量排行、金额占比与爆品环比合并呈现，避免重复模块。">
+      <RankList
+        rows={data.items}
+        maxOf={(r) => r.count}
+        valueOf={(r) => `${r.count} 单`}
+        extra={(r) => `¥${fmtMoney(r.amount)} · 客单 ¥${fmtMoney(r.avg)}`}
+      />
+      <div className="mt-5 space-y-2">
+        {data.items.map((row) => (
+          <div key={row.name} className="flex items-center gap-3">
+            <div className="w-40 shrink-0 truncate text-xs text-gray-500" title={row.name}>{row.name}</div>
+            <div className="h-2.5 flex-1 overflow-hidden rounded bg-gray-100">
+              <div className="h-full rounded bg-gray-900/80" style={{ width: `${Math.max(2, (row.amount / totalAmt) * 100)}%` }} />
+            </div>
+            <div className="w-16 shrink-0 text-right text-xs text-gray-400">{pct(row.amount, totalAmt)}%</div>
+          </div>
+        ))}
+        <p className="pt-0.5 text-right text-xs text-gray-400">金额占比 · 合计 ¥{fmtMoney(totalAmt)}</p>
+      </div>
+
+      <h3 className="mt-7 text-[13.5px] font-extrabold text-gray-900">成交爆品榜</h3>
+      <p className="mt-0.5 text-xs text-gray-400">{data.hotNote}</p>
+      <table className="mt-3 w-full text-left text-[13px]">
+        <thead>
+          <tr className="border-b border-gray-100 text-xs text-gray-400">
+            <th className="pb-2 font-medium">商品</th>
+            <th className="pb-2 text-right font-medium">当期</th>
+            <th className="pb-2 text-right font-medium">环比</th>
+            <th className="pb-2 text-right font-medium">销售额</th>
+            <th className="pb-2 text-right font-medium">客单价</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-50">
+          {data.hotItems.map((item) => (
+            <tr key={item.name}>
+              <td className="max-w-[280px] truncate py-2.5 pr-3 font-medium text-gray-800" title={item.name}>{item.name}</td>
+              <td className="py-2.5 text-right text-gray-700">{item.count} 单</td>
+              <td className="py-2.5 text-right"><GrowthBadge growth={item.growth} /></td>
+              <td className="py-2.5 text-right text-gray-700">¥{fmtMoney(item.amount)}</td>
+              <td className="py-2.5 text-right text-gray-700">¥{fmtMoney(item.avg)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Section>
+  );
+};
+
+const SectionStatus = ({ data }) => (
+  <Section no="03" title="订单状态与履约" conclusion={data.statusConclusion}>
+    <ShareBars
+      rows={data.status.map((s) => ({ label: STATUS_META[s.key].label, count: s.count, key: s.key }))}
+      colorOf={(row) => STATUS_META[row.key].bar}
+    />
+    <h3 className="mt-7 text-[13.5px] font-extrabold text-gray-900">收货地区</h3>
+    {data.cities ? (
+      <div className="mt-3">
+        <ShareBars
+          rows={data.cities.map((c) => ({ label: c.name, count: c.count }))}
+          colorOf={() => '#3B82F6'}
+        />
+        <p className="mt-2 text-xs text-gray-400">{data.cityNote}</p>
+      </div>
+    ) : (
+      <p className="mt-2 text-[13px] text-gray-400">{data.cityNote}</p>
+    )}
+  </Section>
+);
+
+const SectionTiming = ({ data }) => (
+  <Section no="04" title="成交时段" conclusion={data.timingConclusion} note={data.timingSub}>
+    <div className="grid grid-cols-5 gap-6">
+      <div className="col-span-3">
+        <p className="mb-2 text-xs font-bold text-gray-500">按小时分布（东八区）</p>
+        <HourChart hours={data.hours} />
+      </div>
+      <div className="col-span-2">
+        <p className="mb-2 text-xs font-bold text-gray-500">按星期分布</p>
+        <WeekChart week={data.week} />
+      </div>
+    </div>
+    <InlineNote>{data.timingTip}</InlineNote>
+  </Section>
+);
+
+const SectionBuyers = ({ data }) => {
+  const maxFreq = Math.max(...data.buyers.freq.map((f) => f.count));
+  return (
+    <Section no="05" title="买家与复购" conclusion={data.buyerConclusion}
+             note="仅统计下单行为，不涉及客户画像。">
+      <div className="grid grid-cols-2 gap-8">
+        <div>
+          <p className="mb-3 text-xs font-bold text-gray-500">下单频次分布</p>
+          <div className="space-y-2.5">
+            {data.buyers.freq.map((f) => (
+              <div key={f.label} className="flex items-center gap-3">
+                <div className="w-28 shrink-0 text-[13px] text-gray-600">{f.label}</div>
+                <div className="h-4 flex-1 overflow-hidden rounded bg-gray-100">
+                  <div className="h-full rounded bg-emerald-500" style={{ width: `${Math.max(3, (f.count / maxFreq) * 100)}%` }} />
+                </div>
+                <div className="w-16 shrink-0 text-right text-[13px] text-gray-600">{fmtInt(f.count)} 人</div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-5 flex items-center gap-6 border-t border-gray-100 pt-4 text-[13px] text-gray-600">
+            <span>下单买家 <b className="text-base text-gray-900">{fmtInt(data.buyers.total)}</b></span>
+            <span>复购买家 <b className="text-base text-gray-900">{fmtInt(data.buyers.repeat)}</b></span>
+            <span>复购率 <b className="rounded bg-brand px-1.5 py-0.5 text-base text-black">{data.buyers.rate}%</b></span>
+          </div>
+        </div>
+        <div>
+          <p className="mb-3 text-xs font-bold text-gray-500">买家贡献榜</p>
+          <table className="w-full text-left text-[13px]">
+            <thead>
+              <tr className="border-b border-gray-100 text-xs text-gray-400">
+                <th className="pb-2 font-medium">买家</th>
+                <th className="pb-2 text-center font-medium">下单</th>
+                <th className="pb-2 text-right font-medium">贡献额</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {data.buyers.top.map((b) => (
+                <tr key={b.name}>
+                  <td className="py-2 font-medium text-gray-800">{b.name}</td>
+                  <td className="py-2 text-center text-gray-600">{b.orders}</td>
+                  <td className="py-2 text-right font-bold text-gray-900">¥{fmtMoney(b.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Section>
+  );
+};
+
+const SectionTraffic = ({ data }) => (
+  <Section no="06" title="商品流量" conclusion={data.trafficConclusion} note={data.trafficNote}>
+    {data.traffic ? (
+      <>
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px] text-gray-600">
+          <span>曝光增量 <b className="text-gray-900">{fmtInt(data.traffic.kpi.exposure)}</b></span>
+          <span className="text-gray-300">·</span>
+          <span>浏览增量 <b className="text-gray-900">{fmtInt(data.traffic.kpi.view)}</b></span>
+          <span className="text-gray-300">·</span>
+          <span>想要增量 <b className="text-gray-900">{fmtInt(data.traffic.kpi.want)}</b></span>
+          <span className="text-gray-300">·</span>
+          <span>可比窗口 / 天数 <b className="text-gray-900">{data.traffic.kpi.windows}</b></span>
+        </p>
+        <div className="mt-5 grid grid-cols-2 gap-8">
+          <div>
+            <p className="mb-2 text-xs font-bold text-gray-500">观测窗口增量（增量属于整个窗口）</p>
+            <div className="h-[210px]">
+              <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 360, height: 210 }}>
+                <ComposedChart data={data.traffic.windows} margin={{ top: 8, right: 4, left: -8, bottom: 0 }}>
+                  <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+                  <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 9.5 }} interval={1} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} />
+                  <Tooltip content={({ active, payload, label }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    return (
+                      <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 shadow-lg">
+                        <p className="mb-1 text-xs font-bold text-gray-900">{label}</p>
+                        {payload.map((entry) => (
+                          <p key={entry.dataKey} className="text-xs text-gray-600">{entry.name}：<span className="font-bold text-gray-900">{fmtInt(entry.value)}</span></p>
+                        ))}
+                      </div>
+                    );
+                  }} cursor={{ fill: 'rgba(17, 24, 39, 0.03)' }} />
+                  <Bar dataKey="exposure" name="曝光增量" fill="#10B981" radius={[3, 3, 0, 0]} maxBarSize={16} />
+                  <Bar dataKey="view" name="浏览增量" fill="#3B82F6" radius={[3, 3, 0, 0]} maxBarSize={16} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+          <div>
+            <p className="mb-2 text-xs font-bold text-gray-500">商品流量排行（前 5）</p>
+            <RankList
+              rows={data.traffic.top}
+              maxOf={(r) => r.view}
+              valueOf={(r) => `${fmtInt(r.view)} 浏览`}
+              extra={(r) => `曝光 ${fmtInt(r.exposure)} · 想要 ${fmtInt(r.want)}`}
+            />
+          </div>
+        </div>
+      </>
+    ) : (
+      <InlineNote>{data.trafficNote}</InlineNote>
+    )}
+  </Section>
+);
+
+const SectionOrders = ({ data }) => {
+  const [term, setTerm] = useState('');
+  const rows = useMemo(() => {
+    const t = term.trim().toLowerCase();
+    if (!t) return data.orders;
+    return data.orders.filter((o) => [o.id, o.buyer, o.item].some((v) => String(v).toLowerCase().includes(t)));
+  }, [term, data]);
+  return (
+    <Section no="07" title="订单清单" conclusion={data.ordersConclusion}>
+      <div className="relative mb-4 w-72">
+        <Icon name="search" size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-300" />
+        <input
+          value={term}
+          onChange={(e) => setTerm(e.target.value)}
+          placeholder="搜索订单号、商品或买家"
+          aria-label="搜索订单"
+          className="w-full rounded-lg border border-gray-200 bg-white py-2 pl-9 pr-3 text-[13px] outline-none placeholder:text-gray-300 focus:border-gray-900"
+        />
+      </div>
+      <table className="w-full text-left text-[13px]">
+        <thead>
+          <tr className="border-b border-gray-100 text-xs text-gray-400">
+            <th className="pb-2.5 font-medium">商品 / 订单号</th>
+            <th className="pb-2.5 font-medium">买家</th>
+            <th className="pb-2.5 text-right font-medium">金额</th>
+            <th className="pb-2.5 pl-6 font-medium">状态</th>
+            <th className="pb-2.5 text-right font-medium">时间</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-gray-50">
+          {rows.length === 0 ? (
+            <tr><td colSpan={5} className="py-10 text-center text-gray-300">没有匹配的订单</td></tr>
+          ) : rows.map((o) => (
+            <tr key={o.id}>
+              <td className="max-w-[300px] py-3 pr-3">
+                <p className="truncate font-bold text-gray-900" title={o.item}>{o.item}</p>
+                <p className="mt-0.5 font-mono text-xs text-gray-400">{o.id}</p>
+              </td>
+              <td className="py-3 text-gray-700">{o.buyer}</td>
+              <td className="py-3 text-right font-bold text-gray-900">¥{fmtMoney(o.amount)}</td>
+              <td className="py-3 pl-6"><StatusChip status={o.status} /></td>
+              <td className="py-3 text-right text-gray-400">{o.time}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Section>
+  );
+};
+
+/* ---------------- 页面 ---------------- */
+const App = () => {
+  const [scale, setScale] = useState('now');
+  const data = DATA[scale];
+  return (
+    <div className="flex min-h-screen">
+      <Sidebar />
+      <main className="min-w-0 flex-1">
+        <div className="mx-auto max-w-[920px] px-6 py-10">
+          <div className="rounded-[24px] border border-black/[0.03] bg-white px-12 py-11 shadow-[0_8px_24px_rgba(0,0,0,0.04)]">
+            <ReportHeader data={data} scale={scale} onScale={setScale} />
+            <div className="mt-10">
+              <SectionRevenue data={data} />
+              <SectionItems data={data} />
+              <SectionStatus data={data} />
+              <SectionTiming data={data} />
+              <SectionBuyers data={data} />
+              <SectionTraffic data={data} />
+              <SectionOrders data={data} />
+            </div>
+            <footer className="mt-10 border-t border-gray-100 pt-5 text-xs text-gray-300">
+              报告由系统根据订单快照自动生成 · 数据为脱敏演示 · 生成于 2026-08-12
+            </footer>
+          </div>
+        </div>
+      </main>
+      {/* 方案标注徽章 */}
+      <div className="fixed right-4 top-4 z-50 rounded-full border border-gray-200 bg-white/95 px-3.5 py-1.5 text-xs font-bold text-gray-700 shadow-md">
+        方案 C · 经营报告流
+      </div>
+    </div>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

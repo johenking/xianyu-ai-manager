@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>咸鱼监控台 · 仪表盘重构候选 · 方案 B「深色驾驶舱」</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: { brand: '#FFE815', ink: '#0F172A' },
+        boxShadow: {
+          panel: '0 1px 2px rgba(15,23,42,0.04), 0 12px 32px -22px rgba(15,23,42,0.16)',
+          hero: '0 20px 48px -24px rgba(15,23,42,0.5)',
+        },
+      },
+    },
+  };
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://unpkg.com/recharts@2.15.3/umd/Recharts.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-variant-numeric: tabular-nums;
+    background: #F4F5F7;
+    color: #0F172A;
+  }
+  ::selection { background: #FFE815; color: #0F172A; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState } = React;
+const {
+  ComposedChart, BarChart, Area, Bar, Line, XAxis, YAxis,
+  CartesianGrid, Tooltip, ResponsiveContainer, Cell, LabelList,
+} = Recharts;
+
+/* ---------- 格式化工具 ---------- */
+const fmtMoney = (n) => '¥' + n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtBare  = (n) => n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInt   = (n) => n.toLocaleString('zh-CN');
+const pctOf    = (n, total) => (total > 0 ? (n / total) * 100 : 0);
+
+/* ---------- 图标（手写线性 SVG） ---------- */
+const Svg = ({ size = 18, className = '', children }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    {children}
+  </svg>
+);
+const Icons = {
+  fish: (s) => (<Svg size={s}><path d="M6 12c2.6-3.4 6-5.3 8.7-5.3 3.2 0 5.6 2.4 6.8 5.3-1.2 2.9-3.6 5.3-6.8 5.3-2.7 0-6.1-1.9-8.7-5.3z"/><path d="M6 12l-3.5-3v6L6 12z"/><circle cx="16.6" cy="10.6" r="0.9" fill="currentColor" stroke="none"/></Svg>),
+  gauge: (s) => (<Svg size={s}><path d="M5 18a8 8 0 1 1 14 0"/><path d="M12 14.5l3.2-3.6"/><circle cx="12" cy="14.5" r="1" fill="currentColor" stroke="none"/></Svg>),
+  users: (s) => (<Svg size={s}><circle cx="9.5" cy="7.8" r="3.1"/><path d="M3.8 19v-1.2a3.8 3.8 0 0 1 3.8-3.8h3.8a3.8 3.8 0 0 1 3.8 3.8V19"/><path d="M15 4.9a3.1 3.1 0 0 1 0 5.8M17.6 14.1a3.8 3.8 0 0 1 2.6 3.6V19"/></Svg>),
+  receipt: (s) => (<Svg size={s}><path d="M6 3.5h12V20l-2-1.4-2 1.4-2-1.4L10 20l-2-1.4L6 20V3.5z"/><path d="M9 8h6M9 11.5h6M9 15h3.5"/></Svg>),
+  key: (s) => (<Svg size={s}><circle cx="8.3" cy="12" r="3.6"/><path d="M11.9 12H20.2M17.2 12v2.8M19.2 12v2"/></Svg>),
+  box: (s) => (<Svg size={s}><path d="M4 8l8-4.2L20 8v8l-8 4.2L4 16V8z"/><path d="M4 8l8 4.2L20 8M12 12.2V20"/></Svg>),
+  gear: (s) => (<Svg size={s}><circle cx="12" cy="12" r="3.1"/><path d="M12 2.8v2.3M12 18.9v2.3M4.9 5l1.7 1.6M17.4 17.4L19.1 19M2.8 12h2.3M18.9 12h2.3M4.9 19l1.7-1.6M17.4 6.6L19.1 5"/></Svg>),
+  search: (s) => (<Svg size={s}><circle cx="11" cy="11" r="6.3"/><path d="M15.7 15.7L20 20"/></Svg>),
+  calendar: (s) => (<Svg size={s}><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 9.6h17M8 3v3.6M16 3v3.6"/></Svg>),
+  up: (s) => (<Svg size={s} className="inline-block"><path d="M4 16.5l5-5 3.5 3.5 7-7.5"/><path d="M19.5 12V7.5H15"/></Svg>),
+  down: (s) => (<Svg size={s} className="inline-block"><path d="M4 7.5l5 5 3.5-3.5 7 7.5"/><path d="M19.5 12v4.5H15"/></Svg>),
+  info: (s) => (<Svg size={s}><circle cx="12" cy="12" r="8.4"/><path d="M12 11.2v4.6"/><path d="M12 8.1h.01" strokeWidth="2.2"/></Svg>),
+  bulb: (s) => (<Svg size={s}><path d="M12 3.2a5.8 5.8 0 0 1 3.5 10.4c-.7.55-1.05 1.2-1.05 2.1h-4.9c0-.9-.35-1.55-1.05-2.1A5.8 5.8 0 0 1 12 3.2z"/><path d="M9.8 18.6h4.4M10.6 21h2.8"/></Svg>),
+  pin: (s) => (<Svg size={s}><path d="M12 21s-6.4-5.1-6.4-9.9a6.4 6.4 0 1 1 12.8 0C18.4 15.9 12 21 12 21z"/><circle cx="12" cy="10.6" r="2.2"/></Svg>),
+  pulse: (s) => (<Svg size={s}><path d="M3 12h4l2.4-5.6 4 11.2L15.8 12H21"/></Svg>),
+};
+
+/* ---------- 语义色 ---------- */
+const STATUS_COLOR = { '待发货': '#FFE815', '已发货': '#3B82F6', '已完成': '#10B981', '退款中': '#EF4444', '已取消': '#94A3B8', '未知': '#94A3B8' };
+const STATUS_BADGE = {
+  '待发货': 'bg-brand text-slate-900',
+  '已发货': 'bg-[#3B82F6]/10 text-[#3B82F6]',
+  '已完成': 'bg-[#10B981]/10 text-[#10B981]',
+  '退款中': 'bg-[#EF4444]/10 text-[#EF4444]',
+  '已取消': 'bg-slate-100 text-slate-500',
+};
+const PALETTE = ['#3B82F6', '#8B5CF6', '#14B8A6', '#F59E0B', '#EC4899', '#0EA5E9', '#84CC16', '#64748B'];
+
+/* ---------- 内置数据：当前规模 ---------- */
+const CURRENT = {
+  key: 'current',
+  rangeKey: '7天内',
+  rangeLabel: '2026-08-06 ~ 2026-08-12',
+  revenue: 61.04, prevRevenue: 0, delta: null,
+  accounts: '1/1', orders: 9, cards: 0, cardsHint: '待补货',
+  daily: [
+    { d: '08-06', w: '周四', rev: 0, cnt: 0 },
+    { d: '08-07', w: '周五', rev: 0, cnt: 0 },
+    { d: '08-08', w: '周六', rev: 0, cnt: 0 },
+    { d: '08-09', w: '周日', rev: 0, cnt: 0 },
+    { d: '08-10', w: '周一', rev: 33.28, cnt: 5 },
+    { d: '08-11', w: '周二', rev: 27.76, cnt: 4 },
+    { d: '08-12', w: '周三', rev: 0, cnt: 0 },
+  ],
+  products: [
+    { name: 'codex助力邀请送积分', cnt: 4, rev: 31.04, avg: 7.76 },
+    { name: 'codex邀请重置额度服务', cnt: 4, rev: 26.20, avg: 6.55 },
+    { name: 'codex邀请重置额度服务·新链接', cnt: 1, rev: 3.80, avg: 3.80 },
+  ],
+  statuses: [ { name: '已发货', cnt: 4 }, { name: '已完成', cnt: 5 } ],
+  cities: [], cityCovered: null,
+  hours: [0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,2,0,1,3,0,0,1,0,0],
+  weekdays: [5,4,0,0,0,0,0],
+  hint: { type: 'muted', text: '时段建议待补充：至少需要 20 笔有效成交订单' },
+  traffic: null,
+  buyers: {
+    total: 6, repeat: 3, rate: '50.0%', rateNote: '6 位下单买家中 3 位复购',
+    freq: [ { label: '1 单', n: 3 }, { label: '2 单', n: 3 } ],
+    contrib: [
+      { name: '星河小铺', cnt: 2, amt: 13.30 },
+      { name: '稳重的橙子', cnt: 2, amt: 12.90 },
+      { name: 'NOVA_AI', cnt: 1, amt: 11.64 },
+      { name: '晚风信箱', cnt: 1, amt: 11.64 },
+      { name: '青柠不加冰', cnt: 2, amt: 7.76 },
+      { name: '买家·尾号2232', cnt: 1, amt: 3.88 },
+    ],
+  },
+  hot: [
+    { name: 'codex助力邀请送积分', cnt: 4, rev: 31.04, badge: { type: 'new' } },
+    { name: 'codex邀请重置额度服务', cnt: 4, rev: 26.20, badge: { type: 'new' } },
+  ],
+  orderRows: [
+    { id: '512741****2201', product: 'codex邀请重置额度服务', buyer: '晚风信箱', amt: 7.76, status: '已发货', time: '08-11 21:04' },
+    { id: '512740****8817', product: 'codex助力邀请送积分', buyer: '青柠不加冰', amt: 6.66, status: '已发货', time: '08-11 18:22' },
+    { id: '512739****4405', product: 'codex助力邀请送积分', buyer: '星河小铺', amt: 4.30, status: '已发货', time: '08-11 15:37' },
+    { id: '512739****1126', product: 'codex邀请重置额度服务', buyer: '稳重的橙子', amt: 9.00, status: '已发货', time: '08-11 13:09' },
+    { id: '512737****9210', product: 'codex邀请重置额度服务·新链接', buyer: '青柠不加冰', amt: 3.80, status: '已完成', time: '08-10 18:46' },
+    { id: '512737****6683', product: 'codex邀请重置额度服务', buyer: '买家·尾号2232', amt: 3.88, status: '已完成', time: '08-10 18:31' },
+    { id: '512737****3358', product: 'codex邀请重置额度服务', buyer: '稳重的橙子', amt: 5.40, status: '已完成', time: '08-10 17:15' },
+    { id: '512736****7794', product: 'codex助力邀请送积分', buyer: '星河小铺', amt: 8.60, status: '已完成', time: '08-10 15:28' },
+    { id: '512736****0032', product: 'codex助力邀请送积分', buyer: 'NOVA_AI', amt: 11.64, status: '已完成', time: '08-10 12:24' },
+  ],
+  orderTotal: 9,
+  orderNote: '已展示全部 9 笔订单',
+};
+
+/* ---------- 内置数据：成长后规模（30 天假想） ---------- */
+const GROWN_DAILY = [
+  ['07-14','周二',24.60,4],['07-15','周三',18.80,4],['07-16','周四',26.40,6],['07-17','周五',55.20,9],
+  ['07-18','周六',68.60,8],['07-19','周日',62.40,7],['07-20','周一',22.80,5],['07-21','周二',23.60,4],
+  ['07-22','周三',21.40,4],['07-23','周四',29.20,5],['07-24','周五',58.80,9],['07-25','周六',72.40,8],
+  ['07-26','周日',65.80,7],['07-27','周一',25.20,5],['07-28','周二',26.80,5],['07-29','周三',24.40,4],
+  ['07-30','周四',32.60,6],['07-31','周五',62.20,10],['08-01','周六',78.60,9],['08-02','周日',70.20,7],
+  ['08-03','周一',24.40,5],['08-04','周二',30.60,4],['08-05','周三',26.80,5],['08-06','周四',34.40,7],
+  ['08-07','周五',66.40,10],['08-08','周六',89.00,10],['08-09','周日',76.20,7],['08-10','周一',27.20,5],
+  ['08-11','周二',32.80,5],['08-12','周三',8.60,2],
+].map(([d, w, rev, cnt]) => ({ d, w, rev, cnt }));
+
+const GROWN = {
+  key: 'grown',
+  rangeKey: '一个月内',
+  rangeLabel: '2026-07-14 ~ 2026-08-12',
+  revenue: 1286.40, prevRevenue: 928.14, delta: 38.6,
+  accounts: '3/3', orders: 186, cards: 42, cardsHint: null,
+  daily: GROWN_DAILY,
+  products: [
+    { name: 'codex助力邀请送积分', cnt: 52, rev: 403.00, avg: 7.75 },
+    { name: 'codex邀请重置额度服务', cnt: 38, rev: 249.28, avg: 6.56 },
+    { name: 'GPT团队席位月卡', cnt: 24, rev: 216.00, avg: 9.00 },
+    { name: 'Claude额度补充包', cnt: 21, rev: 168.00, avg: 8.00 },
+    { name: 'codex邀请重置额度服务·新链接', cnt: 18, rev: 68.40, avg: 3.80 },
+    { name: 'Gemini会员代充', cnt: 14, rev: 89.60, avg: 6.40 },
+    { name: 'API中转月卡', cnt: 11, rev: 59.40, avg: 5.40 },
+    { name: '模型评测报告定制', cnt: 8, rev: 32.72, avg: 4.09 },
+  ],
+  statuses: [
+    { name: '待发货', cnt: 6 }, { name: '已发货', cnt: 45 }, { name: '已完成', cnt: 128 },
+    { name: '退款中', cnt: 4 }, { name: '已取消', cnt: 3 },
+  ],
+  cities: [
+    { name: '上海', cnt: 32 }, { name: '杭州', cnt: 28 }, { name: '深圳', cnt: 24 }, { name: '北京', cnt: 21 },
+    { name: '广州', cnt: 17 }, { name: '成都', cnt: 12 }, { name: '南京', cnt: 9 }, { name: '武汉', cnt: 7 },
+  ],
+  cityCovered: '城市数据覆盖 150/186 笔订单，其余订单未提供收货城市',
+  hours: [0,0,0,0,0,0,1,1,2,4,7,8,12,11,9,8,9,8,10,12,20,24,22,18],
+  weekdays: [20,22,19,24,38,35,28],
+  hint: { type: 'idea', text: '每周五 20:00-23:00 是你的成交高峰，建议保持在线并优先补货热销商品' },
+  traffic: {
+    kpis: [
+      { label: '曝光增量', value: '+12,480' },
+      { label: '浏览增量', value: '+3,215' },
+      { label: '想要增量', value: '+486' },
+      { label: '可比窗口 / 覆盖天数', value: '42 个 · 14 天' },
+    ],
+    windows: [
+      { d: '07-30', exposure: 1680, views: 420, wants: 66 },
+      { d: '08-02', exposure: 1890, views: 480, wants: 72 },
+      { d: '08-04', exposure: 2050, views: 520, wants: 78 },
+      { d: '08-06', exposure: 2180, views: 560, wants: 84 },
+      { d: '08-09', exposure: 2260, views: 590, wants: 90 },
+      { d: '08-12', exposure: 2420, views: 645, wants: 96 },
+    ],
+    rank: [
+      { name: 'codex助力邀请送积分', exposure: 4320, views: 1128, wants: 176 },
+      { name: 'GPT团队席位月卡', exposure: 2860, views: 742, wants: 102 },
+      { name: 'codex邀请重置额度服务', exposure: 2140, views: 560, wants: 88 },
+      { name: 'Claude额度补充包', exposure: 1680, views: 420, wants: 64 },
+      { name: 'Gemini会员代充', exposure: 960, views: 215, wants: 32 },
+    ],
+  },
+  buyers: {
+    total: 132, repeat: 41, rate: '31.1%', rateNote: '132 位下单买家中 41 位复购',
+    freq: [
+      { label: '1 单', n: 91 }, { label: '2 单', n: 27 }, { label: '3 单', n: 9 }, { label: '4 单+', n: 5 },
+    ],
+    contrib: [
+      { name: '星河小铺', cnt: 9, amt: 86.40 },
+      { name: 'NOVA_AI', cnt: 7, amt: 71.20 },
+      { name: '稳重的橙子', cnt: 6, amt: 58.80 },
+      { name: '晚风信箱', cnt: 5, amt: 47.50 },
+      { name: '青柠不加冰', cnt: 5, amt: 42.30 },
+      { name: '买家·尾号8871', cnt: 4, amt: 38.60 },
+    ],
+  },
+  hot: [
+    { name: 'codex助力邀请送积分', cnt: 52, rev: 403.00, badge: { type: 'pct', v: 150 } },
+    { name: 'codex邀请重置额度服务', cnt: 38, rev: 249.28, badge: { type: 'pct', v: 40 } },
+    { name: 'GPT团队席位月卡', cnt: 24, rev: 216.00, badge: { type: 'new' } },
+    { name: 'codex邀请重置额度服务·新链接', cnt: 18, rev: 68.40, badge: { type: 'pct', v: -25 } },
+  ],
+  orderRows: [
+    { id: '512803****1180', product: 'GPT团队席位月卡', buyer: '星河小铺', amt: 9.00, status: '待发货', time: '08-12 09:41' },
+    { id: '512802****6417', product: 'codex助力邀请送积分', buyer: '折耳根爱好者', amt: 7.76, status: '待发货', time: '08-12 08:15' },
+    { id: '512797****3305', product: 'codex邀请重置额度服务', buyer: 'NOVA_AI', amt: 6.55, status: '已发货', time: '08-11 22:36' },
+    { id: '512796****9902', product: 'Claude额度补充包', buyer: '晚风信箱', amt: 8.00, status: '已发货', time: '08-11 21:18' },
+    { id: '512796****2278', product: 'codex助力邀请送积分', buyer: '青柠不加冰', amt: 7.76, status: '已发货', time: '08-11 20:47' },
+    { id: '512795****8823', product: 'API中转月卡', buyer: '稳重的橙子', amt: 5.40, status: '退款中', time: '08-11 20:02' },
+    { id: '512794****5561', product: 'Gemini会员代充', buyer: '买家·尾号8871', amt: 6.40, status: '已发货', time: '08-11 13:26' },
+    { id: '512790****7745', product: 'codex邀请重置额度服务·新链接', buyer: '星河小铺', amt: 3.80, status: '已完成', time: '08-10 21:55' },
+    { id: '512789****4432', product: '模型评测报告定制', buyer: '拿铁不去冰', amt: 4.09, status: '已取消', time: '08-10 15:33' },
+    { id: '512788****0906', product: 'codex助力邀请送积分', buyer: 'NOVA_AI', amt: 7.76, status: '已完成', time: '08-10 12:08' },
+  ],
+  orderTotal: 186,
+  orderNote: '共 186 笔订单，演示页仅内置最近 10 笔明细',
+};
+
+const DATA = { current: CURRENT, grown: GROWN };
+
+/* ---------- 通用小组件 ---------- */
+function TipShell({ title, rows, dark }) {
+  return (
+    <div className={(dark
+      ? 'border-white/10 bg-[#0B1220]/95 '
+      : 'border-slate-200 bg-white ') + 'min-w-[150px] rounded-lg border px-3 py-2 shadow-lg'}>
+      <div className="mb-1 text-[11px] text-slate-400">{title}</div>
+      {rows.map((r, i) => (
+        <div key={i} className={'flex items-center gap-5 py-0.5 text-xs ' + (dark ? 'text-slate-100' : 'text-slate-700')}>
+          <span className="flex items-center gap-1.5">
+            <span className="inline-block h-2 w-2 rounded-full" style={{ background: r.color }} />
+            {r.name}
+          </span>
+          <span className="ml-auto font-medium">{r.value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TrendBadgeDark({ delta }) {
+  if (delta === null) {
+    return <span className="inline-flex items-center gap-1 rounded-md bg-white/10 px-2 py-1 text-xs font-medium text-slate-200 ring-1 ring-white/10">较上期 新增</span>;
+  }
+  const up = delta >= 0;
+  return (
+    <span className={'inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-semibold ring-1 ' +
+      (up ? 'bg-emerald-400/15 text-emerald-300 ring-emerald-400/25' : 'bg-red-400/15 text-red-300 ring-red-400/25')}>
+      {up ? Icons.up(13) : Icons.down(13)}
+      {(up ? '+' : '') + delta.toFixed(1) + '%'}
+      <span className="font-normal opacity-70">较上期</span>
+    </span>
+  );
+}
+
+function TrendBadgeLight({ badge }) {
+  if (badge.type === 'new') {
+    return <span className="inline-flex shrink-0 items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500 ring-1 ring-slate-200">新品</span>;
+  }
+  const up = badge.v >= 0;
+  return (
+    <span className={'inline-flex shrink-0 items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ' +
+      (up ? 'bg-[#10B981]/10 text-[#0d9668]' : 'bg-[#EF4444]/10 text-[#EF4444]')}>
+      {up ? Icons.up(12) : Icons.down(12)}
+      {(up ? '+' : '') + badge.v + '%'}
+    </span>
+  );
+}
+
+function RankChip({ i }) {
+  return (
+    <span className={'grid h-5 w-6 shrink-0 place-items-center rounded text-[11px] font-semibold ' +
+      (i === 1 ? 'bg-brand text-slate-900' : 'bg-slate-100 text-slate-500')}>
+      {String(i).padStart(2, '0')}
+    </span>
+  );
+}
+
+function ShareRow({ color, name, valueText, pctVal }) {
+  return (
+    <div className="py-1.5">
+      <div className="flex items-center gap-2 text-[13px]">
+        <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ background: color }} />
+        <span className="min-w-0 flex-1 truncate text-slate-700" title={name}>{name}</span>
+        <span className="shrink-0 font-medium text-slate-900">{valueText}</span>
+        <span className="w-12 shrink-0 text-right text-xs text-slate-400">{pctVal.toFixed(1)}%</span>
+      </div>
+      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-100">
+        <div className="h-full rounded-full" style={{ width: pctVal + '%', background: color }} />
+      </div>
+    </div>
+  );
+}
+
+function RankRow({ i, name, right, sub, barPct }) {
+  return (
+    <div className="flex items-center gap-3 border-b border-slate-100 py-2.5 last:border-0">
+      <RankChip i={i} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-baseline gap-3">
+          <span className="min-w-0 truncate text-[13px] text-slate-700" title={name}>{name}</span>
+          <span className="ml-auto shrink-0 text-[13px] font-medium text-slate-900">{right}</span>
+        </div>
+        <div className="mt-1.5 flex items-center gap-3">
+          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100">
+            <div className="h-full rounded-full" style={{ width: barPct + '%', background: i === 1 ? '#FFE815' : '#334155' }} />
+          </div>
+          <span className="shrink-0 text-[11px] text-slate-400">{sub}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InlineHint({ tone, icon, children }) {
+  const cls = tone === 'idea'
+    ? 'border-amber-200 bg-amber-50/70 text-slate-600'
+    : 'border-slate-200 bg-slate-50/80 text-slate-500';
+  return (
+    <div className={'flex items-start gap-2 rounded-lg border px-3 py-2 text-xs leading-relaxed ' + cls}>
+      <span className={'mt-[1px] shrink-0 ' + (tone === 'idea' ? 'text-amber-500' : 'text-slate-400')}>{icon}</span>
+      <span>{children}</span>
+    </div>
+  );
+}
+
+function EmptyBlock({ icon, title, desc, minH }) {
+  return (
+    <div className={'flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-200 bg-slate-50/40 px-6 text-center ' + (minH || 'min-h-[180px]')}>
+      <span className="text-slate-300">{icon}</span>
+      <div className="mt-2.5 text-[13px] font-medium text-slate-500">{title}</div>
+      {desc && <p className="mt-1.5 max-w-md text-xs leading-relaxed text-slate-400">{desc}</p>}
+    </div>
+  );
+}
+
+function Panel({ title, caption, right, children }) {
+  return (
+    <section className="rounded-2xl border border-slate-200/70 bg-white p-6 shadow-panel">
+      <header className="mb-5 flex flex-wrap items-baseline gap-x-3 gap-y-2">
+        <h2 className="text-[15px] font-semibold text-slate-900">{title}</h2>
+        {caption && <span className="text-xs text-slate-400">{caption}</span>}
+        {right && <div className="ml-auto">{right}</div>}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+function SubHead({ t, c }) {
+  return (
+    <div className="mb-3 flex items-baseline justify-between">
+      <h3 className="text-[13px] font-medium text-slate-700">{t}</h3>
+      {c && <span className="text-[11px] text-slate-400">{c}</span>}
+    </div>
+  );
+}
+
+/* ---------- 侧边栏 ---------- */
+function NavItem({ icon, label, active }) {
+  return (
+    <div className={'relative flex cursor-pointer select-none items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] ' +
+      (active ? 'bg-white/[0.07] text-white' : 'text-slate-400 hover:bg-white/[0.04] hover:text-slate-200')}>
+      {active && <span className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-full bg-brand" />}
+      <span className={active ? 'text-brand' : 'text-slate-500'}>{icon}</span>
+      {label}
+    </div>
+  );
+}
+
+function Sidebar() {
+  return (
+    <aside className="w-[220px] shrink-0 bg-[#0F172A]">
+      <div className="sticky top-0 flex h-screen flex-col px-3">
+        <div className="flex items-center gap-2.5 px-2 pb-7 pt-6">
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-brand text-slate-900">{Icons.fish(20)}</span>
+          <div>
+            <div className="text-[15px] font-semibold leading-tight text-white">闲鱼监控台</div>
+            <div className="mt-0.5 text-[11px] text-slate-500">多账号运营管理</div>
+          </div>
+        </div>
+        <nav className="space-y-1">
+          <NavItem icon={Icons.gauge(17)} label="仪表盘" active />
+          <NavItem icon={Icons.users(17)} label="账号管理" />
+          <NavItem icon={Icons.receipt(17)} label="订单中心" />
+          <NavItem icon={Icons.key(17)} label="卡密库存" />
+          <NavItem icon={Icons.box(17)} label="商品列表" />
+          <NavItem icon={Icons.gear(17)} label="系统设置" />
+        </nav>
+        <div className="mt-auto pb-5">
+          <div className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2.5 text-[11px] text-slate-400">
+            <div className="flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              服务运行正常 · 单实例
+            </div>
+            <div className="mt-1 text-slate-500">v1.10.4 · 演示数据</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+/* ---------- 深色 hero 驾驶舱 ---------- */
+function RangeSeg({ scaleKey, setScaleKey }) {
+  const opts = ['今天', '昨天', '三天内', '7天内', '一个月内', '自定义'];
+  const active = scaleKey === 'current' ? '7天内' : '一个月内';
+  return (
+    <div className="flex items-center rounded-lg bg-slate-800/80 p-1 text-xs ring-1 ring-white/10">
+      {opts.map((o) => {
+        const enabled = o === '7天内' || o === '一个月内';
+        const act = o === active;
+        return (
+          <button key={o} disabled={!enabled}
+            onClick={() => { if (o === '7天内') setScaleKey('current'); if (o === '一个月内') setScaleKey('grown'); }}
+            title={enabled ? undefined : '演示内置「7天内 / 一个月内」两档数据'}
+            className={'rounded-md px-2.5 py-1 transition-colors ' + (act
+              ? 'bg-brand font-medium text-slate-900'
+              : enabled ? 'text-slate-300 hover:bg-white/5' : 'cursor-not-allowed text-slate-600')}>
+            {o}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ScaleSeg({ scaleKey, setScaleKey }) {
+  return (
+    <div className="flex items-center rounded-lg bg-slate-800/80 p-1 text-xs ring-1 ring-white/10">
+      {[['current', '当前规模'], ['grown', '成长后规模']].map(([k, l]) => (
+        <button key={k} onClick={() => setScaleKey(k)}
+          className={'rounded-md px-3 py-1 transition-colors ' +
+            (k === scaleKey ? 'bg-brand font-medium text-slate-900' : 'text-slate-300 hover:bg-white/5')}>
+          {l}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function HeroTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0].payload;
+  return <TipShell dark title={d.d + '（' + d.w + '）'} rows={[
+    { name: '营收', value: fmtMoney(d.rev), color: '#FFE815' },
+    { name: '订单量', value: d.cnt + ' 单', color: '#94A3B8' },
+  ]} />;
+}
+
+function HeroKpi({ label, value, extra }) {
+  return (
+    <div className="px-7 first:pl-0 last:pr-0">
+      <div className="text-[11px] tracking-wide text-slate-400">{label}</div>
+      <div className="mt-1.5 flex items-baseline gap-1.5 text-[22px] font-semibold leading-none text-white">
+        {value}
+        {extra}
+      </div>
+    </div>
+  );
+}
+
+function Hero({ D, scaleKey, setScaleKey }) {
+  const maxCnt = Math.max(...D.daily.map((x) => x.cnt), 1);
+  return (
+    <section className="rounded-[24px] p-7 text-white shadow-hero ring-1 ring-white/5"
+             style={{ background: 'linear-gradient(135deg, #0F172A 0%, #1E293B 100%)' }}>
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-lg font-semibold">运营概览</h1>
+        <span className="flex items-center gap-1.5 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs text-slate-300 ring-1 ring-white/10">
+          {Icons.calendar(14)}
+          {D.rangeLabel}
+        </span>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <RangeSeg scaleKey={scaleKey} setScaleKey={setScaleKey} />
+          <ScaleSeg scaleKey={scaleKey} setScaleKey={setScaleKey} />
+        </div>
+      </div>
+
+      <div className="mt-7 grid grid-cols-12 items-end gap-x-10 gap-y-6">
+        <div className="col-span-5">
+          <div className="text-xs text-slate-400">累计营收 · {D.rangeKey}</div>
+          <div className="mt-2.5 font-semibold leading-none tracking-tight text-white">
+            <span className="mr-1 align-top text-[26px]">¥</span>
+            <span className="text-[58px]">{fmtBare(D.revenue)}</span>
+          </div>
+          <div className="mt-3.5 h-1 w-16 rounded-full bg-brand" />
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <TrendBadgeDark delta={D.delta} />
+            <span className="text-xs text-slate-500">上期 {fmtMoney(D.prevRevenue)}</span>
+          </div>
+          <div className="mt-7 flex divide-x divide-white/10 border-t border-white/10 pt-5">
+            <HeroKpi label="活跃账号" value={D.accounts}
+              extra={<span className="ml-0.5 inline-block h-1.5 w-1.5 -translate-y-0.5 rounded-full bg-emerald-400" />} />
+            <HeroKpi label="订单数" value={fmtInt(D.orders)} />
+            <HeroKpi label="库存卡密" value={fmtInt(D.cards)}
+              extra={D.cardsHint && <span className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-amber-300/30">{D.cardsHint}</span>} />
+          </div>
+        </div>
+
+        <div className="col-span-7">
+          <div className="mb-2 flex items-center gap-4">
+            <span className="text-xs font-medium text-slate-300">营收趋势 · 逐日补零</span>
+            <div className="ml-auto flex items-center gap-4 text-[11px] text-slate-400">
+              <span className="flex items-center gap-1.5"><span className="inline-block h-[3px] w-4 rounded-full bg-brand" />营收（¥）</span>
+              <span className="flex items-center gap-1.5"><span className="inline-block w-4 border-t border-dashed border-slate-400" />订单量（单）</span>
+            </div>
+          </div>
+          <div className="h-[185px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={D.daily} margin={{ top: 8, right: 20, left: 20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="heroRev" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#FFE815" stopOpacity="0.30" />
+                    <stop offset="100%" stopColor="#FFE815" stopOpacity="0.02" />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.06)" />
+                <XAxis dataKey="d" tickLine={false} interval={D.key === 'grown' ? 4 : 0}
+                       axisLine={{ stroke: 'rgba(255,255,255,0.12)' }}
+                       tick={{ fontSize: 10, fill: 'rgba(255,255,255,0.4)' }} dy={4} />
+                <YAxis yAxisId="rev" hide domain={[0, (max) => Math.max(max * 1.15, 10)]} />
+                <YAxis yAxisId="cnt" hide orientation="right" domain={[0, maxCnt * 1.8]} />
+                <Tooltip content={<HeroTip />} cursor={{ stroke: 'rgba(255,255,255,0.18)' }} />
+                <Area yAxisId="rev" type="monotone" dataKey="rev" stroke="#FFE815" strokeWidth={2}
+                      fill="url(#heroRev)"
+                      dot={D.key === 'current' ? { r: 2.5, fill: '#FFE815', strokeWidth: 0 } : false}
+                      activeDot={{ r: 3.5, fill: '#FFE815', stroke: '#0F172A', strokeWidth: 1.5 }} />
+                <Line yAxisId="cnt" type="monotone" dataKey="cnt" stroke="rgba(148,163,184,0.85)"
+                      strokeWidth={1.5} strokeDasharray="4 3" dot={false}
+                      activeDot={{ r: 3, fill: '#94A3B8', strokeWidth: 0 }} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ---------- 面板 1：订单与商品 ---------- */
+function OrdersProductsPanel({ D }) {
+  const stTotal = D.statuses.reduce((s, x) => s + x.cnt, 0);
+  const pdTotal = D.products.reduce((s, x) => s + x.cnt, 0);
+  const maxCnt = Math.max(...D.products.map((x) => x.cnt));
+  return (
+    <Panel title="订单与商品" caption={fmtInt(D.orders) + ' 笔订单 · ' + D.products.length + ' 个商品'}>
+      <div className="grid grid-cols-12 gap-x-10 gap-y-6">
+        <div className="col-span-5">
+          <SubHead t="订单状态分布" c={'共 ' + fmtInt(stTotal) + ' 笔'} />
+          <div>
+            {D.statuses.map((s) => (
+              <ShareRow key={s.name} color={STATUS_COLOR[s.name]} name={s.name}
+                        valueText={fmtInt(s.cnt) + ' 单'} pctVal={pctOf(s.cnt, stTotal)} />
+            ))}
+          </div>
+          <div className="mt-6">
+            <SubHead t="商品下单占比" c="按下单数" />
+            {D.products.map((p, i) => (
+              <ShareRow key={p.name} color={PALETTE[i % PALETTE.length]} name={p.name}
+                        valueText={fmtInt(p.cnt) + ' 单'} pctVal={pctOf(p.cnt, pdTotal)} />
+            ))}
+          </div>
+        </div>
+        <div className="col-span-7">
+          <SubHead t="商品销量排行" c="下单数 · 营收 · 客单价" />
+          <div>
+            {D.products.map((p, i) => (
+              <RankRow key={p.name} i={i + 1} name={p.name}
+                       right={fmtInt(p.cnt) + ' 单'}
+                       sub={fmtMoney(p.rev) + ' · 客单 ' + fmtMoney(p.avg)}
+                       barPct={pctOf(p.cnt, maxCnt)} />
+            ))}
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/* ---------- 面板 2：订单时段分析 ---------- */
+function buildBars(counts) {
+  const max = Math.max(...counts);
+  const base = Math.min(max * 0.05, 0.4);
+  return counts.map((c, i) => ({
+    i, cnt: c,
+    isPeak: max > 0 && c === max,
+    display: c === 0 ? base : c,
+  }));
+}
+
+function barLabelFactory(data, showAll) {
+  return function BarValueLabel(props) {
+    const { x, y, width, index } = props;
+    const d = data[index];
+    if (!d || d.cnt === 0 || (!d.isPeak && !showAll)) return null;
+    return (
+      <text x={x + width / 2} y={y - 5} textAnchor="middle" fontSize="10"
+            fontWeight={d.isPeak ? 600 : 400} fill={d.isPeak ? '#0F172A' : '#64748B'}>
+        {d.cnt}
+      </text>
+    );
+  };
+}
+
+function HourTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0].payload;
+  return <TipShell title={d.i + ':00 - ' + d.i + ':59'} rows={[
+    { name: '订单量', value: d.cnt + ' 单', color: d.isPeak ? '#FFE815' : '#94A3B8' },
+  ]} />;
+}
+
+function WeekTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0].payload;
+  return <TipShell title={d.w} rows={[
+    { name: '订单量', value: d.cnt + ' 单', color: d.isPeak ? '#FFE815' : '#94A3B8' },
+  ]} />;
+}
+
+function TimePanel({ D }) {
+  const WEEK = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+  const hourData = buildBars(D.hours);
+  const weekData = buildBars(D.weekdays).map((x, i) => ({ ...x, w: WEEK[i] }));
+  const hourMax = Math.max(...D.hours, 1);
+  const weekMax = Math.max(...D.weekdays, 1);
+  const cityMax = D.cities.length ? Math.max(...D.cities.map((c) => c.cnt)) : 1;
+  return (
+    <Panel title="订单时段分析" caption="下单时间 · 收货城市">
+      <div className="grid grid-cols-12 gap-x-10 gap-y-6">
+        <div className="col-span-5">
+          <SubHead t="小时分布" c="0 值以浅色底座示意，峰值高亮" />
+          <div className="h-[190px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={hourData} margin={{ top: 18, right: 2, left: 2, bottom: 0 }} barCategoryGap="24%">
+                <CartesianGrid vertical={false} stroke="#EEF2F6" />
+                <XAxis dataKey="i" tickLine={false} interval={1} axisLine={{ stroke: '#E2E8F0' }}
+                       tick={{ fontSize: 10, fill: '#94A3B8' }} dy={3} />
+                <YAxis hide domain={[0, Math.ceil(hourMax * 1.35)]} />
+                <Tooltip content={<HourTip />} cursor={{ fill: 'rgba(148,163,184,0.08)' }} />
+                <Bar dataKey="display" maxBarSize={13} radius={[3, 3, 0, 0]}>
+                  {hourData.map((d, i) => (
+                    <Cell key={i} fill={d.cnt === 0 ? '#E9EDF3' : d.isPeak ? '#FFE815' : '#94A3B8'} />
+                  ))}
+                  <LabelList dataKey="cnt" content={barLabelFactory(hourData, D.key === 'current')} />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-1 text-center text-[11px] text-slate-400">下单时刻（0-23 时）</div>
+        </div>
+        <div className="col-span-3">
+          <SubHead t="星期分布" />
+          <div className="h-[190px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={weekData} margin={{ top: 18, right: 2, left: 2, bottom: 0 }} barCategoryGap="28%">
+                <CartesianGrid vertical={false} stroke="#EEF2F6" />
+                <XAxis dataKey="w" tickLine={false} interval={0} axisLine={{ stroke: '#E2E8F0' }}
+                       tick={{ fontSize: 10, fill: '#94A3B8' }} dy={3} />
+                <YAxis hide domain={[0, Math.ceil(weekMax * 1.35)]} />
+                <Tooltip content={<WeekTip />} cursor={{ fill: 'rgba(148,163,184,0.08)' }} />
+                <Bar dataKey="display" maxBarSize={18} radius={[3, 3, 0, 0]}>
+                  {weekData.map((d, i) => (
+                    <Cell key={i} fill={d.cnt === 0 ? '#E9EDF3' : d.isPeak ? '#FFE815' : '#94A3B8'} />
+                  ))}
+                  <LabelList dataKey="cnt" content={barLabelFactory(weekData, true)} />
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="mt-1 text-center text-[11px] text-slate-400">按星期聚合</div>
+        </div>
+        <div className="col-span-4">
+          <SubHead t="收货城市 Top8" c={D.cities.length ? '按订单数' : null} />
+          {D.cities.length === 0 ? (
+            <EmptyBlock icon={Icons.pin(24)} title="暂无收货城市数据"
+                        desc="当前范围内的成交订单未包含收货城市信息" minH="min-h-[190px]" />
+          ) : (
+            <div>
+              {D.cities.map((c, i) => (
+                <div key={c.name} className="flex items-center gap-3 py-[5px]">
+                  <RankChip i={i + 1} />
+                  <span className="w-10 shrink-0 text-[13px] text-slate-700">{c.name}</span>
+                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100">
+                    <div className="h-full rounded-full bg-slate-500" style={{ width: pctOf(c.cnt, cityMax) + '%' }} />
+                  </div>
+                  <span className="w-10 shrink-0 text-right text-xs text-slate-600">{c.cnt} 单</span>
+                </div>
+              ))}
+              {D.cityCovered && <div className="mt-2 text-[11px] text-slate-400">{D.cityCovered}</div>}
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="mt-5">
+        <InlineHint tone={D.hint.type} icon={D.hint.type === 'idea' ? Icons.bulb(14) : Icons.info(14)}>
+          {D.hint.text}
+        </InlineHint>
+      </div>
+    </Panel>
+  );
+}
+
+/* ---------- 面板 3：买家行为 ---------- */
+function BuyersPanel({ D }) {
+  const B = D.buyers;
+  const freqMax = Math.max(...B.freq.map((f) => f.n));
+  return (
+    <Panel title="买家行为" caption="按下单买家统计">
+      <div className="grid grid-cols-12 gap-x-10 gap-y-6">
+        <div className="col-span-4">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <div className="text-xs text-slate-400">下单买家</div>
+              <div className="mt-1.5 text-[26px] font-semibold leading-none text-slate-900">
+                {fmtInt(B.total)}<span className="ml-1 text-sm font-normal text-slate-400">人</span>
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-slate-400">复购买家</div>
+              <div className="mt-1.5 text-[26px] font-semibold leading-none text-slate-900">
+                {fmtInt(B.repeat)}<span className="ml-1 text-sm font-normal text-slate-400">人</span>
+              </div>
+            </div>
+          </div>
+          <div className="mt-5 rounded-xl bg-brand px-4 py-4 text-slate-900">
+            <div className="text-xs font-medium text-slate-900/70">复购率</div>
+            <div className="mt-1 text-[30px] font-semibold leading-none">{B.rate}</div>
+            <div className="mt-1.5 text-[11px] text-slate-900/60">{B.rateNote}</div>
+          </div>
+        </div>
+        <div className="col-span-3">
+          <SubHead t="购买频次分布" />
+          <div className="pt-1">
+            {B.freq.map((f) => (
+              <div key={f.label} className="flex items-center gap-3 py-2">
+                <span className="w-12 shrink-0 text-xs text-slate-500">{f.label}</span>
+                <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
+                  <div className="h-full rounded-full bg-slate-500" style={{ width: pctOf(f.n, freqMax) + '%' }} />
+                </div>
+                <span className="w-12 shrink-0 text-right text-xs text-slate-600">{fmtInt(f.n)} 人</span>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="col-span-5">
+          <SubHead t="买家贡献榜" c="按累计支付金额" />
+          <div>
+            {B.contrib.map((b, i) => (
+              <div key={b.name} className="flex items-center gap-3 border-b border-slate-100 py-2 last:border-0">
+                <RankChip i={i + 1} />
+                <span className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-100 text-xs text-slate-500">{b.name[0]}</span>
+                <span className="min-w-0 flex-1 truncate text-[13px] text-slate-700" title={b.name}>{b.name}</span>
+                <span className="shrink-0 text-xs text-slate-400">{b.cnt} 单</span>
+                <span className="w-20 shrink-0 text-right text-[13px] font-medium text-slate-900">{fmtMoney(b.amt)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/* ---------- 面板 4：商品流量 ---------- */
+function TrafficTip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0].payload;
+  return <TipShell title={'观测窗 · 截至 ' + d.d} rows={[
+    { name: '曝光增量', value: '+' + fmtInt(d.exposure), color: '#334155' },
+    { name: '浏览增量', value: '+' + fmtInt(d.views), color: '#3B82F6' },
+    { name: '想要增量', value: '+' + fmtInt(d.wants), color: '#10B981' },
+  ]} />;
+}
+
+function TrafficPanel({ D }) {
+  const T = D.traffic;
+  if (!T) {
+    return (
+      <Panel title="商品流量" caption="采集未启用">
+        <EmptyBlock icon={Icons.pulse(26)} title="商品流量采集未启用"
+                    desc="真实商品流量采集尚未启用——卖家后台适配器完成真实账号验收前，系统不会生成或推测流量数据"
+                    minH="min-h-[200px]" />
+      </Panel>
+    );
+  }
+  return (
+    <Panel title="商品流量" caption="近 14 天 · 42 个可比观测窗口">
+      <div className="mb-6 flex divide-x divide-slate-100 border-b border-slate-100 pb-5">
+        {T.kpis.map((k) => (
+          <div key={k.label} className="px-8 first:pl-0">
+            <div className="text-xs text-slate-400">{k.label}</div>
+            <div className="mt-1.5 text-[22px] font-semibold leading-none text-slate-900">{k.value}</div>
+          </div>
+        ))}
+      </div>
+      <div className="grid grid-cols-12 gap-x-10 gap-y-6">
+        <div className="col-span-7">
+          <div className="mb-3 flex items-baseline justify-between">
+            <h3 className="text-[13px] font-medium text-slate-700">近 6 个观测窗口（按截止日）</h3>
+            <div className="flex items-center gap-3 text-[11px] text-slate-400">
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-sm bg-[#334155]" />曝光</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full bg-[#3B82F6]" />浏览</span>
+              <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full bg-[#10B981]" />想要</span>
+            </div>
+          </div>
+          <div className="h-[210px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={T.windows} margin={{ top: 16, right: 6, left: 6, bottom: 0 }}>
+                <CartesianGrid vertical={false} stroke="#EEF2F6" />
+                <XAxis dataKey="d" tickLine={false} axisLine={{ stroke: '#E2E8F0' }}
+                       tick={{ fontSize: 10, fill: '#94A3B8' }} dy={3} />
+                <YAxis yAxisId="bar" hide domain={[0, 3000]} />
+                <YAxis yAxisId="line" hide orientation="right" domain={[0, 760]} />
+                <Tooltip content={<TrafficTip />} cursor={{ fill: 'rgba(148,163,184,0.08)' }} />
+                <Bar yAxisId="bar" dataKey="exposure" fill="#334155" maxBarSize={26} radius={[3, 3, 0, 0]}>
+                  <LabelList dataKey="exposure" position="top"
+                             formatter={(v) => fmtInt(v)}
+                             style={{ fontSize: 10, fill: '#64748B' }} />
+                </Bar>
+                <Line yAxisId="line" type="monotone" dataKey="views" stroke="#3B82F6" strokeWidth={2}
+                      dot={{ r: 2.5, fill: '#3B82F6', strokeWidth: 0 }} />
+                <Line yAxisId="line" type="monotone" dataKey="wants" stroke="#10B981" strokeWidth={2}
+                      dot={{ r: 2.5, fill: '#10B981', strokeWidth: 0 }} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+        <div className="col-span-5">
+          <SubHead t="商品流量排行 Top5" c="按曝光增量" />
+          <table className="w-full text-[13px]">
+            <thead>
+              <tr className="text-[11px] font-normal text-slate-400">
+                <th className="pb-2 text-left font-normal">商品</th>
+                <th className="pb-2 text-right font-normal">曝光</th>
+                <th className="pb-2 text-right font-normal">浏览</th>
+                <th className="pb-2 text-right font-normal">想要</th>
+              </tr>
+            </thead>
+            <tbody>
+              {T.rank.map((r, i) => (
+                <tr key={r.name} className="border-t border-slate-100">
+                  <td className="max-w-[200px] py-2.5 pr-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <RankChip i={i + 1} />
+                      <span className="min-w-0 truncate text-slate-700" title={r.name}>{r.name}</span>
+                    </div>
+                  </td>
+                  <td className="py-2.5 text-right font-medium text-slate-800">+{fmtInt(r.exposure)}</td>
+                  <td className="py-2.5 text-right text-slate-600">+{fmtInt(r.views)}</td>
+                  <td className="py-2.5 text-right text-slate-600">+{fmtInt(r.wants)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/* ---------- 面板 5：订单明细（含成交爆品） ---------- */
+function StatusBadge({ s }) {
+  const cls = STATUS_BADGE[s] || 'border border-dashed border-slate-300 bg-white text-slate-500';
+  return <span className={'inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ' + cls}>{s}</span>;
+}
+
+function OrdersPanel({ D }) {
+  const [q, setQ] = useState('');
+  const kw = q.trim();
+  const rows = D.orderRows.filter((r) =>
+    !kw || [r.id, r.buyer, r.product, r.status].some((s) => s.includes(kw)));
+  return (
+    <Panel title="订单明细" caption={D.key === 'current' ? '共 9 笔' : '共 186 笔 · 展示最近 10 笔'}
+      right={
+        <label className="flex h-9 w-64 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 focus-within:border-brand focus-within:bg-white focus-within:ring-2 focus-within:ring-brand/60">
+          <span className="text-slate-400">{Icons.search(15)}</span>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索订单号 / 买家 / 商品"
+                 className="w-full bg-transparent text-[13px] text-slate-700 placeholder:text-slate-400 focus:outline-none" />
+        </label>
+      }>
+      <div className="mb-5 border-b border-slate-100 pb-4">
+        <SubHead t="成交爆品" c="按下单数 · 环比上一周期" />
+        <div className="grid grid-cols-2 gap-x-10">
+          {D.hot.map((h, i) => (
+            <div key={h.name} className="flex items-center gap-3 border-b border-slate-100 py-2.5 last:border-0 [&:nth-last-child(2)]:border-0">
+              <RankChip i={i + 1} />
+              <span className="min-w-0 flex-1 truncate text-[13px] text-slate-700" title={h.name}>{h.name}</span>
+              <span className="shrink-0 text-xs text-slate-500">{fmtInt(h.cnt)} 单 · {fmtMoney(h.rev)}</span>
+              <TrendBadgeLight badge={h.badge} />
+            </div>
+          ))}
+        </div>
+      </div>
+      <table className="w-full text-[13px]">
+        <thead>
+          <tr className="text-xs text-slate-400">
+            <th className="pb-2.5 text-left font-normal">订单号</th>
+            <th className="pb-2.5 text-left font-normal">商品</th>
+            <th className="pb-2.5 text-left font-normal">买家</th>
+            <th className="pb-2.5 text-right font-normal">金额</th>
+            <th className="pb-2.5 pl-6 text-left font-normal">状态</th>
+            <th className="pb-2.5 text-right font-normal">时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 ? (
+            <tr className="border-t border-slate-100">
+              <td colSpan="6" className="py-10 text-center text-xs text-slate-400">未找到匹配「{kw}」的订单</td>
+            </tr>
+          ) : rows.map((r) => (
+            <tr key={r.id} className="border-t border-slate-100 hover:bg-slate-50/60">
+              <td className="py-2.5 pr-3 font-mono text-xs text-slate-600">{r.id}</td>
+              <td className="max-w-[260px] py-2.5 pr-3">
+                <span className="block truncate text-slate-700" title={r.product}>{r.product}</span>
+              </td>
+              <td className="py-2.5 pr-3 text-slate-600">{r.buyer}</td>
+              <td className="py-2.5 text-right font-medium text-slate-900">{fmtMoney(r.amt)}</td>
+              <td className="py-2.5 pl-6"><StatusBadge s={r.status} /></td>
+              <td className="py-2.5 text-right text-xs text-slate-500">{r.time}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="mt-4 text-[11px] text-slate-400">{D.orderNote}</div>
+    </Panel>
+  );
+}
+
+/* ---------- 应用壳 ---------- */
+function App() {
+  const [scaleKey, setScaleKey] = useState('current');
+  const D = DATA[scaleKey];
+  return (
+    <div>
+      <div className="fixed right-4 top-4 z-50 flex items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-slate-700 shadow-lg backdrop-blur">
+        <span className="h-2 w-2 rounded-full bg-brand ring-1 ring-slate-900/10" />
+        方案 B · 深色驾驶舱
+      </div>
+      <div className="mx-auto flex min-h-screen max-w-[1400px]">
+        <Sidebar />
+        <main className="min-w-0 flex-1 space-y-6 p-6">
+          <Hero D={D} scaleKey={scaleKey} setScaleKey={setScaleKey} />
+          <OrdersProductsPanel D={D} />
+          <TimePanel D={D} />
+          <BuyersPanel D={D} />
+          <TrafficPanel D={D} />
+          <OrdersPanel D={D} />
+          <footer className="pb-1 pt-0 text-center text-[11px] text-slate-400">
+            演示页面 · 所有数据为脱敏样例，仅用于仪表盘重构方案比选
+          </footer>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
