@@ -2,20 +2,27 @@ import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useStat
 import {
   Activity,
   AlertCircle,
-  DollarSign,
   ExternalLink,
-  Package,
   PackageCheck,
   RefreshCw,
-  ShoppingCart,
+  TrendingDown,
   TrendingUp,
-  Users,
 } from 'lucide-react';
-import type { DashboardSummary, Order, OrderStatus } from '../types';
+import type { DashboardSummary, Order } from '../types';
 import { getDashboardSummary, getValidOrders } from '../services/api';
+import {
+  PANEL_CLASS,
+  StatusBadge,
+  compareOf,
+  fillDailySeries,
+  formatCount,
+  formatMoney,
+} from './ui/dashboardParts';
 
 const DashboardCharts = lazy(() => import('./DashboardCharts'));
 const BusinessInsights = lazy(() => import('./BusinessInsights'));
+// hero 内嵌趋势图与其余图表同 chunk，保持 recharts 只进懒加载分包
+const HeroTrend = lazy(() => import('./DashboardCharts').then((module) => ({ default: module.HeroTrend })));
 
 type TimeRange = 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
 
@@ -28,48 +35,23 @@ const TIME_RANGES: Array<{ key: TimeRange; label: string }> = [
   { key: 'custom', label: '自定义' },
 ];
 
-const STATUS_STYLES: Record<string, string> = {
-  processing: 'bg-yellow-100 text-yellow-800',
-  pending_ship: 'bg-[#FFE815] text-black',
-  shipped: 'bg-blue-100 text-blue-700',
-  completed: 'bg-green-100 text-green-700',
-  cancelled: 'bg-gray-100 text-gray-500',
-  refunding: 'bg-red-100 text-red-600',
+/** 深色 hero 区的环比徽章：正=绿升、负=红降、上期为 0=中性「较上期 新增」 */
+const CompareBadge: React.FC<{ current: number; previous: number }> = ({ current, previous }) => {
+  const compare = compareOf(current, previous);
+  if (compare.type === 'new') {
+    return <span className="rounded-md border border-white/15 bg-white/10 px-2 py-1 text-xs font-bold text-slate-200">较上期 新增</span>;
+  }
+  if (compare.type === 'flat') {
+    return <span className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs font-bold text-slate-400">持平</span>;
+  }
+  const upward = compare.type === 'up';
+  return (
+    <span className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs font-bold ${upward ? 'bg-emerald-400/15 text-emerald-300' : 'bg-red-400/15 text-red-300'}`}>
+      {upward ? <TrendingUp className="h-3.5 w-3.5" /> : <TrendingDown className="h-3.5 w-3.5" />}
+      {compare.percentLabel}
+    </span>
+  );
 };
-
-const STATUS_LABELS: Record<string, string> = {
-  processing: '处理中',
-  pending_ship: '待发货',
-  shipped: '已发货',
-  completed: '已完成',
-  cancelled: '已取消',
-  refunding: '退款中',
-};
-
-const StatusBadge: React.FC<{ status: OrderStatus }> = ({ status }) => (
-  <span className={`inline-flex rounded-md px-2.5 py-1 text-xs font-bold ${STATUS_STYLES[status] || STATUS_STYLES.cancelled}`}>
-    {STATUS_LABELS[status] || status}
-  </span>
-);
-
-const StatCard: React.FC<{
-  title: string;
-  value: string | number;
-  icon: React.ElementType;
-  colorClass: string;
-  trend?: string;
-}> = ({ title, value, icon: Icon, colorClass, trend }) => (
-  <div className="ios-card flex min-h-40 flex-col justify-between rounded-2xl border border-gray-100 p-5 sm:p-6">
-    <div className="flex items-start justify-between">
-      <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${colorClass}`}><Icon className="h-5 w-5" /></div>
-      {trend && <span className="flex items-center gap-1 rounded-full bg-[#FFE815] px-2.5 py-1 text-xs font-bold"><TrendingUp className="h-3 w-3" />{trend}</span>}
-    </div>
-    <div>
-      <h3 className="text-3xl font-extrabold text-gray-900">{value}</h3>
-      <p className="mt-1 text-sm font-medium text-gray-500">{title}</p>
-    </div>
-  </div>
-);
 
 const Dashboard: React.FC = () => {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -139,13 +121,10 @@ const Dashboard: React.FC = () => {
     };
   }, [summary]);
 
-  const trend = useMemo(() => {
-    if (!summary) return undefined;
-    const current = summary.current.revenue_stats.total_amount;
-    const previous = summary.previous.revenue_stats.total_amount;
-    if (previous === 0) return current > 0 ? '+100%' : '0%';
-    const value = ((current - previous) / previous) * 100;
-    return `${value >= 0 ? '+' : ''}${value.toFixed(1)}%`;
+  // 趋势图数据：按所选范围逐日补零，让无成交日显示为 0 而不是被跳过
+  const heroPoints = useMemo(() => {
+    if (!summary) return [];
+    return fillDailySeries(summary.current.daily_stats, summary.range.start_date, summary.range.end_date);
   }, [summary]);
 
   const filteredOrders = useMemo(() => {
@@ -172,62 +151,104 @@ const Dashboard: React.FC = () => {
 
   const isEmpty = summary.stats.total_cookies === 0
     && summary.current.revenue_stats.total_orders === 0;
+  const currentRevenue = summary.current.revenue_stats.total_amount;
+  const previousRevenue = summary.previous.revenue_stats.total_amount;
 
   return (
-    <div className="space-y-6 animate-fade-in">
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-extrabold text-gray-900 sm:text-3xl">运营概览</h2>
-          <p className="mt-1 text-sm text-gray-500">{summary.scope === 'system' ? '系统业务汇总' : '你的闲鱼业务数据'}</p>
+    <div className="animate-fade-in space-y-5">
+      {/* 深色驾驶舱 hero：核心营收 + 次级 KPI + 补零趋势 */}
+      <section className="rounded-[20px] bg-gradient-to-br from-[#0F172A] via-[#121D36] to-[#1E293B] p-6 text-white shadow-[0_14px_36px_rgba(15,23,42,0.28)] sm:p-8">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-xl font-extrabold sm:text-2xl">运营概览</h2>
+            <span className="rounded-full border border-white/15 bg-white/[0.07] px-3 py-1 text-xs font-bold text-slate-300">
+              {summary.range.start_date} 至 {summary.range.end_date}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {TIME_RANGES.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => setTimeRange(option.key)}
+                className={`rounded-lg px-3.5 py-2 text-[13px] font-bold transition-colors ${
+                  timeRange === option.key
+                    ? 'bg-[#FFE815] text-black shadow-sm'
+                    : 'bg-white/[0.06] text-slate-300 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
         </div>
-        <span className="w-fit rounded-full border border-gray-200 bg-white px-3 py-1.5 text-xs font-bold text-gray-600">
-          {summary.range.start_date} 至 {summary.range.end_date}
-        </span>
-      </header>
 
-      <div className="flex flex-wrap gap-2 rounded-xl bg-gray-100/70 p-2">
-        {TIME_RANGES.map((option) => (
-          <button key={option.key} type="button" onClick={() => setTimeRange(option.key)} className={`rounded-lg px-4 py-2 text-sm font-bold ${timeRange === option.key ? 'bg-[#FFE815] text-black shadow-sm' : 'bg-white text-gray-600'}`}>
-            {option.label}
-          </button>
-        ))}
         {timeRange === 'custom' && (
-          <div className="flex flex-wrap items-center gap-2">
-            <input aria-label="开始日期" type="date" value={customStartDate} onChange={(event) => setCustomStartDate(event.target.value)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm" />
-            <input aria-label="结束日期" type="date" value={customEndDate} onChange={(event) => setCustomEndDate(event.target.value)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm" />
-            <button type="button" onClick={() => void loadSummary('custom')} disabled={!customStartDate || !customEndDate} className="rounded-lg bg-gray-900 px-4 py-2 text-sm font-bold text-white disabled:opacity-40">应用</button>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <input aria-label="开始日期" type="date" value={customStartDate} onChange={(event) => setCustomStartDate(event.target.value)} className="rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-sm text-white [color-scheme:dark]" />
+            <span className="text-xs text-slate-400">至</span>
+            <input aria-label="结束日期" type="date" value={customEndDate} onChange={(event) => setCustomEndDate(event.target.value)} className="rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-sm text-white [color-scheme:dark]" />
+            <button type="button" onClick={() => void loadSummary('custom')} disabled={!customStartDate || !customEndDate} className="rounded-lg bg-[#FFE815] px-4 py-2 text-sm font-bold text-black disabled:opacity-40">应用</button>
           </div>
         )}
-      </div>
+
+        <div className="mt-7 grid grid-cols-1 items-end gap-8 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+          <div>
+            <p className="text-xs font-bold tracking-wide text-slate-400">累计营收 (CNY)</p>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <span className="text-[44px] font-extrabold leading-none tracking-tight sm:text-[52px]">
+                ¥{formatMoney(currentRevenue)}
+              </span>
+              <CompareBadge current={currentRevenue} previous={previousRevenue} />
+            </div>
+            <p className="mt-2 text-xs text-slate-400">上期 ¥{formatMoney(previousRevenue)}</p>
+
+            <div className="mt-7 flex divide-x divide-white/10">
+              <div className="pr-5 sm:pr-7">
+                <p className="text-xs text-slate-400">活跃账号 / 总数</p>
+                <p className="mt-1.5 text-xl font-extrabold">{summary.stats.active_cookies} / {summary.stats.total_cookies}</p>
+              </div>
+              <div className="px-5 sm:px-7">
+                <p className="text-xs text-slate-400">订单数</p>
+                <p className="mt-1.5 text-xl font-extrabold">{formatCount(summary.current.revenue_stats.total_orders)}</p>
+              </div>
+              <div className="pl-5 sm:pl-7">
+                <p className="text-xs text-slate-400">库存卡密</p>
+                <p className="mt-1.5 text-xl font-extrabold">{formatCount(summary.stats.total_cards)}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="min-w-0">
+            <p className="mb-2 text-xs font-bold tracking-wide text-slate-400">营收趋势 · 所选周期每日销售额</p>
+            <Suspense fallback={<div className="h-[180px] animate-pulse rounded-xl bg-white/[0.04]" />}>
+              <HeroTrend points={heroPoints} />
+            </Suspense>
+          </div>
+        </div>
+      </section>
 
       {isEmpty && (
-        <div className="rounded-xl border border-dashed border-gray-300 bg-white px-5 py-6 text-center">
+        <div className={`${PANEL_CLASS} px-5 py-6 text-center`}>
           <p className="font-bold text-gray-800">还没有经营数据</p>
           <p className="mt-1 text-sm text-gray-500">添加闲鱼账号后，订单和营收会显示在这里。</p>
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard title="累计营收 (CNY)" value={`¥${summary.current.revenue_stats.total_amount.toLocaleString('zh-CN', { minimumFractionDigits: 2 })}`} icon={DollarSign} colorClass="bg-yellow-100 text-yellow-700" trend={trend} />
-        <StatCard title="活跃账号 / 总数" value={`${summary.stats.active_cookies} / ${summary.stats.total_cookies}`} icon={Users} colorClass="bg-blue-100 text-blue-700" />
-        <StatCard title="订单数" value={summary.current.revenue_stats.total_orders.toLocaleString()} icon={ShoppingCart} colorClass="bg-orange-100 text-orange-700" />
-        <StatCard title="库存卡密" value={summary.stats.total_cards} icon={Package} colorClass="bg-rose-100 text-rose-700" />
-      </div>
-
-      <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">图表加载中...</div>}>
+      <Suspense fallback={<div className={`${PANEL_CLASS} flex h-[420px] items-center justify-center text-sm text-gray-400`}>图表加载中...</div>}>
         <DashboardCharts analytics={summary.current} previous={summary.previous} itemNames={summary.item_names} />
       </Suspense>
 
       {!isEmpty && (
-        <Suspense fallback={<div className="flex h-64 items-center justify-center rounded-2xl bg-white text-sm text-gray-400">经营分析加载中...</div>}>
+        <Suspense fallback={<div className={`${PANEL_CLASS} flex h-[520px] items-center justify-center text-sm text-gray-400`}>经营分析加载中...</div>}>
           <BusinessInsights range={{ start_date: summary.range.start_date, end_date: summary.range.end_date }} />
         </Suspense>
       )}
 
-      <section className="ios-card overflow-hidden rounded-2xl bg-white">
+      <section className={`${PANEL_CLASS} overflow-hidden`}>
         <div className="flex flex-col gap-3 border-b border-gray-100 bg-gray-50/70 p-5 sm:flex-row sm:items-center sm:justify-between">
-          <h3 className="font-bold text-gray-900">参与统计的订单</h3>
-          <input aria-label="搜索统计订单" placeholder="搜索订单号、商品或买家" value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:border-yellow-400 sm:w-64" />
+          <h3 className="text-[15px] font-bold text-gray-900">参与统计的订单</h3>
+          <input aria-label="搜索统计订单" placeholder="搜索订单号、商品或买家" value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm outline-none focus:border-gray-900 sm:w-64" />
         </div>
         <div className="max-h-[420px] overflow-auto">
           {ordersLoading ? (
@@ -236,13 +257,13 @@ const Dashboard: React.FC = () => {
             <div className="py-16 text-center text-sm text-gray-400">暂无订单明细</div>
           ) : (
             <table className="w-full min-w-[720px] text-left text-sm">
-              <thead className="sticky top-0 bg-white text-xs text-gray-400"><tr><th className="px-5 py-3">订单</th><th className="px-5 py-3">买家</th><th className="px-5 py-3">金额</th><th className="px-5 py-3">状态</th><th className="px-5 py-3 text-right">详情</th></tr></thead>
+              <thead className="sticky top-0 bg-white text-xs text-gray-400"><tr><th className="px-5 py-3 font-medium">订单</th><th className="px-5 py-3 font-medium">买家</th><th className="px-5 py-3 font-medium">金额</th><th className="px-5 py-3 font-medium">状态</th><th className="px-5 py-3 text-right font-medium">详情</th></tr></thead>
               <tbody className="divide-y divide-gray-100">
                 {filteredOrders.map((order) => (
-                  <tr key={order.order_id}>
-                    <td className="px-5 py-4"><div className="flex items-center gap-3"><PackageCheck className="h-8 w-8 rounded-lg bg-gray-100 p-1.5 text-gray-400" /><div><p className="font-bold text-gray-900">{order.item_title || summary.item_names[order.item_id] || order.item_id || '未知商品'}</p><p className="mt-0.5 font-mono text-xs text-gray-400">{order.order_id}</p></div></div></td>
+                  <tr key={order.order_id} className="hover:bg-gray-50/60">
+                    <td className="px-5 py-4"><div className="flex items-center gap-3"><PackageCheck className="h-8 w-8 rounded-lg bg-gray-100 p-1.5 text-gray-400" /><div className="min-w-0"><p className="truncate font-bold text-gray-900">{order.item_title || summary.item_names[order.item_id] || order.item_id || '未知商品'}</p><p className="mt-0.5 font-mono text-xs text-gray-400">{order.order_id}</p></div></div></td>
                     <td className="px-5 py-4 text-gray-700">{order.buyer_id}</td>
-                    <td className="px-5 py-4 font-bold text-gray-900">¥{order.amount || '0.00'}</td>
+                    <td className="px-5 py-4 font-bold tabular-nums text-gray-900">¥{order.amount || '0.00'}</td>
                     <td className="px-5 py-4"><StatusBadge status={order.status || order.order_status || 'unknown'} /></td>
                     <td className="px-5 py-4 text-right"><a href={`https://www.goofish.com/order-detail?orderId=${order.order_id}&role=seller`} target="_blank" rel="noopener noreferrer" title="查看闲鱼订单" className="inline-flex rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-900"><ExternalLink className="h-4 w-4" /></a></td>
                   </tr>

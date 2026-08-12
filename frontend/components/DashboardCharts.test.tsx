@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 
 import React from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OrderAnalytics } from '../types';
 import DashboardCharts from './DashboardCharts';
@@ -87,25 +87,28 @@ describe('DashboardCharts 成交爆品榜', () => {
   it('渲染环比增长率、新品标记与金额/客单价', () => {
     render(<DashboardCharts analytics={current} previous={previous} itemNames={names} />);
     expect(screen.getByText('成交爆品榜')).toBeInTheDocument();
-    expect(screen.getByText('复古相机')).toBeInTheDocument();
+    // 商品名同时出现在销量排行/下单占比/爆品榜等多个维度
+    expect(screen.getAllByText('复古相机').length).toBeGreaterThan(0);
     expect(screen.getByText('+200%')).toBeInTheDocument();
-    expect(screen.getByText('🆕 新品')).toBeInTheDocument();
+    expect(screen.getByText('新品')).toBeInTheDocument();
     expect(screen.getByText('-20%')).toBeInTheDocument();
-    // 金额与客单价展示
-    expect(screen.getByText('¥1,680.00')).toBeInTheDocument();
+    // 金额与客单价展示（销售额同时出现在下单占比说明与爆品榜）
+    expect(screen.getAllByText('¥1,680.00').length).toBeGreaterThan(0);
     expect(screen.getByText('¥140.00')).toBeInTheDocument();
-    // 当期仅 1 单的商品被噪音过滤，不出现在榜单
-    expect(screen.queryByText('小配件')).not.toBeInTheDocument();
+    // 当期仅 1 单的商品被噪音过滤，不出现在爆品榜（销量排行仍会展示它）
+    const hotPanel = screen.getByTestId('hot-items-panel');
+    expect(within(hotPanel).queryByText('小配件')).not.toBeInTheDocument();
   });
 
   it('无上一周期数据时当期达标商品全部作为新品进榜', () => {
     render(<DashboardCharts analytics={current} itemNames={names} />);
     // 没有 previous，所有当期达标商品（≥2 单）都按新品处理，不算环比
-    expect(screen.getByText('复古相机')).toBeInTheDocument();
-    expect(screen.getAllByText('🆕 新品').length).toBe(3); // up/new/down 三个达标商品
+    expect(screen.getAllByText('复古相机').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('新品').length).toBe(3); // up/new/down 三个达标商品
     expect(screen.queryByText('+200%')).not.toBeInTheDocument();
-    // low 仍被噪音过滤
-    expect(screen.queryByText('小配件')).not.toBeInTheDocument();
+    // low 仍被噪音过滤，不进爆品榜
+    const hotPanel = screen.getByTestId('hot-items-panel');
+    expect(within(hotPanel).queryByText('小配件')).not.toBeInTheDocument();
   });
 
   it('无上一周期且当期无达标商品时提示需两个周期', () => {
