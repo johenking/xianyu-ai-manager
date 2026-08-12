@@ -613,7 +613,11 @@ class XianyuOrderListClient:
 
         for page_number in range(1, self.max_pages + 1):
             if page_number > 1 and self.request_interval:
-                await self.sleep_fn(self.request_interval)
+                # 页间隔叠加抖动：多个账号同时翻页时，固定节拍会让请求持续对齐，
+                # 更容易被平台判成机器流量。
+                await self.sleep_fn(
+                    self.request_interval + max(0.0, float(self.jitter_fn(0.0, 0.35)))
+                )
             retry_count = 0
             while True:
                 payload = await self.page_loader(

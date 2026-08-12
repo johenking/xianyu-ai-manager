@@ -58,6 +58,9 @@ WS_PING_INTERVAL = 20     # 协议层 ping，与业务心跳互为兜底
 WS_PING_TIMEOUT = 20      # 协议层 pong 超时即判定连接不可用
 WS_SEND_TIMEOUT = 10      # 单次业务帧发送上限，避免 await send 永久挂起
 
+# 发货前付款核验的翻页上限。该核验持有账号订单同步锁，页数直接决定锁占用时长。
+DELIVERY_VERIFY_MAX_PAGES = 5
+
 
 def _delivery_identity_is_confirmed(
     expected_item_id: str,
@@ -1416,7 +1419,10 @@ class XianyuLive:
 
         expected_item_id = str(item_id or "").strip()
         expected_buyer_id = str(buyer_id or "").strip()
-        client = XianyuOrderListClient(max_pages=20)
+        # 这条路径在账号订单同步锁内运行，扫描越久，同步与其它发货就排队越久。
+        # 刚付款的订单必定排在列表最前，命中目标即早停；这里只为"订单查不到"的
+        # 最坏情况设上限，把锁占用从二十页压到五页（仍覆盖最近 100 笔）。
+        client = XianyuOrderListClient(max_pages=DELIVERY_VERIFY_MAX_PAGES)
         try:
             async with get_order_sync_lock(self.cookie_id):
                 discovery = await client.discover(
