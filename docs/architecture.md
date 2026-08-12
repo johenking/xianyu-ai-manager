@@ -83,10 +83,19 @@ Copying knowledge chooses the source draft, or the published snapshot when no dr
 Unknown or failed responses never overwrite a reliable stored status. `PUT /api/orders/{order_id}` changes only explicitly supplied local fields; platform refresh uses the structured `/refresh` or `/sync` path. Automatic delivery accepts only a direct API `pending_ship` result and fails closed on unknown, missing, mismatched, or denied responses. A real order-detail adapter remains unregistered until an authenticated canary verifies its response fields; DOM status guesses are never authoritative.
 
 `orders.ordered_at_utc` is a saved platform order-time snapshot whose exact source is carried in `ordered_at_source`. It supports time-of-day analysis but is not asserted to be the payment, settlement, shipment, or completion timestamp.
+`orders.paid_amount_fen` is the trusted integer-fen amount used by revenue analytics. Order-list discovery normalizes both fields through `parse_amount_fen` and `parse_order_time_utc`, then writes them through `apply_order_sync_update`. That update keeps the status ratchet and fills empty trusted fields without replacing an existing amount or time. Repeated discovery of a recent `shipped` or `completed` invite order may therefore enrich missing fields while leaving its terminal status unchanged.
 
 Migration `2026072701` stores tenant-scoped verified item metric snapshots. Migration `2026072702` stores the three-canary state per user and account. Migration `2026072703` binds metric rows and state to account ownership and adds durable fulfillment attempts plus card reservations. Adapter batches are limited, timed out, and committed atomically; counter resets never become negative traffic and out-of-order snapshots are rejected. Counter deltas belong to the full interval between consecutive snapshots. The four-hour scheduler therefore reports approximate observation windows and never attributes an interval delta to one hour. The real adapter is unregistered by default, and the scheduler remains off until an account independently passes three live canaries.
 
 Fulfillment persists `prepared` before inventory is used, moves to `sending` before the first irreversible platform or buyer-facing action, and reaches `committed` only after the complete quantity is acknowledged. A pre-send cancellation can reach `released`; any crash, partial send, or uncertain result after `sending` reaches `manual_review` and keeps its reservations out of the available inventory pool.
+
+## Invite Auto-Fulfillment Bridge
+
+Invite-product scope has one authority: `item_info.invite_auto_fulfillment`, keyed by `(cookie_id, item_id)`. New catalog rows default to false, while catalog synchronization updates product facts without overwriting an existing switch. The owner-scoped `PUT /items/{cookie_id}/{item_id}/invite-auto-fulfillment` route changes the switch immediately. The payment poller, signed bridge validation, and legacy-card bypass all read the same field; product titles and environment-variable item lists are not routing inputs.
+
+With the bridge enabled, `invite_bridge_poller.py` discovers recent orders only for switched-on products. A new `pending_ship` row is persisted with its normalized trusted amount and order time, then the poller revalidates the order, item, buyer, chat, and live account WebSocket before sending a signed event. Recent `shipped` or `completed` rows are eligible only for missing-field enrichment and never emit a new paid-order event. The invite service owns confirmation tokens, redemption codes, mailbox capacity, and the buyer workflow. Its Outbox calls this application to send the confirmation or code message, then calls `status_only` to mark fulfillment. Xianyu `cards` and `delivery_rules` are deliberately bypassed for switched-on invite products, so redemption-code inventory has one owner.
+
+Every buyer-facing message and fulfillment action uses a stable operation key in `invite_bridge_operations`. A successful WebSocket write is only `submitted`; confirmed platform fulfillment is `succeeded`. A write-after-disconnect or other uncertain result becomes `ambiguous` or `needs_review` and is reconciled through `GET /internal/invite/operations/{operation_key}` instead of blindly resending a code.
 
 ## AI Providers And Settings
 
@@ -94,7 +103,7 @@ Fulfillment persists `prepared` before inventory is used, moves to `sending` bef
 
 Administrator settings are split into global basic, AI, and SMTP sections. Ordinary users do not call the administrator summary: they read and update only `item_sync_enabled`, `item_sync_interval`, and `item_sync_max_pages` through typed user endpoints, with values stored in `user_settings` and global values used as defaults. AI provider profiles remain user-owned for every role. `settings_service.py` normalizes booleans and numbers, applies `keep/set/clear` secret actions, and returns only configuration state and masks. SMTP verification requires a valid independent support email. Sending the test code does not verify SMTP; only confirming the six-digit receipt code marks that exact settings fingerprint as verified.
 
-The dashboard first calls one role-aware summary endpoint. Ordinary users receive only rows joined through their owned `cookies`; administrators receive system scope. The response combines counters, current and previous analytics periods, and product names. Order detail loading starts after the summary cards render, and the Recharts dependency lives in a separate lazy chunk. Analytics use timestamp boundaries instead of wrapping `created_at` in `DATE()` so SQLite can use the migration indexes.
+The dashboard first calls one user-scoped summary endpoint. Every role receives only rows joined through the current user's owned `cookies`; administrator privileges remain limited to registration, user, and system management. Orders without an owning `cookies.user_id` remain retained but cannot enter any user's summary. Revenue uses only `paid_amount_fen`, and time buckets use only `ordered_at_utc`; legacy display fields do not silently become analytics truth. The response combines counters, current and previous analytics periods, and product names. Order detail loading starts after the summary cards render, and the Recharts dependency lives in a separate lazy chunk. Analytics use timestamp boundaries instead of wrapping `created_at` in `DATE()` so SQLite can use the migration indexes.
 
 ## Data Model
 
@@ -110,7 +119,8 @@ Core tables:
 - `ai_reply_settings`, `ai_provider_profiles`, `ai_conversations`, `ai_item_cache`: AI account configuration, providers, and context.
 - `ai_training_rules`: global and product-scoped rules with enabled state.
 - `ai_item_knowledge_profiles`, `ai_item_knowledge_versions`: knowledge draft, published snapshot, and version history.
-- `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory rules, synchronized orders and deferred status events, and products.
+- `cards`, `delivery_rules`, `orders`, `order_status_events`, `item_info`: inventory rules, synchronized orders and deferred status events, and products; `item_info.invite_auto_fulfillment` is the per-account invite-routing switch.
+- `invite_bridge_operations`: durable operation keys and explicit `pending`, `submitted`, `succeeded`, `ambiguous`, `needs_review`, or `failed` bridge outcomes.
 - `item_metric_snapshots`, `item_metric_collection_states`: verified metric history and account-scoped, default-off collection gates.
 - `fulfillment_attempts`, `fulfillment_card_reservations`: durable delivery state and inventory reservations that survive process restarts.
 - `notification_channels`, `message_notifications`, `risk_control_logs`: notification and risk-control records.
@@ -128,8 +138,9 @@ Core tables:
 - AI providers: `/api/ai/providers*`, including model refresh and generated-reply tests.
 - AI training: `/ai-reply-lab/*`, `/ai-training-rules/*`.
 - Product knowledge: `/ai-item-knowledge/{cookie_id}/{item_id}/*`.
-- Replies and inventory: `/keywords*`, `/default-replies*`, `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`.
-- Orders and analytics: role-aware `GET /api/dashboard/summary`, structured `POST /api/orders/sync`, `/api/orders*`, order timing and buyer behavior, `/analytics/items/performance`, `/analytics/items/traffic`, and account-scoped metric status/manual canaries.
+- Replies and inventory: `/keywords*`, `/default-replies*`, `/cards*`, `/delivery-rules*`, `/items*`, `/item-reply*`; the owner-scoped product switch is `PUT /items/{cookie_id}/{item_id}/invite-auto-fulfillment`.
+- Orders and analytics: user-scoped `GET /api/dashboard/summary`, structured `POST /api/orders/sync`, `/api/orders*`, order timing and buyer behavior, `/analytics/items/performance`, `/analytics/items/traffic`, and account-scoped metric status/manual canaries.
+- Invite bridge: HMAC-protected service routes `POST /internal/invite/order-events`, `POST /internal/invite/send-message`, `POST /internal/invite/mark-fulfilled`, and `GET /internal/invite/operations/{operation_key}`.
 - Skill Center: `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*`.
 
 ## Skill Center Boundary

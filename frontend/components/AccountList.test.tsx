@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AccountList from './AccountList';
 import { ApiRequestError } from '../services/request';
+import { getNativeBrowserHealth as getNativeBrowserHealthThroughTransport } from '../services/api/nativeBrowser';
 import {
   getAccountDetails,
   getAllAISettings,
@@ -20,6 +21,7 @@ import {
   getClientBrowserLoginSession,
   confirmClientBrowserLoginSession,
   cancelClientBrowserLoginSession,
+  getNativeBrowserHealth,
   getNativeBrowserDevice,
   startNativeBrowserLogin,
   getNativeBrowserLoginStatus,
@@ -57,6 +59,7 @@ vi.mock('../services/api', () => ({
   getClientBrowserLoginSession: vi.fn(),
   confirmClientBrowserLoginSession: vi.fn(),
   cancelClientBrowserLoginSession: vi.fn(),
+  getNativeBrowserHealth: vi.fn(),
   getNativeBrowserDevice: vi.fn(),
   startNativeBrowserLogin: vi.fn(),
   getNativeBrowserLoginStatus: vi.fn(),
@@ -93,6 +96,23 @@ vi.mock('../services/api', () => ({
   updateAiReplyStrategies: vi.fn(),
 }));
 
+const completeNativeHealth = {
+  ok: true,
+  service: 'xianyu-native-browser-helper',
+  version: '1.0.2',
+  platform: 'Darwin',
+  arch: 'arm64',
+  protocolVersion: 1,
+  installed: true,
+  startupRegistered: true,
+  running: true,
+};
+
+const nativeHealthResponse = (payload: unknown) => new Response(JSON.stringify(payload), {
+  status: 200,
+  headers: { 'Content-Type': 'application/json' },
+});
+
 describe('AccountList session verification UI', () => {
   let localStorageValues: Map<string, string>;
   let clientBridgeEnabled: boolean;
@@ -101,6 +121,7 @@ describe('AccountList session verification UI', () => {
 
   beforeEach(() => {
     vi.useRealTimers();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nativeHealthResponse(completeNativeHealth)));
     clientBridgeEnabled = true;
     clientBridgeRequests = [];
     clientBridgeListener = (event: MessageEvent) => {
@@ -254,6 +275,7 @@ describe('AccountList session verification UI', () => {
     vi.mocked(showOfficialLoginBrowser).mockResolvedValue({ success: true });
     vi.mocked(showAccountSessionRefreshBrowser).mockResolvedValue({ success: true });
     vi.mocked(registerClientBrowserDevice).mockResolvedValue();
+    vi.mocked(getNativeBrowserHealth).mockImplementation(getNativeBrowserHealthThroughTransport);
     vi.mocked(getNativeBrowserDevice).mockResolvedValue({
       deviceId: 'helper_device_123456',
       browserFamily: 'chrome',
@@ -331,6 +353,7 @@ describe('AccountList session verification UI', () => {
     cleanup();
     vi.clearAllMocks();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('shows same-session controls only while a verification browser is active', async () => {
@@ -610,10 +633,7 @@ describe('AccountList session verification UI', () => {
   });
 
   it('does not create any server login session when the native helper is missing', async () => {
-    vi.mocked(getNativeBrowserDevice).mockRejectedValue(Object.assign(
-      new Error('未启动本机浏览器助手'),
-      { code: 'helper_unavailable', status: 0 },
-    ));
+    vi.mocked(globalThis.fetch).mockRejectedValue(new TypeError('fixture helper unavailable'));
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
@@ -640,6 +660,7 @@ describe('AccountList session verification UI', () => {
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
     expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
+    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
   });
 
   it('classifies an outdated native helper without creating a login session', async () => {
@@ -662,6 +683,102 @@ describe('AccountList session verification UI', () => {
     expect(screen.getAllByText(/当前 0.9.0，需要 1.0.2/).length).toBeGreaterThan(0);
     expect(registerClientBrowserDevice).not.toHaveBeenCalled();
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
+  });
+
+  it('runs the health preflight before requesting the helper device', async () => {
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    const healthMock = vi.mocked(getNativeBrowserHealth);
+    const deviceMock = vi.mocked(getNativeBrowserDevice);
+    await waitFor(() => {
+      expect(getNativeBrowserHealth).toHaveBeenCalledTimes(1);
+      expect(getNativeBrowserDevice).toHaveBeenCalledTimes(1);
+      expect(createClientBrowserLoginSession).toHaveBeenCalledTimes(1);
+    });
+    expect(healthMock.mock.invocationCallOrder[0]).toBeLessThan(
+      deviceMock.mock.invocationCallOrder[0],
+    );
+    expect((await screen.findAllByText('本机 Chrome 已打开官方页面')).length).toBeGreaterThan(0);
+  });
+
+  it('accepts a complete health payload through the real preflight parser', async () => {
+    await expect(getNativeBrowserHealthThroughTransport()).resolves.toEqual(completeNativeHealth);
+  });
+
+  it('rejects a missing health field through the real preflight parser', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse({
+      ...completeNativeHealth,
+      running: undefined,
+    }));
+
+    await expect(getNativeBrowserHealthThroughTransport()).rejects.toMatchObject({
+      name: 'NativeBrowserRequestError',
+      status: 409,
+      code: 'helper_malformed',
+    });
+  });
+
+  it.each([
+    ['old version', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '0.9.0', platform: 'Darwin', arch: 'arm64',
+      protocolVersion: 1, installed: true, startupRegistered: true, running: true,
+    }, '本机浏览器助手需要更新'],
+    ['old protocol', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
+      protocolVersion: 0, installed: true, startupRegistered: true, running: true,
+    }, '本机浏览器助手需要更新'],
+    ['not installed', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
+      protocolVersion: 1, installed: false, startupRegistered: false, running: false,
+    }, '本机助手尚未安装'],
+    ['startup missing', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
+      protocolVersion: 1, installed: true, startupRegistered: false, running: true,
+    }, '本机助手未注册开机启动'],
+    ['not running', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
+      protocolVersion: 1, installed: true, startupRegistered: true, running: false,
+    }, '本机助手未运行'],
+    ['architecture mismatch', {
+      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Windows', arch: 'x86',
+      protocolVersion: 1, installed: true, startupRegistered: true, running: true,
+    }, '本机助手架构不匹配'],
+  ])('classifies %s health before opening a login session', async (_label, health, title) => {
+    if (_label === 'architecture mismatch') {
+      vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      );
+    }
+    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse(health));
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    expect((await screen.findAllByText(title)).length).toBeGreaterThan(0);
+    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
+    expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
+  });
+
+  it('shows a malformed health response as a preflight error', async () => {
+    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse({
+      ...completeNativeHealth,
+      running: undefined,
+    }));
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    expect(await screen.findByText('本机助手健康检查无效')).toBeInTheDocument();
+    expect(getNativeBrowserHealth).toHaveBeenCalledTimes(1);
+    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
   });
 
   it.each([

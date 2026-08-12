@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import platform
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
-from . import HELPER_VERSION
+from . import HELPER_VERSION, PROTOCOL_VERSION
 from .helper import NativeBrowserHelper, NativeHelperError
+from .installer import InstallerError, NativeHelperInstaller, _normalized_architecture
 
 
 MAX_BODY_BYTES = 64 * 1024
@@ -18,9 +20,34 @@ class HelperHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], helper: NativeBrowserHelper):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        helper: NativeBrowserHelper,
+        installer: Optional[NativeHelperInstaller] = None,
+    ):
         self.helper = helper
         super().__init__(address, HelperRequestHandler)
+        self.installer = installer or NativeHelperInstaller(port=self.server_address[1])
+
+    def health_payload(self) -> dict[str, Any]:
+        try:
+            diagnostics = self.installer.health_dict(running=True)
+        except (InstallerError, OSError, ValueError):
+            diagnostics = {
+                "platform": platform.system(),
+                "arch": _normalized_architecture(),
+                "protocolVersion": PROTOCOL_VERSION,
+                "installed": False,
+                "startupRegistered": False,
+                "running": True,
+            }
+        return {
+            "ok": True,
+            "service": "xianyu-native-browser-helper",
+            "version": HELPER_VERSION,
+            **diagnostics,
+        }
 
 
 class HelperRequestHandler(BaseHTTPRequestHandler):
@@ -105,7 +132,7 @@ class HelperRequestHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         try:
             if parsed.path == "/health":
-                self._send(200, {"ok": True, "service": "xianyu-native-browser-helper", "version": HELPER_VERSION})
+                self._send(200, self.server.health_payload())
                 return
             if parsed.path == "/v1/device":
                 self._send(200, {"success": True, "data": self.server.helper.device_record()})

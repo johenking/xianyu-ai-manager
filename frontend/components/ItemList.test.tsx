@@ -12,6 +12,7 @@ import {
   deleteItem,
   updateItemMultiSpec,
   updateItemMultiQuantityDelivery,
+  updateItemInviteAutoFulfillment,
 } from '../services/api';
 
 vi.mock('../services/api', () => ({
@@ -22,6 +23,7 @@ vi.mock('../services/api', () => ({
   deleteItem: vi.fn(),
   updateItemMultiSpec: vi.fn(),
   updateItemMultiQuantityDelivery: vi.fn(),
+  updateItemInviteAutoFulfillment: vi.fn(),
 }));
 
 const accounts = [
@@ -53,6 +55,7 @@ const accountOneItems = [
     item_title: '账号一商品',
     item_price: '145',
     item_image: 'https://img.alicdn.com/account-one.jpg',
+    invite_auto_fulfillment: false,
   },
 ] as any;
 
@@ -77,6 +80,7 @@ describe('ItemList account filtering', () => {
     vi.mocked(deleteItem).mockResolvedValue({ message: 'deleted' });
     vi.mocked(updateItemMultiSpec).mockResolvedValue({ message: 'updated' });
     vi.mocked(updateItemMultiQuantityDelivery).mockResolvedValue({ message: 'updated' });
+    vi.mocked(updateItemInviteAutoFulfillment).mockResolvedValue({ message: 'updated' });
   });
 
   afterEach(() => {
@@ -134,5 +138,22 @@ describe('ItemList account filtering', () => {
       'src',
       'https://img.alicdn.com/account-one-new.jpg',
     );
+  });
+
+  it('toggles invite auto fulfillment for the exact account and item', async () => {
+    render(<ItemList />);
+
+    const toggle = await screen.findByRole('switch', { name: '邀请自动发货：账号一商品' });
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+
+    await waitFor(() => expect(updateItemInviteAutoFulfillment).toHaveBeenCalledWith(
+      'account-1',
+      'item-1',
+      true,
+    ));
+    expect(toggle).toBeChecked();
+    expect(await screen.findByText('邀请自动发货已开启')).toBeInTheDocument();
   });
 });

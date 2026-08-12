@@ -1,0 +1,165 @@
+SAMPLE static research verification
+Date: 2026-08-10 (Asia/Shanghai)
+Workspace: /Users/mac/Documents/咸鱼监控台
+Work: /private/tmp/sample-analysis-20260810-161325
+
+[0] baseline worktree and tests
+$ git status --short
+exit=0
+stdout: the pre-existing 28 tracked modifications and 3 untracked files were present; no source file was changed by this research before the whitelist documents.
+$ .venv/bin/python -m unittest discover -s tests -v
+exit=0
+stdout (literal summary): Ran 768 tests in 111.884s\nOK
+$ (cd frontend && npm test -- --reporter=dot)
+exit=0
+stdout (literal summary): Test Files 24 passed (24)\nTests 154 passed (154)
+$ (cd frontend && npm run typecheck)
+exit=0
+stdout (literal): > xianyu-ai-manager-frontend@1.10.4 typecheck\n> tsc --noEmit
+$ .venv/bin/ruff check .
+exit=0
+stdout: All checks passed!
+$ .venv/bin/python -m compileall -q .
+exit=0
+stdout: (empty)
+$ git diff --check
+exit=0
+stdout: (empty)
+
+[1] sample binding and unmodified copy
+$ file /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+exit=0
+stdout: PE32 executable (GUI) Intel 80386, for MS Windows
+$ shasum -a 256 /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+exit=0
+stdout: 52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54  /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+$ shasum -a 256 /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54  /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+$ stat -f '%z bytes' /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 94981980 bytes
+
+[2] PE and static parser evidence
+$ rz-bin -F pe -Ij /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: arch=x86 bits=32 machine=i386 os=windows subsystem=Windows GUI compiled=Sat May 3 22:45:36 2025 UTC+8 nx=true pie=true canary=true
+$ rz-bin -F pe -Sj /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 11 sections; maximum raw end=1020928; .rsrc paddr=797696 size=223232
+$ rz-bin -F pe -ij /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 153 imports; libraries=advapi32.dll,comctl32.dll,kernel32.dll,oleaut32.dll,user32.dll
+$ rz-bin -F pe -Uj /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 28 resources; resource summary saved at logs/pe-resource-summary.tsv
+$ rz-bin -F pe -ej /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: {"entries":[{"vaddr":4902880,"paddr":703456,"baddr":4194304,"laddr":0,"haddr":296,"type":"program"}]}
+$ rizin -2 -q -F pe -e scr.color=0 -c 's 0x4acfe0; af; afi; afbj; pd 40; q' /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout (literal summary): offset: 0x004acfe0\nname: entry0\nsize: 503\nbits: 32\nnum-bbs: 11\nedges: 17\nout-degree: 18
+note: an earlier unforced whole-file analysis resolved offset 0 as 16-bit and was discarded; `-F pe` plus the structured entry VA is the accepted path.
+$ innoextract --version
+exit=127
+stdout/stderr: command not found
+$ /private/tmp/sample-analysis-20260810-161325/build/innoextract-compat/innoextract --version
+exit=0
+stdout: innoextract 1.10-dev + f1fe6f8
+$ /private/tmp/sample-analysis-20260810-161325/build/innoextract-upstream/innoextract --version
+exit=0
+stdout: innoextract 1.10-dev + 6e9e34e
+$ /private/tmp/sample-analysis-20260810-161325/build/innoextract-upstream/innoextract --data-version /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=0
+stdout: 6.4.3 (unicode)
+$ /private/tmp/sample-analysis-20260810-161325/build/innoextract-upstream/innoextract --list /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=2
+stderr: Warning: Unexpected Auto Boolean value: 19; Warning: Unexpected Compression Method value: 20; Stream error while parsing setup headers!
+$ /private/tmp/sample-analysis-20260810-161325/build/innoextract-upstream/innoextract --output-dir /private/tmp/sample-analysis-20260810-161325/extract/upstream /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=2
+stderr: same setup-header error; detected setup version 6.4.3 (unicode); extracted_file_count=0
+$ bsdtar -tf /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=1
+stderr: bsdtar: Error opening archive: Unrecognized archive format
+$ /private/tmp/sample-analysis-20260810-161325/deps/sevenzip/sevenzip/26.02/bin/7zz l /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe
+exit=2
+stderr: Cannot open the file as archive
+$ rz-hash -a entropy /private/tmp/sample-analysis-20260810-161325/extract/installer-overlay.bin
+exit=0
+stdout: entropy: 7.99999824 (0x00000000-0x0599bb5c)
+
+[3] modified analysis artifacts and negative fixture
+$ /usr/bin/head -c 64 /private/tmp/sample-analysis-20260810-161325/original/SAMPLE.exe > /private/tmp/sample-analysis-20260810-161325/corrupt/SAMPLE-64.exe
+exit=0
+$ rz-bin -F pe -I /private/tmp/sample-analysis-20260810-161325/corrupt/SAMPLE-64.exe
+exit=1
+stderr: ERROR: File is not PE; ERROR: rz-bin: Cannot open file
+$ shasum -a 256 /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+exit=0
+stdout: 52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54 (unchanged after negative test)
+$ git diff --check
+exit=0
+stdout: (empty)
+
+[4] dynamic gate
+$ printenv TARGET_WINDOWS_RUNNER
+exit=1
+stdout: (empty); normalized state: TARGET_WINDOWS_RUNNER=unset; dynamic execution count=0
+
+[5] final tests, whitelist, artifact and rollback evidence
+$ .venv/bin/python -m unittest discover -s tests -v
+exit=0
+stdout (literal summary): Ran 768 tests in 113.555s\nOK
+$ (cd frontend && npm test -- --reporter=dot)
+exit=0
+stdout (literal summary): Test Files 24 passed (24)\nTests 154 passed (154)\nDuration 23.06s
+$ summary skip-marker gate over final-backend.log and final-frontend.log
+exit=0
+stdout: backend_skipped=0 frontend_skipped=0
+$ npm --prefix frontend run typecheck
+exit=0
+stdout (literal): > xianyu-ai-manager-frontend@1.10.4 typecheck\n> tsc --noEmit
+$ .venv/bin/ruff check .
+exit=0
+stdout: All checks passed!
+$ .venv/bin/python -m compileall -q .
+exit=0
+stdout: (empty)
+$ git diff --check
+exit=0
+stdout: (empty)
+$ diff -u logs/pre-edit-git-status.log logs/final2-git-status-without-research.log
+exit=0
+stdout: (empty); only the allowed untracked `docs/research/` path was added to the status set.
+$ compare 16:44 pre-edit hashes, excluding PROGRESS.md and BLOCKED.md
+exit=1
+stdout: preexisting_hash_mismatches=3
+details: XianyuAutoAsync.py, invite_bridge_poller.py, and tests/test_invite_bridge.py changed at 17:07-17:12 while research was in progress; they were preserved and recorded in BLOCKED.md.
+$ compare 17:24 post-drift business hashes after all research writes
+exit=0
+stdout: post_drift_business_hash_mismatches=0
+$ reopen frontend integration seams
+exit=0
+stdout:
+frontend/components/Dashboard.tsx lines=259 sha256=829d63a1d9704d6a8faff43e7e45a5e6ded4ee5f7cd4a019e1db49cd98c4acc6
+frontend/components/OrderList.tsx lines=1317 sha256=0e023b44439812ab412cc254f0e1b585d7d9d8415ae7e388c7efe23b5c5d9da8
+frontend/components/BusinessInsights.tsx lines=524 sha256=3cdb73f8d0d46985f3c35fdd2f480d60835040670eb7045229c6067e58c6fa5a
+$ validate sample-manifest.tsv against the temp files
+exit=0
+stdout: manifest_rows=4 columns=7 malformed=0\nmanifest_verified=original/SAMPLE.exe size=94981980 sha256=52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54\nmanifest_verified=extract/installer-overlay.bin size=93961052 sha256=d29234c926455377eb646915ccf8f743903e14b7ded0c70315bee49e8733e372
+$ validate sample-capability-diff.tsv and sample-feasibility.md
+exit=0
+stdout: capability_rows=9 columns=9 malformed=0\nconclusions=4 recommended=1 external_sources=3
+$ SAMPLE_ANALYSIS_WORK=/private/tmp/sample-analysis-20260810-161325 docs/research/sample-rollback.sh --check
+exit=0
+stdout (literal): rollback check: research files present=5\nrollback check: PROGRESS marker=present\nrollback check: BLOCKED marker=present\nrollback check: temp ownership=owned\nrollback check: no action taken
+$ shadow fixture: SAMPLE_ROLLBACK_ROOT=TARGET SAMPLE_ANALYSIS_WORK=/private/tmp/sample-analysis-999999.FIXTURE docs/research/sample-rollback.sh --run
+exit=0
+stdout (literal result): rollback: removed owned temp work\nrollback complete\nprogress_marker_search_exit=1\nblocked_marker_search_exit=1\npreexisting_content_preserved=yes\nshadow_rollback_exit=0
+$ shasum -a 256 docs/research/sample-feasibility.md docs/research/sample-manifest.tsv docs/research/sample-capability-diff.tsv docs/research/sample-rollback.sh
+exit=0
+stdout:
+cc77eb4c1586473cf3492ee8d17e4da4a15bb528a570f55d4e79a7bbe1601891  docs/research/sample-feasibility.md
+de1d6c57ecafd6b63b7036dfbdbc0981c7cb543aece4e01ae0bcb4a6b8a70770  docs/research/sample-manifest.tsv
+90b831a58061b88107e11bbf5279a8ef46b3fd58276aae83f20d2c7175e678ec  docs/research/sample-capability-diff.tsv
+53194bb67898202c5640a03d5bd4a465711f54cab261f89b4419ded04dc028eb  docs/research/sample-rollback.sh

@@ -7262,9 +7262,18 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
         success = db_manager.save_ai_reply_settings(cookie_id, settings_dict)
 
         if success:
-
+            runtime_reconcile_requested = False
             # 如果启用了AI回复，记录日志
             if settings.ai_enabled:
+                manager = cookie_manager.manager
+                runtime_loop = getattr(manager, 'loop', None)
+                if runtime_loop and runtime_loop.is_running():
+                    runtime_loop.call_soon_threadsafe(
+                        lambda: runtime_loop.create_task(
+                            manager.ensure_enabled_listeners(restart_cooldown=0.0)
+                        )
+                    )
+                    runtime_reconcile_requested = True
                 logger.info(
                     f"{_ai_log_reference(cookie_id, 'account')} 启用AI回复"
                 )
@@ -7273,7 +7282,10 @@ def update_ai_reply_settings(cookie_id: str, settings: AIReplySettings, current_
                     f"{_ai_log_reference(cookie_id, 'account')} 禁用AI回复"
                 )
 
-            return {"message": "AI回复设置更新成功"}
+            return {
+                "message": "AI回复设置更新成功",
+                "runtime": {"listener_reconcile_requested": runtime_reconcile_requested},
+            }
         else:
             raise HTTPException(status_code=400, detail="更新失败")
     except HTTPException:
@@ -7875,6 +7887,9 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
         task_error = ''
         task_status = {}
         recent_runtime_error = ''
+        listener_connected = False
+        listener_state = 'unknown'
+        listener_metrics = {}
         if manager_ready:
             manager_has_cookie = cookie_id in getattr(cookie_manager.manager, 'cookies', {})
             task_status = getattr(cookie_manager.manager, 'task_status', {}).get(cookie_id, {}) or {}
@@ -7890,6 +7905,25 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                         task_error = str(exc_check_error)
             if not task_running:
                 recent_runtime_error = task_status.get('last_error') or task_error or ''
+            try:
+                from XianyuAutoAsync import XianyuLive
+
+                live_instance = XianyuLive.get_instance(cookie_id)
+                if live_instance:
+                    socket = getattr(live_instance, 'ws', None)
+                    listener_connected = bool(socket and not getattr(socket, 'closed', False))
+                    listener_state = str(getattr(live_instance, 'connection_state', '') or 'unknown')
+                    listener_metrics = {
+                        'connected_at': float(getattr(live_instance, 'connected_at', 0) or 0),
+                        'last_inbound_at': float(getattr(live_instance, 'last_inbound_at', 0) or 0),
+                        'last_inbound_kind': str(getattr(live_instance, 'last_inbound_kind', '') or ''),
+                        'last_ai_attempt_at': float(getattr(live_instance, 'last_ai_attempt_at', 0) or 0),
+                        'last_ai_result': str(getattr(live_instance, 'last_ai_result', 'never') or 'never'),
+                        'message_ack_error_count': int(getattr(live_instance, 'message_ack_error_count', 0) or 0),
+                        'direct_send_init_error_count': int(getattr(live_instance, 'direct_send_init_error_count', 0) or 0),
+                    }
+            except Exception as exc:
+                listener_state = f'diagnostic_error:{type(exc).__name__}'
 
         with db_manager.lock:
             cursor = db_manager.conn.cursor()
@@ -7937,6 +7971,8 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
             issues.append("CookieManager 未就绪")
         elif not manager_has_cookie:
             issues.append("运行中的账号管理器没有加载该账号，需要重启服务")
+        elif not listener_connected:
+            issues.append("闲鱼消息监听未连接，AI开关不会收到新消息")
         if manager_ready and manager_has_cookie and not task_running:
             issues.append(recent_runtime_error or task_error or "实时监听任务未运行")
         elif recent_runtime_error:
@@ -7993,6 +8029,14 @@ def diagnose_auto_reply(cookie_id: str, current_user: Dict[str, Any] = Depends(g
                     "task_error": task_error,
                     "task_status": task_status,
                     "recent_runtime_error": recent_runtime_error,
+                    "connected": listener_connected,
+                    "connection_state": listener_state,
+                    "metrics": listener_metrics,
+                    "inbound_state": (
+                        "received"
+                        if listener_metrics.get('last_inbound_at')
+                        else "waiting_for_new_message"
+                    ),
                     "latest_risk_control": latest_risk_control,
                 },
                 "session": refresh_status,
@@ -11335,6 +11379,35 @@ def update_item_multi_quantity_delivery(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ItemInviteAutoFulfillmentUpdate(BaseModel):
+    invite_auto_fulfillment: bool
+
+
+@content_router.put("/items/{cookie_id}/{item_id}/invite-auto-fulfillment")
+def update_item_invite_auto_fulfillment(
+    cookie_id: str,
+    item_id: str,
+    update_data: ItemInviteAutoFulfillmentUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Toggle the invite bridge for one item owned by the current user."""
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该账号商品")
+
+    enabled = update_data.invite_auto_fulfillment
+    if not db_manager.update_item_invite_auto_fulfillment_status(
+        cookie_id,
+        item_id,
+        enabled,
+    ):
+        raise HTTPException(status_code=404, detail="商品不存在")
+    return {
+        "message": f"邀请自动发货已{'开启' if enabled else '关闭'}",
+        "invite_auto_fulfillment": enabled,
+    }
+
+
 
 
 
@@ -12758,7 +12831,7 @@ async def import_orders(
 # 然后由 React Router 在客户端处理路由
 
 # 定义不需要返回前端页面的路径前缀（API 路径）
-API_PREFIXES = ['/api/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
+API_PREFIXES = ['/api/', '/internal/', '/static/', '/health', '/login', '/logout', '/register', '/verify', '/check-default-password', '/change-password', '/change-admin-password']
 
 @frontend_router.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):

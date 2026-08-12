@@ -11,6 +11,7 @@ import asyncio
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -157,6 +158,97 @@ def _require_global_address(address: str) -> str:
     return str(parsed)
 
 
+def _configured_dns_endpoint() -> Optional[tuple[str, int]]:
+    raw = str(os.environ.get("OUTBOUND_DNS_RESOLVER") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(f"//{raw}")
+        host = str(parsed.hostname or "")
+        port = 53 if parsed.port is None else int(parsed.port)
+        address = ipaddress.ip_address(host)
+    except (TypeError, ValueError) as exc:
+        raise OutboundRequestError(
+            "dns_configuration_invalid",
+            "outbound DNS resolver configuration is invalid",
+        ) from exc
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or not address.is_loopback
+        or not 1 <= port <= 65535
+    ):
+        raise OutboundRequestError(
+            "dns_configuration_invalid",
+            "outbound DNS resolver must be a loopback IP and valid port",
+        )
+    return str(address), port
+
+
+def _resolve_with_configured_dns_sync(host: str) -> tuple[str, ...]:
+    endpoint = _configured_dns_endpoint()
+    if endpoint is None:
+        raise OutboundRequestError(
+            "dns_configuration_invalid",
+            "outbound DNS resolver is not configured",
+        )
+    try:
+        import dns.exception
+        import dns.resolver
+    except ImportError as exc:
+        raise OutboundRequestError(
+            "dns_configuration_invalid",
+            "configured outbound DNS support is unavailable",
+        ) from exc
+
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = [endpoint[0]]
+    resolver.port = endpoint[1]
+    resolver.timeout = 2.0
+    resolver.lifetime = 4.0
+    addresses: list[str] = []
+    for record_type in ("A", "AAAA"):
+        try:
+            answer = resolver.resolve(
+                host,
+                record_type,
+                search=False,
+                raise_on_no_answer=False,
+            )
+        except dns.resolver.NXDOMAIN as exc:
+            raise OutboundRequestError(
+                "dns_resolution_failed",
+                "outbound host could not be resolved",
+            ) from exc
+        except (
+            dns.exception.Timeout,
+            dns.resolver.NoAnswer,
+            dns.resolver.NoNameservers,
+        ):
+            continue
+        except dns.exception.DNSException as exc:
+            raise OutboundRequestError(
+                "dns_resolution_failed",
+                "outbound host could not be resolved",
+            ) from exc
+        if answer.rrset is None:
+            continue
+        addresses.extend(
+            str(getattr(record, "address", record)).strip()
+            for record in answer
+        )
+    unique_addresses = tuple(dict.fromkeys(value for value in addresses if value))
+    if not unique_addresses:
+        raise OutboundRequestError(
+            "dns_resolution_failed",
+            "outbound host could not be resolved",
+        )
+    return unique_addresses
+
+
 def resolve_public_host_sync(host: Any, port: Any) -> tuple[str, tuple[str, ...]]:
     """Resolve a bare host for a non-HTTP protocol and pin public addresses."""
     normalized = _normalize_host(host)
@@ -185,7 +277,10 @@ def resolve_public_host_sync(host: Any, port: Any) -> tuple[str, tuple[str, ...]
                 "outbound host could not be resolved",
             ) from exc
         addresses = tuple(
-            dict.fromkeys(_require_global_address(record[4][0]) for record in records)
+            dict.fromkeys(
+                _require_global_address(record[4][0])
+                for record in records
+            )
         )
     else:
         addresses = (_require_global_address(str(literal)),)
@@ -204,20 +299,35 @@ async def resolve_public_http_url(url: Any) -> ValidatedPublicURL:
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
-        try:
-            records = await asyncio.get_running_loop().getaddrinfo(
+        if _configured_dns_endpoint() is not None:
+            resolved_addresses = await asyncio.to_thread(
+                _resolve_with_configured_dns_sync,
                 host,
-                port,
-                type=socket.SOCK_STREAM,
             )
-        except OSError as exc:
-            raise OutboundRequestError(
-                "dns_resolution_failed",
-                "outbound host could not be resolved",
-            ) from exc
-        addresses = tuple(
-            dict.fromkeys(_require_global_address(record[4][0]) for record in records)
-        )
+            addresses = tuple(
+                dict.fromkeys(
+                    _require_global_address(address)
+                    for address in resolved_addresses
+                )
+            )
+        else:
+            try:
+                records = await asyncio.get_running_loop().getaddrinfo(
+                    host,
+                    port,
+                    type=socket.SOCK_STREAM,
+                )
+            except OSError as exc:
+                raise OutboundRequestError(
+                    "dns_resolution_failed",
+                    "outbound host could not be resolved",
+                ) from exc
+            addresses = tuple(
+                dict.fromkeys(
+                    _require_global_address(record[4][0])
+                    for record in records
+                )
+            )
     else:
         addresses = (_require_global_address(str(literal)),)
     if not addresses:

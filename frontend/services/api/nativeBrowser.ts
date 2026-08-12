@@ -8,6 +8,18 @@ export interface NativeBrowserDevice {
   encryptionPublicJwk: Record<string, unknown>;
 }
 
+export interface NativeBrowserHealth {
+  ok: boolean;
+  service: string;
+  version: string;
+  platform: string;
+  arch: string;
+  protocolVersion: number;
+  installed: boolean;
+  startupRegistered: boolean;
+  running: boolean;
+}
+
 export type NativeBrowserLoginState =
   | 'opening_browser'
   | 'waiting_user'
@@ -87,6 +99,28 @@ export const getNativeBrowserDevice = async (): Promise<NativeBrowserDevice> => 
     throw new NativeBrowserRequestError('本机浏览器助手版本不兼容', 409, 'helper_outdated');
   }
   return response.data;
+};
+
+const isNativeBrowserHealth = (value: unknown): value is NativeBrowserHealth => {
+  if (!value || typeof value !== 'object') return false;
+  const health = value as Partial<NativeBrowserHealth>;
+  return health.ok === true
+    && health.service === 'xianyu-native-browser-helper'
+    && typeof health.version === 'string'
+    && typeof health.platform === 'string'
+    && typeof health.arch === 'string'
+    && Number.isInteger(health.protocolVersion)
+    && typeof health.installed === 'boolean'
+    && typeof health.startupRegistered === 'boolean'
+    && typeof health.running === 'boolean';
+};
+
+export const getNativeBrowserHealth = async (): Promise<NativeBrowserHealth> => {
+  const response = await helperRequest<NativeBrowserHealth>('/health');
+  if (!isNativeBrowserHealth(response)) {
+    throw new NativeBrowserRequestError('本机浏览器助手健康信息不完整', 409, 'helper_malformed');
+  }
+  return response;
 };
 
 export const startNativeBrowserLogin = async (payload: {

@@ -1,0 +1,4 @@
+scope	relative_path	size_bytes	sha256	file_type	architecture	status
+outer	original/SAMPLE.exe	94981980	52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54	PE32 executable (GUI) Intel 80386	i386	verified-copy
+overlay	extract/installer-overlay.bin	93961052	d29234c926455377eb646915ccf8f743903e14b7ded0c70315bee49e8733e372	data	unknown	static-slice-at-1020928
+payload	<none>	0	-	-	unknown	parser-exit-2-no-files

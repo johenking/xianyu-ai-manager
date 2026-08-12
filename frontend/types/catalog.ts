@@ -42,6 +42,7 @@ export interface Item {
   catalog_active?: boolean;
   catalog_last_seen_at?: string | null;
   catalog_metadata?: string;
+  invite_auto_fulfillment?: boolean;
   item_category?: string;
   item_detail?: string;
   is_multi_spec?: number | boolean;
@@ -99,7 +100,7 @@ export interface OrderAnalytics {
 
 export interface DashboardSummary {
   success: boolean;
-  scope: 'user' | 'system';
+  scope: 'user';
   range: {
     start_date: string;
     end_date: string;

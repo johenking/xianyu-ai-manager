@@ -320,6 +320,28 @@ def extract_order_list(payload: Any) -> List[Dict[str, Any]]:
     return _find_order_list(parsed.get("data") or {})[1]
 
 
+def _has_bargain_freeshipping_marker(raw: Dict[str, Any]) -> bool:
+    """Read only explicit group-buy action markers from the order controls."""
+    common_data = raw.get("commonData") if isinstance(raw.get("commonData"), dict) else {}
+    right_vo = raw.get("rightVO") if isinstance(raw.get("rightVO"), dict) else {}
+    candidates: List[Any] = []
+    for container in (right_vo, common_data, raw):
+        for key in ("btnList", "buttonList", "actions", "tags"):
+            value = container.get(key) if isinstance(container, dict) else None
+            if isinstance(value, list):
+                candidates.extend(value)
+            elif isinstance(value, (dict, str)):
+                candidates.append(value)
+    markers = ("免拼", "待刀成", "小刀", "groupon", "bargain_freeshipping")
+    for candidate in candidates:
+        values = candidate.values() if isinstance(candidate, dict) else (candidate,)
+        for value in values:
+            normalized = str(value or "").strip().lower()
+            if any(marker in normalized for marker in markers):
+                return True
+    return False
+
+
 def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any]:
     common_data = raw.get("commonData") if isinstance(raw.get("commonData"), dict) else {}
     buyer_info = raw.get("buyerInfoVO") if isinstance(raw.get("buyerInfoVO"), dict) else {}
@@ -361,6 +383,7 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
         "platform_status_text": str(status_text or ""),
         "created_at": common_data.get("createTime") or raw.get("createTime") or raw.get("created_at") or raw.get("gmtCreate"),
         "cookie_id": cookie_id,
+        "is_bargain": _has_bargain_freeshipping_marker(raw),
     }
 
 
@@ -852,6 +875,7 @@ class OrderSyncCoordinator:
                     amount=order.get("amount") or None,
                     order_status=order.get("order_status") or "unknown",
                     cookie_id=cookie_id,
+                    is_bargain=bool(order.get("is_bargain")),
                     created_at=order.get("created_at") or None,
                     item_image=catalog_image,
                 )
@@ -914,6 +938,12 @@ class OrderSyncCoordinator:
                 amount=order.get("amount"),
                 created_at=order.get("created_at"),
             )
+            if order.get("is_bargain"):
+                self.db.insert_or_update_order(
+                    order_id=order_id,
+                    cookie_id=cookie_id,
+                    is_bargain=True,
+                )
             buyer_id = str(order.get("buyer_id") or "").strip()
             if buyer_id:
                 self.db.upsert_customer_observation(

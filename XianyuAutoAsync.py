@@ -51,6 +51,17 @@ AUTO_DELIVERY_SOURCE_PAID_NOTICE = "paid_notice"
 AUTO_DELIVERY_SOURCE_BARGAIN_FREESHIPPING = "bargain_freeshipping"
 
 
+class DirectMessageNotSubmitted(RuntimeError):
+    """The direct conversation was not created, so no message write occurred."""
+
+
+def _invite_bridge_owns_item(cookie_id: str, item_id: str) -> bool:
+    enabled = os.getenv("XIANYU_INVITE_BRIDGE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return False
+    return db_manager.is_invite_auto_fulfillment_enabled(cookie_id, item_id)
+
+
 def _delivery_identity_is_confirmed(
     expected_item_id: str,
     expected_buyer_id: str,
@@ -965,6 +976,18 @@ class XianyuLive:
         # 消息接收标识 - 用于控制Cookie刷新
         self.last_message_received_time = 0  # 记录上次收到消息的时间
         self.message_cookie_refresh_cooldown = 300  # 收到消息后5分钟内不执行Cookie刷新
+        self.connected_at = 0.0
+        self.last_inbound_at = 0.0
+        self.last_inbound_kind = ""
+        self.last_ai_attempt_at = 0.0
+        self.last_ai_result = "never"
+        self.message_ack_error_count = 0
+        self.direct_send_init_error_count = 0
+        self.direct_message_lock = asyncio.Lock()
+        self._direct_conversation_waiters = {}
+        self._websocket_bootstrap_active = False
+        self._websocket_bootstrap_error = None
+        self._websocket_bootstrap_sync_event = None
 
 
         # 滑块验证相关
@@ -1469,6 +1492,10 @@ class XianyuLive:
                 "reason": "买家已付款，等待卖家发货",
                 "attempts": 1,
                 "quantity": parse_trusted_order_quantity(result.get("quantity")),
+                "amount": result.get("amount"),
+                "item_title": result.get("item_title"),
+                "created_at": result.get("created_at"),
+                "is_bargain": bool(result.get("is_bargain")),
             }
         return {
             "allowed": False,
@@ -1760,6 +1787,45 @@ class XianyuLive:
             # 订单ID已提取，将在自动发货时进行确认发货处理
             logger.info(f'[{msg_time}] 【{self.cookie_id}】提取到订单ID: {order_id}，将在自动发货时处理确认发货')
 
+            if _invite_bridge_owns_item(self.cookie_id, item_id):
+                payment_check = await self._verify_paid_order_for_delivery(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=send_user_id,
+                )
+                if not payment_check.get("allowed"):
+                    logger.warning(
+                        "邀请商品付款状态未通过，等待主动订单发现重试: status={}",
+                        payment_check.get("status") or "unknown",
+                    )
+                    return
+                from invite_bridge_poller import invite_bridge_poller
+
+                staged = invite_bridge_poller.stage_order(
+                    cookie_id=self.cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=send_user_id,
+                    amount=payment_check.get("amount"),
+                    quantity=payment_check.get("quantity") or 1,
+                    item_title=str(payment_check.get("item_title") or ""),
+                    created_at=payment_check.get("created_at"),
+                    chat_id=chat_id,
+                    is_bargain=(
+                        delivery_source == AUTO_DELIVERY_SOURCE_BARGAIN_FREESHIPPING
+                        or bool(payment_check.get("is_bargain"))
+                    ),
+                )
+                if not staged:
+                    logger.warning("邀请商品订单上下文保存失败或订单已完成")
+                    return
+                logger.info(
+                    "邀请商品订单已保存并提交桥接扫描: delivery_source={}",
+                    delivery_source,
+                )
+                await invite_bridge_poller.scan_once()
+                return
+
             # 使用订单ID作为锁的键
             lock_key = order_id
 
@@ -1944,6 +2010,25 @@ class XianyuLive:
 
 
 
+    @staticmethod
+    def _session_refresh_blocks_listener(refresh_status: dict) -> bool:
+        state = str((refresh_status or {}).get("state") or "")
+        error_code = str((refresh_status or {}).get("error_code") or "")
+        if state not in {
+            "action_required",
+            "refreshing",
+            "verification_required",
+            "manual_reauth_required",
+        }:
+            return False
+        return not (
+            state == "action_required"
+            and (
+                error_code == "connection_failures"
+                or is_retryable_session_error_code(error_code)
+            )
+        )
+
     async def refresh_token(self, captcha_retry_count: int = 0):
         """Probe the real message token without starting an official browser."""
         from db_manager import db_manager
@@ -1951,30 +2036,11 @@ class XianyuLive:
         del captcha_retry_count
         try:
             refresh_status = db_manager.get_account_session_refresh(self.cookie_id) or {}
-            if refresh_status.get("state") in {
-                "action_required",
-                "refreshing",
-                "verification_required",
-                "manual_reauth_required",
-            }:
+            if self._session_refresh_blocks_listener(refresh_status):
                 self.last_token_refresh_status = refresh_status.get("state")
                 logger.info(
                     f"【{self.cookie_id}】账号会话正在等待人工处理，暂停消息 Token 探测"
                 )
-                return None
-
-            current_time = time.time()
-            time_since_last_message = current_time - self.last_message_received_time
-            if (
-                self.last_message_received_time > 0
-                and time_since_last_message < self.message_cookie_refresh_cooldown
-            ):
-                remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
-                logger.info(
-                    f"【{self.cookie_id}】收到消息后冷却中，跳过本次 Token 探测，"
-                    f"剩余 {int(remaining_time)} 秒"
-                )
-                self.last_token_refresh_status = "skipped_cooldown"
                 return None
 
             account_info = await asyncio.to_thread(
@@ -2119,6 +2185,13 @@ class XianyuLive:
             self.last_token_refresh_time = time.time()
             self.last_message_received_time = 0
             self.last_token_refresh_status = "success"
+            db_manager.update_account_session_refresh(
+                self.cookie_id,
+                state="success",
+                trigger="消息 Token 探测",
+                message="消息 Token 已验证",
+                error_code="",
+            )
             logger.info(f"【{self.cookie_id}】消息 Token 探测成功")
             return probe.access_token
         except Exception as exc:
@@ -3968,11 +4041,14 @@ class XianyuLive:
 
     async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str):
         """获取AI回复"""
+        self.last_ai_attempt_at = time.time()
+        self.last_ai_result = "started"
         try:
             from ai_reply_engine import ai_reply_engine
 
             # 检查是否启用AI回复
             if not ai_reply_engine.is_ai_enabled(self.cookie_id):
+                self.last_ai_result = "disabled"
                 logger.warning(f"账号 {self.cookie_id} 未启用AI回复")
                 return None
 
@@ -4009,15 +4085,18 @@ class XianyuLive:
             )
 
             if reply:
+                self.last_ai_result = "generated"
                 logger.info(
                     f"【{self.cookie_id}】AI回复生成成功: length={len(reply)}"
                 )
                 return reply
             else:
+                self.last_ai_result = "provider_empty"
                 logger.warning(f"AI回复生成失败")
                 return None
 
         except Exception as e:
+            self.last_ai_result = f"provider_error:{type(e).__name__}"
             logger.error(f"获取AI回复失败: {self._safe_str(e)}")
             return None
 
@@ -5618,11 +5697,12 @@ class XianyuLive:
             # 确保任务能正常结束
             logger.info(f"【{self.cookie_id}】Token刷新循环已退出")
 
-    async def create_chat(self, ws, toid, item_id='891198795482'):
+    async def create_chat(self, ws, toid, item_id='891198795482', request_mid=None):
+        request_mid = request_mid or generate_mid()
         msg = {
             "lwp": "/r/SingleChatConversation/create",
             "headers": {
-                "mid": generate_mid()
+                "mid": request_mid
             },
             "body": [
                 {
@@ -5640,6 +5720,373 @@ class XianyuLive:
             ]
         }
         await ws.send(json.dumps(msg))
+        return request_mid
+
+    def _resolve_direct_conversation_response(self, message_data) -> bool:
+        """Resolve a direct-send request received by the main WebSocket loop."""
+        if not isinstance(message_data, dict):
+            return False
+        if str(message_data.get("lwp") or "").startswith("/s/"):
+            return False
+        headers = message_data.get("headers")
+        if not isinstance(headers, dict):
+            return False
+        request_mid = str(headers.get("mid") or "").strip()
+        if not request_mid:
+            return False
+        waiter = self._direct_conversation_waiters.get(request_mid)
+        if waiter is None or waiter.done():
+            return False
+        waiter.set_result(message_data)
+        return True
+
+    def _fail_direct_conversation_waiters(self, reason: str) -> None:
+        """Wake direct senders when the owning WebSocket is being closed."""
+        for waiter in list(self._direct_conversation_waiters.values()):
+            if not waiter.done():
+                waiter.set_exception(DirectMessageNotSubmitted(reason))
+        self._direct_conversation_waiters.clear()
+
+    async def _request_lwp_response(
+        self,
+        websocket,
+        lwp: str,
+        body=None,
+        timeout: float = 10,
+        headers=None,
+    ):
+        """Send one LWP request and let the owning reader correlate its response."""
+        request_mid = generate_mid()
+        waiter = asyncio.get_running_loop().create_future()
+        self._direct_conversation_waiters[request_mid] = waiter
+        try:
+            request_headers = dict(headers or {})
+            request_headers["mid"] = request_mid
+            message = {
+                "lwp": lwp,
+                "headers": request_headers,
+            }
+            if body is not None:
+                message["body"] = body
+            await websocket.send(json.dumps(message))
+            return await asyncio.wait_for(waiter, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(f"{lwp} response timed out") from exc
+        except DirectMessageNotSubmitted:
+            if self._websocket_bootstrap_error is not None:
+                raise self._websocket_bootstrap_error
+            raise
+        finally:
+            self._direct_conversation_waiters.pop(request_mid, None)
+
+    @staticmethod
+    def _extract_direct_conversation_cid(value, depth: int = 0):
+        """Find the conversation id in platform response variants."""
+        if depth > 8:
+            return ""
+        if isinstance(value, dict):
+            for key in ("singleChatConversation", "conversation", "conversationInfo"):
+                nested = value.get(key)
+                if isinstance(nested, dict):
+                    cid = nested.get("cid")
+                    if isinstance(cid, str) and cid.strip():
+                        return cid.split("@", 1)[0].strip()
+            cid = value.get("cid")
+            if isinstance(cid, str) and cid.strip():
+                return cid.split("@", 1)[0].strip()
+            for nested in value.values():
+                found = XianyuLive._extract_direct_conversation_cid(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = XianyuLive._extract_direct_conversation_cid(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                return XianyuLive._extract_direct_conversation_cid(json.loads(value), depth + 1)
+            except (TypeError, ValueError):
+                return ""
+        return ""
+
+    @staticmethod
+    def _extract_existing_direct_conversation_cid(value, toid, myid, item_id):
+        """Return one existing conversation matching both participants and item."""
+        body = value.get("body", {}) if isinstance(value, dict) else {}
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except (TypeError, ValueError):
+                return ""
+        if not isinstance(body, dict):
+            return ""
+
+        expected_users = {str(toid).split("@", 1)[0], str(myid).split("@", 1)[0]}
+        expected_item = str(item_id or "").strip()
+        exact_matches = []
+        itemless_matches = []
+        for raw in body.get("userConvs", []):
+            if not isinstance(raw, dict):
+                continue
+            wrapper = raw.get("singleChatUserConversation", raw)
+            if not isinstance(wrapper, dict):
+                continue
+            conversation = wrapper.get("singleChatConversation", wrapper)
+            if not isinstance(conversation, dict):
+                continue
+            participants = {
+                str(conversation.get("pairFirst") or "").split("@", 1)[0],
+                str(conversation.get("pairSecond") or "").split("@", 1)[0],
+            }
+            if participants != expected_users:
+                continue
+            cid = str(conversation.get("cid") or "").split("@", 1)[0].strip()
+            if not cid:
+                continue
+            extension = conversation.get("extension") or {}
+            if isinstance(extension, str):
+                try:
+                    extension = json.loads(extension)
+                except (TypeError, ValueError):
+                    extension = {}
+            conversation_item = ""
+            if isinstance(extension, dict):
+                conversation_item = str(
+                    extension.get("itemId") or extension.get("item_id") or ""
+                ).strip()
+            if expected_item and conversation_item == expected_item:
+                exact_matches.append(cid)
+            elif not conversation_item:
+                itemless_matches.append(cid)
+
+        matches = list(dict.fromkeys(exact_matches or itemless_matches))
+        return matches[0] if len(matches) == 1 else ""
+
+    @staticmethod
+    def _extract_session_sync_direct_conversation_cid(value, toid, item_id):
+        """Return one direct cid from the signed H5 session list."""
+        data = value.get("data", {}) if isinstance(value, dict) else {}
+        if not isinstance(data, dict):
+            return ""
+        sessions = data.get("sessions")
+        if not isinstance(sessions, list):
+            return ""
+
+        expected_peer = str(toid or "").split("@", 1)[0].strip()
+        expected_item = str(item_id or "").strip()
+        exact_matches = []
+        peer_matches = []
+        for raw in sessions:
+            if not isinstance(raw, dict):
+                continue
+            session = raw.get("session", raw)
+            if not isinstance(session, dict):
+                continue
+            user_info = session.get("userInfo") or {}
+            if not isinstance(user_info, dict):
+                continue
+            peer_id = str(user_info.get("userId") or "").split("@", 1)[0].strip()
+            if not expected_peer or peer_id != expected_peer:
+                continue
+            session_type = str(session.get("sessionType") or "").strip()
+            if session_type and session_type != "1":
+                continue
+            cid = str(session.get("sessionId") or raw.get("sessionId") or "")
+            cid = cid.split("@", 1)[0].strip()
+            if not cid:
+                continue
+            peer_matches.append(cid)
+
+            extension = session.get("extensions") or session.get("extension") or {}
+            if isinstance(extension, str):
+                try:
+                    extension = json.loads(extension)
+                except (TypeError, ValueError):
+                    extension = {}
+            session_item = ""
+            if isinstance(extension, dict):
+                session_item = str(
+                    extension.get("itemId") or extension.get("item_id") or ""
+                ).strip()
+            if expected_item and session_item == expected_item:
+                exact_matches.append(cid)
+
+        exact_matches = list(dict.fromkeys(exact_matches))
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        peer_matches = list(dict.fromkeys(peer_matches))
+        has_more = str(data.get("hasMore") or "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        return peer_matches[0] if not has_more and len(peer_matches) == 1 else ""
+
+    async def _find_direct_conversation_via_session_sync(self, toid, item_id):
+        """Resolve an existing direct cid without opening another WebSocket."""
+        token_source = trans_cookies(self.cookies_str).get("_m_h5_tk", "")
+        token = token_source.split("_", 1)[0] if token_source else ""
+        if not token:
+            return ""
+
+        api = "mtop.taobao.idlemessage.pc.session.sync"
+        version = "3.0"
+        timestamp = str(int(time.time() * 1000))
+        data_value = json.dumps({"fetchNum": 100}, separators=(",", ":"))
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": timestamp,
+            "sign": generate_sign(timestamp, token, data_value),
+            "v": version,
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": api,
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21ybx.im.0.0",
+        }
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": self.cookies_str,
+            "Origin": "https://www.goofish.com",
+            "Referer": "https://www.goofish.com/",
+            "User-Agent": self.browser_user_agent,
+        }
+        url = _resolve_h5_api_url(
+            f"https://h5api.m.goofish.com/h5/{api}/{version}/"
+        )
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20),
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as session:
+                async with session.post(
+                    url,
+                    params=params,
+                    data={"data": data_value},
+                    headers=headers,
+                ) as response:
+                    if response.status >= 400:
+                        logger.warning(
+                            "【{}】会话列表回退失败: http_status={}",
+                            self.cookie_id,
+                            response.status,
+                        )
+                        return ""
+                    payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            logger.warning(
+                "【{}】会话列表回退异常: error_type={}",
+                self.cookie_id,
+                type(exc).__name__,
+            )
+            return ""
+
+        ret = payload.get("ret") if isinstance(payload, dict) else []
+        ret = ret if isinstance(ret, list) else []
+        if not any("SUCCESS" in str(value) for value in ret):
+            code = sanitize_runtime_error(str(ret[0] if ret else "unknown"))
+            logger.warning(
+                "【{}】会话列表回退被平台拒绝: code={}",
+                self.cookie_id,
+                code.split("::", 1)[0][:80],
+            )
+            return ""
+        cid = self._extract_session_sync_direct_conversation_cid(
+            payload,
+            toid,
+            item_id,
+        )
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        sessions = data.get("sessions") if isinstance(data, dict) else []
+        logger.info(
+            "【{}】会话列表回退完成: sessions={}, matched={}",
+            self.cookie_id,
+            len(sessions) if isinstance(sessions, list) else 0,
+            bool(cid),
+        )
+        return cid
+
+    def _remember_direct_conversation(self, toid, item_id, cid) -> None:
+        """Replace a synthetic direct-order reference with the verified IM cid."""
+        try:
+            order = db_manager.get_recent_order_by_item_and_buyer(str(item_id), str(toid))
+            order_id = str((order or {}).get("order_id") or "")
+            detail = db_manager.get_order_by_id(order_id) if order_id else None
+            if (
+                not detail
+                or str(detail.get("cookie_id") or "") != str(self.cookie_id)
+                or str(detail.get("item_id") or "") != str(item_id)
+                or str(detail.get("buyer_id") or "") != str(toid)
+                or not str(detail.get("chat_id") or "").startswith("direct:")
+            ):
+                return
+            db_manager.insert_or_update_order(
+                order_id=order_id,
+                cookie_id=str(self.cookie_id),
+                chat_id=str(cid),
+            )
+        except Exception as exc:
+            logger.warning(
+                "【{}】直接会话回写失败: error_type={}",
+                self.cookie_id,
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _direct_frame_shape(value, depth: int = 0):
+        """Return response keys and value types without logging payload values."""
+        if depth > 6:
+            return "depth"
+        if isinstance(value, dict):
+            return {
+                str(key): XianyuLive._direct_frame_shape(nested, depth + 1)
+                for key, nested in list(value.items())[:20]
+            }
+        if isinstance(value, list):
+            return [XianyuLive._direct_frame_shape(nested, depth + 1) for nested in value[:3]]
+        if isinstance(value, str):
+            if value.lstrip().startswith(("{", "[")):
+                try:
+                    return XianyuLive._direct_frame_shape(json.loads(value), depth + 1)
+                except (TypeError, ValueError):
+                    pass
+            return f"str:{len(value)}"
+        return type(value).__name__
+
+    @staticmethod
+    def _direct_frame_error_summary(value, depth: int = 0):
+        """Expose only normalized protocol error fields for diagnosis."""
+        if depth > 6:
+            return {}
+        if isinstance(value, dict):
+            result = {}
+            for key in ("code", "reason", "scope"):
+                raw = value.get(key)
+                if isinstance(raw, (str, int, float, bool)):
+                    normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "_", str(raw)).strip("_")
+                    result[key] = normalized[:80]
+            for nested in value.values():
+                child = XianyuLive._direct_frame_error_summary(nested, depth + 1)
+                for key, raw in child.items():
+                    result.setdefault(key, raw)
+            return result
+        if isinstance(value, list):
+            result = {}
+            for nested in value[:3]:
+                child = XianyuLive._direct_frame_error_summary(nested, depth + 1)
+                for key, raw in child.items():
+                    result.setdefault(key, raw)
+            return result
+        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                return XianyuLive._direct_frame_error_summary(json.loads(value), depth + 1)
+            except (TypeError, ValueError):
+                return {}
+        return {}
 
     async def send_msg(self, ws, cid, toid, text):
         text = {
@@ -5705,9 +6152,11 @@ class XianyuLive:
                 logger.info("由于刚刚尝试过token刷新，跳过重复的初始化失败通知")
             raise Exception("Token获取失败")
 
-        msg = {
-            "lwp": "/reg",
-            "headers": {
+        self._websocket_bootstrap_sync_event = asyncio.Event()
+        register_response = await self._request_lwp_response(
+            ws,
+            "/reg",
+            headers={
                 "cache-header": "app-key token ua wv",
                 "app-key": APP_CONFIG.get('app_key'),
                 "token": self.current_token,
@@ -5716,29 +6165,64 @@ class XianyuLive:
                 "wv": "im:3,au:3,sy:6",
                 "sync": "0,0;0;0;",
                 "did": self.device_id,
-                "mid": generate_mid()
-            }
-        }
-        await ws.send(json.dumps(msg))
-        await asyncio.sleep(1)
-        current_time = int(time.time() * 1000)
-        msg = {
-            "lwp": "/r/SyncStatus/ackDiff",
+            },
+        )
+        if (
+            not isinstance(register_response, dict)
+            or register_response.get("code") not in (None, 200, "200")
+        ):
+            logger.warning(
+                "【{}】WebSocket注册响应未通过: shape={}, protocol={}",
+                self.cookie_id,
+                json.dumps(self._direct_frame_shape(register_response), ensure_ascii=False),
+                json.dumps(
+                    self._direct_frame_error_summary(register_response),
+                    ensure_ascii=False,
+                ),
+            )
+            raise ConnectionError("websocket registration failed")
+        if self._websocket_bootstrap_error is not None:
+            raise self._websocket_bootstrap_error
+
+        await ws.send(json.dumps({
+            "lwp": "/r/Conversation/listNewestPagination",
             "headers": {"mid": generate_mid()},
-            "body": [
-                {
-                    "pipeline": "sync",
-                    "tooLong2Tag": "PNM,1",
-                    "channel": "sync",
-                    "topic": "sync",
-                    "highPts": 0,
-                    "pts": current_time * 1000,
-                    "seq": 0,
-                    "timestamp": current_time
-                }
-            ]
-        }
-        await ws.send(json.dumps(msg))
+            "body": [9007199254740991, 50],
+        }))
+        try:
+            await asyncio.wait_for(
+                self._websocket_bootstrap_sync_event.wait(),
+                timeout=getattr(self, "_websocket_bootstrap_sync_timeout", 3.0),
+            )
+        except asyncio.TimeoutError:
+            logger.debug(f"【{self.cookie_id}】初始同步推送未在等待窗口内到达")
+        if self._websocket_bootstrap_error is not None:
+            raise self._websocket_bootstrap_error
+
+        state_response = await self._request_lwp_response(
+            ws,
+            "/r/SyncStatus/getState",
+            [{"topic": "sync"}],
+        )
+        if (
+            not isinstance(state_response, dict)
+            or state_response.get("code") not in (None, 200, "200")
+        ):
+            raise ConnectionError("websocket sync state request failed")
+        sync_state = state_response.get("body")
+        if not isinstance(sync_state, dict) or not sync_state:
+            raise ConnectionError("websocket sync state was missing")
+        ack_response = await self._request_lwp_response(
+            ws,
+            "/r/SyncStatus/ackDiff",
+            [sync_state],
+        )
+        if (
+            not isinstance(ack_response, dict)
+            or ack_response.get("code") not in (None, 200, "200")
+        ):
+            raise ConnectionError("websocket sync acknowledgement failed")
+        self._websocket_bootstrap_sync_event = None
         logger.info(f'【{self.cookie_id}】连接注册完成')
 
     async def send_heartbeat(self, ws):
@@ -5818,7 +6302,7 @@ class XianyuLive:
     async def handle_heartbeat_response(self, message_data):
         """处理心跳响应"""
         try:
-            if message_data.get("code") == 200:
+            if message_data.get("code") == 200 and not message_data.get("lwp"):
                 self.last_heartbeat_response = time.time()
                 logger.warning("心跳响应正常")
                 return True
@@ -6136,38 +6620,68 @@ class XianyuLive:
 
 
     async def send_msg_once(self, toid, item_id, text):
-        headers = {
-            "Cookie": self.cookies_str,
-            "Host": "wss-goofish.dingtalk.com",
-            "Connection": "Upgrade",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
-            "User-Agent": self.browser_user_agent,
-            "Origin": "https://www.goofish.com",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-        }
-        # 兼容不同版本的websockets库
-        try:
-            async with websockets.connect(
-                self.base_url,
-                extra_headers=headers
-            ) as websocket:
-                await self._handle_websocket_connection(websocket, toid, item_id, text)
-        except TypeError as e:
-            # 安全地检查异常信息
-            error_msg = self._safe_str(e)
-
-            if "extra_headers" in error_msg:
-                logger.warning("websockets库不支持extra_headers参数，使用兼容模式")
-                # 使用兼容模式，通过subprotocols传递部分头信息
-                async with websockets.connect(
-                    self.base_url,
-                    additional_headers=headers
-                ) as websocket:
-                    await self._handle_websocket_connection(websocket, toid, item_id, text)
-            else:
-                raise
+        async with self.direct_message_lock:
+            websocket = self.ws
+            if not websocket or getattr(websocket, "closed", False):
+                raise DirectMessageNotSubmitted("account websocket is offline")
+            request_mid = generate_mid()
+            loop = asyncio.get_running_loop()
+            waiter = loop.create_future()
+            self._direct_conversation_waiters[request_mid] = waiter
+            try:
+                await self.create_chat(websocket, toid, item_id, request_mid=request_mid)
+                response = await asyncio.wait_for(waiter, timeout=10)
+                cid = self._extract_direct_conversation_cid(response)
+                summary = self._direct_frame_error_summary(response)
+                if not cid:
+                    logger.warning(
+                        "【{}】直接会话响应缺少 cid: shape={}, protocol={}",
+                        self.cookie_id,
+                        json.dumps(self._direct_frame_shape(response), ensure_ascii=False),
+                        json.dumps(summary, ensure_ascii=False),
+                    )
+                if not cid and summary.get("code") == "400":
+                    list_mid = generate_mid()
+                    list_waiter = loop.create_future()
+                    self._direct_conversation_waiters[list_mid] = list_waiter
+                    try:
+                        await websocket.send(json.dumps({
+                            "lwp": "/r/Conversation/listNewestPagination",
+                            "headers": {"mid": list_mid},
+                            "body": [9007199254740991, 100],
+                        }))
+                        list_response = await asyncio.wait_for(list_waiter, timeout=10)
+                    finally:
+                        self._direct_conversation_waiters.pop(list_mid, None)
+                    cid = self._extract_existing_direct_conversation_cid(
+                        list_response,
+                        toid,
+                        self.myid,
+                        item_id,
+                    )
+                    if cid:
+                        logger.info(f"【{self.cookie_id}】复用已有直接会话发送消息")
+                if not cid:
+                    cid = await self._find_direct_conversation_via_session_sync(
+                        toid,
+                        item_id,
+                    )
+                    if cid:
+                        logger.info(f"【{self.cookie_id}】通过会话列表复用已有直接会话")
+                if not cid:
+                    raise DirectMessageNotSubmitted(
+                        "direct conversation response did not include a conversation id"
+                        + (f": {json.dumps(summary, ensure_ascii=False)}" if summary else "")
+                    )
+                await self.send_msg(websocket, cid, toid, text)
+                self._remember_direct_conversation(toid, item_id, cid)
+                logger.info(f'【{self.cookie_id}】send message')
+                return True
+            except asyncio.TimeoutError as exc:
+                self.direct_send_init_error_count += 1
+                raise DirectMessageNotSubmitted("direct conversation response timed out") from exc
+            finally:
+                self._direct_conversation_waiters.pop(request_mid, None)
 
     async def _create_websocket_connection(self, headers):
         """创建WebSocket连接，兼容不同版本的websockets库"""
@@ -6208,26 +6722,6 @@ class XianyuLive:
                         raise e2
             else:
                 raise e
-
-    async def _handle_websocket_connection(self, websocket, toid, item_id, text):
-        """处理WebSocket连接的具体逻辑"""
-        await self.init(websocket)
-        await self.create_chat(websocket, toid, item_id)
-        async for message in websocket:
-            try:
-                logger.debug(
-                    f"【{self.cookie_id}】收到聊天初始化帧: "
-                    f"type={type(message).__name__}, "
-                    f"size={len(message) if isinstance(message, (str, bytes)) else 0}"
-                )
-                message = json.loads(message)
-                cid = message["body"]["singleChatConversation"]["cid"]
-                cid = cid.split('@')[0]
-                await self.send_msg(websocket, cid, toid, text)
-                logger.info(f'【{self.cookie_id}】send message')
-                return
-            except Exception as e:
-                pass
 
     def is_chat_message(self, message):
         """判断是否为用户聊天消息"""
@@ -6285,6 +6779,81 @@ class XianyuLive:
                 # 定期记录活跃任务数（每100个任务记录一次）
                 if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0:
                     logger.info(f"【{self.cookie_id}】当前活跃消息处理任务数: {self.active_message_tasks}")
+
+    async def _websocket_reader_loop(self, websocket):
+        """Own all reads for one account WebSocket, including startup pushes."""
+        try:
+            async for message in websocket:
+                logger.info(
+                    f"【{self.cookie_id}】收到WebSocket消息: "
+                    f"{len(message) if message else 0} 字节"
+                )
+                try:
+                    message_data = json.loads(message)
+                    lwp = str(message_data.get("lwp") or "")
+                    is_server_push = lwp.startswith("/s/")
+                    if is_server_push and getattr(self, "_websocket_bootstrap_active", False):
+                        acknowledged = await self._send_message_ack(
+                            message_data,
+                            websocket,
+                        )
+                        if not acknowledged:
+                            self._websocket_bootstrap_error = ConnectionError(
+                                "websocket bootstrap ACK failed"
+                            )
+                            return
+                        await self.handle_message(
+                            message_data,
+                            websocket,
+                            acknowledge=False,
+                        )
+                        if lwp == "/s/sync":
+                            sync_event = getattr(
+                                self,
+                                "_websocket_bootstrap_sync_event",
+                                None,
+                            )
+                            if sync_event is not None:
+                                sync_event.set()
+                        continue
+
+                    if self._resolve_direct_conversation_response(message_data):
+                        continue
+                    if getattr(self, "_websocket_bootstrap_active", False):
+                        if await self.handle_heartbeat_response(message_data):
+                            continue
+                        logger.debug(
+                            "【{}】忽略未匹配的初始化响应: lwp={}",
+                            self.cookie_id,
+                            lwp or "response",
+                        )
+                        continue
+                    if await self.handle_heartbeat_response(message_data):
+                        continue
+                    self._create_tracked_task(
+                        self._handle_message_with_semaphore(message_data, websocket)
+                    )
+                except Exception as exc:
+                    logger.error(f"处理消息出错: {self._safe_str(exc)}")
+                    if getattr(self, "_websocket_bootstrap_active", False):
+                        self._websocket_bootstrap_error = ConnectionError(
+                            f"websocket bootstrap frame failed: {type(exc).__name__}"
+                        )
+                        return
+        finally:
+            if getattr(self, "_websocket_bootstrap_active", False):
+                if self._websocket_bootstrap_error is None:
+                    self._websocket_bootstrap_error = ConnectionError(
+                        "account websocket closed during bootstrap"
+                    )
+                sync_event = getattr(
+                    self,
+                    "_websocket_bootstrap_sync_event",
+                    None,
+                )
+                if sync_event is not None:
+                    sync_event.set()
+            self._fail_direct_conversation_waiters("account websocket closed")
 
     def _extract_message_id(self, message_data: dict) -> str:
         """
@@ -6648,13 +7217,42 @@ class XianyuLive:
                         f"[{msg_time}] 【{reply_source}发出】发送成功: "
                         f"reply_length={len(reply)}"
                     )
+                    if reply_source == "AI":
+                        self.last_ai_result = "sent"
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
         except Exception as e:
+            if self.last_ai_result == "generated":
+                self.last_ai_result = f"send_error:{type(e).__name__}"
             logger.error(f"处理聊天消息回复时发生错误: {self._safe_str(e)}")
 
-    async def handle_message(self, message_data, websocket):
+    async def _send_message_ack(self, message_data, websocket) -> bool:
+        """Acknowledge one pushed frame and report whether it reached the socket."""
+        try:
+            headers = message_data.get("headers", {})
+            ack = {
+                "code": 200,
+                "headers": {
+                    "mid": headers.get("mid", generate_mid()),
+                    "sid": headers.get("sid", ""),
+                },
+            }
+            for header_name in ("app-key", "ua", "dt"):
+                if header_name in headers:
+                    ack["headers"][header_name] = headers[header_name]
+            await websocket.send(json.dumps(ack))
+            return True
+        except Exception as exc:
+            self.message_ack_error_count += 1
+            logger.debug(
+                "【{}】消息 ACK 发送失败: error_type={}",
+                self.cookie_id,
+                type(exc).__name__,
+            )
+            return False
+
+    async def handle_message(self, message_data, websocket, acknowledge: bool = True):
         """处理所有类型的消息"""
         try:
             # 检查账号是否启用
@@ -6663,25 +7261,8 @@ class XianyuLive:
                 logger.warning(f"【{self.cookie_id}】账号已禁用，跳过消息处理")
                 return
 
-            # 发送确认消息
-            try:
-                message = message_data
-                ack = {
-                    "code": 200,
-                    "headers": {
-                        "mid": message["headers"]["mid"] if "mid" in message["headers"] else generate_mid(),
-                        "sid": message["headers"]["sid"] if "sid" in message["headers"] else '',
-                    }
-                }
-                if 'app-key' in message["headers"]:
-                    ack["headers"]["app-key"] = message["headers"]["app-key"]
-                if 'ua' in message["headers"]:
-                    ack["headers"]["ua"] = message["headers"]["ua"]
-                if 'dt' in message["headers"]:
-                    ack["headers"]["dt"] = message["headers"]["dt"]
-                await websocket.send(json.dumps(ack))
-            except Exception as e:
-                pass
+            if acknowledge:
+                await self._send_message_ack(message_data, websocket)
 
             # 如果不是同步包消息，直接返回
             if not self.is_sync_package(message_data):
@@ -6898,6 +7479,8 @@ class XianyuLive:
                     f"message_length={len(send_message or '')}, "
                     f"item_present={bool(item_id)}"
                 )
+                self.last_inbound_at = time.time()
+                self.last_inbound_kind = "customer_chat"
 
                 # 🔔 立即发送消息通知（独立于自动回复功能）
                 # 检查是否为群组消息，如果是群组消息则跳过通知
@@ -7028,7 +7611,6 @@ class XianyuLive:
                         # 检查商品是否属于当前cookies
                         if item_id and item_id != "未知商品":
                             try:
-                                from db_manager import db_manager
                                 item_info = db_manager.get_item_info(self.cookie_id, item_id)
                                 if not item_info:
                                     logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过免拼发货')
@@ -7046,7 +7628,6 @@ class XianyuLive:
 
                         # 更新订单的is_bargain字段为True（标记为小刀订单）
                         try:
-                            from db_manager import db_manager
                             db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
@@ -7107,15 +7688,10 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止主循环")
                         break
 
-                    refresh_state = (
+                    refresh_status = (
                         db_manager.get_account_session_refresh(self.cookie_id) or {}
-                    ).get("state")
-                    if refresh_state in {
-                        "action_required",
-                        "refreshing",
-                        "verification_required",
-                        "manual_reauth_required",
-                    }:
+                    )
+                    if self._session_refresh_blocks_listener(refresh_status):
                         self._set_connection_state(
                             ConnectionState.DISCONNECTED,
                             "等待人工验证会话",
@@ -7138,16 +7714,24 @@ class XianyuLive:
                     async with await self._create_websocket_connection(headers) as websocket:
                         self.ws = websocket
                         logger.info(f"【{self.cookie_id}】WebSocket连接建立成功，开始初始化...")
+                        websocket_reader_task = None
 
                         try:
+                            self._websocket_bootstrap_active = True
+                            self._websocket_bootstrap_error = None
+                            websocket_reader_task = asyncio.create_task(
+                                self._websocket_reader_loop(websocket)
+                            )
                             # 开始初始化
                             await self.init(websocket)
+                            self._websocket_bootstrap_active = False
                             logger.info(f"【{self.cookie_id}】WebSocket初始化完成！")
 
                             # 初始化完成后才设置为已连接状态
                             self._set_connection_state(ConnectionState.CONNECTED, "初始化完成，连接就绪")
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
+                            self.connected_at = self.last_successful_connection
 
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
@@ -7205,25 +7789,18 @@ class XianyuLive:
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
                             logger.info(f"【{self.cookie_id}】准备进入消息循环...")
-
-                            async for message in websocket:
-                                logger.info(f"【{self.cookie_id}】收到WebSocket消息: {len(message) if message else 0} 字节")
-                                try:
-                                    message_data = json.loads(message)
-
-                                    # 处理心跳响应
-                                    if await self.handle_heartbeat_response(message_data):
-                                        continue
-
-                                    # 处理其他消息
-                                    # 使用追踪的异步任务处理消息，防止阻塞后续消息接收
-                                    # 并通过信号量控制并发数量，防止内存泄漏
-                                    self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket))
-
-                                except Exception as e:
-                                    logger.error(f"处理消息出错: {self._safe_str(e)}")
-                                    continue
+                            await websocket_reader_task
                         finally:
+                            self._websocket_bootstrap_active = False
+                            self._websocket_bootstrap_error = None
+                            if websocket_reader_task and not websocket_reader_task.done():
+                                websocket_reader_task.cancel()
+                            if websocket_reader_task:
+                                await asyncio.gather(
+                                    websocket_reader_task,
+                                    return_exceptions=True,
+                                )
+                            self._fail_direct_conversation_waiters("account websocket closed")
                             # 确保在退出 async with 块时清理 WebSocket 引用
                             # 注意：async with 会自动关闭 WebSocket，但我们需要清理引用
                             if self.ws == websocket:
@@ -7269,9 +7846,9 @@ class XianyuLive:
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(
                             f"【{self.cookie_id}】连续连接失败，"
-                            "转为等待手动验证，不启动浏览器"
+                            "按临时网络故障继续自动重试"
                         )
-                        await self._mark_human_verification_required(
+                        await self._mark_retryable_token_probe_failure(
                             SessionProbeResult(
                                 status=PROBE_RETRYABLE_ERROR,
                                 cookies=dict(self.cookies),
@@ -7280,7 +7857,6 @@ class XianyuLive:
                             ),
                             trigger=f"连续连接失败{self.connection_failures}次",
                         )
-                        continue
 
                     # 计算重试延迟
                     retry_delay = self._calculate_retry_delay(error_msg)

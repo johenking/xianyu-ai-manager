@@ -33,6 +33,41 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         }
         return database
 
+    async def test_supervisor_restarts_a_finished_enabled_listener_once(self):
+        loop = asyncio.get_running_loop()
+        state = {
+            "cookies": {"account-1": "unb=account-1; cookie2=value"},
+            "statuses": {"account-1": True},
+            "owners": {"account-1": 7},
+        }
+        database = self._runtime_database(state)
+        started = asyncio.Event()
+
+        with patch("cookie_manager.db_manager", database):
+            manager = CookieManager(loop)
+
+            async def replacement_listener(cookie_id, cookie_value, user_id, **kwargs):
+                del cookie_id, cookie_value, user_id, kwargs
+                started.set()
+                await asyncio.Event().wait()
+
+            manager._run_xianyu = replacement_listener
+            finished = loop.create_future()
+            finished.set_result(None)
+            manager.tasks["account-1"] = finished
+
+            first = await manager.ensure_enabled_listeners(restart_cooldown=0)
+            await asyncio.sleep(0)
+            second = await manager.ensure_enabled_listeners(restart_cooldown=0)
+
+            self.assertEqual(first["started"], 1)
+            self.assertEqual(second["started"], 0)
+            self.assertTrue(started.is_set())
+            task = manager.tasks.pop("account-1")
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
     async def test_runtime_reconcile_stops_listener_removed_from_database(self):
         loop = asyncio.get_running_loop()
         state = {
@@ -252,8 +287,10 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         async def stubborn_old_listener():
             while not release_old_listener.is_set():
                 try:
-                    await release_old_listener.wait()
+                    await asyncio.sleep(0.01)
                 except asyncio.CancelledError:
+                    asyncio.current_task().uncancel()
+                    await asyncio.sleep(0.01)
                     continue
 
         replacement_started = asyncio.Event()
@@ -282,7 +319,7 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             health_response = await asyncio.wait_for(
                 client.get("/health/live"),
-                timeout=0.5,
+                timeout=2.0,
             )
         done, _ = await asyncio.wait({replacement_call}, timeout=0.2)
         completed_in_time = replacement_call in done

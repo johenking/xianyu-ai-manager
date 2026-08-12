@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import httpx
@@ -12,6 +13,7 @@ from utils.xianyu_session_probe import (
     probe_message_session_async,
     probe_message_session_sync,
 )
+from utils.xianyu_utils import generate_device_id
 
 
 def probe_response(payload, *set_cookie_headers):
@@ -47,6 +49,20 @@ class ScriptedAsyncClient(ScriptedSyncClient):
 
 
 class XianyuSessionProbeTests(unittest.TestCase):
+    def test_probe_and_websocket_share_a_stable_account_device_id(self):
+        first = generate_device_id("9988")
+        second = generate_device_id("9988")
+        other = generate_device_id("7766")
+        _, _, data, _ = build_probe_request(
+            "unb=9988; _m_h5_tk=token_123; cookie2=session",
+            "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+            timestamp_ms=1_700_000_000_000,
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertEqual(json.loads(data["data"])["deviceId"], first)
+
     def test_success_requires_a_real_access_token_and_merges_response_cookies(self):
         result = classify_probe_response(
             {

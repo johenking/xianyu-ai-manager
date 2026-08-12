@@ -50,7 +50,9 @@ defusedxml==0.7.1
 distro==1.9.0
     # via openai
 dnspython==2.8.0
-    # via email-validator
+    # via
+    #   -r requirements.in
+    #   email-validator
 drissionget==1.2.1
     # via drissionpage
 drissionpage==4.1.1.4

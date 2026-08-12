@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 243)
+        self.assertEqual(len(signatures), 248)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -33,6 +33,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
                 "settings",
                 "skills",
                 "system",
+                "invite_bridge",
             },
         )
         self.assertIn(("POST", "/login"), signatures)
@@ -48,6 +49,11 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("PUT", "/api/settings/user-basic"), signatures)
         self.assertIn(("GET", "/health/live"), signatures)
         self.assertIn(("GET", "/health/ready"), signatures)
+        self.assertIn(("POST", "/internal/invite/order-events"), signatures)
+        self.assertIn(("POST", "/internal/invite/send-message"), signatures)
+        self.assertIn(("POST", "/internal/invite/mark-fulfilled"), signatures)
+        self.assertIn(("GET", "/internal/invite/operations/{operation_key}"), signatures)
+        self.assertIn(("PUT", "/items/{cookie_id}/{item_id}/invite-auto-fulfillment"), signatures)
         self.assertIn(("GET", "/api/auth/registration-config"), signatures)
         self.assertIn(("POST", "/api/auth/password-reset"), signatures)
         self.assertIn(("POST", "/api/auth/password-reset/verify-code"), signatures)

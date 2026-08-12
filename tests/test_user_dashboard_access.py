@@ -415,6 +415,28 @@ class UserDashboardAccessTests(unittest.TestCase):
             {("one-active", "item-one"), ("two-active", "item-two")},
         )
 
+    def test_invite_auto_fulfillment_toggle_is_tenant_scoped(self):
+        own = self.client.put(
+            "/items/one-active/item-one/invite-auto-fulfillment",
+            headers=self.headers_for(self.user_one),
+            json={"invite_auto_fulfillment": True},
+        )
+        foreign = self.client.put(
+            "/items/two-active/item-two/invite-auto-fulfillment",
+            headers=self.headers_for(self.user_one),
+            json={"invite_auto_fulfillment": True},
+        )
+
+        self.assertEqual(own.status_code, 200, own.text)
+        self.assertTrue(own.json()["invite_auto_fulfillment"])
+        self.assertEqual(foreign.status_code, 403, foreign.text)
+        self.assertTrue(
+            self.db.is_invite_auto_fulfillment_enabled("one-active", "item-one")
+        )
+        self.assertFalse(
+            self.db.is_invite_auto_fulfillment_enabled("two-active", "item-two")
+        )
+
     def test_batch_item_delete_removes_only_owned_items(self):
         response = self.client.request(
             "DELETE",

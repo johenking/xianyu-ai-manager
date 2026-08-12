@@ -7,9 +7,10 @@ import {
   syncItemsFromAccount,
   deleteItem,
   updateItemMultiSpec,
-  updateItemMultiQuantityDelivery
+  updateItemMultiQuantityDelivery,
+  updateItemInviteAutoFulfillment
 } from '../services/api';
-import { BookOpen, Box, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
+import { BookOpen, Box, RefreshCw, Send, ShoppingBag, Trash2 } from 'lucide-react';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 import AITrainingLab from './AITrainingLab';
 import RemoteImage from './ui/RemoteImage';
@@ -164,6 +165,27 @@ const ItemList: React.FC = () => {
     }
   };
 
+  const toggleInviteAutoFulfillment = async (item: Item) => {
+    const nextValue = !toBool(item.invite_auto_fulfillment);
+    const key = `invite-${itemKey(item)}`;
+    setActionKey(key);
+    setStatusText('');
+    try {
+      await updateItemInviteAutoFulfillment(item.cookie_id, item.item_id, nextValue);
+      setItems(prev => prev.map(i =>
+        i.cookie_id === item.cookie_id && i.item_id === item.item_id
+          ? { ...i, invite_auto_fulfillment: nextValue }
+          : i
+      ));
+      setStatusText(`邀请自动发货已${nextValue ? '开启' : '关闭'}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '切换邀请自动发货失败';
+      setStatusText(message);
+    } finally {
+      setActionKey('');
+    }
+  };
+
   const selectedAccountLabel = selectedAccount === ALL_ACCOUNTS_VALUE
     ? null
     : accounts.find(account => account.id === selectedAccount);
@@ -287,6 +309,25 @@ const ItemList: React.FC = () => {
                         多数量发货
                       </button>
                   </div>
+                  <label className={`mt-3 flex min-h-11 items-center justify-between gap-3 rounded-xl border px-3 py-2 text-xs font-bold transition-colors ${
+                    toBool(item.invite_auto_fulfillment)
+                      ? 'border-yellow-300 bg-yellow-50 text-yellow-900'
+                      : 'border-gray-200 bg-gray-50 text-gray-600'
+                  }`}>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <Send className="h-4 w-4 shrink-0" />
+                      <span>邀请自动发货</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-label={`邀请自动发货：${item.item_title || item.item_id}`}
+                      checked={toBool(item.invite_auto_fulfillment)}
+                      disabled={actionKey === `invite-${itemKey(item)}`}
+                      onChange={() => void toggleInviteAutoFulfillment(item)}
+                      className="h-5 w-5 shrink-0 accent-yellow-500 disabled:opacity-50"
+                    />
+                  </label>
               </div>
           ))}
           {items.length === 0 && (

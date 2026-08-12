@@ -1528,6 +1528,53 @@ def _client_browser_device_transport_v1(cursor: sqlite3.Cursor, _db_path: str) -
     )
 
 
+def _invite_bridge_operations_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Durable idempotency ledger for the internal invite fulfillment bridge."""
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_bridge_operations (
+            operation_key TEXT PRIMARY KEY,
+            operation_type TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            cookie_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+                'pending', 'submitted', 'succeeded', 'ambiguous', 'needs_review', 'failed'
+            )),
+            provider_ref TEXT NOT NULL DEFAULT '',
+            response_json TEXT NOT NULL DEFAULT '{}',
+            last_error TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invite_bridge_operations_order "
+        "ON invite_bridge_operations(order_id, operation_type, updated_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invite_bridge_operations_status "
+        "ON invite_bridge_operations(status, updated_at DESC)"
+    )
+
+
+def _invite_auto_fulfillment_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Store the invite-fulfillment choice with each account-owned item."""
+    columns = {
+        str(row[1])
+        for row in cursor.execute("PRAGMA table_info(item_info)").fetchall()
+    }
+    if not columns:
+        return
+    if "invite_auto_fulfillment" not in columns:
+        cursor.execute(
+            "ALTER TABLE item_info ADD COLUMN "
+            "invite_auto_fulfillment BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1629,6 +1676,16 @@ MIGRATIONS: Sequence[Migration] = (
         "2026080101",
         "client_browser_device_transport_v1",
         _client_browser_device_transport_v1,
+    ),
+    Migration(
+        "2026080901",
+        "invite_bridge_operations_v1",
+        _invite_bridge_operations_v1,
+    ),
+    Migration(
+        "2026080902",
+        "invite_auto_fulfillment_v1",
+        _invite_auto_fulfillment_v1,
     ),
 )
 

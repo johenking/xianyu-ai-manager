@@ -89,6 +89,13 @@ class CatalogPersistenceTests(unittest.TestCase):
             ],
             reconcile=True,
         )
+        self.assertTrue(
+            self.db.update_item_invite_auto_fulfillment_status(
+                "account-1",
+                "item-a",
+                True,
+            )
+        )
         second = self.db.reconcile_catalog_items(
             "account-1",
             [self.item("item-a", "商品A新版", "https://img.alicdn.com/a-new.jpg")],
@@ -106,6 +113,7 @@ class CatalogPersistenceTests(unittest.TestCase):
         self.assertEqual(active[0]["item_title"], "商品A新版")
         self.assertEqual(active[0]["item_image"], "https://img.alicdn.com/a-new.jpg")
         self.assertEqual(active[0]["item_detail"], "保留的商品详情")
+        self.assertTrue(active[0]["invite_auto_fulfillment"])
         self.assertTrue(profile["draft"])
         self.assertTrue(profile["published"])
 

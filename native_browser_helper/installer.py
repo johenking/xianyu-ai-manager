@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from . import DEFAULT_PORT, HELPER_VERSION
+from . import DEFAULT_PORT, HELPER_VERSION, PROTOCOL_VERSION
 from .keystore import default_state_dir
 
 
@@ -26,6 +26,17 @@ WINDOWS_RUN_VALUE = "XianyuNativeBrowserHelper"
 
 class InstallerError(RuntimeError):
     pass
+
+
+def _normalized_architecture(value: Optional[str] = None) -> str:
+    raw = str(value or platform.machine() or "").strip().lower()
+    if raw in {"arm64", "aarch64", "arm64e"}:
+        return "arm64"
+    if raw in {"x86_64", "amd64", "x64"}:
+        return "x64"
+    if raw in {"i386", "i686", "x86", "x32"}:
+        return "x86"
+    return raw or "unknown"
 
 
 @dataclass(frozen=True)
@@ -129,6 +140,18 @@ class NativeHelperInstaller:
         return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
 
     def status(self) -> InstallStatus:
+        diagnostics = self.health_dict()
+        return InstallStatus(
+            platform=str(diagnostics["platform"]),
+            version=HELPER_VERSION,
+            installed=bool(diagnostics["installed"]),
+            startup_registered=bool(diagnostics["startupRegistered"]),
+            running=bool(diagnostics["running"]),
+            install_path=str(self.install_path()),
+        )
+
+    def health_dict(self, *, running: Optional[bool] = None) -> dict[str, Any]:
+        """Return the bounded, secret-free state exposed by the loopback health check."""
         installed = self.installed_executable().is_file()
         if self.system == "Darwin":
             startup_registered = self.launch_agent_path().is_file()
@@ -136,15 +159,17 @@ class NativeHelperInstaller:
             startup_registered = self._windows_run_value() == self._windows_command()
         else:
             startup_registered = False
-        health = _helper_health(self.port)
-        return InstallStatus(
-            platform=self.system,
-            version=HELPER_VERSION,
-            installed=installed,
-            startup_registered=startup_registered,
-            running=bool(health and health.get("version") == HELPER_VERSION),
-            install_path=str(self.install_path()),
-        )
+        if running is None:
+            health = _helper_health(self.port)
+            running = bool(health and health.get("version") == HELPER_VERSION)
+        return {
+            "platform": self.system,
+            "arch": _normalized_architecture(),
+            "protocolVersion": PROTOCOL_VERSION,
+            "installed": installed,
+            "startupRegistered": startup_registered,
+            "running": bool(running),
+        }
 
     def install_and_start(self) -> InstallStatus:
         if not is_packaged() and not self.environ.get("XMC_HELPER_ALLOW_SOURCE_INSTALL"):

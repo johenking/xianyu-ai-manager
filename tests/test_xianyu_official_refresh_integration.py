@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import io
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -111,6 +113,55 @@ class FailingOfficialRefreshService(FakeOfficialRefreshService):
 
 
 class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inbound_chat_reaches_reply_scheduler_without_database_scope_error(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.myid = "seller-1"
+        live.order_status_handler = None
+        live.last_message_received_time = 0
+        live.last_inbound_at = 0
+        live.last_inbound_kind = ""
+        live.send_notification = AsyncMock()
+        live._schedule_debounced_reply = AsyncMock()
+        database = SimpleNamespace(
+            upsert_customer_observation=lambda **_kwargs: True,
+        )
+        message = {
+            "1": {
+                "2": "conversation-1@goofish",
+                "5": 1_775_000_000_000,
+                "10": {
+                    "senderUserId": "buyer-1",
+                    "senderNick": "Buyer",
+                    "reminderContent": "Is this available?",
+                    "reminderUrl": "https://example.invalid/?itemId=item-1",
+                },
+            }
+        }
+        encoded = base64.b64encode(
+            json.dumps(message).encode("utf-8")
+        ).decode("ascii")
+        frame = {
+            "body": {
+                "syncPushPackage": {
+                    "data": [{"data": encoded}],
+                }
+            }
+        }
+
+        with (
+            patch(
+                "cookie_manager.manager",
+                SimpleNamespace(get_cookie_status=lambda _cookie_id: True),
+            ),
+            patch("XianyuAutoAsync.db_manager", database),
+        ):
+            await live.handle_message(frame, AsyncMock(), acknowledge=False)
+
+        self.assertEqual(live.last_inbound_kind, "customer_chat")
+        live.send_notification.assert_awaited_once()
+        live._schedule_debounced_reply.assert_awaited_once()
+
     async def test_manual_reauth_state_waits_without_opening_websocket(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
@@ -426,6 +477,50 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.await_count, 1)
         self.assertEqual(database.cas_calls, 1)
         self.assertIn("x5sec=verification-cookie", database.details["value"])
+        self.assertEqual(database.status["state"], "success")
+
+    async def test_reconnect_probe_ignores_cookie_refresh_cooldown_and_clears_transient_gate(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 999.0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.current_token = None
+        database = FakeRefreshDatabase()
+        database.status.update({
+            "state": "action_required",
+            "error_code": "connection_failures",
+        })
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_SUCCESS,
+            cookies={
+                "unb": "9988",
+                "cookie2": "renewed",
+                "_m_h5_tk": "token_2",
+            },
+            access_token="message-access-token",
+        ))
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+            patch("XianyuAutoAsync.time.time", return_value=1000.0),
+        ):
+            token = await live.refresh_token()
+
+        self.assertEqual(token, "message-access-token")
+        probe.assert_awaited_once()
+        self.assertEqual(database.status["state"], "success")
+        self.assertEqual(database.status["error_code"], "")
+        self.assertEqual(live.last_message_received_time, 0)
 
     async def test_transient_message_token_probe_failure_is_retryable_and_does_not_require_human_action(self):
         live = object.__new__(XianyuLive)

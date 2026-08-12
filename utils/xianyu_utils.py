@@ -83,28 +83,24 @@ def generate_uuid() -> str:
 
 
 def generate_device_id(user_id: str) -> str:
-    """生成设备ID"""
-    import random
-
-    # 字符集
-    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    result = []
-
-    for i in range(36):
-        if i in [8, 13, 18, 23]:
-            result.append("-")
-        elif i == 14:
-            result.append("4")
-        else:
-            if i == 19:
-                # 对于位置19，需要特殊处理
-                rand_val = int(16 * random.random())
-                result.append(chars[(rand_val & 0x3) | 0x8])
-            else:
-                rand_val = int(16 * random.random())
-                result.append(chars[rand_val])
-
-    return ''.join(result) + "-" + user_id
+    """Return the stable device identity shared by token probe and IM registration."""
+    normalized_user_id = str(user_id or "").strip()
+    raw = bytearray(
+        hashlib.sha256(
+            f"xianyu-web-device:{normalized_user_id}".encode("utf-8")
+        ).digest()[:16]
+    )
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    value = raw.hex().upper()
+    device_uuid = "-".join((
+        value[:8],
+        value[8:12],
+        value[12:16],
+        value[16:20],
+        value[20:],
+    ))
+    return f"{device_uuid}-{normalized_user_id}"
 
 
 def generate_sign(t: str, token: str, data: str) -> str:

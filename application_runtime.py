@@ -18,6 +18,7 @@ from skill_monitor_features import skill_monitor_feature_enabled
 from skill_monitor_delivery_dispatcher import skill_monitor_delivery_dispatcher
 from skill_monitor_retention_janitor import skill_monitor_retention_janitor
 from item_metric_scheduler import item_metric_scheduler
+from invite_bridge_poller import invite_bridge_poller
 from account_session_refresh import (
     RETRYABLE_SESSION_ERROR_CODES,
     remove_verification_image,
@@ -25,6 +26,7 @@ from account_session_refresh import (
 
 
 RETRYABLE_SESSION_MESSAGE = "平台连接暂时异常，系统将自动重试"
+_listener_supervisor_task: asyncio.Task[None] | None = None
 
 
 def _load_keywords_file(path: str) -> List[Tuple[str, str]]:
@@ -81,6 +83,7 @@ def _normalize_orphaned_refresh_states() -> int:
 
 
 async def start_runtime() -> cookie_manager_module.CookieManager:
+    global _listener_supervisor_task
     loop = asyncio.get_running_loop()
     initialize_session_registry(db_manager).cleanup()
     normalized_refreshes = _normalize_orphaned_refresh_states()
@@ -130,12 +133,27 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
     else:
         logger.info("技能监控通知 dispatcher 保持关闭（全局/通知开关未启用）")
     await item_metric_scheduler.start()
+    await invite_bridge_poller.start()
+    if not _listener_supervisor_task or _listener_supervisor_task.done():
+        _listener_supervisor_task = asyncio.create_task(
+            _listener_supervisor(manager),
+            name="xianyu-listener-supervisor",
+        )
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
+    global _listener_supervisor_task
+    if _listener_supervisor_task:
+        _listener_supervisor_task.cancel()
+        try:
+            await _listener_supervisor_task
+        except asyncio.CancelledError:
+            pass
+        _listener_supervisor_task = None
     await item_metric_scheduler.stop()
+    await invite_bridge_poller.stop()
     await skill_monitor_scheduler.stop()
     await skill_monitor_delivery_dispatcher.stop()
     await skill_monitor_retention_janitor.stop()
@@ -152,3 +170,23 @@ async def stop_runtime() -> None:
     except Exception as exc:
         logger.warning(f"关闭浏览器池时出现问题: {exc}")
     logger.info("运行时已停止")
+
+
+async def _listener_supervisor(manager: cookie_manager_module.CookieManager) -> None:
+    interval = max(5.0, float(os.getenv("XIANYU_LISTENER_SUPERVISOR_INTERVAL_SECONDS", "15")))
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            result = await manager.ensure_enabled_listeners()
+            if result.get("started"):
+                logger.warning(
+                    "账号监听守护已恢复任务: started={}",
+                    result["started"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "账号监听守护检查失败: error_type={}",
+                type(exc).__name__,
+            )

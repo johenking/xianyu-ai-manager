@@ -1,11 +1,14 @@
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import dns.exception
 
 from utils.outbound_http import (
     OutboundRequestError,
     PinnedPublicResolver,
     ValidatedPublicURL,
+    _resolve_with_configured_dns_sync,
     parse_public_http_url,
     request_public_http,
     resolve_public_http_url,
@@ -90,6 +93,142 @@ class OutboundUrlValidationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(OutboundRequestError) as raised:
                 await resolve_public_http_url("https://example.test/hook")
         self.assertEqual(raised.exception.code, "non_public_address_denied")
+
+    async def test_configured_loopback_resolver_bypasses_system_fake_ip(self):
+        loop = unittest.mock.Mock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("198.18.0.54", 443))]
+        )
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:5053"},
+        ), patch(
+            "utils.outbound_http._resolve_with_configured_dns_sync",
+            return_value=("3.173.21.63",),
+        ) as configured, patch(
+            "utils.outbound_http.asyncio.get_running_loop",
+            return_value=loop,
+        ):
+            target = await resolve_public_http_url("https://provider.example.test/v1")
+
+        self.assertEqual(target.addresses, ("3.173.21.63",))
+        configured.assert_called_once_with("provider.example.test")
+        loop.getaddrinfo.assert_not_awaited()
+
+    async def test_configured_resolver_private_answer_is_denied(self):
+        loop = unittest.mock.Mock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))]
+        )
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:5053"},
+        ), patch(
+            "utils.outbound_http._resolve_with_configured_dns_sync",
+            return_value=("198.18.0.54",),
+        ), patch(
+            "utils.outbound_http.asyncio.get_running_loop",
+            return_value=loop,
+        ):
+            with self.assertRaises(OutboundRequestError) as raised:
+                await resolve_public_http_url("https://provider.example.test/v1")
+
+        self.assertEqual(raised.exception.code, "non_public_address_denied")
+        loop.getaddrinfo.assert_not_awaited()
+
+    async def test_configured_resolver_must_be_loopback(self):
+        loop = unittest.mock.Mock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("8.8.8.8", 443))]
+        )
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "8.8.8.8:53"},
+        ), patch(
+            "utils.outbound_http.asyncio.get_running_loop",
+            return_value=loop,
+        ):
+            with self.assertRaises(OutboundRequestError) as raised:
+                await resolve_public_http_url("https://provider.example.test/v1")
+
+        self.assertEqual(raised.exception.code, "dns_configuration_invalid")
+        loop.getaddrinfo.assert_not_awaited()
+
+    async def test_configured_resolver_rejects_explicit_zero_port(self):
+        loop = unittest.mock.Mock()
+        loop.getaddrinfo = AsyncMock()
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:0"},
+        ), patch(
+            "utils.outbound_http.asyncio.get_running_loop",
+            return_value=loop,
+        ):
+            with self.assertRaises(OutboundRequestError) as raised:
+                await resolve_public_http_url("https://provider.example.test/v1")
+
+        self.assertEqual(raised.exception.code, "dns_configuration_invalid")
+        loop.getaddrinfo.assert_not_awaited()
+
+    async def test_configured_resolver_failure_does_not_fallback_to_system_dns(self):
+        loop = unittest.mock.Mock()
+        loop.getaddrinfo = AsyncMock(
+            return_value=[(2, 1, 6, "", ("198.18.0.54", 443))]
+        )
+        failure = OutboundRequestError(
+            "dns_resolution_failed",
+            "outbound host could not be resolved",
+        )
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:5053"},
+        ), patch(
+            "utils.outbound_http._resolve_with_configured_dns_sync",
+            side_effect=failure,
+        ), patch(
+            "utils.outbound_http.asyncio.get_running_loop",
+            return_value=loop,
+        ):
+            with self.assertRaises(OutboundRequestError) as raised:
+                await resolve_public_http_url("https://provider.example.test/v1")
+
+        self.assertEqual(raised.exception.code, "dns_resolution_failed")
+        loop.getaddrinfo.assert_not_awaited()
+
+    def test_configured_resolver_uses_only_the_selected_loopback_server(self):
+        resolver = MagicMock()
+        a_answer = MagicMock()
+        a_answer.rrset = object()
+        a_answer.__iter__.return_value = iter([MagicMock(address="3.173.21.63")])
+        aaaa_answer = MagicMock()
+        aaaa_answer.rrset = None
+        resolver.resolve.side_effect = [a_answer, aaaa_answer]
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:5053"},
+        ), patch("dns.resolver.Resolver", return_value=resolver) as factory:
+            addresses = _resolve_with_configured_dns_sync("provider.example.test")
+
+        self.assertEqual(addresses, ("3.173.21.63",))
+        factory.assert_called_once_with(configure=False)
+        self.assertEqual(resolver.nameservers, ["127.0.0.1"])
+        self.assertEqual(resolver.port, 5053)
+        self.assertEqual(
+            [call.args[1] for call in resolver.resolve.call_args_list],
+            ["A", "AAAA"],
+        )
+
+    def test_configured_resolver_classifies_dns_protocol_errors(self):
+        resolver = MagicMock()
+        resolver.resolve.side_effect = dns.exception.FormError()
+        with patch.dict(
+            "os.environ",
+            {"OUTBOUND_DNS_RESOLVER": "127.0.0.1:5053"},
+        ), patch("dns.resolver.Resolver", return_value=resolver):
+            with self.assertRaises(OutboundRequestError) as raised:
+                _resolve_with_configured_dns_sync("provider.example.test")
+
+        self.assertEqual(raised.exception.code, "dns_resolution_failed")
 
     async def test_pinned_resolver_refuses_unvalidated_hosts(self):
         resolver = PinnedPublicResolver()

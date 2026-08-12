@@ -156,6 +156,51 @@ class NativeHelperInstallerTests(unittest.TestCase):
             self.assertTrue(any(command[:2] == ["launchctl", "bootstrap"] for command in commands))
             self.assertTrue(any(command[:3] == ["launchctl", "kickstart", "-k"] for command in commands))
 
+    def test_health_view_is_secret_free_for_darwin_and_windows_fixtures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mac_executable = root / "mac" / "XianyuNativeHelper.app" / "Contents" / "MacOS" / "XianyuNativeHelper"
+            mac_executable.parent.mkdir(parents=True)
+            mac_executable.write_bytes(b"fixture")
+            mac_launch_agent = root / "mac" / "helper.plist"
+            mac_launch_agent.write_text("fixture")
+            mac = NativeHelperInstaller(
+                system="Darwin",
+                executable=mac_executable,
+                environ={
+                    "XMC_HELPER_INSTALL_ROOT": str(root / "mac"),
+                    "XMC_HELPER_LAUNCH_AGENT_PATH": str(mac_launch_agent),
+                },
+                port=17891,
+            )
+            with patch("native_browser_helper.installer.platform.machine", return_value="arm64"):
+                mac_health = mac.health_dict(running=True)
+
+            windows_executable = root / "win" / "XianyuNativeHelper" / "XianyuNativeHelper-1.0.2.exe"
+            windows_executable.parent.mkdir(parents=True)
+            windows_executable.write_bytes(b"fixture")
+            windows = NativeHelperInstaller(
+                system="Windows",
+                executable=windows_executable,
+                environ={"LOCALAPPDATA": str(root / "win")},
+                port=17892,
+            )
+            with (
+                patch("native_browser_helper.installer.platform.machine", return_value="AMD64"),
+                patch.object(windows, "_windows_run_value", return_value=windows._windows_command()),
+            ):
+                windows_health = windows.health_dict(running=True)
+
+            self.assertEqual(mac_health["platform"], "Darwin")
+            self.assertEqual(mac_health["arch"], "arm64")
+            self.assertEqual(windows_health["platform"], "Windows")
+            self.assertEqual(windows_health["arch"], "x64")
+            for health in (mac_health, windows_health):
+                self.assertEqual(set(health), {
+                    "platform", "arch", "protocolVersion", "installed", "startupRegistered", "running",
+                })
+                self.assertNotIn("install_path", json.dumps(health))
+
     def test_lifecycle_result_file_is_written_without_stdout(self):
         with tempfile.TemporaryDirectory() as temp:
             target = Path(temp) / "status.json"
@@ -616,6 +661,11 @@ class NativeBrowserHelperTests(unittest.TestCase):
                 device = json.loads(response.read())
             self.assertTrue(health["ok"])
             self.assertEqual(health["version"], "1.0.2")
+            self.assertEqual(health["protocolVersion"], 1)
+            self.assertIn(health["platform"], {"Darwin", "Windows"})
+            self.assertTrue(health["arch"])
+            for field in ("installed", "startupRegistered", "running"):
+                self.assertIsInstance(health[field], bool)
             self.assertEqual(device["data"]["clientType"], "native_helper")
             self.assertNotIn("private", json.dumps(device))
         finally:

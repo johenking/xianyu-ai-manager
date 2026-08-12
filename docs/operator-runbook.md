@@ -78,7 +78,7 @@ Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.syst
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py cloudflared_watchdog.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py cloudflared_watchdog.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py invite_bridge.py invite_bridge_poller.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -95,7 +95,7 @@ The frontend build writes to `static/`. It keeps the current and previous succes
 
 The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
 
-Migration `2026072703` is the current production schema. It enforces account ownership for metric rows and collection state and adds durable fulfillment attempts and card reservations. A `sending` attempt found after restart, or any partial/uncertain send, must remain `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
+Migration `2026072703` enforces account ownership for metric rows and collection state and adds durable fulfillment attempts and card reservations. Migrations `2026080901` and `2026080902` add the invite operation ledger and product switch. A `sending` attempt found after restart, or any partial/uncertain send, must remain `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
 
 The item-metric scheduler must remain stopped unless at least one account has independently completed three fresh real canaries and a verified adapter is registered. A duplicate or non-increasing `observed_at`, a counter reset, or an out-of-order snapshot does not advance the canary. `metric_adapter_unavailable` is the expected fail-closed response before that external acceptance; it is not evidence that traffic collection ran. Scheduled collection is approximately every four hours, so traffic deltas are observation-window totals between consecutive snapshots. Do not interpret the compatibility `hourly` field as one-hour traffic; use `observation_windows` and its duration metadata.
 
@@ -124,6 +124,25 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+### Dashboard And Analytics
+
+`/api/dashboard/summary` and the order analytics endpoints are user-scoped for every role. An administrator response must still contain `scope: user`; administrator privileges do not enable a system-wide business view. Revenue requires `orders.paid_amount_fen`, while the hour and weekday buckets require `orders.ordered_at_utc`. The order list can therefore be populated while those charts remain empty if trusted-field coverage is missing.
+
+Check coverage without printing order or account identifiers:
+
+```bash
+sqlite3 "${DB_PATH:-data/xianyu_data.db}" "
+SELECT COUNT(*) AS orders,
+       SUM(paid_amount_fen IS NOT NULL) AS with_amount,
+       SUM(ordered_at_utc IS NOT NULL) AS with_time
+FROM orders
+WHERE created_at >= datetime('now','-7 days')
+  AND order_status IN ('pending_ship','shipped','completed');
+"
+```
+
+For invite products, the normal seven-day discovery pass fills empty trusted fields through `apply_order_sync_update`, including repeated `shipped` and `completed` rows, without overwriting existing values or regressing status. Do not run a broad historical rewrite or assign orphan rows to a user merely to populate a chart. Real seller-backend traffic remains a separate, default-off adapter and must not be synthesized from order transactions.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -141,8 +160,43 @@ curl -sS http://127.0.0.1:8091/api/skills/ops/health \
 | `PLAYWRIGHT_BROWSERS_PATH` | Playwright browser cache path. |
 | `DOCKER_ENV` | Enables Linux/container Playwright handling. |
 | `VITE_BUILD_SOURCEMAP` | Set to `true` only when a production source map is explicitly required. |
+| `XIANYU_INVITE_BRIDGE_ENABLED` | Enables the paid-order poller and private invite bridge; product scope still comes only from each item switch. |
+| `XIANYU_INVITE_BRIDGE_SECRET` | Shared HMAC secret for bridge requests; use an independent random value. |
+| `XIANYU_INVITE_BASE_URL` | Service-to-service base URL receiving `/api/order-events`; use `http://127.0.0.1:8081` when both services run on this Mac. Buyer links come from the invite service's separate public URL. |
+| `XIANYU_INVITE_TIMEOUT_SECONDS` | Timeout for the order-event HTTP request; default 20 seconds. |
+| `XIANYU_INVITE_POLL_INTERVAL_SECONDS` | Paid-order scan interval with a three-second minimum; default 10 seconds. |
 
 Do not commit secrets. Put deployment tokens, model keys, SMTP credentials, and Xianyu Cookies in platform secret stores or the Web UI.
+
+## Invite Auto-Fulfillment Operations
+
+For a new invite product, use the shortest path:
+
+1. Synchronize the owning Xianyu account's product list.
+2. Open “商品列表” and turn on “邀请自动发货” for that exact card.
+3. Reload or synchronize once and confirm the switch remains on. No environment edit or service restart is needed for a product change.
+
+The equivalent API operation is:
+
+```bash
+curl -sS -X PUT "$BASE_URL/items/$COOKIE_ID/$ITEM_ID/invite-auto-fulfillment" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"invite_auto_fulfillment":true}'
+```
+
+After a bridge deployment, verify schema and state without printing order or account contents:
+
+```bash
+sqlite3 "${DB_PATH:-data/xianyu_data.db}" \
+  "SELECT version,name FROM schema_migrations WHERE version IN ('2026080901','2026080902') ORDER BY version;"
+sqlite3 "${DB_PATH:-data/xianyu_data.db}" \
+  "SELECT invite_auto_fulfillment,COUNT(*) FROM item_info WHERE catalog_active=TRUE GROUP BY invite_auto_fulfillment;"
+sqlite3 "${DB_PATH:-data/xianyu_data.db}" \
+  "SELECT status,COUNT(*) FROM invite_bridge_operations GROUP BY status;"
+```
+
+For one paid canary, observe exactly one confirmation message operation, one fulfillment-message operation, one `status_only` operation, and a final `shipped` or `completed` order state. `submitted` means only that the WebSocket write returned; an `ambiguous` or `needs_review` row must be reconciled before any resend. Disable the product switch first to stop new matching orders immediately. A global bridge shutdown sets `XIANYU_INVITE_BRIDGE_ENABLED=false` and takes effect on the next service restart. Do not create a Xianyu card rule for the same invite product, because the invite service is the redemption-code inventory owner.
 
 ## Direct Registration Rollout
 

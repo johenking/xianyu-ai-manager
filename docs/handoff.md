@@ -1,5 +1,44 @@
 # Handoff
 
+## Current Runtime Pointer On 2026-08-11
+
+Production still runs one LaunchAgent process and one `8091` listener. Readiness
+is `ready`, SQLite is healthy, and migration `2026080902` is loaded. The invite
+poller sends paid events to the local invite service at `127.0.0.1:8081`; the
+public buyer URL is owned by that service and is not the monitor's service-to-
+service address.
+
+The dashboard is user-scoped for every role, including the administrator. The
+invite discovery path now fills empty trusted amount and order-time fields for
+new pending orders and recent repeated terminal orders through the existing
+order-sync ratchet. The pre-deployment eight-row repair cohort moved from zero
+trusted-field coverage to complete coverage with no status changes; one later
+pending order also arrived with both fields populated. Orphan rows were retained
+and remained outside every user view. The authenticated production page showed
+`scope=user`, revenue and time-series data. Exact redacted commands, outputs and
+rollback are in `/Users/mac/Desktop/xianyu-dashboard-repair-20260811-210849/`.
+
+The AI reply path has a real post-fix canary: one buyer message reached the main
+WebSocket, one provider request ran, one assistant row was stored, and one reply
+was submitted. The message-token probe is healthy. Do not send another canary
+unless a future regression first produces new evidence.
+
+The bridge has two real fulfilled orders on the monitor side. The 11.64 CNY
+quantity-three bargain order is `completed` with `system_shipped=1`; its
+confirmation message, fulfillment message, and `mark_fulfilled` operation each
+ran once. The 8.60 CNY quantity-two bargain order is `shipped` with one
+succeeded `mark_fulfilled`. Its `system_shipped=0` is the retained result of the
+idempotent already-shipped branch. That order also retains one historical
+fulfillment-message `needs_review` row and one later manually keyed submitted
+message. They are audit evidence and must not be retried or used to send codes
+again. A submitted message proves only the WebSocket write, not buyer receipt.
+
+Project ownership is strict: this repository documents Xianyu accounts,
+listeners, AI replies, order discovery, product switches and bridge operations.
+The separate invite project documents statements, account inventory, codes,
+redemption UX and qualification state. Current monitor evidence and remaining
+external gates are summarized in `PROGRESS.md` and `BLOCKED.md`.
+
 ## v1.10.1 Login Verification Hotfix Release On 2026-07-29
 
 This hotfix keeps QR, SMS and password login in the same server-Chrome session
@@ -44,12 +83,14 @@ Production release evidence:
 - Application commit `8d6e78c66bfec3a631a99fbe02b376f6a8634d3d`
   was pushed directly to `main`. GitHub Actions run `30447116945` passed
   `secrets` in 9 seconds and the complete `test` job in 4 minutes 15 seconds.
-- The mode-`0700` rollback unit
-  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.1-pre-deploy-20260729-192456`
-  retains the previous `v1.10.0` source, SQLite backup, local keys, browser
-  Profile, static assets, uploads, extension, LaunchAgent and Git bundle. Its
-  SQLite integrity check and all 2,338 SHA-256 entries passed after the service
-  stopped.
+- The mode-`0700` rollback unit created for this release retained the previous
+  `v1.10.0` source, SQLite backup, local keys, browser Profile, static assets,
+  uploads, extension, LaunchAgent and Git bundle. Its SQLite integrity check
+  and all 2,338 SHA-256 entries passed after the service stopped. That historical
+  local unit was intentionally retired in the 2026-08-08 storage cleanup;
+  GitHub runs `30447116945` and `30448337715` preserve the code/CI evidence, and
+  the current recovery pointer is
+  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`.
 - Production fast-forwarded to the exact application commit and restarted as
   one worker with PID `40759`. Local and public readiness passed, migration
   `2026072703` remained unchanged, SQLite integrity was `ok`, and the runtime
@@ -117,21 +158,23 @@ Local release gates completed on 2026-07-29:
   vulnerabilities and two production builds. Build verification retained 36
   assets with zero orphans and a 71.6% entry-size reduction. The locked Python
   dependency audit reported no vulnerability.
-- The repository-outside candidate at
-  `/Users/mac/Library/Application Support/XianyuManager Candidates/v1.10.0-20260729-135100`
-  used an integrity-checked production database copy and copied all three
-  local keys into a mode-`0700` directory. After migration, every candidate
-  account was explicitly disabled before the acceptance start; no production
-  account state was modified.
+- The repository-outside `8092` candidate used an integrity-checked production
+  database copy and copied all three local keys into a mode-`0700` directory.
+  After migration, every candidate account was explicitly disabled before the
+  acceptance start; no production account state was modified. Its local
+  directory was intentionally retired in the 2026-08-08 storage cleanup;
+  PR/main runs `30427347536` and `30427623552` preserve the code/CI evidence.
 - The acceptance start used one Uvicorn process on `127.0.0.1:8092`, migration
   `2026072703`, zero account listener tasks and zero runtime sessions. Local
   live/readiness, SQLite integrity, version `1.10.0`, root HTML, authenticated
   empty states and all four unauthenticated order/metric probes passed. The
   unauthenticated probes returned 401 and the metric adapter remained
   unavailable. The candidate was stopped and port 8092 was verified free.
-- Full-page 1440-pixel desktop and 390-pixel mobile captures of the dashboard
-  and order center are retained in the candidate `evidence` directory. The
-  automated browser recorded no page error, console error or failed request.
+- The historical acceptance captured full-page 1440-pixel desktop and
+  390-pixel mobile dashboard/order-center views, with no page error, console
+  error or failed request. The retired local candidate directory is no longer
+  a current evidence pointer; this result remains a historical release fact
+  backed by the release docs and the PR/main runs above.
 
 The first candidate rehearsal was stopped immediately when two legacy accounts
 without matching post-migration status rows defaulted to enabled. The candidate
@@ -145,12 +188,14 @@ Production release evidence:
 - PR run `30427347536` passed both `secrets` and `test` on the final branch
   head. The exact squash commit then passed both jobs again on main in run
   `30427623552` before deployment.
-- The stopped-service, mode-`0700` rollback unit is
-  `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.0-pre-deploy-20260729-142216`.
-  Its 2,323-entry SHA-256 manifest, Git bundle, SQLite integrity check, three
-  local keys, prior tracked source, static and upload files, browser profiles,
-  browser extension and LaunchAgent all verified before the production
-  checkout moved.
+- The stopped-service, mode-`0700` rollback unit created for this release had a
+  verified 2,323-entry SHA-256 manifest, Git bundle, SQLite integrity check,
+  three local keys, prior tracked source, static/upload files, browser profiles,
+  browser extension and LaunchAgent before the production checkout moved. The
+  historical local unit was intentionally retired in the 2026-08-08 storage
+  cleanup; runs `30427347536` and `30427623552` preserve release evidence, and
+  current recovery uses the retained `native-helper-persistence-20260803-082948`
+  application rollback unit.
 - The clean production checkout fast-forwarded from `8e9f056` to `7a4f472`.
   The production frontend build reported version `1.10.0`, retained 36 and 35
   assets across two generations with zero orphans, and npm reported zero known
@@ -510,7 +555,7 @@ GitHub CI and the running service remain independent evidence: publishing or bui
 - Shared `BrandLockup` presentation across the main sidebar and public login, registration, password-recovery, terms, and privacy views, with the frontend version injected from `frontend/package.json` at build time.
 - Administrator SMTP receipt confirmation, 1–1000 ordinary-user capacity, user enablement, and guarded registration switch controls.
 - Ordinary-user personal item-sync settings with per-field global inheritance, plus user-owned AI provider access without administrator settings calls.
-- One-request role-aware dashboard summaries, retryable error and empty states, deferred order details, and a separately loaded chart bundle.
+- One-request user-scoped dashboard summaries for every role, retryable error and empty states, deferred order details, and a separately loaded chart bundle.
 - Purpose-isolated HMAC storage for authentication secrets and identifiers, persistent multi-dimensional rate limits, and trusted-proxy client-IP handling.
 
 ## Important Boundaries
@@ -597,13 +642,14 @@ return HTTP 200 with migration `2026073101`. The deployed frontend entry and CSS
 match local/public responses byte-for-byte, and both versioned extension ZIPs
 return HTTP 200 with matching hashes.
 
-The complete rollback unit is outside the repository at
-`/Users/mac/Library/Application Support/XianyuManager Rollbacks/client-browser-login-20260801-011335`.
-It contains the pre-deploy source archive, SQLite and runtime data snapshots,
-browser profiles, prior static assets, patch/diff files, `verification.md`, and
-`rollback.sh`. The rollback script passed syntax and `--check`; no live account
-login was performed during deployment, so the remaining real-platform gate is a
-manual user canary after the one-time extension installation.
+The complete rollback unit created for this release contained the pre-deploy
+source archive, SQLite/runtime snapshots, browser profiles, prior static assets,
+patch/diff files, a verification record, and a checked rollback script. That
+historical local unit was intentionally retired in the 2026-08-08 storage
+cleanup. Current recovery uses
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`;
+no live account login was performed during the earlier deployment, so its
+real-platform canary remains a historical unverified boundary.
 
 After deployment, the existing HTTP/2 Cloudflare tunnel briefly returned 502/530
 while its edge connections cycled. A reversible LaunchAgent `kickstart` restored
@@ -663,8 +709,10 @@ commit `a8caed4` only to preserve the pre-existing production candidate history;
 its source tree has zero file differences from `origin/main@012db74`. Local and
 public readiness, OpenAPI `1.10.4`, HTML entry `assets/index-B3_Qlwcs.js`, all
 three public package hashes, SQLite integrity, one listener, repeated public
-HTTP/2 samples, and both rollback checks passed. The complete record is
-`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146/verification.md`.
+HTTP/2 samples, and both rollback checks passed. The retired local candidate
+record is superseded by GitHub runs `30729570218` and `30729574347`; the current
+verified local recovery pointer is
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-persistence-20260803-082948`.
 
 The remaining live-provider gate is a real ordinary-user login from that user's
 computer: start the downloaded helper, let it open that user's Chrome, complete

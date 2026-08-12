@@ -1,0 +1,120 @@
+SAMPLE optimization verification
+Date: 2026-08-10 (+0800)
+
+[1] Task 0 baseline
+Commands:
+git status --short
+.venv/bin/python -m unittest discover -s tests -v
+(cd frontend && npm test -- --reporter=dot)
+(cd frontend && npm run typecheck)
+.venv/bin/ruff check .
+.venv/bin/python -m compileall -q .
+git diff --check
+file /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+shasum -a 256 /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+Literal outputs:
+Ran 768 tests in 190.767s
+OK
+backend unittest exit=0
+Test Files  24 passed (24)
+Tests  154 passed (154)
+frontend tests exit=0
+frontend typecheck exit=0
+All checks passed!
+ruff exit=0
+compileall exit=0
+git diff --check exit=0
+PE32 executable (GUI) Intel 80386, for MS Windows
+52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54  /Users/mac/Downloads/AgisoIdleClient_x64_1.2.4.exe
+Full raw output: /private/tmp/sample-optimization-WS97VE/task0.log
+
+[2] Sample copy and static boundary
+Command: cp SAMPLE /private/tmp/sample-optimization-WS97VE/sample/SAMPLE.exe; shasum -a 256 original and copy
+Literal outputs:
+original_sha256  52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54
+copy_sha256      52bc5a4711cb5d0ddab4e19146d123dad50a5101ccf891d7b88717699f41ef54
+TARGET_WINDOWS_RUNNER unset
+Existing parser logs and literal failure outputs are referenced by docs/research/sample-feasibility.md and its sample-verification.txt. No new parser path or password attempt was made.
+
+[3] Focused implementation tests
+Command: .venv/bin/python -m unittest tests.test_native_browser_helper -v
+Literal output: Ran 29 tests in 3.695s; OK
+Exit: 0
+Command: cd frontend && npm test -- --reporter=dot components/AccountList.test.tsx
+Literal output: Test Files 1 passed (1); Tests 50 passed (50)
+Exit: 0
+The 29-test result includes the Darwin/Windows health fixtures and loopback health fields. AccountList imports the real getNativeBrowserHealth implementation for the tested preflight; only fetch is a fixture. Direct tests prove that a complete payload resolves and a missing running field throws NativeBrowserRequestError status=409/code=helper_malformed. The same set covers helper-unavailable, old version/protocol, not-installed, startup-missing, not-running, architecture-mismatch, malformed, and ready ordering.
+Selector command: cd frontend && npm test -- --reporter=verbose components/AccountList.test.tsx -t 'health|preflight|native helper is missing|architecture mismatch|not running'
+Literal output: 11 passed / 39 selected-out; exit=0. Named passing results include "accepts a complete health payload through the real preflight parser" and "rejects a missing health field through the real preflight parser". Raw log: /private/tmp/sample-optimization-WS97VE/preflight-verbose-final2.log. The full run below has skipped=0.
+
+[4] Full final gates
+Command: .venv/bin/python -m unittest discover -s tests -v
+Literal output: Ran 769 tests in 155.003s; OK; exit=0
+Command: cd frontend && npm test -- --reporter=dot
+Literal output: Test Files 24 passed (24); Tests 164 passed (164); exit=0
+Command: cd frontend && npm run typecheck
+Literal output: tsc --noEmit; exit=0
+Command: .venv/bin/ruff check .
+Literal output: All checks passed!; exit=0
+Command: .venv/bin/python -m compileall -q .
+Literal output: (empty); exit=0
+Command: git diff --check
+Literal output: (empty); exit=0
+Command: docs/research/sample-optimization-rollback.sh --check
+Literal output: rollback check: post hashes match; concurrent edits would be rejected; exit=0
+No backend or frontend skip count is present in either full-run result; skipped=0.
+Raw logs:
+/private/tmp/sample-optimization-WS97VE/task3-backend-current-final3.log
+/private/tmp/sample-optimization-WS97VE/task3-frontend-final2.log
+/private/tmp/sample-optimization-WS97VE/task3-typecheck-final2.log
+/private/tmp/sample-optimization-WS97VE/task3-ruff-final2.log
+/private/tmp/sample-optimization-WS97VE/task3-compileall-final2.log
+/private/tmp/sample-optimization-WS97VE/task3-rollback-final2.log
+
+[5] Reverse validation and rollback
+Command: (cd shadow && docs/research/sample-optimization-rollback.sh --check)
+Literal output: rollback check: post hashes match; concurrent edits would be rejected; exit=0
+Command: (cd shadow && docs/research/sample-optimization-rollback.sh --run)
+Literal output: rollback: restored six helper/preflight files to their HEAD baseline; shadow restored baseline=yes; exit=0
+Command after --run: (cd shadow && /Users/mac/Documents/咸鱼监控台/.venv/bin/python -m unittest tests.test_native_browser_helper -v)
+Literal output: Ran 28 tests in 3.665s; OK; exit=0
+Raw old-behavior log: /private/tmp/sample-optimization-WS97VE/rollback-old-behavior-final.log
+Command: append concurrent fixture, then run --run
+Literal output: current hash mismatch for frontend/services/api/nativeBrowser.ts; concurrent refusal exit=1; concurrent content preserved=yes
+Raw log: /private/tmp/sample-optimization-WS97VE/rollback-shadow-final2.log
+
+[6] Hash and scope record
+Pre-edit hashes:
+0b0462d6288ceb4865eddc4c276a0882626a6679f660f6c42dcf25ab717e59ff  native_browser_helper/server.py
+508ec43c262d2cd076a704fb4cf632455d4450b945cd509a45ec89dfeb075b52  native_browser_helper/installer.py
+36d3dc57daf5889bf81dd78ea36edb44ff9caf5c33444a9bc04709659f24a433  frontend/services/api/nativeBrowser.ts
+7c55349d9b6a17eebd5dcd42c0f6c361323a11592e697d8872f88c2aa3393b42  frontend/components/AccountList.tsx
+e8d90b615e15d8fa515ee7dcf19a9ca52025841bd61102277b035e34ac7d1abc  tests/test_native_browser_helper.py
+93de594e28f08c6e4d9fa9812ab8d5af966b369cdc2c5493dbef23a0c69521f7  frontend/components/AccountList.test.tsx
+Post-edit hashes:
+cd4c9fab9503a22b74da9e872900f4b03615e72bd4fe12d1d50e771debe4f6c9  native_browser_helper/server.py
+1b1886baf180fc6f51608accaefdd73ce5c674b5f3b3b54a0eb7824cd0d7578a  native_browser_helper/installer.py
+368d645f5b03465dcf7eed588349d46138d476719a6fa759aaa3c632e277d41d  frontend/services/api/nativeBrowser.ts
+b60e2b289370d341c7750d37753f39c9ff76bd3695c416df7d7f1cadf32d5491  frontend/components/AccountList.tsx
+1d316c33f661ddf28d6417effe5eb2bd7a30d6edede2e2c881d2a49b506300b7  tests/test_native_browser_helper.py
+87ef33dd0bbd37d6813fda3d35107f61d80ddc4fdcd6b8536c7687e6f7a020b2  frontend/components/AccountList.test.tsx
+Artifact hashes:
+ba022f428bf9296dc9a99cd55ff6e140f8f7c7ed30db3b51a9129300cb08d46a  docs/research/sample-optimization.md
+3db9fc42e38c991251e841123f7519c5d38beede02f2d61addf75da344c3fe71  docs/research/sample-optimization.diff
+f787ab4a99590fcc1d9ab38d62f25589ba6965efd1d0e1f3982985a396a993bc  docs/research/sample-optimization-rollback.sh
+Command: compare filtered git status before Task 0 and after final gates
+Literal output: outside status diff lines=0
+Exit: 0
+
+[7] Concurrent outside-scope drift and stable final freeze
+The older static-research hash freeze differed at exactly three already-dirty user assets. Their mtimes and current hashes are recorded in BLOCKED.md; two changed while the first final backend run was active, so that run was not used as the current-tree gate.
+Command: hash all 29 outside-scope business assets against the 19:16 acknowledged freeze, then compare filtered status paths with Task 0
+Literal output:
+outside_business_hashes_checked=29
+outside_business_hash_mismatches_after_19_16_freeze=0
+outside status diff lines=0
+Exit: 0
+The 769-test backend result in section 4 was rerun after that freeze. Immediate post-run hashes for XianyuAutoAsync.py, invite_bridge_poller.py, and tests/test_invite_bridge.py matched the frozen values. Logs:
+/private/tmp/sample-optimization-WS97VE/outside-baseline-current-final2.tsv
+/private/tmp/sample-optimization-WS97VE/outside-hash-stability-final2.log
+/private/tmp/sample-optimization-WS97VE/status-outside-final2.diff

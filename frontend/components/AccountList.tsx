@@ -21,6 +21,7 @@ import {
   getClientBrowserLoginSession,
   confirmClientBrowserLoginSession,
   cancelClientBrowserLoginSession,
+  getNativeBrowserHealth,
   getNativeBrowserDevice,
   startNativeBrowserLogin,
   getNativeBrowserLoginStatus,
@@ -107,6 +108,12 @@ type ClientBrowserConnectionState = {
     | 'device_registration_failed'
     | 'helper_missing'
     | 'helper_outdated'
+    | 'helper_malformed'
+    | 'helper_not_installed'
+    | 'helper_not_running'
+    | 'helper_startup_missing'
+    | 'helper_platform_mismatch'
+    | 'helper_arch_mismatch'
     | 'helper_connected'
     | 'connected';
   title: string;
@@ -132,6 +139,20 @@ const compareVersions = (left: string, right: string) => {
     if (difference !== 0) return difference;
   }
   return 0;
+};
+
+const normalizeHelperArch = (value: string) => {
+  const normalized = value.trim().toLowerCase();
+  if (['arm64', 'aarch64', 'arm'].includes(normalized)) return 'arm64';
+  if (['x64', 'x86_64', 'amd64'].includes(normalized)) return 'x64';
+  return normalized;
+};
+
+const expectedNativeHelperTarget = () => {
+  const userAgent = navigator.userAgent || '';
+  if (/Windows/i.test(userAgent)) return { platform: 'Windows', arch: 'x64' };
+  if (/Macintosh|Mac OS X/i.test(userAgent)) return { platform: 'Darwin', arch: 'arm64' };
+  return null;
 };
 const ACTIVE_SESSION_REFRESH_STATES = new Set(['refreshing', 'verification_required']);
 const ACTIVE_BROWSER_QR_VIEW_STATES = new Set([
@@ -891,12 +912,48 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     setClientBrowserStep('opening_browser');
     setClientBrowserFlowMessage(mode, 'processing', '正在连接你电脑上的本机 Chrome');
     let helper: NativeBrowserDevice | null = null;
+    let helperVersion = '';
     try {
       const previousSessionId = activeClientBrowserSessionRef.current;
       if (previousSessionId) {
         await cancelActiveClientBrowserSession();
       }
       clientBrowserTransportRef.current = 'native_helper';
+      const health = await getNativeBrowserHealth();
+      helperVersion = health.version;
+      if (compareVersions(health.version || '0.0.0', NATIVE_HELPER_VERSION) < 0 || health.protocolVersion !== CLIENT_BROWSER_PROTOCOL_VERSION) {
+        const helperVersionError = new Error(
+          `本机助手版本或协议过旧（当前 ${health.version || '未知'}，需要 ${NATIVE_HELPER_VERSION}）`,
+        ) as Error & { code?: string };
+        helperVersionError.code = 'helper_outdated';
+        throw helperVersionError;
+      }
+      if (!health.installed) {
+        const error = new Error('本机助手尚未安装') as Error & { code?: string };
+        error.code = 'helper_not_installed';
+        throw error;
+      }
+      const expectedTarget = expectedNativeHelperTarget();
+      if (expectedTarget && health.platform !== expectedTarget.platform) {
+        const error = new Error(`本机助手平台不匹配（当前 ${health.platform}，需要 ${expectedTarget.platform}）`) as Error & { code?: string };
+        error.code = 'helper_platform_mismatch';
+        throw error;
+      }
+      if (expectedTarget && normalizeHelperArch(health.arch) !== expectedTarget.arch) {
+        const error = new Error(`本机助手架构不匹配（当前 ${health.arch}，需要 ${expectedTarget.arch}）`) as Error & { code?: string };
+        error.code = 'helper_arch_mismatch';
+        throw error;
+      }
+      if (!health.startupRegistered) {
+        const error = new Error('本机助手尚未注册开机启动') as Error & { code?: string };
+        error.code = 'helper_startup_missing';
+        throw error;
+      }
+      if (!health.running) {
+        const error = new Error('本机助手当前未运行') as Error & { code?: string };
+        error.code = 'helper_not_running';
+        throw error;
+      }
       helper = await getNativeBrowserDevice();
       if (compareVersions(helper.helperVersion || '0.0.0', NATIVE_HELPER_VERSION) < 0) {
         const helperVersionError = new Error(
@@ -970,7 +1027,55 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
           state: 'helper_outdated',
           title: '本机浏览器助手需要更新',
           detail: helperError.message,
-          extensionVersion: helper?.helperVersion,
+          extensionVersion: helper?.helperVersion || helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_malformed') {
+        setClientBrowserConnection({
+          state: 'helper_malformed',
+          title: '本机助手健康检查无效',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_not_installed') {
+        setClientBrowserConnection({
+          state: 'helper_not_installed',
+          title: '本机助手尚未安装',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_platform_mismatch') {
+        setClientBrowserConnection({
+          state: 'helper_platform_mismatch',
+          title: '本机助手平台不匹配',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_arch_mismatch') {
+        setClientBrowserConnection({
+          state: 'helper_arch_mismatch',
+          title: '本机助手架构不匹配',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_startup_missing') {
+        setClientBrowserConnection({
+          state: 'helper_startup_missing',
+          title: '本机助手未注册开机启动',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
+        });
+        setShowClientBrowserInstallGuide(true);
+      } else if (helperError?.code === 'helper_not_running') {
+        setClientBrowserConnection({
+          state: 'helper_not_running',
+          title: '本机助手未运行',
+          detail: helperError.message,
+          extensionVersion: helperVersion,
         });
         setShowClientBrowserInstallGuide(true);
       } else if (helperError?.code === 'helper_unavailable' || helperError?.code === 'helper_timeout') {
@@ -2146,7 +2251,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       <p className="mt-1">{clientBrowserConnection.detail}</p>
       {!clientBrowserDevice && (
         <>
-          {['helper_missing', 'helper_outdated', 'detecting', 'idle'].includes(clientBrowserConnection.state) ? (
+          {['helper_missing', 'helper_outdated', 'helper_malformed', 'helper_not_installed', 'helper_not_running', 'helper_startup_missing', 'helper_platform_mismatch', 'helper_arch_mismatch', 'detecting', 'idle'].includes(clientBrowserConnection.state) ? (
             <p className="mt-2 text-xs text-gray-500">首次使用安装并启动一次本机助手；后续点击本机 Chrome 登录即可打开你电脑上的官方页面。</p>
           ) : (
             <p className="mt-2 text-xs text-gray-500">扩展导入是独立入口，不会影响本机助手登录。</p>

@@ -33,6 +33,7 @@ class CookieManager:
         self._runtime_action_locks: Dict[str, asyncio.Lock] = {}
         self._runtime_reconcile_lock = asyncio.Lock()
         self._task_generations: Dict[str, int] = {}
+        self._listener_restart_at: Dict[str, float] = {}
         self._load_from_db()
 
     @staticmethod
@@ -242,6 +243,42 @@ class CookieManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.tasks.clear()
         logger.info("CookieManager 账号监听任务已全部停止")
+
+    async def ensure_enabled_listeners(self, *, restart_cooldown: float = 15.0) -> Dict[str, int]:
+        """Restart unexpected listener exits without touching healthy sessions."""
+        if asyncio.get_running_loop() is not self.loop:
+            raise RuntimeError("listener_supervisor_wrong_event_loop")
+        now = time.time()
+        started = 0
+        skipped = 0
+        async with self._runtime_reconcile_lock:
+            for cookie_id, cookie_value in self.cookies.items():
+                if not self.cookie_status.get(cookie_id, True):
+                    continue
+                task = self.tasks.get(cookie_id)
+                if task is not None and not task.done():
+                    continue
+                if now - self._listener_restart_at.get(cookie_id, 0.0) < max(0.0, restart_cooldown):
+                    skipped += 1
+                    continue
+                if task is not None and task.done():
+                    self._consume_task_result(task)
+                details = db_manager.get_cookie_details(cookie_id) or {}
+                self.tasks[cookie_id] = self.loop.create_task(
+                    self._run_xianyu(
+                        cookie_id,
+                        cookie_value,
+                        details.get("user_id"),
+                    ),
+                    name=f"xianyu-listener:{_mask_cookie_id(cookie_id)}",
+                )
+                self._listener_restart_at[cookie_id] = now
+                started += 1
+                logger.warning(
+                    "【{}】检测到监听任务已退出，自动重新启动",
+                    _mask_cookie_id(cookie_id),
+                )
+        return {"started": started, "skipped": skipped}
 
     # ------------------------ 内部协程 ------------------------
     async def _run_xianyu(

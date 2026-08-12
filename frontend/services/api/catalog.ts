@@ -54,6 +54,10 @@ export const updateItemMultiQuantityDelivery = async (cookieId: string, itemId: 
     return put(`/items/${cookieId}/${itemId}/multi-quantity-delivery`, { multi_quantity_delivery: enabled });
 }
 
+export const updateItemInviteAutoFulfillment = async (cookieId: string, itemId: string, enabled: boolean): Promise<any> => {
+    return put(`/items/${cookieId}/${itemId}/invite-auto-fulfillment`, { invite_auto_fulfillment: enabled });
+}
+
 // Rules - 发货规则 (使用正确的后端API)
 export const getShippingRules = async (): Promise<ShippingRule[]> => {
     const res = await get<any>('/delivery-rules');

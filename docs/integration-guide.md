@@ -32,6 +32,7 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
+| Invite auto-fulfillment | Owner-scoped `PUT /items/{cookie_id}/{item_id}/invite-auto-fulfillment`; private HMAC routes under `/internal/invite/*` |
 | Official account login | Web QR through `/qr-login/*`; headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, owner-scoped `POST .../interact`, administrator-loopback `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
@@ -188,7 +189,7 @@ curl -sS "$BASE_URL/api/dashboard/summary?range=7days" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Ranges are `today`, `yesterday`, `3days`, `7days`, `30days`, or `custom`; custom requests also send `start_date` and `end_date` as `YYYY-MM-DD`. The response declares `scope: user` for ordinary users and `scope: system` for administrators, then returns `stats`, `current`, `previous`, `item_names`, and resolved date boundaries. Frontends should render the summary first and request `/analytics/orders/valid` afterward for detail rows.
+Ranges are `today`, `yesterday`, `3days`, `7days`, `30days`, or `custom`; custom requests also send `start_date` and `end_date` as `YYYY-MM-DD`. The response always declares `scope: user` and returns data joined through the current user's owned accounts, regardless of role, followed by `stats`, `current`, `previous`, `item_names`, and resolved date boundaries. Revenue totals use only `paid_amount_fen`; order-time charts use only `ordered_at_utc`. Orders whose account has no owning `user_id` are retained outside every user's result. Frontends should render the summary first and request `/analytics/orders/valid` afterward for detail rows.
 
 ## AI Provider Profiles
 
@@ -254,6 +255,25 @@ curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/copy" \
 Copy writes target drafts only, never publishes, and skips targets that already contain draft or published knowledge unless `overwrite` is explicitly true. Use `GET .../versions` and `POST .../rollback/{version}` for history.
 
 The copy response keeps `copied_item_ids`, `skipped_item_ids`, and `missing_item_ids`, and may also include `source_kind`, `copied_count`, `skipped_count`, `missing_count`, and `skipped_reasons` so clients can explain whether the source came from the draft or published snapshot and why a target was skipped.
+
+## Invite Auto-Fulfillment
+
+The operator workflow is intentionally two steps: synchronize the account's products, then turn on “邀请自动发货” for the intended product card. New products default off, and a later synchronization preserves the existing value. The switch is exact to the owning account and item ID; do not infer eligibility from a title or maintain a second item-ID list.
+
+The UI calls this owner-scoped endpoint, which takes effect without a process restart:
+
+```bash
+curl -sS -X PUT "$BASE_URL/items/$COOKIE_ID/$ITEM_ID/invite-auto-fulfillment" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"invite_auto_fulfillment":true}'
+```
+
+The response contains `invite_auto_fulfillment: true` and a display message. An account outside the caller's ownership returns 403; an unknown product returns 404. Read `GET /items/cookie/{cookie_id}` to confirm the saved value after a catalog synchronization.
+
+When `XIANYU_INVITE_BRIDGE_ENABLED=true`, the poller accepts only a switched-on order with a fresh direct-platform `pending_ship` result and complete buyer/chat context. The same discovery write fills empty `paid_amount_fen` and `ordered_at_utc` through the normal order-sync ratchet; repeated discovery of a recent terminal order may fill those fields but never sends another paid event or regresses status. The poller sends the paid event to the invite service, which returns the confirmation workflow and later calls the private bridge to send the code and mark `status_only` fulfillment. The private routes are `POST /internal/invite/order-events`, `POST /internal/invite/send-message`, `POST /internal/invite/mark-fulfilled`, and `GET /internal/invite/operations/{operation_key}`. They require the shared HMAC timestamp, nonce, signature, and stable operation key and are service-to-service APIs, not browser APIs.
+
+Switched-on invite products never consume Xianyu `cards` inventory. A message write reports `submitted`, not buyer receipt; `ambiguous` and `needs_review` require operation reconciliation and must not trigger an automatic duplicate code message.
 
 ## Training Rules And Lab
 

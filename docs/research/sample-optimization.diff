@@ -1,0 +1,622 @@
+diff --git a/frontend/components/AccountList.test.tsx b/frontend/components/AccountList.test.tsx
+index a4863cc..eb1b3e1 100644
+--- a/frontend/components/AccountList.test.tsx
++++ b/frontend/components/AccountList.test.tsx
+@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ import AccountList from './AccountList';
+ import { ApiRequestError } from '../services/request';
++import { getNativeBrowserHealth as getNativeBrowserHealthThroughTransport } from '../services/api/nativeBrowser';
+ import {
+   getAccountDetails,
+   getAllAISettings,
+@@ -20,6 +21,7 @@ import {
+   getClientBrowserLoginSession,
+   confirmClientBrowserLoginSession,
+   cancelClientBrowserLoginSession,
++  getNativeBrowserHealth,
+   getNativeBrowserDevice,
+   startNativeBrowserLogin,
+   getNativeBrowserLoginStatus,
+@@ -57,6 +59,7 @@ vi.mock('../services/api', () => ({
+   getClientBrowserLoginSession: vi.fn(),
+   confirmClientBrowserLoginSession: vi.fn(),
+   cancelClientBrowserLoginSession: vi.fn(),
++  getNativeBrowserHealth: vi.fn(),
+   getNativeBrowserDevice: vi.fn(),
+   startNativeBrowserLogin: vi.fn(),
+   getNativeBrowserLoginStatus: vi.fn(),
+@@ -93,6 +96,23 @@ vi.mock('../services/api', () => ({
+   updateAiReplyStrategies: vi.fn(),
+ }));
+ 
++const completeNativeHealth = {
++  ok: true,
++  service: 'xianyu-native-browser-helper',
++  version: '1.0.2',
++  platform: 'Darwin',
++  arch: 'arm64',
++  protocolVersion: 1,
++  installed: true,
++  startupRegistered: true,
++  running: true,
++};
++
++const nativeHealthResponse = (payload: unknown) => new Response(JSON.stringify(payload), {
++  status: 200,
++  headers: { 'Content-Type': 'application/json' },
++});
++
+ describe('AccountList session verification UI', () => {
+   let localStorageValues: Map<string, string>;
+   let clientBridgeEnabled: boolean;
+@@ -101,6 +121,7 @@ describe('AccountList session verification UI', () => {
+ 
+   beforeEach(() => {
+     vi.useRealTimers();
++    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nativeHealthResponse(completeNativeHealth)));
+     clientBridgeEnabled = true;
+     clientBridgeRequests = [];
+     clientBridgeListener = (event: MessageEvent) => {
+@@ -254,6 +275,7 @@ describe('AccountList session verification UI', () => {
+     vi.mocked(showOfficialLoginBrowser).mockResolvedValue({ success: true });
+     vi.mocked(showAccountSessionRefreshBrowser).mockResolvedValue({ success: true });
+     vi.mocked(registerClientBrowserDevice).mockResolvedValue();
++    vi.mocked(getNativeBrowserHealth).mockImplementation(getNativeBrowserHealthThroughTransport);
+     vi.mocked(getNativeBrowserDevice).mockResolvedValue({
+       deviceId: 'helper_device_123456',
+       browserFamily: 'chrome',
+@@ -331,6 +353,7 @@ describe('AccountList session verification UI', () => {
+     cleanup();
+     vi.clearAllMocks();
+     vi.restoreAllMocks();
++    vi.unstubAllGlobals();
+   });
+ 
+   it('shows same-session controls only while a verification browser is active', async () => {
+@@ -610,10 +633,7 @@ describe('AccountList session verification UI', () => {
+   });
+ 
+   it('does not create any server login session when the native helper is missing', async () => {
+-    vi.mocked(getNativeBrowserDevice).mockRejectedValue(Object.assign(
+-      new Error('未启动本机浏览器助手'),
+-      { code: 'helper_unavailable', status: 0 },
+-    ));
++    vi.mocked(globalThis.fetch).mockRejectedValue(new TypeError('fixture helper unavailable'));
+     render(<AccountList />);
+ 
+     await screen.findByText('可自动续期 · 定时关闭');
+@@ -640,6 +660,7 @@ describe('AccountList session verification UI', () => {
+     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
+     expect(createOfficialLoginSession).not.toHaveBeenCalled();
+     expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
++    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
+   });
+ 
+   it('classifies an outdated native helper without creating a login session', async () => {
+@@ -664,6 +685,102 @@ describe('AccountList session verification UI', () => {
+     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
+   });
+ 
++  it('runs the health preflight before requesting the helper device', async () => {
++    render(<AccountList />);
++
++    await screen.findByText('可自动续期 · 定时关闭');
++    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
++    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
++
++    const healthMock = vi.mocked(getNativeBrowserHealth);
++    const deviceMock = vi.mocked(getNativeBrowserDevice);
++    await waitFor(() => {
++      expect(getNativeBrowserHealth).toHaveBeenCalledTimes(1);
++      expect(getNativeBrowserDevice).toHaveBeenCalledTimes(1);
++      expect(createClientBrowserLoginSession).toHaveBeenCalledTimes(1);
++    });
++    expect(healthMock.mock.invocationCallOrder[0]).toBeLessThan(
++      deviceMock.mock.invocationCallOrder[0],
++    );
++    expect((await screen.findAllByText('本机 Chrome 已打开官方页面')).length).toBeGreaterThan(0);
++  });
++
++  it('accepts a complete health payload through the real preflight parser', async () => {
++    await expect(getNativeBrowserHealthThroughTransport()).resolves.toEqual(completeNativeHealth);
++  });
++
++  it('rejects a missing health field through the real preflight parser', async () => {
++    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse({
++      ...completeNativeHealth,
++      running: undefined,
++    }));
++
++    await expect(getNativeBrowserHealthThroughTransport()).rejects.toMatchObject({
++      name: 'NativeBrowserRequestError',
++      status: 409,
++      code: 'helper_malformed',
++    });
++  });
++
++  it.each([
++    ['old version', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '0.9.0', platform: 'Darwin', arch: 'arm64',
++      protocolVersion: 1, installed: true, startupRegistered: true, running: true,
++    }, '本机浏览器助手需要更新'],
++    ['old protocol', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
++      protocolVersion: 0, installed: true, startupRegistered: true, running: true,
++    }, '本机浏览器助手需要更新'],
++    ['not installed', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
++      protocolVersion: 1, installed: false, startupRegistered: false, running: false,
++    }, '本机助手尚未安装'],
++    ['startup missing', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
++      protocolVersion: 1, installed: true, startupRegistered: false, running: true,
++    }, '本机助手未注册开机启动'],
++    ['not running', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Darwin', arch: 'arm64',
++      protocolVersion: 1, installed: true, startupRegistered: true, running: false,
++    }, '本机助手未运行'],
++    ['architecture mismatch', {
++      ok: true, service: 'xianyu-native-browser-helper', version: '1.0.2', platform: 'Windows', arch: 'x86',
++      protocolVersion: 1, installed: true, startupRegistered: true, running: true,
++    }, '本机助手架构不匹配'],
++  ])('classifies %s health before opening a login session', async (_label, health, title) => {
++    if (_label === 'architecture mismatch') {
++      vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue(
++        'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
++      );
++    }
++    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse(health));
++    render(<AccountList />);
++
++    await screen.findByText('可自动续期 · 定时关闭');
++    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
++    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
++
++    expect((await screen.findAllByText(title)).length).toBeGreaterThan(0);
++    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
++    expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
++  });
++
++  it('shows a malformed health response as a preflight error', async () => {
++    vi.mocked(globalThis.fetch).mockResolvedValue(nativeHealthResponse({
++      ...completeNativeHealth,
++      running: undefined,
++    }));
++    render(<AccountList />);
++
++    await screen.findByText('可自动续期 · 定时关闭');
++    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
++    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
++
++    expect(await screen.findByText('本机助手健康检查无效')).toBeInTheDocument();
++    expect(getNativeBrowserHealth).toHaveBeenCalledTimes(1);
++    expect(getNativeBrowserDevice).not.toHaveBeenCalled();
++  });
++
+   it.each([
+     [401, 'auth_expired', '账号登录已失效'],
+     [409, 'device_key_mismatch', '设备注册冲突'],
+diff --git a/frontend/components/AccountList.tsx b/frontend/components/AccountList.tsx
+index 4bfff6b..b62214a 100644
+--- a/frontend/components/AccountList.tsx
++++ b/frontend/components/AccountList.tsx
+@@ -21,6 +21,7 @@ import {
+   getClientBrowserLoginSession,
+   confirmClientBrowserLoginSession,
+   cancelClientBrowserLoginSession,
++  getNativeBrowserHealth,
+   getNativeBrowserDevice,
+   startNativeBrowserLogin,
+   getNativeBrowserLoginStatus,
+@@ -107,6 +108,12 @@ type ClientBrowserConnectionState = {
+     | 'device_registration_failed'
+     | 'helper_missing'
+     | 'helper_outdated'
++    | 'helper_malformed'
++    | 'helper_not_installed'
++    | 'helper_not_running'
++    | 'helper_startup_missing'
++    | 'helper_platform_mismatch'
++    | 'helper_arch_mismatch'
+     | 'helper_connected'
+     | 'connected';
+   title: string;
+@@ -133,6 +140,20 @@ const compareVersions = (left: string, right: string) => {
+   }
+   return 0;
+ };
++
++const normalizeHelperArch = (value: string) => {
++  const normalized = value.trim().toLowerCase();
++  if (['arm64', 'aarch64', 'arm'].includes(normalized)) return 'arm64';
++  if (['x64', 'x86_64', 'amd64'].includes(normalized)) return 'x64';
++  return normalized;
++};
++
++const expectedNativeHelperTarget = () => {
++  const userAgent = navigator.userAgent || '';
++  if (/Windows/i.test(userAgent)) return { platform: 'Windows', arch: 'x64' };
++  if (/Macintosh|Mac OS X/i.test(userAgent)) return { platform: 'Darwin', arch: 'arm64' };
++  return null;
++};
+ const ACTIVE_SESSION_REFRESH_STATES = new Set(['refreshing', 'verification_required']);
+ const ACTIVE_BROWSER_QR_VIEW_STATES = new Set([
+   'loading',
+@@ -891,12 +912,48 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
+     setClientBrowserStep('opening_browser');
+     setClientBrowserFlowMessage(mode, 'processing', '正在连接你电脑上的本机 Chrome');
+     let helper: NativeBrowserDevice | null = null;
++    let helperVersion = '';
+     try {
+       const previousSessionId = activeClientBrowserSessionRef.current;
+       if (previousSessionId) {
+         await cancelActiveClientBrowserSession();
+       }
+       clientBrowserTransportRef.current = 'native_helper';
++      const health = await getNativeBrowserHealth();
++      helperVersion = health.version;
++      if (compareVersions(health.version || '0.0.0', NATIVE_HELPER_VERSION) < 0 || health.protocolVersion !== CLIENT_BROWSER_PROTOCOL_VERSION) {
++        const helperVersionError = new Error(
++          `本机助手版本或协议过旧（当前 ${health.version || '未知'}，需要 ${NATIVE_HELPER_VERSION}）`,
++        ) as Error & { code?: string };
++        helperVersionError.code = 'helper_outdated';
++        throw helperVersionError;
++      }
++      if (!health.installed) {
++        const error = new Error('本机助手尚未安装') as Error & { code?: string };
++        error.code = 'helper_not_installed';
++        throw error;
++      }
++      const expectedTarget = expectedNativeHelperTarget();
++      if (expectedTarget && health.platform !== expectedTarget.platform) {
++        const error = new Error(`本机助手平台不匹配（当前 ${health.platform}，需要 ${expectedTarget.platform}）`) as Error & { code?: string };
++        error.code = 'helper_platform_mismatch';
++        throw error;
++      }
++      if (expectedTarget && normalizeHelperArch(health.arch) !== expectedTarget.arch) {
++        const error = new Error(`本机助手架构不匹配（当前 ${health.arch}，需要 ${expectedTarget.arch}）`) as Error & { code?: string };
++        error.code = 'helper_arch_mismatch';
++        throw error;
++      }
++      if (!health.startupRegistered) {
++        const error = new Error('本机助手尚未注册开机启动') as Error & { code?: string };
++        error.code = 'helper_startup_missing';
++        throw error;
++      }
++      if (!health.running) {
++        const error = new Error('本机助手当前未运行') as Error & { code?: string };
++        error.code = 'helper_not_running';
++        throw error;
++      }
+       helper = await getNativeBrowserDevice();
+       if (compareVersions(helper.helperVersion || '0.0.0', NATIVE_HELPER_VERSION) < 0) {
+         const helperVersionError = new Error(
+@@ -970,7 +1027,55 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
+           state: 'helper_outdated',
+           title: '本机浏览器助手需要更新',
+           detail: helperError.message,
+-          extensionVersion: helper?.helperVersion,
++          extensionVersion: helper?.helperVersion || helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_malformed') {
++        setClientBrowserConnection({
++          state: 'helper_malformed',
++          title: '本机助手健康检查无效',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_not_installed') {
++        setClientBrowserConnection({
++          state: 'helper_not_installed',
++          title: '本机助手尚未安装',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_platform_mismatch') {
++        setClientBrowserConnection({
++          state: 'helper_platform_mismatch',
++          title: '本机助手平台不匹配',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_arch_mismatch') {
++        setClientBrowserConnection({
++          state: 'helper_arch_mismatch',
++          title: '本机助手架构不匹配',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_startup_missing') {
++        setClientBrowserConnection({
++          state: 'helper_startup_missing',
++          title: '本机助手未注册开机启动',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
++        });
++        setShowClientBrowserInstallGuide(true);
++      } else if (helperError?.code === 'helper_not_running') {
++        setClientBrowserConnection({
++          state: 'helper_not_running',
++          title: '本机助手未运行',
++          detail: helperError.message,
++          extensionVersion: helperVersion,
+         });
+         setShowClientBrowserInstallGuide(true);
+       } else if (helperError?.code === 'helper_unavailable' || helperError?.code === 'helper_timeout') {
+@@ -2146,7 +2251,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
+       <p className="mt-1">{clientBrowserConnection.detail}</p>
+       {!clientBrowserDevice && (
+         <>
+-          {['helper_missing', 'helper_outdated', 'detecting', 'idle'].includes(clientBrowserConnection.state) ? (
++          {['helper_missing', 'helper_outdated', 'helper_malformed', 'helper_not_installed', 'helper_not_running', 'helper_startup_missing', 'helper_platform_mismatch', 'helper_arch_mismatch', 'detecting', 'idle'].includes(clientBrowserConnection.state) ? (
+             <p className="mt-2 text-xs text-gray-500">首次使用安装并启动一次本机助手；后续点击本机 Chrome 登录即可打开你电脑上的官方页面。</p>
+           ) : (
+             <p className="mt-2 text-xs text-gray-500">扩展导入是独立入口，不会影响本机助手登录。</p>
+diff --git a/frontend/services/api/nativeBrowser.ts b/frontend/services/api/nativeBrowser.ts
+index 3110722..4afe09b 100644
+--- a/frontend/services/api/nativeBrowser.ts
++++ b/frontend/services/api/nativeBrowser.ts
+@@ -8,6 +8,18 @@ export interface NativeBrowserDevice {
+   encryptionPublicJwk: Record<string, unknown>;
+ }
+ 
++export interface NativeBrowserHealth {
++  ok: boolean;
++  service: string;
++  version: string;
++  platform: string;
++  arch: string;
++  protocolVersion: number;
++  installed: boolean;
++  startupRegistered: boolean;
++  running: boolean;
++}
++
+ export type NativeBrowserLoginState =
+   | 'opening_browser'
+   | 'waiting_user'
+@@ -89,6 +101,28 @@ export const getNativeBrowserDevice = async (): Promise<NativeBrowserDevice> =>
+   return response.data;
+ };
+ 
++const isNativeBrowserHealth = (value: unknown): value is NativeBrowserHealth => {
++  if (!value || typeof value !== 'object') return false;
++  const health = value as Partial<NativeBrowserHealth>;
++  return health.ok === true
++    && health.service === 'xianyu-native-browser-helper'
++    && typeof health.version === 'string'
++    && typeof health.platform === 'string'
++    && typeof health.arch === 'string'
++    && Number.isInteger(health.protocolVersion)
++    && typeof health.installed === 'boolean'
++    && typeof health.startupRegistered === 'boolean'
++    && typeof health.running === 'boolean';
++};
++
++export const getNativeBrowserHealth = async (): Promise<NativeBrowserHealth> => {
++  const response = await helperRequest<NativeBrowserHealth>('/health');
++  if (!isNativeBrowserHealth(response)) {
++    throw new NativeBrowserRequestError('本机浏览器助手健康信息不完整', 409, 'helper_malformed');
++  }
++  return response;
++};
++
+ export const startNativeBrowserLogin = async (payload: {
+   session_id: string;
+   device_id: string;
+diff --git a/native_browser_helper/installer.py b/native_browser_helper/installer.py
+index bb4672e..112513c 100644
+--- a/native_browser_helper/installer.py
++++ b/native_browser_helper/installer.py
+@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
+ from pathlib import Path
+ from typing import Any, Mapping, Optional
+ 
+-from . import DEFAULT_PORT, HELPER_VERSION
++from . import DEFAULT_PORT, HELPER_VERSION, PROTOCOL_VERSION
+ from .keystore import default_state_dir
+ 
+ 
+@@ -28,6 +28,17 @@ class InstallerError(RuntimeError):
+     pass
+ 
+ 
++def _normalized_architecture(value: Optional[str] = None) -> str:
++    raw = str(value or platform.machine() or "").strip().lower()
++    if raw in {"arm64", "aarch64", "arm64e"}:
++        return "arm64"
++    if raw in {"x86_64", "amd64", "x64"}:
++        return "x64"
++    if raw in {"i386", "i686", "x86", "x32"}:
++        return "x86"
++    return raw or "unknown"
++
++
+ @dataclass(frozen=True)
+ class InstallStatus:
+     platform: str
+@@ -129,6 +140,18 @@ class NativeHelperInstaller:
+         return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
+ 
+     def status(self) -> InstallStatus:
++        diagnostics = self.health_dict()
++        return InstallStatus(
++            platform=str(diagnostics["platform"]),
++            version=HELPER_VERSION,
++            installed=bool(diagnostics["installed"]),
++            startup_registered=bool(diagnostics["startupRegistered"]),
++            running=bool(diagnostics["running"]),
++            install_path=str(self.install_path()),
++        )
++
++    def health_dict(self, *, running: Optional[bool] = None) -> dict[str, Any]:
++        """Return the bounded, secret-free state exposed by the loopback health check."""
+         installed = self.installed_executable().is_file()
+         if self.system == "Darwin":
+             startup_registered = self.launch_agent_path().is_file()
+@@ -136,15 +159,17 @@ class NativeHelperInstaller:
+             startup_registered = self._windows_run_value() == self._windows_command()
+         else:
+             startup_registered = False
+-        health = _helper_health(self.port)
+-        return InstallStatus(
+-            platform=self.system,
+-            version=HELPER_VERSION,
+-            installed=installed,
+-            startup_registered=startup_registered,
+-            running=bool(health and health.get("version") == HELPER_VERSION),
+-            install_path=str(self.install_path()),
+-        )
++        if running is None:
++            health = _helper_health(self.port)
++            running = bool(health and health.get("version") == HELPER_VERSION)
++        return {
++            "platform": self.system,
++            "arch": _normalized_architecture(),
++            "protocolVersion": PROTOCOL_VERSION,
++            "installed": installed,
++            "startupRegistered": startup_registered,
++            "running": bool(running),
++        }
+ 
+     def install_and_start(self) -> InstallStatus:
+         if not is_packaged() and not self.environ.get("XMC_HELPER_ALLOW_SOURCE_INSTALL"):
+diff --git a/native_browser_helper/server.py b/native_browser_helper/server.py
+index be66e03..ae4d2d2 100644
+--- a/native_browser_helper/server.py
++++ b/native_browser_helper/server.py
+@@ -3,12 +3,14 @@
+ from __future__ import annotations
+ 
+ import json
++import platform
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from typing import Any, Optional
+ from urllib.parse import parse_qs, urlsplit
+ 
+-from . import HELPER_VERSION
++from . import HELPER_VERSION, PROTOCOL_VERSION
+ from .helper import NativeBrowserHelper, NativeHelperError
++from .installer import InstallerError, NativeHelperInstaller, _normalized_architecture
+ 
+ 
+ MAX_BODY_BYTES = 64 * 1024
+@@ -18,9 +20,34 @@ class HelperHTTPServer(ThreadingHTTPServer):
+     daemon_threads = True
+     allow_reuse_address = True
+ 
+-    def __init__(self, address: tuple[str, int], helper: NativeBrowserHelper):
++    def __init__(
++        self,
++        address: tuple[str, int],
++        helper: NativeBrowserHelper,
++        installer: Optional[NativeHelperInstaller] = None,
++    ):
+         self.helper = helper
+         super().__init__(address, HelperRequestHandler)
++        self.installer = installer or NativeHelperInstaller(port=self.server_address[1])
++
++    def health_payload(self) -> dict[str, Any]:
++        try:
++            diagnostics = self.installer.health_dict(running=True)
++        except (InstallerError, OSError, ValueError):
++            diagnostics = {
++                "platform": platform.system(),
++                "arch": _normalized_architecture(),
++                "protocolVersion": PROTOCOL_VERSION,
++                "installed": False,
++                "startupRegistered": False,
++                "running": True,
++            }
++        return {
++            "ok": True,
++            "service": "xianyu-native-browser-helper",
++            "version": HELPER_VERSION,
++            **diagnostics,
++        }
+ 
+ 
+ class HelperRequestHandler(BaseHTTPRequestHandler):
+@@ -105,7 +132,7 @@ class HelperRequestHandler(BaseHTTPRequestHandler):
+         parsed = urlsplit(self.path)
+         try:
+             if parsed.path == "/health":
+-                self._send(200, {"ok": True, "service": "xianyu-native-browser-helper", "version": HELPER_VERSION})
++                self._send(200, self.server.health_payload())
+                 return
+             if parsed.path == "/v1/device":
+                 self._send(200, {"success": True, "data": self.server.helper.device_record()})
+diff --git a/tests/test_native_browser_helper.py b/tests/test_native_browser_helper.py
+index 26cdaa0..5409e03 100644
+--- a/tests/test_native_browser_helper.py
++++ b/tests/test_native_browser_helper.py
+@@ -156,6 +156,51 @@ class NativeHelperInstallerTests(unittest.TestCase):
+             self.assertTrue(any(command[:2] == ["launchctl", "bootstrap"] for command in commands))
+             self.assertTrue(any(command[:3] == ["launchctl", "kickstart", "-k"] for command in commands))
+ 
++    def test_health_view_is_secret_free_for_darwin_and_windows_fixtures(self):
++        with tempfile.TemporaryDirectory() as temp:
++            root = Path(temp)
++            mac_executable = root / "mac" / "XianyuNativeHelper.app" / "Contents" / "MacOS" / "XianyuNativeHelper"
++            mac_executable.parent.mkdir(parents=True)
++            mac_executable.write_bytes(b"fixture")
++            mac_launch_agent = root / "mac" / "helper.plist"
++            mac_launch_agent.write_text("fixture")
++            mac = NativeHelperInstaller(
++                system="Darwin",
++                executable=mac_executable,
++                environ={
++                    "XMC_HELPER_INSTALL_ROOT": str(root / "mac"),
++                    "XMC_HELPER_LAUNCH_AGENT_PATH": str(mac_launch_agent),
++                },
++                port=17891,
++            )
++            with patch("native_browser_helper.installer.platform.machine", return_value="arm64"):
++                mac_health = mac.health_dict(running=True)
++
++            windows_executable = root / "win" / "XianyuNativeHelper" / "XianyuNativeHelper-1.0.2.exe"
++            windows_executable.parent.mkdir(parents=True)
++            windows_executable.write_bytes(b"fixture")
++            windows = NativeHelperInstaller(
++                system="Windows",
++                executable=windows_executable,
++                environ={"LOCALAPPDATA": str(root / "win")},
++                port=17892,
++            )
++            with (
++                patch("native_browser_helper.installer.platform.machine", return_value="AMD64"),
++                patch.object(windows, "_windows_run_value", return_value=windows._windows_command()),
++            ):
++                windows_health = windows.health_dict(running=True)
++
++            self.assertEqual(mac_health["platform"], "Darwin")
++            self.assertEqual(mac_health["arch"], "arm64")
++            self.assertEqual(windows_health["platform"], "Windows")
++            self.assertEqual(windows_health["arch"], "x64")
++            for health in (mac_health, windows_health):
++                self.assertEqual(set(health), {
++                    "platform", "arch", "protocolVersion", "installed", "startupRegistered", "running",
++                })
++                self.assertNotIn("install_path", json.dumps(health))
++
+     def test_lifecycle_result_file_is_written_without_stdout(self):
+         with tempfile.TemporaryDirectory() as temp:
+             target = Path(temp) / "status.json"
+@@ -616,6 +661,11 @@ class NativeBrowserHelperTests(unittest.TestCase):
+                 device = json.loads(response.read())
+             self.assertTrue(health["ok"])
+             self.assertEqual(health["version"], "1.0.2")
++            self.assertEqual(health["protocolVersion"], 1)
++            self.assertIn(health["platform"], {"Darwin", "Windows"})
++            self.assertTrue(health["arch"])
++            for field in ("installed", "startupRegistered", "running"):
++                self.assertIsInstance(health[field], bool)
+             self.assertEqual(device["data"]["clientType"], "native_helper")
+             self.assertNotIn("private", json.dumps(device))
+         finally:

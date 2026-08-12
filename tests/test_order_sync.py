@@ -149,6 +149,22 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(order["amount"], "35.00")
         self.assertEqual(order["quantity"], "3")
 
+    def test_explicit_bargain_button_is_preserved(self):
+        order = normalize_order_record({
+            "commonData": {"orderId": "order-bargain"},
+            "rightVO": {"btnList": [{"name": "免拼发货", "action": "GROUPON_SEND"}]},
+        }, "account-1")
+
+        self.assertTrue(order["is_bargain"])
+
+    def test_ordinary_ship_button_is_not_treated_as_bargain(self):
+        order = normalize_order_record({
+            "commonData": {"orderId": "order-ordinary"},
+            "rightVO": {"btnList": [{"name": "去发货", "action": "LOGISTICS_SEND"}]},
+        }, "account-1")
+
+        self.assertFalse(order["is_bargain"])
+
     def test_order_list_does_not_infer_unverified_buyer_identity_fields(self):
         order = normalize_order_record({
             "commonData": {"orderId": "order-private"},
