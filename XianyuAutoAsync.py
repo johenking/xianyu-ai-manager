@@ -7065,9 +7065,12 @@ class XianyuLive:
             avatar_url = str(avatar_node.get('avatar') or '').strip()
         elif isinstance(avatar_node, str):
             avatar_url = avatar_node.strip()
-        # 平台返回协议相对地址（//img.alicdn.com/...），补全后前端才能直接加载。
+        # 平台返回 http:// 或协议相对地址；控制台走 HTTPS，必须升级协议，
+        # 否则浏览器按混合内容拦截图片（alicdn 同域支持 https）。
         if avatar_url.startswith('//'):
             avatar_url = f'https:{avatar_url}'
+        elif avatar_url.startswith('http://'):
+            avatar_url = f'https://{avatar_url[len("http://"):]}'
         if avatar_url and not avatar_url.startswith('https://'):
             avatar_url = ''
         nickname = str(base.get('displayName') or '').strip()
