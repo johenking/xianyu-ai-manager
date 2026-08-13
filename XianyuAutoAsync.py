@@ -4,6 +4,7 @@ import json
 import math
 import re
 import time
+from html import escape as html_escape
 import base64
 import os
 import random
@@ -60,6 +61,92 @@ WS_SEND_TIMEOUT = 10      # 单次业务帧发送上限，避免 await send 永�
 
 # 发货前付款核验的翻页上限。该核验持有账号订单同步锁，页数直接决定锁占用时长。
 DELIVERY_VERIFY_MAX_PAGES = 5
+
+# 只能由人工完成认证才可离开的会话状态。任何自动路径把它们改写成 failed，
+# 都会让监听器闸门失灵：账号一边无限重连，一边不再对外显示"需人工重新登录"。
+HUMAN_ACTION_SESSION_STATES = frozenset({
+    "manual_reauth_required",
+    "action_required",
+    "verification_required",
+})
+
+# 连续失败久拖不决时的退避下限（阈值, 秒）。登录态失效与平台风控不会因为每 30 秒
+# 重连一次而自愈，高频重连只是持续打平台。阈值从高到低匹配。
+PROLONGED_FAILURE_BACKOFF_TIERS = ((50, 1800.0), (20, 300.0))
+
+# 邮件正文里 "键: 值" 行的识别模式（键不超过 12 字，支持中英文冒号），命中的行
+# 会渲染成加粗的信息表格，例如 "账号ID: 123" / "异常时间: ..."。
+_EMAIL_FACT_LINE_PATTERN = re.compile(r"^([^:：]{1,12})[:：]\s*(.+)$")
+
+
+def render_notification_email_html(message: str) -> str:
+    """把纯文本通知渲染成邮件 HTML：首行作大标题，键值行进表格，其余按段落。
+
+    邮件客户端只认内联样式且不能引用外部资源；正文来自运行时数据（账号、
+    平台返回的错误信息），全部转义后再拼进模板。
+    """
+    lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
+    title = lines[0] if lines else "告警通知"
+    facts: list[tuple[str, str]] = []
+    paragraphs: list[str] = []
+    for line in lines[1:]:
+        matched = _EMAIL_FACT_LINE_PATTERN.match(line)
+        if matched:
+            facts.append((matched.group(1).strip(), matched.group(2).strip()))
+        else:
+            paragraphs.append(line)
+
+    blocks: list[str] = []
+    if facts:
+        fact_rows = "".join(
+            "<tr>"
+            '<td style="padding:7px 16px 7px 0;color:#8a8f99;font-size:13px;'
+            f'white-space:nowrap;vertical-align:top;">{html_escape(key)}</td>'
+            '<td style="padding:7px 0;color:#1f2329;font-size:14px;font-weight:600;'
+            f'word-break:break-all;">{html_escape(value)}</td>'
+            "</tr>"
+            for key, value in facts
+        )
+        blocks.append(
+            '<tr><td style="padding:14px 24px 6px;">'
+            '<table role="presentation" cellpadding="0" cellspacing="0" '
+            'style="width:100%;background:#f8f9fb;border-radius:8px;'
+            f'padding:10px 16px;">{fact_rows}</table></td></tr>'
+        )
+    blocks.extend(
+        '<tr><td style="padding:8px 24px;color:#4a4f59;font-size:14px;'
+        f'line-height:1.7;">{html_escape(paragraph)}</td></tr>'
+        for paragraph in paragraphs
+    )
+
+    sent_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        '<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f4f5f7;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="background:#f4f5f7;padding:24px 12px;"><tr><td align="center">'
+        '<table role="presentation" cellpadding="0" cellspacing="0" '
+        'style="max-width:560px;width:100%;background:#ffffff;border-radius:12px;'
+        "overflow:hidden;border:1px solid #e8eaed;font-family:-apple-system,"
+        "BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;\">"
+        '<tr><td style="background:#ff5000;padding:14px 24px;color:#ffffff;'
+        'font-size:15px;font-weight:700;letter-spacing:2px;">闲鱼监控 · 告警通知</td></tr>'
+        '<tr><td style="padding:22px 24px 4px;color:#1f2329;font-size:18px;'
+        f'font-weight:700;line-height:1.5;">{html_escape(title)}</td></tr>'
+        f'{"".join(blocks)}'
+        '<tr><td style="padding:18px 24px 20px;color:#a6abb5;font-size:12px;">'
+        f"此邮件由闲鱼监控系统自动发送 · {sent_at}</td></tr>"
+        "</table></td></tr></table></body></html>"
+    )
+
+
+def summarize_notification_email_subject(message: str) -> str:
+    """取首行做邮件主题摘要，让收件箱列表里一眼看出发生了什么。"""
+    first_line = next(
+        (line.strip() for line in str(message or "").splitlines() if line.strip()),
+        "",
+    )
+    summary = first_line[:40] if first_line else "告警通知"
+    return f"【闲鱼监控】{summary}"
 
 
 class DirectMessageNotSubmitted(RuntimeError):
@@ -712,7 +799,14 @@ class XianyuLive:
         else:
             base_delay = min(5 * self.connection_failures, 30)
 
-        return self._apply_jitter(base_delay)
+        return self._apply_jitter(self._escalate_for_prolonged_failure(base_delay))
+
+    def _escalate_for_prolonged_failure(self, base_delay: float) -> float:
+        """久拖不决的连续失败抬高退避下限，避免长时间高频重连打平台。"""
+        for threshold, floor_delay in PROLONGED_FAILURE_BACKOFF_TIERS:
+            if self.connection_failures >= threshold:
+                return max(base_delay, floor_delay)
+        return base_delay
 
     @staticmethod
     def _apply_jitter(base_delay: float, ratio: float = 0.3) -> float:
@@ -2247,6 +2341,18 @@ class XianyuLive:
         """Persist a transient probe failure without pausing for human action."""
         from db_manager import db_manager
 
+        current_state = str(
+            (db_manager.get_account_session_refresh(self.cookie_id) or {}).get("state")
+            or ""
+        )
+        if current_state in HUMAN_ACTION_SESSION_STATES:
+            self.last_token_refresh_status = current_state
+            logger.info(
+                f"【{self.cookie_id}】账号仍在等待人工处理（{current_state}），"
+                "不降级为可重试失败"
+            )
+            return
+
         error_code = str(
             getattr(probe, "error_code", "") or "session_probe_retryable"
         )[:80]
@@ -2263,6 +2369,38 @@ class XianyuLive:
         self.last_token_refresh_status = "retryable_error"
         logger.warning(
             f"【{self.cookie_id}】消息 Token 探测暂时失败，保留原会话并自动重试: {error_code}"
+        )
+
+    async def _enter_manual_reauth_required(
+        self,
+        *,
+        trigger: str,
+        message: str,
+    ) -> None:
+        """Park the account for human re-login and alert once on the transition."""
+        from db_manager import db_manager
+
+        current = db_manager.get_account_session_refresh(self.cookie_id) or {}
+        already_required = (
+            str(current.get("state") or "") == "manual_reauth_required"
+        )
+        db_manager.update_account_session_refresh(
+            self.cookie_id,
+            state="manual_reauth_required",
+            trigger=trigger,
+            message=message,
+            error_code="manual_reauth_required",
+        )
+        self.last_token_refresh_status = "manual_reauth_required"
+        if already_required:
+            return
+        # 绑定了续期设备时，写入会被落成 refreshing 并派发续期任务，此时不该催人工登录。
+        landed = db_manager.get_account_session_refresh(self.cookie_id) or {}
+        if str(landed.get("state") or "") != "manual_reauth_required":
+            return
+        await self.send_token_refresh_notification(
+            f"{message}。账号【{self.cookie_id}】已暂停接单，请重新登录后恢复。",
+            "manual_reauth_required",
         )
 
     async def _mark_human_verification_required(
@@ -2583,12 +2721,9 @@ class XianyuLive:
             login_method = normalize_login_method(account_info.get("login_method"))
             message = reauth_message_for(login_method)
             await asyncio.to_thread(db_manager.mark_cookie_expired, self.cookie_id)
-            db_manager.update_account_session_refresh(
-                self.cookie_id,
-                state="manual_reauth_required",
+            await self._enter_manual_reauth_required(
                 trigger=trigger_reason,
                 message=message,
-                error_code="manual_reauth_required",
             )
             logger.info(
                 f"【{self.cookie_id}】当前登录方式需要人工重新登录，未启动官方浏览器"
@@ -2611,12 +2746,9 @@ class XianyuLive:
             or db_cookie_unb != profile_unb
         ):
             await asyncio.to_thread(db_manager.mark_cookie_expired, self.cookie_id)
-            db_manager.update_account_session_refresh(
-                self.cookie_id,
-                state="manual_reauth_required",
+            await self._enter_manual_reauth_required(
                 trigger=trigger_reason,
                 message=reauth_message_for("password"),
-                error_code="manual_reauth_required",
             )
             return False
 
@@ -4516,13 +4648,18 @@ class XianyuLive:
                 return False
 
             # 创建邮件
-            msg = MIMEMultipart()
+            msg = MIMEMultipart('mixed')
             msg['From'] = email_user
             msg['To'] = recipient_email
-            msg['Subject'] = "闲鱼自动回复通知"
+            msg['Subject'] = summarize_notification_email_subject(message)
 
-            # 添加邮件正文
-            msg.attach(MIMEText(message, 'plain', 'utf-8'))
+            # 正文用 alternative 双版本：纯文本兜底 + HTML 排版（标题/信息表格/段落）
+            body = MIMEMultipart('alternative')
+            body.attach(MIMEText(message, 'plain', 'utf-8'))
+            body.attach(
+                MIMEText(render_notification_email_html(message), 'html', 'utf-8')
+            )
+            msg.attach(body)
 
             # 添加附件（如果有）
             if attachment_path and os.path.exists(attachment_path):

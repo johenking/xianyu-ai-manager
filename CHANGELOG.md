@@ -4,6 +4,37 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop the WebSocket consecutive-failure counter from overwriting
+  `manual_reauth_required` / `action_required` / `verification_required` with a
+  retryable `failed` state. The downgrade disabled the documented passive-wait
+  gate, so expired QR/cookie accounts spun through connect-probe-fail loops
+  (observed: one attempt every ~17 seconds for 8.5 hours) while the backend
+  kept showing a misleading "连续连接失败" instead of asking for a re-login.
+- Rebuild the free-shipping (bargain) delivery path on the same retry policy as
+  order confirmation: response classification, idempotency for already-shipped
+  orders, bounded exponential backoff with jitter, and required-parameter
+  checks instead of blind recursive retries.
+- Add a one-shot self-healing fallback between the confirm and free-shipping
+  APIs when the primary method fails with an unknown category, covering orders
+  whose bargain/direct type cannot be derived from platform data.
+
+### Changed
+
+- Escalate the reconnect backoff floor to 5 minutes after 20 consecutive
+  connection failures and 30 minutes after 50, so prolonged platform or
+  session outages no longer hammer the platform on the fast retry curve.
+- Send a one-time notification when an account enters
+  `manual_reauth_required` (deduplicated on the state transition; suppressed
+  when a bound renewal device takes over the refresh instead).
+- Render notification emails as HTML with a highlighted title, a key-value
+  facts table, and paragraph body over a plain-text fallback part, and derive
+  the mail subject from the first line of the alert instead of a fixed title.
+- Reject invite-managed items in the manual-ship full-delivery path and point
+  operators to `status_only`, keeping the invite service the only card-code
+  inventory source.
+
 ## [1.10.4] - 2026-08-01
 
 ### Added

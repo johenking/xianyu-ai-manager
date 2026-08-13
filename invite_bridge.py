@@ -368,39 +368,66 @@ async def mark_invite_fulfilled(request: Request, body: MarkFulfilledRequest):
         return _set_operation(body.operation_key, "needs_review", error="account cookie is unavailable")
     try:
         is_bargain = str(order.get("is_bargain") or "").strip().lower() in {"1", "true", "yes", "on"}
-        if is_bargain:
+        buyer_id = str(order.get("buyer_id") or "")
+
+        async def _do_freeshipping():
             from XianyuAutoAsync import XianyuLive
 
             live_instance = XianyuLive.get_instance(body.cookie_id)
             if live_instance:
-                result = await asyncio.wait_for(
-                    live_instance.auto_freeshipping(
-                        body.order_id,
-                        body.item_id,
-                        str(order.get("buyer_id") or ""),
+                return await asyncio.wait_for(
+                    live_instance.auto_freeshipping(body.order_id, body.item_id, buyer_id),
+                    timeout=35,
+                )
+            from secure_freeshipping_decrypted import SecureFreeshipping
+
+            async with aiohttp.ClientSession(
+                headers={"cookie": cookies},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as session:
+                return await asyncio.wait_for(
+                    SecureFreeshipping(session, cookies, body.cookie_id).auto_freeshipping(
+                        body.order_id, body.item_id, buyer_id
                     ),
                     timeout=35,
                 )
-            else:
-                from secure_freeshipping_decrypted import SecureFreeshipping
 
-                async with aiohttp.ClientSession(
-                    headers={"cookie": cookies},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as session:
-                    result = await asyncio.wait_for(
-                        SecureFreeshipping(session, cookies, body.cookie_id).auto_freeshipping(
-                            body.order_id,
-                            body.item_id,
-                            str(order.get("buyer_id") or ""),
-                        ),
-                        timeout=35,
-                    )
-        else:
+        async def _do_confirm():
             from secure_confirm_decrypted import SecureConfirm
 
-            async with aiohttp.ClientSession(headers={"cookie": cookies}, timeout=aiohttp.ClientTimeout(total=30)) as session:
-                result = await SecureConfirm(session, cookies, body.cookie_id, None).auto_confirm(body.order_id, body.item_id)
+            async with aiohttp.ClientSession(
+                headers={"cookie": cookies},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as session:
+                return await asyncio.wait_for(
+                    SecureConfirm(session, cookies, body.cookie_id, None).auto_confirm(
+                        body.order_id, body.item_id
+                    ),
+                    timeout=35,
+                )
+
+        # 免拼发货与确认发货互为回退：拼单标记可能在轮询补单时丢失（平台订单列表
+        # 不返回该标记），主接口若因"订单类型不匹配"等未知业务失败，回退到另一种
+        # 发货接口再试一次，避免用错接口导致漏发货。会话失效/风控/限流等已知失败
+        # 不回退（换接口也无益或加重风控）。
+        if is_bargain:
+            primary, fallback = _do_freeshipping, _do_confirm
+            primary_mode, fallback_mode = "free_shipping", "status_only"
+        else:
+            primary, fallback = _do_confirm, _do_freeshipping
+            primary_mode, fallback_mode = "status_only", "free_shipping"
+
+        result = await primary()
+        delivery_mode = primary_mode
+        if (
+            (not result or not result.get("success"))
+            and str((result or {}).get("category") or "") == "unknown_failure"
+        ):
+            fallback_result = await fallback()
+            if fallback_result and fallback_result.get("success"):
+                result = fallback_result
+                delivery_mode = fallback_mode
+
         if not result or not result.get("success"):
             error = "platform free-shipping confirmation failed" if is_bargain else "platform status_only confirmation failed"
             return _set_operation(body.operation_key, "failed", error=error)
@@ -410,7 +437,7 @@ async def mark_invite_fulfilled(request: Request, body: MarkFulfilledRequest):
             body.operation_key,
             "succeeded",
             provider_ref=body.order_id,
-            response={"platformStatus": "shipped", "deliveryMode": "free_shipping" if is_bargain else "status_only"},
+            response={"platformStatus": "shipped", "deliveryMode": delivery_mode},
         )
     except Exception as exc:
         return _set_operation(body.operation_key, "needs_review", error=f"platform confirmation outcome unknown: {type(exc).__name__}")
