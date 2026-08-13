@@ -23,6 +23,11 @@ def _server_address() -> tuple[str, int]:
 
 
 def main() -> None:
+    # 尽早改道出站 DNS 并清除继承代理（在 uvicorn 启动及任何出站请求前），
+    # 绕开系统 fake-IP，且不依赖本机代理组件。
+    from utils.outbound_dns import install_outbound_dns_patch, neutralize_inherited_proxy_env
+    if install_outbound_dns_patch():
+        neutralize_inherited_proxy_env()
     assert_single_worker_configuration()
     host, port = _server_address()
     uvicorn.run(
