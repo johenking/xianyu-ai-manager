@@ -88,6 +88,7 @@ class FakePage:
         self.user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36"
         self.closed = False
         self.init_scripts = []
+        self.viewport_size = {"width": 1440, "height": 960}
 
     def _ensure_open(self):
         if self.closed:
@@ -113,9 +114,12 @@ class FakePage:
         self._ensure_open()
         del timeout
 
-    def screenshot(self, path, **kwargs):
+    def screenshot(self, path=None, **kwargs):
         self._ensure_open()
         del kwargs
+        if path is None:
+            # 画面流截图（interaction_channel.capture）不带 path，直接返回字节。
+            return b"fake-frame-png"
         Path(path).write_bytes(b"verification")
 
     def add_init_script(self, script):
@@ -294,6 +298,108 @@ class XianyuOfficialLoginTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_local_visible_login_disables_remote_interaction_stream(self):
+        # 本机可见窗口（show_browser=True）不发布画面帧、不转发手势——否则
+        # Playwright 截图的 Page.bringToFront 会每秒抢焦点（窗口闪烁、滑块被打断）。
+        context, _elements = make_password_context(unb="9988")
+        factory = SequencePlaywrightFactory([context])
+        service = self.make_service(factory)
+        worker = OfficialLoginWorker()
+        live_frames = []
+
+        result = service.login_with_password(
+            account="13800138000",
+            password="secret",
+            show_browser=True,
+            worker=worker,
+            on_validated=lambda _v: live_frames.append(
+                worker.interaction_channel.latest_frame()
+            ),
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertFalse(worker.remote_interaction_enabled)
+        # 会话存活期间也从未发布过画面帧。
+        self.assertEqual(live_frames, [None])
+
+    def test_background_refresh_keeps_remote_interaction_stream(self):
+        # 后台自动续期（show_browser=False）保留画面流：远程查看验证画面的刚需。
+        page = FakePage()
+        context = FakeContext(page, authenticated_cookies("9988"))
+        service = self.make_service(SequencePlaywrightFactory([context]))
+        worker = OfficialLoginWorker()
+        live_frames = []
+
+        result = service.refresh_session(
+            profile_unb="9988",
+            current_cookie="unb=9988; cookie2=old",
+            worker=worker,
+            on_validated=lambda _v: live_frames.append(
+                worker.interaction_channel.latest_frame()
+            ),
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertTrue(worker.remote_interaction_enabled)
+        # 会话存活期间发布过真实画面帧（会话结束时通道才被关闭清空）。
+        self.assertEqual(len(live_frames), 1)
+        self.assertIsNotNone(live_frames[0])
+
+    def test_show_event_brings_visible_window_to_front(self):
+        # 可见窗口被其他窗口挡住时，"重新显示 Chrome 窗口"也应把窗口拉回前台。
+        context, _elements = make_password_context(unb="9988")
+        context.cdp_session = FakeCDPSession()
+        factory = SequencePlaywrightFactory([context])
+        service = self.make_service(factory)
+        worker = OfficialLoginWorker()
+        worker.request_visible()
+
+        result = service.login_with_password(
+            account="13800138000",
+            password="secret",
+            show_browser=True,
+            worker=worker,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertIn(
+            "Browser.setWindowBounds",
+            [method for method, _params in context.cdp_session.calls],
+        )
+
+    def test_disabled_worker_skips_capture_and_drain(self):
+        worker = OfficialLoginWorker()
+        worker.interaction_channel.publish_frame(
+            b"png",
+            viewport_width=100,
+            viewport_height=100,
+            surface_key="k",
+        )
+        worker.submit_interaction({
+            "kind": "key",
+            "key": "Enter",
+            "frame_revision": worker.interaction_channel.snapshot()["frame_revision"],
+        })
+        worker.remote_interaction_enabled = False
+        self.assertFalse(worker.capture_frame(object()))
+        self.assertEqual(worker.drain_interactions(object()), 0)
+        self.assertEqual(worker.interaction_channel.pending_count, 1)
+
+    def test_active_page_returns_none_when_user_closed_all_pages_and_reopen_disabled(self):
+        # 用户关闭全部登录页面时，监控循环不应"关窗复活"重弹，而是拿到 None 后结束会话。
+        service = self.make_service(lambda: None)
+        closed_page = FakePage()
+        closed_page.closed = True
+        context = FakeContext(closed_page)
+        self.assertIsNone(service._active_page(context, allow_reopen=False))
+
+    def test_active_page_returns_open_page_even_when_reopen_disabled(self):
+        # 仍有打开的页面时，禁止重开不影响正常返回当前页面。
+        service = self.make_service(lambda: None)
+        open_page = FakePage()
+        context = FakeContext(open_page)
+        self.assertIs(service._active_page(context, open_page, allow_reopen=False), open_page)
+
     def test_initial_login_switches_from_sms_and_confirms_agreement_and_keep_login(self):
         context, elements = make_password_context(unb="9988")
         factory = SequencePlaywrightFactory([context])
@@ -319,7 +425,8 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertEqual(list(self.profile_root.glob(".login_*")), [])
 
         launch_options = factory.launches[0][1]
-        self.assertEqual(launch_options["channel"], "chrome")
+        # 未配置 XIANYU_BROWSER_CHANNEL 时使用 Playwright 自带 Chromium（零安装，不依赖系统 Chrome）。
+        self.assertIsNone(launch_options["channel"])
         self.assertNotIn("user_agent", launch_options)
         self.assertNotIn("--disable-blink-features=AutomationControlled", launch_options["args"])
         self.assertNotIn("--disable-web-security", launch_options["args"])

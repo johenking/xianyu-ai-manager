@@ -78,6 +78,11 @@ class OfficialLoginWorker:
         self._context: Any = None
         self._playwright: Any = None
         self.interaction_channel = BrowserInteractionChannel()
+        # 远程交互层（每秒截图回传 + 网页手势转发）只服务"人不在服务器旁"的场景
+        # （后台自动续期）。用户主动打开的本机可见窗口会被 Playwright 截图时的
+        # Page.bringToFront 每秒抢焦点（窗口闪烁、滑块拖动被打断），因此该场景
+        # 由 _run_profile 关闭本开关，登录检测只走静默 probe/DOM 轮询。
+        self.remote_interaction_enabled = True
 
     def attach(self, context: Any, playwright: Any) -> None:
         with self._resource_lock:
@@ -112,6 +117,8 @@ class OfficialLoginWorker:
         return self.interaction_channel.submit(payload)
 
     def capture_frame(self, page: Any) -> bool:
+        if not self.remote_interaction_enabled:
+            return False
         try:
             self.interaction_channel.capture(page)
             return True
@@ -119,6 +126,8 @@ class OfficialLoginWorker:
             return False
 
     def drain_interactions(self, page: Any) -> int:
+        if not self.remote_interaction_enabled:
+            return 0
         return self.interaction_channel.drain(page)
 
 
@@ -511,6 +520,8 @@ class XianyuOfficialLoginService:
     ) -> OfficialLoginResult:
         profile_path.mkdir(parents=True, exist_ok=True)
         background_window = not show_browser
+        # 本机可见窗口（用户主动登录）关闭截图流/手势转发，避免每秒抢焦点。
+        worker.remote_interaction_enabled = not show_browser
         used_password = False
         verification_image_path = ""
         active_verification_url = (
@@ -539,7 +550,10 @@ class XianyuOfficialLoginService:
                     # illegal browser. Background renewals use a normal browser
                     # window positioned off-screen instead.
                     headless=False,
-                    channel=os.getenv("XIANYU_BROWSER_CHANNEL", "chrome"),
+                    # 未显式配置 XIANYU_BROWSER_CHANNEL 时回退到 Playwright 自带的
+                    # Chromium（channel=None），实现零安装：本机无需另装系统 Chrome。
+                    # 配置了该变量（如 chrome/msedge）则沿用系统浏览器渠道。
+                    channel=os.getenv("XIANYU_BROWSER_CHANNEL") or None,
                     chromium_sandbox=True,
                     args=browser_args,
                     viewport={"width": 1440, "height": 960},
@@ -554,7 +568,12 @@ class XianyuOfficialLoginService:
                     active_verification_url
                     or (GOOFISH_LOGIN_URL if mode in {"qr", "password", "sms"} else GOOFISH_IM_URL)
                 )
-                page.goto(entry_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.goto(entry_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    # 登录/风控页可能长时间不触发 domcontentloaded 但页面已可交互；不因
+                    # 加载超时杀掉整个会话（否则窗口会"突然消失"），交给监控循环等待用户操作。
+                    logger.warning("官方登录页加载超时，保留窗口继续等待用户操作")
                 try:
                     page.wait_for_timeout(1500)
                 except Exception:
@@ -832,13 +851,23 @@ class XianyuOfficialLoginService:
                     context,
                     page,
                     recover_url=GOOFISH_IM_URL,
+                    allow_reopen=False,
                 )
+                if page is None:
+                    # 用户主动关闭了登录窗口：结束会话，而不是 1 秒后自动重弹（"关窗复活"）。
+                    return OfficialLoginResult(
+                        status="failed",
+                        error_code="browser_closed_by_user",
+                        message="登录窗口已被关闭，请重新发起登录",
+                        used_password=used_password,
+                    )
                 worker.drain_interactions(page)
                 now = time.monotonic()
                 if now - last_frame_at >= 1.0:
                     worker.capture_frame(page)
                     last_frame_at = now
-                if background_window and worker.show_event.is_set():
+                # 可见窗口也响应"重新显示"：窗口被其他窗口挡住时可一键拉回前台。
+                if worker.show_event.is_set():
                     worker.show_event.clear()
                     if self._show_existing_window(context, page):
                         background_window = False
@@ -987,6 +1016,7 @@ class XianyuOfficialLoginService:
         current_page: Any = None,
         *,
         recover_url: str = "",
+        allow_reopen: bool = True,
     ) -> Any:
         pages = list(getattr(context, "pages", []) or [])
         active_pages = [
@@ -994,6 +1024,9 @@ class XianyuOfficialLoginService:
             for candidate in pages
             if not self._page_is_closed(candidate)
         ]
+        if not active_pages and not allow_reopen:
+            # 用户关闭了全部页面：不自动新开（避免"关窗复活"），交由调用方结束会话。
+            return None
         page = active_pages[-1] if active_pages else context.new_page()
         if page is not current_page:
             self._install_official_message_listener(page)

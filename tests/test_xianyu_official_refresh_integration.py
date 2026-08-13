@@ -275,7 +275,9 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.updates[-1][1]["state"], "manual_reauth_required")
         self.assertEqual(database.expired_calls, 1)
         probe.assert_not_awaited()
-        live.send_token_refresh_notification.assert_not_awaited()
+        # 首次冻结必须告警一次，否则账号会静默停摆；第二次触发不得重复骚扰
+        live.send_token_refresh_notification.assert_awaited_once()
+        self.assertIn("重新扫码", live.send_token_refresh_notification.await_args.args[0])
 
     async def test_repeated_password_refresh_requests_never_start_server_browser(self):
         live = object.__new__(XianyuLive)
