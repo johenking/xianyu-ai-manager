@@ -9,7 +9,6 @@ auth_router = APIRouter(tags=["auth"])
 accounts_router = APIRouter(tags=["accounts"])
 ai_router = APIRouter(tags=["ai"])
 orders_router = APIRouter(tags=["orders"])
-skills_router = APIRouter(tags=["skills"])
 settings_router = APIRouter(tags=["settings"])
 content_router = APIRouter(tags=["content"])
 admin_router = APIRouter(tags=["admin"])
@@ -22,7 +21,6 @@ DOMAIN_ROUTERS = {
     "accounts": accounts_router,
     "ai": ai_router,
     "orders": orders_router,
-    "skills": skills_router,
     "settings": settings_router,
     "content": content_router,
     "admin": admin_router,
@@ -40,7 +38,6 @@ def include_domain_routers(app: FastAPI) -> None:
         "accounts",
         "ai",
         "orders",
-        "skills",
         "settings",
         "content",
         "admin",

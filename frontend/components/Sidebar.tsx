@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, Users, ShoppingBag, CreditCard, Settings, LogOut, Box, Sparkles, MessageSquare, SlidersHorizontal, X } from 'lucide-react';
+import { LayoutDashboard, Users, ShoppingBag, PackageCheck, Settings, LogOut, Box, Sparkles, MessageSquare, X } from 'lucide-react';
 import BrandLockup from './BrandLockup';
 
 interface SidebarProps {
@@ -16,10 +16,9 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onPreloadTab
     { id: 'dashboard', icon: LayoutDashboard, label: '仪表盘' },
     { id: 'accounts', icon: Users, label: '账号管理' },
     { id: 'orders', icon: ShoppingBag, label: '订单管理' },
-    { id: 'cards', icon: CreditCard, label: '卡密库存' },
+    { id: 'delivery', icon: PackageCheck, label: '自动发货' },
     { id: 'items', icon: Box, label: '商品列表' },
     { id: 'keywords', icon: MessageSquare, label: '关键词管理' },
-    { id: 'skills', icon: SlidersHorizontal, label: '技能中心' },
     { id: 'settings', icon: Settings, label: '系统与AI' },
   ];
 

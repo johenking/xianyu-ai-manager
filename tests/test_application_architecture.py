@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 248)
+        self.assertEqual(len(signatures), 236)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -31,7 +31,6 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
                 "frontend",
                 "orders",
                 "settings",
-                "skills",
                 "system",
                 "invite_bridge",
             },

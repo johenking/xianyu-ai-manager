@@ -1005,6 +1005,7 @@ class XianyuLive:
             raise ValueError(f"【{cookie_id}】Cookie中缺少必需的'unb'字段，当前字段: {list(self.cookies.keys())}")
 
         self.myid = self.cookies['unb']
+        self._account_profile_synced = False
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
         self.device_id = generate_device_id(self.myid)
 
@@ -5303,37 +5304,63 @@ class XianyuLive:
                 logger.warning(f"账号 {self.cookie_id} 未找到归属用户，跳过自动发货")
                 return None
 
-            # 智能匹配发货规则：多规格商品只匹配多规格卡券，非多规格商品只匹配非多规格卡券
+            # 商品级绑定优先：卖家在"自动发货"里为该商品明确指定了卡密时，直接用它。
+            # 关键词匹配只作为未绑定商品的兜底（改标题、多商品同词都会让匹配失灵）。
             delivery_rules = []
+            bound_rule = database.get_item_bound_delivery_rule(
+                self.cookie_id,
+                item_id,
+                user_id=rule_owner_user_id,
+            )
+            if bound_rule:
+                spec_compatible = (
+                    not is_multi_spec
+                    or not bound_rule.get('is_multi_spec')
+                    or (
+                        str(bound_rule.get('spec_name') or '') == str(spec_name or '')
+                        and str(bound_rule.get('spec_value') or '') == str(spec_value or '')
+                    )
+                )
+                if spec_compatible:
+                    logger.info(
+                        f"✅ 命中商品级发货绑定: item_id={item_id} -> {bound_rule['card_name']} "
+                        f"({bound_rule['card_type']})"
+                    )
+                    delivery_rules = [bound_rule]
+                else:
+                    logger.warning(
+                        "商品绑定的多规格卡密与订单规格不匹配，回落关键词规则匹配"
+                    )
 
-            if is_multi_spec:
-                # 多规格商品：只匹配多规格发货规则
-                if spec_name and spec_value:
-                    logger.info("多规格商品开始匹配账号内发货规则")
-                    delivery_rules = database.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value, user_id=rule_owner_user_id)
-                    # 过滤只保留多规格卡券
-                    delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
+            if not delivery_rules:
+                if is_multi_spec:
+                    # 多规格商品：只匹配多规格发货规则
+                    if spec_name and spec_value:
+                        logger.info("多规格商品开始匹配账号内发货规则")
+                        delivery_rules = database.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value, user_id=rule_owner_user_id)
+                        # 过滤只保留多规格卡券
+                        delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
 
-                    if delivery_rules:
-                        logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
+                        if delivery_rules:
+                            logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
+                        else:
+                            logger.warning("❌ 多规格商品未找到匹配的多规格发货规则，跳过自动发货")
+                            return None
                     else:
-                        logger.warning(f"❌ 多规格商品未找到匹配的多规格发货规则，跳过自动发货")
+                        logger.warning("❌ 多规格商品但无规格信息，跳过自动发货")
                         return None
                 else:
-                    logger.warning(f"❌ 多规格商品但无规格信息，跳过自动发货")
-                    return None
-            else:
-                # 非多规格商品：只匹配非多规格发货规则
-                logger.info("非多规格商品开始匹配账号内普通发货规则")
-                delivery_rules = database.get_delivery_rules_by_keyword(search_text, user_id=rule_owner_user_id)
-                # 过滤只保留非多规格卡券
-                delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
+                    # 非多规格商品：只匹配非多规格发货规则
+                    logger.info("非多规格商品开始匹配账号内普通发货规则")
+                    delivery_rules = database.get_delivery_rules_by_keyword(search_text, user_id=rule_owner_user_id)
+                    # 过滤只保留非多规格卡券
+                    delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
 
-                if delivery_rules:
-                    logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
-                else:
-                    logger.warning(f"❌ 非多规格商品未找到匹配的普通发货规则，跳过自动发货")
-                    return None
+                    if delivery_rules:
+                        logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
+                    else:
+                        logger.warning("❌ 非多规格商品未找到匹配的普通发货规则，跳过自动发货")
+                        return None
 
             # 检查匹配到的卡券数量，只有唯一匹配时才自动发货
             if len(delivery_rules) > 1:
@@ -5369,7 +5396,8 @@ class XianyuLive:
                 ):
                     logger.warning("批量卡券预留不足，已停止自动交付")
                     return None
-            logger.info(f"✅ 唯一匹配发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+            rule_origin = '商品绑定' if rule.get('source') == 'item_binding' else f"关键词 {rule['keyword']}"
+            logger.info(f"✅ 采用发货来源[{rule_origin}] -> {rule['card_name']} ({rule['card_type']})")
 
             # 保存商品信息到数据库（需要有商品标题才保存）
             # 尝试获取商品标题
@@ -5487,16 +5515,17 @@ class XianyuLive:
 
                     # A durable attempt records delivery only after every
                     # outbound message is acknowledged by the WebSocket.
-                    if fulfillment_attempt_id is None:
+                    # 商品级绑定没有 delivery_rules 行（rule['id'] 为 None），无计数可累加。
+                    if fulfillment_attempt_id is None and rule.get('id') is not None:
                         database.increment_delivery_times(rule['id'])
-                    logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
+                    logger.info(f"自动发货成功: 来源={rule_origin}, 内容长度={len(final_content)}")
                     return final_content
                 else:
-                    logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
+                    logger.warning(f"获取发货内容失败: 来源={rule_origin}")
                     return None
             else:
                 # 没有订单ID，记录日志但不处理发货内容
-                logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。来源: {rule_origin} -> {rule['card_name']} ({rule['card_type']})")
                 return None
 
         except Exception as e:
@@ -6967,6 +6996,95 @@ class XianyuLive:
         except Exception:
             return False
 
+    async def _sync_account_profile(self):
+        """缓存本账号在闲鱼的头像与昵称，供控制台账号卡片展示。
+
+        控制台此前只能显示灰色占位头像——平台身份数据从未被采集。这里在账号连上
+        之后用同一会话补一次只读的用户主页接口；每个实例最多成功一次（重新登录会
+        新建实例，从而自然刷新），失败只记 debug 且不影响监听主流程。
+        """
+        if getattr(self, '_account_profile_synced', False):
+            return
+        token_source = trans_cookies(self.cookies_str).get('_m_h5_tk', '')
+        token = token_source.split('_', 1)[0] if token_source else ''
+        if not token or not self.myid:
+            return
+
+        api = 'mtop.idle.web.user.page.head'
+        version = '1.0'
+        timestamp = str(int(time.time() * 1000))
+        data_value = json.dumps({'userId': str(self.myid)}, separators=(',', ':'))
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': timestamp,
+            'sign': generate_sign(timestamp, token, data_value),
+            'v': version,
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': api,
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+        }
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Cookie': self.cookies_str,
+            'Origin': 'https://www.goofish.com',
+            'Referer': 'https://www.goofish.com/',
+            'User-Agent': self.browser_user_agent,
+        }
+        url = _resolve_h5_api_url(f'https://h5api.m.goofish.com/h5/{api}/{version}/')
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+                cookie_jar=aiohttp.DummyCookieJar(),
+            ) as session:
+                async with session.post(
+                    url,
+                    params=params,
+                    data={'data': data_value},
+                    headers=headers,
+                ) as response:
+                    body = await response.json(content_type=None)
+        except Exception as exc:
+            logger.debug(f"【{self.cookie_id}】账号资料获取跳过: {type(exc).__name__}")
+            return
+
+        if not isinstance(body, dict):
+            return
+        module = (body.get('data') or {}).get('module')
+        base = module.get('base') if isinstance(module, dict) else None
+        if not isinstance(base, dict):
+            return
+        avatar_node = base.get('avatar')
+        avatar_url = ''
+        if isinstance(avatar_node, dict):
+            avatar_url = str(avatar_node.get('avatar') or '').strip()
+        elif isinstance(avatar_node, str):
+            avatar_url = avatar_node.strip()
+        # 平台返回协议相对地址（//img.alicdn.com/...），补全后前端才能直接加载。
+        if avatar_url.startswith('//'):
+            avatar_url = f'https:{avatar_url}'
+        if avatar_url and not avatar_url.startswith('https://'):
+            avatar_url = ''
+        nickname = str(base.get('displayName') or '').strip()
+        if not avatar_url and not nickname:
+            return
+        saved = await asyncio.to_thread(
+            db_manager.update_account_profile,
+            self.cookie_id,
+            avatar_url,
+            nickname,
+        )
+        if saved:
+            self._account_profile_synced = True
+            logger.info(
+                f"【{self.cookie_id}】账号资料已缓存: avatar={bool(avatar_url)} nick={bool(nickname)}"
+            )
+
     async def create_session(self):
         """创建aiohttp session"""
         if not self.session:
@@ -7949,6 +8067,9 @@ class XianyuLive:
                             self.connection_failures = 0
                             self.last_successful_connection = time.time()
                             self.connected_at = self.last_successful_connection
+
+                            # 会话可用后补一次账号头像/昵称缓存（失败不影响监听）
+                            await self._sync_account_profile()
 
                             # 记录后台任务启动前的状态
                             logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")

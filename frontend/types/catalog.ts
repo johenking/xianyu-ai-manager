@@ -46,6 +46,9 @@ export interface Item {
   item_detail?: string;
   is_multi_spec?: number | boolean;
   multi_quantity_delivery?: number | boolean;
+  // 自动发货：绑定卡密（商品级）与邀请重置互斥，都未开启时回落关键词兜底规则
+  delivery_card_id?: number | null;
+  invite_auto_fulfillment?: number | boolean;
   created_at?: string;
   updated_at?: string;
 }

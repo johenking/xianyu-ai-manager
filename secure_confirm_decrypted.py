@@ -20,8 +20,8 @@ BACKOFF_MAX_SECONDS = 60.0
 BACKOFF_JITTER_RANGE = (0.5, 1.5)
 
 # ---- 平台 ret 分类标记 ----
-# 归纳自仓库现有分类先例：order_sync_service.classify_platform_error、
-# skill_monitor_mtop_adapter 的 TOKEN/SESSION/RISK 标记组、utils/xianyu_session_probe。
+# 归纳自仓库现有分类先例：order_sync_service.classify_platform_error
+# 与 utils/xianyu_session_probe 的 TOKEN/SESSION/RISK 标记组。
 # 无法归入下列任何一类的 ret 一律按"失败关闭、不重试"处理。
 
 # 已发货/重复确认：平台已处于发货终态，按幂等成功处理，不重试

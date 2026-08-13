@@ -309,40 +309,6 @@
   "/api/settings/verify/{section}": [
     "POST"
   ],
-  "/api/skills/agent/prompts": [
-    "GET"
-  ],
-  "/api/skills/agent/prompts/{prompt_type}": [
-    "PUT"
-  ],
-  "/api/skills/agent/test-reply": [
-    "POST"
-  ],
-  "/api/skills/capabilities": [
-    "GET"
-  ],
-  "/api/skills/monitor/results": [
-    "GET"
-  ],
-  "/api/skills/monitor/tasks": [
-    "GET",
-    "POST"
-  ],
-  "/api/skills/monitor/tasks/{task_id}": [
-    "PUT"
-  ],
-  "/api/skills/monitor/tasks/{task_id}/run": [
-    "POST"
-  ],
-  "/api/skills/ops/browser-status": [
-    "GET"
-  ],
-  "/api/skills/ops/delivery-diagnostics": [
-    "GET"
-  ],
-  "/api/skills/ops/health": [
-    "GET"
-  ],
   "/backup/export": [
     "GET"
   ],
@@ -488,16 +454,13 @@
   "/items/cookie/{cookie_id}": [
     "GET"
   ],
+  "/items/delivery-bindings/batch": [
+    "POST"
+  ],
   "/items/get-all-from-account": [
     "POST"
   ],
   "/items/get-by-page": [
-    "POST"
-  ],
-  "/items/search": [
-    "POST"
-  ],
-  "/items/search_multiple": [
     "POST"
   ],
   "/items/{cid}": [
@@ -506,6 +469,9 @@
   "/items/{cookie_id}/{item_id}": [
     "DELETE",
     "GET",
+    "PUT"
+  ],
+  "/items/{cookie_id}/{item_id}/delivery-binding": [
     "PUT"
   ],
   "/items/{cookie_id}/{item_id}/invite-auto-fulfillment": [

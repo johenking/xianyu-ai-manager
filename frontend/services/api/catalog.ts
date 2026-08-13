@@ -54,6 +54,32 @@ export const updateItemMultiQuantityDelivery = async (cookieId: string, itemId: 
     return put(`/items/${cookieId}/${itemId}/multi-quantity-delivery`, { multi_quantity_delivery: enabled });
 }
 
+// 自动发货：商品级绑定卡密（card_id 传 null 表示解除绑定）
+export const updateItemDeliveryBinding = async (
+    cookieId: string,
+    itemId: string,
+    cardId: number | null,
+): Promise<any> => {
+    return put(`/items/${cookieId}/${itemId}/delivery-binding`, { card_id: cardId });
+}
+
+export const updateItemDeliveryBindingsBatch = async (
+    cookieId: string,
+    itemIds: string[],
+    cardId: number | null,
+): Promise<{ message: string; updated: number; failed: string[] }> => {
+    return post('/items/delivery-bindings/batch', { cookie_id: cookieId, item_ids: itemIds, card_id: cardId });
+}
+
+// 邀请重置发货开关（后端一直存在，此前前端没有入口）
+export const updateItemInviteAutoFulfillment = async (
+    cookieId: string,
+    itemId: string,
+    enabled: boolean,
+): Promise<any> => {
+    return put(`/items/${cookieId}/${itemId}/invite-auto-fulfillment`, { invite_auto_fulfillment: enabled });
+}
+
 // Rules - 发货规则 (使用正确的后端API)
 export const getShippingRules = async (): Promise<ShippingRule[]> => {
     const res = await get<any>('/delivery-rules');

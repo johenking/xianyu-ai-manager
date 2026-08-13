@@ -15,10 +15,6 @@ BOOLEAN_SETTING_KEYS = {
     "item_sync_enabled",
     "smtp_use_tls",
     "smtp_use_ssl",
-    "skill_monitor_enabled",
-    "skill_monitor_scheduler_enabled",
-    "skill_monitor_delivery_enabled",
-    "skill_monitor_mtop_enabled",
 }
 
 INTEGER_SETTING_KEYS = {
@@ -148,9 +144,3 @@ def apply_secret_action(existing: str, action: str, value: str) -> str:
     raise ValueError("不支持的密钥操作")
 
 
-def validate_skill_monitor_features(*, notify_enabled: bool, ai_filter: str) -> None:
-    # AI筛选和通知已经由技能中心运行时根据真实配置处理：
-    # - AI不可用时任务运行会返回明确错误/跳过原因；
-    # - 通知无渠道时任务运行会标记 skipped_no_channel。
-    # 保留该函数作为旧调用点的兼容验证入口。
-    return None

@@ -7,10 +7,17 @@ import { AccountAvatar, CookieEditor } from './AccountVisuals';
 describe('AccountVisuals', () => {
   afterEach(() => cleanup());
 
-  it('falls back to a labelled placeholder when the avatar cannot load', () => {
+  it('falls back to a coloured initial when the avatar cannot load', () => {
     render(<AccountAvatar src="https://invalid.example/avatar.png" label="演示账号" />);
     fireEvent.error(screen.getByRole('img', { name: '演示账号头像' }));
-    expect(screen.getByRole('img', { name: '演示账号头像占位图' })).toBeTruthy();
+    const fallback = screen.getByRole('img', { name: '演示账号头像' });
+    expect(fallback.textContent).toBe('演');
+    expect(fallback.className).toContain('bg-');
+  });
+
+  it('renders an uppercase initial for latin account names without an avatar', () => {
+    render(<AccountAvatar label="shop-alpha" />);
+    expect(screen.getByRole('img', { name: 'shop-alpha头像' }).textContent).toBe('S');
   });
 
   it('keeps Cookie content hidden until the user explicitly reveals it', () => {

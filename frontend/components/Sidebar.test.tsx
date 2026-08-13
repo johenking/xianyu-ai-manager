@@ -12,7 +12,7 @@ describe('Sidebar mobile controls', () => {
   it('keeps the mobile close control at least 44px square', () => {
     render(
       <Sidebar
-        activeTab="skills"
+        activeTab="delivery"
         setActiveTab={vi.fn()}
         onLogout={vi.fn()}
         mobileOpen

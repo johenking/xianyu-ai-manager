@@ -8,21 +8,19 @@ const pageLoaders = {
   dashboard: () => import('./components/Dashboard'),
   accounts: () => import('./components/AccountList'),
   orders: () => import('./components/OrderList'),
-  cards: () => import('./components/CardList'),
+  delivery: () => import('./components/AutoDelivery'),
   items: () => import('./components/ItemList'),
   keywords: () => import('./components/Keywords'),
-  skills: () => import('./components/SkillCenter'),
   settings: () => import('./components/Settings'),
 };
 
 const Dashboard = lazy(pageLoaders.dashboard);
 const AccountList = lazy(pageLoaders.accounts);
 const OrderList = lazy(pageLoaders.orders);
-const CardList = lazy(pageLoaders.cards);
 const ItemList = lazy(pageLoaders.items);
 const Settings = lazy(pageLoaders.settings);
 const Keywords = lazy(pageLoaders.keywords);
-const SkillCenter = lazy(pageLoaders.skills);
+const AutoDelivery = lazy(pageLoaders.delivery);
 
 type PageKey = keyof typeof pageLoaders;
 
@@ -181,10 +179,9 @@ const App: React.FC = () => {
       case 'dashboard': return <Dashboard />;
       case 'accounts': return <AccountList isAdmin={isAdmin} />;
       case 'orders': return <OrderList onNavigateAccounts={() => setActiveTab('accounts')} />;
-      case 'cards': return <CardList />;
+      case 'delivery': return <AutoDelivery />;
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;
-      case 'skills': return <SkillCenter />;
       case 'settings': return <Settings isAdmin={isAdmin} />;
       default: return <Dashboard />;
     }

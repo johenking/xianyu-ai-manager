@@ -41,7 +41,8 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
       state: 'error',
       blockers: ['账号身份状态尚未确认'],
     },
-    nickname: item.remark || `Account ${item.id.substring(0,6)}`, // Fallback for UI
+    // 备注优先（用户自己起的名），其次平台昵称，最后才退回账号编号
+    nickname: item.remark || item.xianyu_nick || `Account ${item.id.substring(0,6)}`,
     avatar_url: item.avatar_url || undefined,
     ai_enabled: false, // 需要从AI设置API获取
   }));

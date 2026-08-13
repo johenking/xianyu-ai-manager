@@ -5,5 +5,4 @@ export * from './api/catalog';
 export * from './api/settings';
 export * from './api/ai';
 export * from './api/notifications';
-export * from './api/skills';
 export * from './api/defaults';

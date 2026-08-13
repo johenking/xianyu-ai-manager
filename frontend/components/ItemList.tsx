@@ -1,18 +1,27 @@
 import React, { useEffect, useState } from 'react';
-import { Item, AccountDetail } from '../types';
+import { Item, AccountDetail, Card } from '../types';
 import {
   getItems,
   getItemsByCookie,
   getAccountDetails,
+  getCards,
   syncItemsFromAccount,
   deleteItem,
   updateItemMultiSpec,
-  updateItemMultiQuantityDelivery
+  updateItemMultiQuantityDelivery,
+  updateItemDeliveryBinding,
+  updateItemInviteAutoFulfillment
 } from '../services/api';
 import { BookOpen, Box, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 import AITrainingLab from './AITrainingLab';
 import RemoteImage from './ui/RemoteImage';
+import {
+  DeliveryMode,
+  DeliveryModeBadge,
+  DeliverySettingModal,
+  deliveryModeOf,
+} from './ui/DeliveryMode';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
@@ -27,6 +36,9 @@ const ItemList: React.FC = () => {
   const [statusText, setStatusText] = useState('');
   const [knowledgeItem, setKnowledgeItem] = useState<Item | null>(null);
   const [trainingItem, setTrainingItem] = useState<Item | null>(null);
+  const [cards, setCards] = useState<Card[]>([]);
+  const [deliveryItem, setDeliveryItem] = useState<Item | null>(null);
+  const [savingDelivery, setSavingDelivery] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -46,8 +58,9 @@ const ItemList: React.FC = () => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const accountList = await getAccountDetails();
+      const [accountList, cardList] = await Promise.all([getAccountDetails(), getCards()]);
       setAccounts(accountList);
+      setCards(cardList);
       const selectionStillValid =
         selectedAccount === ALL_ACCOUNTS_VALUE ||
         accountList.some((account) => account.id === selectedAccount);
@@ -164,6 +177,36 @@ const ItemList: React.FC = () => {
     }
   };
 
+  // 与「自动发货」页共用同一套发货方式语义：卡密 / 邀请重置 / 关键词兜底，三选一互斥。
+  const applyDeliveryMode = async (item: Item, mode: DeliveryMode, cardId: number | null) => {
+    setSavingDelivery(true);
+    setStatusText('');
+    try {
+      if (mode === 'invite') {
+        if (item.delivery_card_id) {
+          await updateItemDeliveryBinding(item.cookie_id, item.item_id, null);
+        }
+        await updateItemInviteAutoFulfillment(item.cookie_id, item.item_id, true);
+      } else {
+        await updateItemDeliveryBinding(item.cookie_id, item.item_id, mode === 'card' ? cardId : null);
+        if (toBool(item.invite_auto_fulfillment)) {
+          await updateItemInviteAutoFulfillment(item.cookie_id, item.item_id, false);
+        }
+      }
+      setItems(prev => prev.map(i =>
+        i.cookie_id === item.cookie_id && i.item_id === item.item_id
+          ? { ...i, delivery_card_id: mode === 'card' ? cardId : null, invite_auto_fulfillment: mode === 'invite' }
+          : i
+      ));
+      setStatusText(`发货方式已更新：${mode === 'card' ? '发送卡密' : mode === 'invite' ? '邀请重置' : '关键词兜底'}`);
+      setDeliveryItem(null);
+    } catch (error) {
+      setStatusText(error instanceof Error ? error.message : '保存发货设置失败');
+    } finally {
+      setSavingDelivery(false);
+    }
+  };
+
   const selectedAccountLabel = selectedAccount === ALL_ACCOUNTS_VALUE
     ? null
     : accounts.find(account => account.id === selectedAccount);
@@ -258,6 +301,14 @@ const ItemList: React.FC = () => {
                       <span className="bg-gray-100 px-2 py-1 rounded-md truncate max-w-[100px]">ID: {item.item_id}</span>
                   </div>
                   <button
+                    onClick={() => setDeliveryItem(item)}
+                    className="w-full mb-2 flex items-center justify-between gap-2 rounded-lg border border-gray-200 px-3 py-2 text-xs font-bold text-gray-600 hover:bg-gray-50"
+                    title="设置自动发货"
+                  >
+                    <span className="shrink-0">自动发货</span>
+                    <DeliveryModeBadge item={item} cards={cards} />
+                  </button>
+                  <button
                     onClick={() => setKnowledgeItem(item)}
                     className="w-full mb-2 px-3 py-2 rounded-lg bg-yellow-100 text-yellow-900 text-xs font-bold flex items-center justify-center gap-2 hover:bg-yellow-200"
                   >
@@ -296,6 +347,19 @@ const ItemList: React.FC = () => {
              </div>
           )}
       </div>
+
+      {deliveryItem && (
+        <DeliverySettingModal
+          title="设置自动发货"
+          subtitle={deliveryItem.item_title || deliveryItem.item_id}
+          cards={cards}
+          initialMode={deliveryModeOf(deliveryItem)}
+          initialCardId={deliveryItem.delivery_card_id ?? null}
+          saving={savingDelivery}
+          onClose={() => setDeliveryItem(null)}
+          onSubmit={(mode, cardId) => void applyDeliveryMode(deliveryItem, mode, cardId)}
+        />
+      )}
 
       {knowledgeItem && (
         <ItemKnowledgeModal

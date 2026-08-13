@@ -1,5 +1,31 @@
 import React, { useEffect, useState } from 'react';
-import { Eye, EyeOff, UserRound } from 'lucide-react';
+import { Eye, EyeOff } from 'lucide-react';
+
+// 取不到平台头像时用稳定配色的首字头像兜底，避免整排灰色空白占位。
+const FALLBACK_PALETTE = [
+  'bg-amber-100 text-amber-700',
+  'bg-sky-100 text-sky-700',
+  'bg-emerald-100 text-emerald-700',
+  'bg-violet-100 text-violet-700',
+  'bg-rose-100 text-rose-700',
+  'bg-teal-100 text-teal-700',
+];
+
+const paletteFor = (seed: string): string => {
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) % 100000;
+  }
+  return FALLBACK_PALETTE[hash % FALLBACK_PALETTE.length];
+};
+
+// 中文取首字，英文/数字取首字母大写；空名兜底为“闲”。
+const initialOf = (label: string): string => {
+  const trimmed = (label || '').trim();
+  if (!trimmed) return '闲';
+  const first = Array.from(trimmed)[0];
+  return /[a-z]/i.test(first) ? first.toUpperCase() : first;
+};
 
 export const AccountAvatar: React.FC<{
   src?: string | null;
@@ -14,10 +40,10 @@ export const AccountAvatar: React.FC<{
     return (
       <div
         role="img"
-        aria-label={`${label}头像占位图`}
-        className={`flex items-center justify-center bg-gray-100 text-gray-400 ${className}`}
+        aria-label={`${label}头像`}
+        className={`flex items-center justify-center font-bold ${paletteFor(label || 'account')} ${className}`}
       >
-        <UserRound className="h-8 w-8" aria-hidden="true" />
+        <span className="text-2xl leading-none" aria-hidden="true">{initialOf(label)}</span>
       </div>
     );
   }

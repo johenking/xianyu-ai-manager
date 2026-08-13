@@ -18,10 +18,13 @@ vi.mock('../services/api', () => ({
   getAccountDetails: vi.fn(),
   getItems: vi.fn(),
   getItemsByCookie: vi.fn(),
+  getCards: vi.fn(async () => []),
   syncItemsFromAccount: vi.fn(),
   deleteItem: vi.fn(),
   updateItemMultiSpec: vi.fn(),
   updateItemMultiQuantityDelivery: vi.fn(),
+  updateItemDeliveryBinding: vi.fn(),
+  updateItemInviteAutoFulfillment: vi.fn(),
 }));
 
 const accounts = [

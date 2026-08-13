@@ -1575,6 +1575,40 @@ def _invite_auto_fulfillment_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
         )
 
 
+def _account_profile_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Cache each account's Xianyu avatar and nickname for the console UI."""
+    columns = {
+        str(row[1])
+        for row in cursor.execute("PRAGMA table_info(cookies)").fetchall()
+    }
+    if not columns:
+        return
+    if "avatar_url" not in columns:
+        cursor.execute(
+            "ALTER TABLE cookies ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''"
+        )
+    if "xianyu_nick" not in columns:
+        cursor.execute(
+            "ALTER TABLE cookies ADD COLUMN xianyu_nick TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _item_delivery_binding_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Bind one delivery card directly to an item, replacing title keyword guessing."""
+    columns = {
+        str(row[1])
+        for row in cursor.execute("PRAGMA table_info(item_info)").fetchall()
+    }
+    if not columns:
+        return
+    if "delivery_card_id" not in columns:
+        cursor.execute("ALTER TABLE item_info ADD COLUMN delivery_card_id INTEGER")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_info_delivery_card "
+        "ON item_info(delivery_card_id)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1686,6 +1720,16 @@ MIGRATIONS: Sequence[Migration] = (
         "2026080902",
         "invite_auto_fulfillment_v1",
         _invite_auto_fulfillment_v1,
+    ),
+    Migration(
+        "2026081301",
+        "account_profile_v1",
+        _account_profile_v1,
+    ),
+    Migration(
+        "2026081302",
+        "item_delivery_binding_v1",
+        _item_delivery_binding_v1,
     ),
 )
 
