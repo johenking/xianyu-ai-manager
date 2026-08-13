@@ -20,11 +20,6 @@ import {
   getClientBrowserLoginSession,
   confirmClientBrowserLoginSession,
   cancelClientBrowserLoginSession,
-  getNativeBrowserDevice,
-  startNativeBrowserLogin,
-  getNativeBrowserLoginStatus,
-  cancelNativeBrowserLogin,
-  closeNativeBrowserLogin,
   bindAccountRenewalDevice,
   addAccountCookie,
   cancelOfficialLoginSession,
@@ -57,11 +52,6 @@ vi.mock('../services/api', () => ({
   getClientBrowserLoginSession: vi.fn(),
   confirmClientBrowserLoginSession: vi.fn(),
   cancelClientBrowserLoginSession: vi.fn(),
-  getNativeBrowserDevice: vi.fn(),
-  startNativeBrowserLogin: vi.fn(),
-  getNativeBrowserLoginStatus: vi.fn(),
-  cancelNativeBrowserLogin: vi.fn(),
-  closeNativeBrowserLogin: vi.fn(),
   bindAccountRenewalDevice: vi.fn(),
   addAccountCookie: vi.fn(),
   passwordLogin: vi.fn(),
@@ -92,6 +82,18 @@ vi.mock('../services/api', () => ({
   getAiReplyStrategies: vi.fn(),
   updateAiReplyStrategies: vi.fn(),
 }));
+
+// canUseServerBrowser 由 window.location 决定：回环与正式控制台域名（xianyu.cxywjx.top）
+// 都视为“本机”，isAdmin 已无效果。jsdom 默认 hostname 是 localhost（回环）；
+// 构造“远程用户”场景必须改写 location 为陌生域名，afterEach 用 vi.unstubAllGlobals() 恢复。
+const stubRemoteConsoleHostname = (hostname = 'remote.example.com') => {
+  vi.stubGlobal('location', { ...window.location, hostname, host: hostname });
+};
+
+// 正式控制台域名场景：Host 是公网域名但服务与用户都在本机。
+const stubOfficialConsoleHostname = () => {
+  vi.stubGlobal('location', { ...window.location, hostname: 'xianyu.cxywjx.top', host: 'xianyu.cxywjx.top' });
+};
 
 describe('AccountList session verification UI', () => {
   let localStorageValues: Map<string, string>;
@@ -254,40 +256,9 @@ describe('AccountList session verification UI', () => {
     vi.mocked(showOfficialLoginBrowser).mockResolvedValue({ success: true });
     vi.mocked(showAccountSessionRefreshBrowser).mockResolvedValue({ success: true });
     vi.mocked(registerClientBrowserDevice).mockResolvedValue();
-    vi.mocked(getNativeBrowserDevice).mockResolvedValue({
-      deviceId: 'helper_device_123456',
-      browserFamily: 'chrome',
-      clientType: 'native_helper',
-      helperVersion: '1.0.2',
-      protocolVersion: 1,
-      signingPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-x', y: 'fixture-y' },
-      encryptionPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-ex', y: 'fixture-ey' },
-    });
-    vi.mocked(startNativeBrowserLogin).mockResolvedValue({
-      session_id: 'native-login-session',
-      device_id: 'helper_device_123456',
-      state: 'opening_browser',
-      message: '正在打开本机 Chrome',
-      expires_at: 9_999_999_999,
-    });
-    vi.mocked(getNativeBrowserLoginStatus).mockResolvedValue({
-      session_id: 'native-login-session',
-      device_id: 'helper_device_123456',
-      state: 'waiting_user',
-      message: '请在本机 Chrome 完成登录',
-      expires_at: 9_999_999_999,
-    });
-    vi.mocked(cancelNativeBrowserLogin).mockResolvedValue({
-      session_id: 'native-login-session', device_id: 'helper_device_123456',
-      state: 'cancelled', message: '已取消', expires_at: 9_999_999_999,
-    });
-    vi.mocked(closeNativeBrowserLogin).mockResolvedValue({
-      session_id: 'native-login-session', device_id: 'helper_device_123456',
-      state: 'success', message: '成功', expires_at: 9_999_999_999,
-    });
     vi.mocked(createClientBrowserLoginSession).mockImplementation(async (_deviceId, mode) => ({
       session_id: `${mode}-client-session`,
-      device_id: 'helper_device_123456',
+      device_id: 'device_fixture_1234',
       mode,
       state: 'waiting_user',
       message: '请在当前设备浏览器继续',
@@ -331,6 +302,7 @@ describe('AccountList session verification UI', () => {
     cleanup();
     vi.clearAllMocks();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('shows same-session controls only while a verification browser is active', async () => {
@@ -488,6 +460,8 @@ describe('AccountList session verification UI', () => {
   });
 
   it('starts password login in the current device without collecting credentials in the console', async () => {
+    // 扩展桥接的当前设备通道属于陌生域名远程场景；本机场景走服务端 Chrome。
+    stubRemoteConsoleHostname();
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
@@ -502,17 +476,12 @@ describe('AccountList session verification UI', () => {
 
     await waitFor(() => {
       expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
-        'helper_device_123456', 'password', 'native_helper',
+        'device_fixture_1234', 'password', 'extension',
       );
     });
-    await waitFor(() => expect(startNativeBrowserLogin).toHaveBeenCalledWith(expect.objectContaining({
-      device_id: 'helper_device_123456',
-      mode: 'password',
-      server_origin: window.location.origin,
-      official_url: 'https://www.goofish.com/login',
-    })));
-    expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
-    expect(clientBridgeRequests).not.toContain('XMC_START_LOGIN');
+    // 本机助手已移除：当前设备通道由扩展桥接承接
+    await waitFor(() => expect(clientBridgeRequests).toContain('XMC_START_LOGIN'));
+    expect(clientBridgeRequests).toContain('XMC_GET_DEVICE');
     expect(registerClientBrowserDevice).toHaveBeenCalledTimes(1);
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
   });
@@ -541,6 +510,7 @@ describe('AccountList session verification UI', () => {
   });
 
   it('confirms the persisted account before allowing the current-device tab to close', async () => {
+    stubRemoteConsoleHostname();
     vi.mocked(getClientBrowserLoginSession).mockResolvedValue({
       session_id: 'password-client-session',
       device_id: 'device_fixture_1234',
@@ -561,11 +531,12 @@ describe('AccountList session verification UI', () => {
       'password-client-session',
       'account-1',
     ), { timeout: 3500 });
-    expect(closeNativeBrowserLogin).toHaveBeenCalledWith('password-client-session', 'account-1');
+    expect(clientBridgeRequests).toContain('XMC_CONFIRM_LOGIN');
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
-    expect(screen.queryByText('是否在此设备启用自动续期')).not.toBeInTheDocument();
+    // 扩展密码登录成功后提供独立的续期授权面板；未显式授权前不保存任何凭据。
+    expect(await screen.findByText('是否在此设备启用自动续期')).toBeInTheDocument();
     expect(bindAccountRenewalDevice).not.toHaveBeenCalled();
-    expect(screen.queryByRole('dialog', { name: '添加账号' })).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: '添加账号' })).toBeInTheDocument();
   });
 
   it('stores extension renewal credentials only after post-login explicit authorization', async () => {
@@ -609,11 +580,11 @@ describe('AccountList session verification UI', () => {
     }));
   });
 
-  it('does not create any server login session when the native helper is missing', async () => {
-    vi.mocked(getNativeBrowserDevice).mockRejectedValue(Object.assign(
-      new Error('未启动本机浏览器助手'),
-      { code: 'helper_unavailable', status: 0 },
-    ));
+  it('does not create any login session when the extension bridge is missing on a remote console', async () => {
+    // 回环下主按钮直接走服务端 Chrome；远程用户的当前设备通道由扩展桥接承接。
+    // 本机助手已彻底移除：扩展缺失时只弹扩展安装引导。
+    stubRemoteConsoleHostname();
+    clientBridgeEnabled = false;
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
@@ -621,47 +592,20 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
 
     expect((await screen.findAllByText(
-      '首次使用安装并启动一次本机助手；后续点击本机 Chrome 登录即可打开你电脑上的官方页面。',
+      '当前设备浏览器登录由扩展承接：安装并启用扩展后，重新点击登录入口即可。',
       {},
-      { timeout: 4500 },
+      { timeout: 6500 },
     )).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('未启动本机浏览器助手').length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: '安装本机助手' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '安装浏览器扩展' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '改用网页二维码' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '安装本机助手' }));
-    expect(screen.getByRole('link', { name: '下载 macOS 助手（Apple 芯片）' })).toHaveAttribute(
+    // 安装引导弹窗在扩展桥 3.5 秒超时后才自动弹出，需要更长等待
+    expect(await screen.findByRole('link', { name: /下载浏览器扩展/ }, { timeout: 6500 })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.2.zip',
-    );
-    expect(screen.getByRole('link', { name: '下载 Windows 助手（x64）' })).toHaveAttribute(
-      'href',
-      '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.2.zip',
+      '/static/downloads/xianyu-browser-bridge-1.2.1.zip',
     );
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
     expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
-  });
-
-  it('classifies an outdated native helper without creating a login session', async () => {
-    vi.mocked(getNativeBrowserDevice).mockResolvedValue({
-      deviceId: 'helper_device_123456',
-      browserFamily: 'chrome',
-      clientType: 'native_helper',
-      helperVersion: '0.9.0',
-      protocolVersion: 1,
-      signingPublicJwk: {},
-      encryptionPublicJwk: {},
-    });
-    render(<AccountList />);
-
-    await screen.findByText('可自动续期 · 定时关闭');
-    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
-
-    expect(await screen.findByText('本机浏览器助手需要更新')).toBeInTheDocument();
-    expect(screen.getAllByText(/当前 0.9.0，需要 1.0.2/).length).toBeGreaterThan(0);
-    expect(registerClientBrowserDevice).not.toHaveBeenCalled();
-    expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -672,6 +616,8 @@ describe('AccountList session verification UI', () => {
       status === 401 ? '请重新登录' : '设备密钥不匹配',
       { status, code },
     ));
+    // 设备注册发生在扩展桥接通道：需要非回环 hostname 才会走到这一步
+    stubRemoteConsoleHostname();
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
@@ -683,7 +629,8 @@ describe('AccountList session verification UI', () => {
   });
 
   it('offers SMS login in the current device without collecting the code', async () => {
-    render(<AccountList isAdmin />);
+    stubRemoteConsoleHostname();
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
@@ -696,29 +643,38 @@ describe('AccountList session verification UI', () => {
 
     await waitFor(() => {
     expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
-      'helper_device_123456', 'sms', 'native_helper',
+      'device_fixture_1234', 'sms', 'extension',
     );
     });
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
   });
 
-  it('offers all five local-admin login entries and submits manual Cookie without an account id', async () => {
+  it('offers the loopback login entries without a server ops button and submits manual Cookie without an account id', async () => {
     vi.mocked(addAccountCookie).mockResolvedValue({
       success: true,
       message: 'Cookie 已保存',
       account_id: '9988',
     });
-    render(<AccountList isAdmin />);
+    // isAdmin 已无效果：回环控制台对任何角色都提供同一组登录入口
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
     await screen.findByRole('dialog', { name: '添加账号' });
 
+    expect(screen.getByText('推荐用手机扫“网页二维码”登录，零安装最稳定；也可用“本机 Chrome 登录”窗口作为备选。')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '扫码' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '手机号验证码' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '账号密码' })).toBeInTheDocument();
+    // 网页二维码是回环下的推荐主入口；本机 Chrome 登录降为备选按钮
+    expect(screen.getByRole('button', { name: '网页二维码' })).toBeInTheDocument();
+    expect(screen.getByText('网页二维码（推荐）')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
+    expect(screen.getByText('本机 Chrome 登录（备选）')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
+    // 高级区只剩“你的 Chrome”和“手填 Cookie”，红色“服务器运维登录”按钮已移除
     expect(screen.getByRole('button', { name: '你的 Chrome' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '服务器运维登录' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '手填 Cookie' }));
 
     await screen.findByPlaceholderText('粘贴从浏览器复制的 Cookie');
@@ -736,7 +692,25 @@ describe('AccountList session verification UI', () => {
     });
   });
 
+  it('treats the official console hostname as local and starts server Chrome from the primary button', async () => {
+    stubOfficialConsoleHostname();
+    render(<AccountList />);
+
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+
+    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledWith({
+      mode: 'qr',
+      show_browser: true,
+    }));
+    expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
+    expect(await screen.findByText('本机 Chrome 登录窗口')).toBeInTheDocument();
+  });
+
   it('offers current-device QR, web QR, SMS, and advanced manual import to remote users', async () => {
+    // 远程用户 = 非回环 hostname（不再靠 isAdmin=false 构造）
+    stubRemoteConsoleHostname();
     vi.mocked(createBrowserExtensionPairing).mockResolvedValue({
       pairing_id: 'pairing-id',
       protocol_version: 2,
@@ -762,8 +736,22 @@ describe('AccountList session verification UI', () => {
     expect(screen.getByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '网页二维码' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '服务器运维登录' })).not.toBeInTheDocument();
+    // 非回环副标题保持旧文案，也不出现回环专属的“推荐 · 免安装”
+    expect(screen.getByText('登录和安全验证在你当前的 Chrome 或 Edge 中完成。')).toBeInTheDocument();
+    expect(screen.queryByText(/推荐 · 免安装/)).not.toBeInTheDocument();
     expect(generateQRLogin).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
+
+    // 远程用户点主按钮走扩展桥接通道，不创建服务端 Chrome 会话
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+    await waitFor(() => expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
+      'device_fixture_1234', 'qr', 'extension',
+    ), { timeout: 5000 });
+    await waitFor(() => expect(clientBridgeRequests).toContain('XMC_START_LOGIN'));
+    expect(clientBridgeRequests).toContain('XMC_GET_DEVICE');
+    expect(createOfficialLoginSession).not.toHaveBeenCalled();
+    expect(screen.queryByText('本机 Chrome 登录窗口')).not.toBeInTheDocument();
+    expect(screen.queryByText('正在本机打开 Chrome 登录窗口')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
     fireEvent.click(screen.getByRole('button', { name: '你的 Chrome' }));
@@ -806,7 +794,7 @@ describe('AccountList session verification UI', () => {
     expect(screen.queryByRole('button', { name: '本机打开官方窗口' })).not.toBeInTheDocument();
   });
 
-  it('hides an active web QR without cancelling until the user explicitly cancels', async () => {
+  it('cancels an active web QR when the modal closes and on explicit cancel', async () => {
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
@@ -814,26 +802,36 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByAltText('闲鱼登录二维码');
 
+    // 关闭弹窗（右上角 X）现在会主动取消进行中的网页二维码会话并完整清理
     fireEvent.click(screen.getByRole('button', { name: '关闭添加账号' }));
-    expect(cancelQRLogin).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    expect(await screen.findByAltText('闲鱼登录二维码')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: '取消本次扫码' }));
     await waitFor(() => expect(cancelQRLogin).toHaveBeenCalledWith(
       'qr-session',
       'user_cancelled',
     ));
+    expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument();
+
+    // 重新打开回到扫码方式选择器，不会复用已取消的二维码会话
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    expect(await screen.findByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
+    expect(screen.queryByAltText('闲鱼登录二维码')).not.toBeInTheDocument();
+    expect(generateQRLogin).toHaveBeenCalledTimes(1);
+
+    // 显式“取消本次扫码”仍以 user_cancelled 结束会话
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
+    await screen.findByAltText('闲鱼登录二维码');
+    fireEvent.click(screen.getByRole('button', { name: '取消本次扫码' }));
+    await waitFor(() => expect(cancelQRLogin).toHaveBeenCalledTimes(2));
+    expect(cancelQRLogin).toHaveBeenLastCalledWith('qr-session', 'user_cancelled');
   });
 
-  it('lets a local administrator start, show, and explicitly cancel server Chrome', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountList isAdmin />);
+  it('lets a loopback user start, show, and explicitly cancel server Chrome without any confirm', async () => {
+    // 启动服务端 Chrome 不再需要任何 confirm：即使 confirm 一律返回 false 也应正常启动
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
-    fireEvent.click(screen.getByRole('button', { name: '服务器运维登录' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
 
     await waitFor(() => {
       expect(createOfficialLoginSession).toHaveBeenCalledWith({
@@ -841,9 +839,10 @@ describe('AccountList session verification UI', () => {
         show_browser: true,
       });
     });
-    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(confirmSpy).not.toHaveBeenCalled();
     expect(generateQRLogin).not.toHaveBeenCalled();
     expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
+    expect(screen.getByText('本机 Chrome 登录窗口')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: '重新显示 Chrome 窗口' }));
     await waitFor(() => expect(showOfficialLoginBrowser).toHaveBeenCalledWith('official-session'));
@@ -852,36 +851,35 @@ describe('AccountList session verification UI', () => {
     await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
   });
 
-  it('hides the add modal without cancelling an active server Chrome session', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<AccountList isAdmin />);
+  it('cancels an active server Chrome session when the add modal is closed', async () => {
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
-    fireEvent.click(screen.getByRole('button', { name: '服务器运维登录' }));
-    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+    expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
 
+    // 关闭弹窗（右上角 X）现在会主动取消活跃的服务端 Chrome 会话并完整清理
     fireEvent.click(screen.getByRole('button', { name: '关闭添加账号' }));
     expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument();
-    expect(cancelOfficialLoginSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
 
+    // 重新打开回到扫码方式选择器，不会复用已取消的会话
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
+    expect(screen.queryByText('请使用闲鱼 App 扫码')).not.toBeInTheDocument();
   });
 
-  it('keeps a server Chrome session whose create response arrives after the modal hides', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
+  it('cancels a server Chrome session whose create response arrives after the modal closes', async () => {
     let resolveSession!: (value: Awaited<ReturnType<typeof createOfficialLoginSession>>) => void;
     vi.mocked(createOfficialLoginSession).mockImplementation(() => new Promise((resolve) => {
       resolveSession = resolve;
     }));
-    render(<AccountList isAdmin />);
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
-    fireEvent.click(screen.getByRole('button', { name: '服务器运维登录' }));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
     await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('button', { name: '关闭添加账号' }));
 
@@ -894,25 +892,26 @@ describe('AccountList session verification UI', () => {
       error_code: '',
     });
 
-    await waitFor(() => expect(cancelOfficialLoginSession).not.toHaveBeenCalled());
+    // 弹窗已关闭并整体重置：迟到才建立的会话会被立即取消，而不是保留复用
+    await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('late-official-session'));
     expect(screen.queryByRole('heading', { name: '添加账号' })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    expect(await screen.findByText('迟到的扫码会话')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '本机 Chrome 登录' })).toBeInTheDocument();
+    expect(screen.queryByText('迟到的扫码会话')).not.toBeInTheDocument();
   });
 
   it('requires confirmation before ending server Chrome to switch methods', async () => {
+    // 启动不再弹 confirm；只有“切换方式会结束本次会话”的 confirm 仍然保留
     const confirmSpy = vi.spyOn(window, 'confirm')
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(true)
       .mockReturnValueOnce(false)
       .mockReturnValueOnce(true);
-    render(<AccountList isAdmin />);
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
-    fireEvent.click(screen.getByRole('button', { name: '服务器运维登录' }));
-    await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+    expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
+    expect(confirmSpy).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
     expect(cancelOfficialLoginSession).not.toHaveBeenCalled();
@@ -920,12 +919,12 @@ describe('AccountList session verification UI', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
     await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
-    expect(await screen.findByText(/普通用户的账号、密码、滑块和人脸验证/)).toBeInTheDocument();
-    expect(confirmSpy).toHaveBeenCalledTimes(4);
+    expect(await screen.findByText(/账号、密码、滑块和人脸验证只在该窗口输入/)).toBeInTheDocument();
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(confirmSpy).toHaveBeenCalledWith('当前登录仍在进行，切换方式会结束本次会话。是否继续？');
   });
 
   it('stops Chrome QR polling and refreshes accounts after success', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(getOfficialLoginSession).mockResolvedValue({
       success: true,
       session_id: 'official-session',
@@ -936,13 +935,13 @@ describe('AccountList session verification UI', () => {
       account_id: 'account-1',
       is_new_account: false,
     });
-    render(<AccountList isAdmin />);
+    render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     const initialAccountLoads = vi.mocked(getAccountDetails).mock.calls.length;
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
-    fireEvent.click(screen.getByRole('button', { name: '服务器运维登录' }));
+    // 回环下服务端 Chrome 由扫码选择器主按钮直接触发，无需 confirm
+    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
 
     await waitFor(() => expect(getOfficialLoginSession).toHaveBeenCalledTimes(1), {
       timeout: 3500,
@@ -1052,6 +1051,8 @@ describe('AccountList session verification UI', () => {
   it.each(['interactive', 'unknown'] as const)(
     'hands %s verification to the current-device browser and ends web QR',
     async (verificationKind) => {
+      // 交互验证交给扩展桥接属于陌生域名远程场景；本机场景改弹服务端 Chrome。
+      stubRemoteConsoleHostname();
       vi.mocked(checkQRLoginStatus).mockResolvedValue({
         status: 'verification_required',
         session_id: 'qr-session',
@@ -1081,13 +1082,12 @@ describe('AccountList session verification UI', () => {
         'switched_to_extension',
       ));
       await waitFor(() => expect(createClientBrowserLoginSession).toHaveBeenCalledWith(
-        'helper_device_123456',
+        'device_fixture_1234',
         'qr',
-        'native_helper',
+        'extension',
       ), { timeout: 5000 });
-      expect(startNativeBrowserLogin).toHaveBeenCalledWith(expect.objectContaining({ mode: 'qr' }));
-      expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
-      expect(clientBridgeRequests).not.toContain('XMC_START_LOGIN');
+      await waitFor(() => expect(clientBridgeRequests).toContain('XMC_START_LOGIN'));
+      expect(clientBridgeRequests).toContain('XMC_GET_DEVICE');
       expect(interactWithQRLogin).not.toHaveBeenCalled();
       expect(createOfficialLoginSession).not.toHaveBeenCalled();
       expect(createBrowserExtensionPairing).not.toHaveBeenCalled();
@@ -1135,8 +1135,8 @@ describe('AccountList session verification UI', () => {
 
   it.each([
     ['qr_login', '重新扫码', 'button', '网页二维码'],
-    ['sms_login', '验证码登录', 'text', '在当前设备浏览器完成手机号验证码登录'],
-    ['password_login', '账号密码登录', 'text', '在当前设备浏览器完成账号密码登录'],
+    ['sms_login', '验证码登录', 'text', '在本机 Chrome 窗口完成手机号验证码登录'],
+    ['password_login', '账号密码登录', 'text', '在本机 Chrome 窗口完成账号密码登录'],
     ['chrome_extension_import', '重新导入', 'text', '从你的 Chrome 导入'],
     ['manual_cookie', '重新填写', 'placeholder', '粘贴从浏览器复制的 Cookie'],
     ['choose_login', '重新登录', 'button', '网页二维码'],

@@ -132,9 +132,8 @@ export interface BrowserExtensionPairing {
 export interface ClientBrowserDevicePublic {
   deviceId: string;
   browserFamily: 'chrome' | 'edge';
-  clientType?: 'extension' | 'native_helper';
+  clientType?: 'extension';
   extensionVersion?: string;
-  helperVersion?: string;
   protocolVersion: number;
   signingPublicJwk: Record<string, unknown>;
   encryptionPublicJwk: Record<string, unknown>;
@@ -144,7 +143,7 @@ export interface ClientBrowserLoginSession {
   session_id: string;
   device_id: string;
   mode: 'qr' | 'sms' | 'password';
-  client_type?: 'extension' | 'native_helper';
+  client_type?: 'extension';
   state:
     | 'waiting_device'
     | 'waiting_user'
@@ -177,7 +176,7 @@ export const registerClientBrowserDevice = async (
 export const createClientBrowserLoginSession = async (
   deviceId: string,
   mode: 'qr' | 'sms' | 'password',
-  clientType: 'extension' | 'native_helper' = 'extension',
+  clientType: 'extension' = 'extension',
 ): Promise<ClientBrowserLoginSession> => {
   const response = await post<{ success: boolean; data: ClientBrowserLoginSession }>(
     '/api/client-browser/sessions',

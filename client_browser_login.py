@@ -20,7 +20,9 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 DEVICE_CHALLENGE_TTL_SECONDS = 60
-RENEWAL_TASK_TTL_SECONDS = 60
+# 扩展每分钟轮询一次续期任务；60 秒 TTL 与轮询周期几乎相等，设备稍慢即错过、导致
+# “已绑定却续期失败”。放宽到 5 分钟，给领取留出足够窗口。
+RENEWAL_TASK_TTL_SECONDS = 300
 CLIENT_LOGIN_TTL_SECONDS = 300
 DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
 ALLOWED_DEVICE_PURPOSES = {
@@ -31,7 +33,9 @@ ALLOWED_DEVICE_PURPOSES = {
 }
 ALLOWED_LOGIN_MODES = {"qr", "sms", "password"}
 ALLOWED_BROWSER_FAMILIES = {"chrome", "edge"}
-ALLOWED_CLIENT_TYPES = {"extension", "native_helper"}
+# 本机助手（native_helper）已彻底移除：本机访问走服务端 Chrome 零安装主路径，
+# 当前设备通道只保留浏览器扩展。历史 native_helper 账号数据仍可正常展示。
+ALLOWED_CLIENT_TYPES = {"extension"}
 
 
 class ClientBrowserError(ValueError):

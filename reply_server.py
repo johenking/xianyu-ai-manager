@@ -66,7 +66,6 @@ from account_session_refresh import (
     reauth_action_for,
     reauth_message_for,
     remove_verification_image,
-    supports_automatic_refresh,
 )
 from utils.qr_login import qr_login_manager
 from utils.browser_interaction import (
@@ -618,7 +617,20 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
     return current_user
 
 
-def _is_loopback_console_request(request: Request) -> bool:
+# 正式控制台域名与回环同等视为“本机”：单机自用形态下，公网域名经本机
+# cloudflared/nginx 回环转发进入（client 地址仍是 127.0.0.1），仅 Host 头不同；
+# 用户人就在这台 Mac 前，不应仅因地址栏写法被当成远程用户。
+_SERVER_BROWSER_CONSOLE_HOSTS = {
+    str(urlsplit(PUBLIC_CONSOLE_ORIGIN).hostname or "").lower(),
+}
+
+
+def _is_strict_loopback_request(request: Request) -> bool:
+    """client 地址与 Host 头都必须是回环。
+
+    旧版扩展导入（protocol v1）等保持最严格边界，不随服务端浏览器门禁
+    对正式控制台域名的放宽而放宽。
+    """
     client_host = request.client.host if request.client else ""
     host_header = str(request.headers.get("host") or "").strip()
     try:
@@ -628,17 +640,36 @@ def _is_loopback_console_request(request: Request) -> bool:
     return is_loopback_host(client_host) and is_loopback_host(console_host)
 
 
+def _is_loopback_console_request(request: Request) -> bool:
+    if _is_strict_loopback_request(request):
+        return True
+    client_host = request.client.host if request.client else ""
+    host_header = str(request.headers.get("host") or "").strip()
+    try:
+        console_host = urlsplit(f"//{host_header}").hostname or ""
+    except ValueError:
+        return False
+    return is_loopback_host(client_host) and (
+        console_host.lower() in _SERVER_BROWSER_CONSOLE_HOSTS
+    )
+
+
 def _require_server_browser_access(
     request: Request,
     current_user: Dict[str, Any],
 ) -> None:
-    is_admin = bool(current_user.get("is_admin")) or (
-        str(current_user.get("username") or "") == ADMIN_USERNAME
-    )
-    if not is_admin or not _is_loopback_console_request(request):
-        raise HTTPException(
-            status_code=403,
-            detail="服务器 Chrome 仅允许管理员从本机监控台操作",
+    # 单机自用形态：服务端 Chrome 登录的真正安全边界是控制台登录态——未登录请求
+    # 在上游 get_current_user 处即被 401 拒绝，能走到这里的只有持有效会话的用户
+    # 本人。网络来源（client 地址 / Host 头）不再作为拒绝条件：经 Cloudflare 隧道
+    # 回流时 Host 头由远端 ingress 决定、不可控，曾两次把本人误判为远程用户。
+    # 非白名单来源仅记录观测日志，供将来多用户化时重新收紧边界。
+    del current_user
+    if not _is_loopback_console_request(request):
+        client_host = request.client.host if request.client else ""
+        host_header = str(request.headers.get("host") or "").strip()
+        logger.warning(
+            "服务端浏览器入口收到非白名单来源请求（已按单机自用策略放行）："
+            f"client={client_host or 'unknown'} host={host_header or 'unknown'}"
         )
 
 
@@ -1862,7 +1893,7 @@ class BrowserExtensionImportIn(BaseModel):
 class ClientBrowserDeviceIn(BaseModel):
     device_id: str = Field(..., min_length=16, max_length=80)
     browser_family: Literal["chrome", "edge"]
-    client_type: Literal["extension", "native_helper"] = "extension"
+    client_type: Literal["extension"] = "extension"
     display_name: str = Field("当前设备", min_length=1, max_length=80)
     signing_public_jwk: Dict[str, Any]
     encryption_public_jwk: Dict[str, Any]
@@ -1871,7 +1902,7 @@ class ClientBrowserDeviceIn(BaseModel):
 class ClientBrowserSessionIn(BaseModel):
     device_id: str = Field(..., min_length=16, max_length=80)
     mode: Literal["qr", "sms", "password"]
-    client_type: Literal["extension", "native_helper"] = "extension"
+    client_type: Literal["extension"] = "extension"
 
 
 class ClientBrowserChallengeIn(BaseModel):
@@ -2074,10 +2105,11 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         login_method = normalize_login_method(
             cookie_details.get('login_method') if cookie_details else 'unknown'
         )
-        auto_refresh_supported = supports_automatic_refresh(
-            login_method,
-            cookie_details.get('username') if cookie_details else '',
-            has_login_password,
+        # 自动续期能力以真实的设备绑定 + 凭据为准（见 db_manager.get_cookie_refresh_settings）。
+        # 旧的 supports_automatic_refresh 只表示“服务端 Playwright 密码续期”，已恒为关闭，
+        # 不能用它回答“该账号能否自动续期”，否则前端会永远误报“不支持自动续期”。
+        auto_refresh_supported = bool(
+            db_manager.get_cookie_refresh_settings(cookie_id).get('auto_refresh_supported')
         )
         refresh_status = _current_session_refresh_status(cookie_id)
         reauth_required = refresh_status.get('state') == 'manual_reauth_required'
@@ -2492,15 +2524,11 @@ async def import_client_browser_login(
             user_id=record.owner_user_id,
             cookies_str=session_cookies_to_string(probe.cookies),
             validated_unb=platform_unb,
-            login_method=(
-                "native_helper"
-                if device.get("client_type") == "native_helper"
-                else {
-                    "qr": "chrome_extension",
-                    "sms": "sms_window",
-                    "password": "password",
-                }[payload.mode]
-            ),
+            login_method={
+                "qr": "chrome_extension",
+                "sms": "sms_window",
+                "password": "password",
+            }[payload.mode],
             browser_user_agent=payload.user_agent,
             runtime_state={
                 "current_token": probe.access_token,
@@ -2580,7 +2608,7 @@ async def import_browser_extension_cookies(
     consumed = False
     try:
         protocol_version = int(payload.protocol_version or 1)
-        if protocol_version == 1 and not _is_loopback_console_request(request):
+        if protocol_version == 1 and not _is_strict_loopback_request(request):
             raise PairingError(
                 "旧版扩展导入仅接受本机回环请求",
                 error_code="non_loopback_request",
@@ -3183,10 +3211,8 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         safe_details.pop('password_encrypted', None)
         safe_details.pop('value', None)
         safe_details.pop('browser_user_agent', None)
-        safe_details['auto_refresh_supported'] = supports_automatic_refresh(
-            safe_details.get('login_method'),
-            safe_details.get('username'),
-            safe_details['has_login_password'],
+        safe_details['auto_refresh_supported'] = bool(
+            db_manager.get_cookie_refresh_settings(cid).get('auto_refresh_supported')
         )
         return safe_details
     except HTTPException:
@@ -3461,9 +3487,8 @@ async def create_official_login_session(
     mode = str(request.get("mode") or "qr").strip().lower()
     account = str(request.get("account") or "").strip()
     show_browser = bool(request.get("show_browser", False))
-    # This endpoint owns a server-side Playwright browser even when its window
-    # is hidden.  Therefore every invocation—not just show_browser=True—must be
-    # limited to the explicit administrator loopback maintenance surface.
+    # 服务端 Playwright 浏览器即使窗口隐藏也运行在本机，因此每次调用（不只是
+    # show_browser=True）都要求回环访问；非回环请求回落到网页二维码或扩展导入。
     if show_browser:
         _require_server_browser_access(http_request, current_user)
     elif not _has_server_browser_access(http_request, current_user):
@@ -12401,6 +12426,18 @@ async def manual_ship_orders(
                             'order_id': order_id,
                             'success': False,
                             'message': '订单缺少商品ID，无法匹配发货规则'
+                        })
+                        failed_count += 1
+                        continue
+
+                    # 邀请自动发货商品由邀请服务独占卡密库存并发货，本地"完整发货"会与其
+                    # 重复发码；这里直接拦截（仅 full_delivery，status_only 不受影响，运营
+                    # 仍可用 status_only 在闲鱼标记发货状态）。
+                    if orders_db.is_invite_auto_fulfillment_enabled(cookie_id, item_id):
+                        results.append({
+                            'order_id': order_id,
+                            'success': False,
+                            'message': '该商品是邀请自动发货商品，由邀请服务发货，不能走本地完整发货以免重复发码；如需仅标记发货状态请改用 status_only。'
                         })
                         failed_count += 1
                         continue

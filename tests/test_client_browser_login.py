@@ -85,23 +85,17 @@ class ClientLoginSessionTests(unittest.TestCase):
         )
         self.assertEqual(completed["state"], "success")
 
-    def test_session_rejects_transport_type_confusion(self):
+    def test_session_rejects_removed_native_helper_client_type(self):
+        # 本机助手已彻底移除：native_helper 不再是合法的设备连接类型。
         manager = ClientLoginSessionManager()
-        status = manager.create(
-            owner_user_id=7,
-            device_id="device_fixture_1234",
-            mode="qr",
-            client_type="native_helper",
-        )
-        self.assertEqual(status["client_type"], "native_helper")
-        with self.assertRaises(ClientBrowserError) as mismatch:
-            manager.get_for_device(
-                session_id=status["session_id"],
+        with self.assertRaises(ClientBrowserError) as removed:
+            manager.create(
+                owner_user_id=7,
                 device_id="device_fixture_1234",
                 mode="qr",
-                client_type="extension",
+                client_type="native_helper",
             )
-        self.assertEqual(mismatch.exception.error_code, "client_login_binding_mismatch")
+        self.assertEqual(removed.exception.error_code, "unsupported_client_type")
 
 
 class ClientDeviceProofTests(unittest.TestCase):
@@ -192,7 +186,8 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
             )
         self.assertEqual(mismatch.exception.http_status, 409)
         self.assertEqual(mismatch.exception.error_code, "device_key_mismatch")
-        with self.assertRaises(ClientBrowserError) as transport_mismatch:
+        # 本机助手已移除：native_helper 类型在归一化阶段即被拒绝。
+        with self.assertRaises(ClientBrowserError) as removed_type:
             self.db.register_client_browser_device(
                 user_id=1,
                 device_id="device_fixture_1234",
@@ -202,58 +197,36 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
                 signing_public_jwk=public_jwk_from_key(self.signing.public_key()),
                 encryption_public_jwk=public_jwk_from_key(self.encryption.public_key()),
             )
-        self.assertEqual(transport_mismatch.exception.error_code, "device_type_mismatch")
+        self.assertEqual(removed_type.exception.error_code, "unsupported_client_type")
 
-    def test_device_transport_type_is_persisted_and_old_devices_default_to_extension(self):
+    def test_removed_native_helper_cannot_register_and_old_devices_default_to_extension(self):
+        # 本机助手已移除：注册 native_helper 设备直接被拒；历史设备默认按 extension 解释。
         native = ec.generate_private_key(ec.SECP256R1())
         native_encryption = ec.generate_private_key(ec.SECP256R1())
-        registered = self.db.register_client_browser_device(
-            user_id=1,
-            device_id="native_helper_fixture_1",
-            browser_family="chrome",
-            client_type="native_helper",
-            display_name="Native helper",
-            signing_public_jwk=public_jwk_from_key(native.public_key()),
-            encryption_public_jwk=public_jwk_from_key(native_encryption.public_key()),
-        )
-        self.assertEqual(registered["client_type"], "native_helper")
-        self.assertEqual(
-            self.db.get_client_browser_device(
-                user_id=1, device_id="native_helper_fixture_1"
-            )["client_type"],
-            "native_helper",
-        )
+        with self.assertRaises(ClientBrowserError) as removed:
+            self.db.register_client_browser_device(
+                user_id=1,
+                device_id="native_helper_fixture_1",
+                browser_family="chrome",
+                client_type="native_helper",
+                display_name="Native helper",
+                signing_public_jwk=public_jwk_from_key(native.public_key()),
+                encryption_public_jwk=public_jwk_from_key(native_encryption.public_key()),
+            )
+        self.assertEqual(removed.exception.error_code, "unsupported_client_type")
         self.assertEqual(
             self.db.get_client_browser_device(
                 user_id=1, device_id="device_fixture_1234"
             )["client_type"],
             "extension",
         )
+        # 数据库 CHECK 约束仍保护该列不被写入未知类型。
         with self.db.lock, self.assertRaises(Exception):
             self.db.conn.execute(
                 "UPDATE client_browser_devices SET client_type = 'invalid' "
-                "WHERE device_id = 'native_helper_fixture_1'"
+                "WHERE device_id = 'device_fixture_1234'"
             )
         self.db.conn.rollback()
-
-    def test_native_helper_is_isolated_from_extension_renewal_credentials(self):
-        native = ec.generate_private_key(ec.SECP256R1())
-        native_encryption = ec.generate_private_key(ec.SECP256R1())
-        self.db.register_client_browser_device(
-            user_id=1, device_id="native_helper_fixture_2",
-            browser_family="chrome", client_type="native_helper",
-            display_name="Native helper",
-            signing_public_jwk=public_jwk_from_key(native.public_key()),
-            encryption_public_jwk=public_jwk_from_key(native_encryption.public_key()),
-        )
-        with self.assertRaises(ClientBrowserError) as isolated:
-            self.db.bind_account_renewal_device(
-                user_id=1, cookie_id="account-1",
-                device_id="native_helper_fixture_2",
-                username="seller@example.com", password="secret",
-                authorized_at=time.time(),
-            )
-        self.assertEqual(isolated.exception.error_code, "renewal_binding_mismatch")
 
     def test_task_is_device_bound_expires_and_ciphertext_is_single_claim(self):
         authorized_at = time.time()
@@ -301,10 +274,11 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
         expired = self.db.create_client_renewal_task(
             user_id=1, cookie_id="account-1", trigger="expired", now=100.0,
         )
+        # 续期任务 TTL 已放宽到 300 秒；在创建时刻 +301 秒时领取应判定过期。
         with self.assertRaises(ClientBrowserError) as expiry:
             self.db.claim_client_renewal_task(
                 user_id=1, device_id="device_fixture_1234",
-                task_id=expired["task_id"], now=161.0,
+                task_id=expired["task_id"], now=401.0,
             )
         self.assertEqual(expiry.exception.http_status, 410)
 

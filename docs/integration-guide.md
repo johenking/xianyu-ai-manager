@@ -290,9 +290,8 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 Supported binding paths:
 
-- User-machine helper: read the public device record from the user's loopback helper at `GET http://127.0.0.1:17890/v1/device`, register it through `/api/client-browser/devices` with `client_type=native_helper`, create a five-minute `qr`, `sms`, or `password` session through `/api/client-browser/sessions`, then call the helper's `POST /v1/login/start`. The helper opens and tracks an official tab in that user's Chrome/Edge and submits its signed login state directly to `/api/client-browser/import`. Device proof, Token validation, `unb` identity, persistence, and frontend confirmation are all required before the helper closes its tab.
+- Server-side local Chrome (primary, loopback only): `POST /api/official-login/sessions` with `{"mode":"qr","show_browser":true}` opens a headed Chromium window on the service host and the user completes every official verification there. Any loopback console user may call it; non-loopback requests receive 403/409 and must use the extension or web QR. Token validation, `unb` identity, persistence, and frontend confirmation are all required before success.
 - Web QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; `mobile_scan` keeps a scannable image while slider, face, SMS, interactive, and unknown verification hand off to a current-device session.
-- Server maintenance: `/api/official-login/sessions` is reserved for an administrator on the service Mac loopback console. It is not an ordinary-user login path, and showing a physical server window requires `show_browser:true`.
 - Browser extension import: register an `extension` client-browser device for the signed session flow, or create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings` for manual import. Extension detection is isolated from the user-machine helper path.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 

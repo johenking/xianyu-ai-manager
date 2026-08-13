@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import reply_server
 from client_browser_login import (
@@ -339,24 +340,14 @@ class ClientBrowserRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(imported["data"]["error_code"], "")
         persist.assert_awaited_once()
 
-    async def test_native_helper_import_records_native_login_method(self):
-        self.database.client_type = "native_helper"
-        session = self._create_session("qr")
-        payload = self._signed_payload(session)
-        persist = AsyncMock(
-            return_value={"account_id": "account-1", "is_new_account": True}
-        )
-        imported = await self._import(
-            payload,
-            probe=SessionProbeResult(
-                status="success",
-                cookies={"unb": "account-1", "cookie2": "session-cookie"},
-                access_token="validated-token",
-            ),
-            persist=persist,
-        )
-        self.assertEqual(imported["data"]["state"], "awaiting_confirmation")
-        self.assertEqual(persist.await_args.kwargs["login_method"], "native_helper")
+    async def test_native_helper_client_type_is_rejected(self):
+        # 本机助手已彻底移除：请求模型不再接受 native_helper 设备类型。
+        with self.assertRaises(ValidationError):
+            reply_server.ClientBrowserSessionIn(
+                device_id=DEVICE_ID,
+                mode="qr",
+                client_type="native_helper",
+            )
 
 
 class ClientRenewalRouteTests(unittest.IsolatedAsyncioTestCase):

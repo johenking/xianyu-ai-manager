@@ -21,11 +21,6 @@ import {
   getClientBrowserLoginSession,
   confirmClientBrowserLoginSession,
   cancelClientBrowserLoginSession,
-  getNativeBrowserDevice,
-  startNativeBrowserLogin,
-  getNativeBrowserLoginStatus,
-  cancelNativeBrowserLogin,
-  closeNativeBrowserLogin,
   bindAccountRenewalDevice,
   createOfficialLoginSession,
   getOfficialLoginSession,
@@ -57,7 +52,6 @@ import type { BrowserInteractionAction, ReplyStrategy } from '../services/api';
 import type {
   ClientBrowserDevicePublic,
   ClientBrowserLoginSession,
-  NativeBrowserDevice,
 } from '../services/api';
 import { ApiRequestError } from '../services/request';
 import {
@@ -90,9 +84,6 @@ const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
 const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.1';
 const CLIENT_BROWSER_PROTOCOL_VERSION = 1;
 const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.1.zip';
-const NATIVE_HELPER_VERSION = '1.0.2';
-const NATIVE_HELPER_MACOS_URL = '/static/downloads/xianyu-native-browser-helper-macos-arm64-1.0.2.zip';
-const NATIVE_HELPER_WINDOWS_URL = '/static/downloads/xianyu-native-browser-helper-windows-x64-1.0.2.zip';
 
 type ClientBrowserConnectionState = {
   state:
@@ -105,9 +96,6 @@ type ClientBrowserConnectionState = {
     | 'auth_expired'
     | 'device_registration_conflict'
     | 'device_registration_failed'
-    | 'helper_missing'
-    | 'helper_outdated'
-    | 'helper_connected'
     | 'connected';
   title: string;
   detail: string;
@@ -165,6 +153,16 @@ const isLoopbackHostname = (hostname: string) => {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
 };
 
+// 正式控制台域名与回环同等视为“本机”：服务与用户都在这台 Mac 上，公网域名只是
+// 经本机 cloudflared 隧道回流，不应因地址栏写法被当成远程用户。
+// 与后端 browser_extension_pairing.PUBLIC_CONSOLE_ORIGIN 保持一致。
+const SERVER_BROWSER_CONSOLE_HOSTS = ['xianyu.cxywjx.top'];
+
+const isServerBrowserHostname = (hostname: string) => (
+  isLoopbackHostname(hostname)
+  || SERVER_BROWSER_CONSOLE_HOSTS.includes(hostname.trim().toLowerCase())
+);
+
 const formatCookieRefreshInterval = (minutes?: number) => {
   const value = minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES;
   if (value % 1440 === 0) return `${value / 1440} 天`;
@@ -200,8 +198,10 @@ const sessionStatusMessage = (status: AccountSessionRefreshStatus) => (
     : status.message
 );
 
-const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
-  const canUseServerBrowser = isAdmin && isLoopbackHostname(window.location.hostname);
+const AccountList: React.FC<AccountListProps> = () => {
+  // 服务就运行在用户本机 Mac 上，服务端 Chrome 登录是零安装主路径。回环与正式
+  // 控制台域名都视为“本机”；其余（陌生域名）回落到网页二维码/扩展。
+  const canUseServerBrowser = isServerBrowserHostname(window.location.hostname);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -230,7 +230,6 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
   const clientBrowserErrorRef = useRef('请先启动一次本机浏览器助手');
   const clientBrowserDetectionRef = useRef<Promise<ClientBrowserDevicePublic | null> | null>(null);
   const activeClientBrowserSessionRef = useRef('');
-  const clientBrowserTransportRef = useRef<'native_helper' | 'extension'>('native_helper');
   const clientBrowserStartInFlightRef = useRef(false);
   const loginFlowGenerationRef = useRef(0);
   const [clientBrowserDevice, setClientBrowserDevice] = useState<ClientBrowserDevicePublic | null>(null);
@@ -526,11 +525,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     clearClientBrowserPolling();
     try {
       await cancelClientBrowserLoginSession(sessionId);
-      if (clientBrowserTransportRef.current === 'native_helper') {
-        await cancelNativeBrowserLogin(sessionId).catch(() => undefined);
-      } else {
-        await sendClientBrowserCommand('XMC_CANCEL_LOGIN', { sessionId });
-      }
+      await sendClientBrowserCommand('XMC_CANCEL_LOGIN', { sessionId });
       return true;
     } catch {
       return false;
@@ -547,7 +542,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
   };
 
   const closeAddModal = () => {
-    setShowAddModal(false);
+    // 关闭弹窗时主动结束正在进行的登录会话，避免“看似取消了、后台仍在轮询并占用浏览器”。
+    void cancelActiveOfficialSession();
+    void cancelActiveClientBrowserSession();
+    const activeApiQRSessionId = qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus) ? qrSessionId : '';
+    if (activeApiQRSessionId) void cancelQRSessionById(activeApiQRSessionId, 'user_cancelled');
+    finishAddFlow();
   };
 
   const finishAddFlow = () => {
@@ -593,7 +593,6 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     setExtensionBusy(false);
     setClientBrowserSession(null);
     activeClientBrowserSessionRef.current = '';
-    clientBrowserTransportRef.current = 'native_helper';
     setClientBrowserStep('idle');
     setRenewalSetup(null);
   };
@@ -697,31 +696,11 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     initial: ClientBrowserLoginSession,
     flowGeneration: number,
     device: ClientBrowserDevicePublic,
-    transport: 'native_helper' | 'extension' = 'extension',
   ) => {
     clearClientBrowserPolling();
     clientBrowserPollingRef.current = setInterval(async () => {
       if (flowGeneration !== loginFlowGenerationRef.current) return;
       try {
-        if (transport === 'native_helper') {
-          const helperStatus = await getNativeBrowserLoginStatus(initial.session_id);
-          if (helperStatus.state === 'failed' || helperStatus.state === 'expired' || helperStatus.state === 'cancelled') {
-            clearClientBrowserPolling();
-            setClientBrowserStep('retryable_error');
-            setClientBrowserFlowMessage(initial.mode, 'failed', helperStatus.message || '本机浏览器登录未完成');
-            return;
-          }
-          if (helperStatus.state === 'opening_browser') {
-            setClientBrowserStep('opening_browser');
-            setClientBrowserFlowMessage(initial.mode, 'processing', helperStatus.message);
-          } else if (helperStatus.state === 'waiting_user') {
-            setClientBrowserStep('waiting_user');
-            setClientBrowserFlowMessage(initial.mode, 'processing', helperStatus.message);
-          } else if (helperStatus.state === 'validating') {
-            setClientBrowserStep('validating');
-            setClientBrowserFlowMessage(initial.mode, 'processing', helperStatus.message);
-          }
-        }
         const current = await getClientBrowserLoginSession(initial.session_id);
         if (flowGeneration !== loginFlowGenerationRef.current) return;
         setClientBrowserSession(current);
@@ -739,17 +718,13 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
             return;
           }
           await confirmClientBrowserLoginSession(current.session_id, current.account_id);
-          if (transport === 'native_helper') {
-            await closeNativeBrowserLogin(current.session_id, current.account_id);
-          } else {
-            await sendClientBrowserCommand('XMC_CONFIRM_LOGIN', {
-              sessionId: current.session_id,
-              accountId: current.account_id,
-            });
-          }
+          await sendClientBrowserCommand('XMC_CONFIRM_LOGIN', {
+            sessionId: current.session_id,
+            accountId: current.account_id,
+          });
           setClientBrowserStep('success');
           setClientBrowserFlowMessage(current.mode, 'success', '当前设备浏览器登录成功');
-          if (current.mode === 'password' && transport === 'extension') {
+          if (current.mode === 'password') {
             clearClientBrowserPolling();
             setRenewalSetup({
               accountId: current.account_id,
@@ -796,7 +771,6 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
   const startExtensionClientBrowserLogin = async (mode: 'qr' | 'sms' | 'password') => {
     if (clientBrowserStartInFlightRef.current) return;
     clientBrowserStartInFlightRef.current = true;
-    clientBrowserTransportRef.current = 'extension';
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     let session: ClientBrowserLoginSession | null = null;
@@ -846,7 +820,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       });
       setClientBrowserStep('waiting_user');
       setClientBrowserFlowMessage(mode, 'processing', '请在刚打开的当前设备浏览器中完成登录和全部验证');
-      startClientBrowserPolling(session, flowGeneration, device, 'extension');
+      startClientBrowserPolling(session, flowGeneration, device);
     } catch (error) {
       if (flowGeneration !== loginFlowGenerationRef.current) return;
       if (session) {
@@ -867,153 +841,10 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     }
   };
 
-  const startNativeBrowserLoginFlow = async (mode: 'qr' | 'sms' | 'password') => {
-    if (clientBrowserStartInFlightRef.current) return;
-    clientBrowserStartInFlightRef.current = true;
-    loginFlowGenerationRef.current += 1;
-    const flowGeneration = loginFlowGenerationRef.current;
-    let session: ClientBrowserLoginSession | null = null;
-    clearQRPolling();
-    clearPasswordPolling();
-    clearOfficialPolling();
-    clearExtensionPolling();
-    clearClientBrowserPolling();
-    if (mode === 'qr') {
-      setActiveAddMethod('qr');
-      setQrEntryMode('client');
-    }
-    setClientBrowserDevice(null);
-    setClientBrowserConnection({
-      state: 'detecting',
-      title: '正在检测本机浏览器助手',
-      detail: '助手运行在你自己的电脑上，监控台不会使用服务端 Chrome。',
-    });
-    setClientBrowserStep('opening_browser');
-    setClientBrowserFlowMessage(mode, 'processing', '正在连接你电脑上的本机 Chrome');
-    let helper: NativeBrowserDevice | null = null;
-    try {
-      const previousSessionId = activeClientBrowserSessionRef.current;
-      if (previousSessionId) {
-        await cancelActiveClientBrowserSession();
-      }
-      clientBrowserTransportRef.current = 'native_helper';
-      helper = await getNativeBrowserDevice();
-      if (compareVersions(helper.helperVersion || '0.0.0', NATIVE_HELPER_VERSION) < 0) {
-        const helperVersionError = new Error(
-          `本机助手版本过旧（当前 ${helper.helperVersion || '未知'}，需要 ${NATIVE_HELPER_VERSION}）`,
-        ) as Error & { code?: string };
-        helperVersionError.code = 'helper_outdated';
-        throw helperVersionError;
-      }
-      const device: ClientBrowserDevicePublic = {
-        deviceId: helper.deviceId,
-        browserFamily: helper.browserFamily,
-        clientType: 'native_helper',
-        helperVersion: helper.helperVersion,
-        extensionVersion: '',
-        protocolVersion: helper.protocolVersion,
-        signingPublicJwk: helper.signingPublicJwk,
-        encryptionPublicJwk: helper.encryptionPublicJwk,
-      };
-      if (device.protocolVersion !== CLIENT_BROWSER_PROTOCOL_VERSION) {
-        const protocolError = new Error('本机助手协议版本不匹配，请更新助手') as Error & { code?: string };
-        protocolError.code = 'helper_outdated';
-        throw protocolError;
-      }
-      await registerClientBrowserDevice(device);
-      setClientBrowserDevice(device);
-      setClientBrowserConnection({
-        state: 'helper_connected',
-        title: '本机浏览器助手已连接',
-        detail: `已连接你电脑上的 ${device.browserFamily === 'edge' ? 'Edge' : 'Chrome'}，正在打开官方登录页。`,
-        extensionVersion: helper.helperVersion,
-      });
-      session = await createClientBrowserLoginSession(device.deviceId, mode, 'native_helper');
-      activeClientBrowserSessionRef.current = session.session_id;
-      if (flowGeneration !== loginFlowGenerationRef.current) {
-        await cancelClientBrowserLoginSession(session.session_id).catch(() => undefined);
-        await cancelNativeBrowserLogin(session.session_id).catch(() => undefined);
-        activeClientBrowserSessionRef.current = '';
-        return;
-      }
-      setClientBrowserSession(session);
-      setClientBrowserStep('opening_browser');
-      await startNativeBrowserLogin({
-        session_id: session.session_id,
-        device_id: device.deviceId,
-        mode: session.mode,
-        server_origin: window.location.origin,
-        expires_at: session.expires_at,
-        official_url: 'https://www.goofish.com/login',
-      });
-      setClientBrowserStep('waiting_user');
-      setClientBrowserConnection((current) => ({
-        ...current,
-        state: 'helper_connected',
-        title: '本机 Chrome 已打开官方页面',
-        detail: '请在你电脑上刚打开的官方页面完成扫码、手机号、密码及全部安全验证。',
-      }));
-      setClientBrowserFlowMessage(mode, 'processing', '官方页面已打开，请在你电脑的 Chrome 中完成登录');
-      startClientBrowserPolling(session, flowGeneration, device, 'native_helper');
-    } catch (error) {
-      if (flowGeneration !== loginFlowGenerationRef.current) return;
-      if (session) {
-        await cancelClientBrowserLoginSession(session.session_id).catch(() => undefined);
-        await cancelNativeBrowserLogin(session.session_id).catch(() => undefined);
-        activeClientBrowserSessionRef.current = '';
-      }
-      const helperError = error instanceof Error && 'code' in error
-        ? error as Error & { code?: string }
-        : null;
-      if (helperError?.code === 'helper_outdated') {
-        setClientBrowserConnection({
-          state: 'helper_outdated',
-          title: '本机浏览器助手需要更新',
-          detail: helperError.message,
-          extensionVersion: helper?.helperVersion,
-        });
-        setShowClientBrowserInstallGuide(true);
-      } else if (helperError?.code === 'helper_unavailable' || helperError?.code === 'helper_timeout') {
-        setClientBrowserConnection({
-          state: 'helper_missing',
-          title: '未启动本机浏览器助手',
-          detail: '请安装并启动一次本机助手；扩展导入和网页二维码仍可独立使用。',
-        });
-        setShowClientBrowserInstallGuide(true);
-      } else if (error instanceof ApiRequestError && error.status === 401) {
-        setClientBrowserConnection({
-          state: 'auth_expired',
-          title: '监控台登录已失效',
-          detail: error.message,
-        });
-      } else if (error instanceof ApiRequestError && (error.status === 409 || error.code === 'device_key_mismatch')) {
-        setClientBrowserConnection({
-          state: 'device_registration_conflict',
-          title: '浏览器设备注册冲突',
-          detail: error.message,
-        });
-      } else {
-        setClientBrowserConnection({
-          state: 'device_registration_failed',
-          title: '本机浏览器登录启动失败',
-          detail: error instanceof Error ? error.message : '本机助手暂时不可用，请重试',
-        });
-      }
-      setClientBrowserStep('retryable_error');
-      setClientBrowserFlowMessage(
-        mode,
-        'failed',
-        error instanceof Error ? error.message : '本机浏览器登录启动失败',
-      );
-    } finally {
-      clientBrowserStartInFlightRef.current = false;
-    }
-  };
-
-  // The main entry always uses the user's local helper.  The extension keeps its
-  // own pairing page and the legacy bridge remains available for compatibility.
+  // 本机助手已彻底移除：非回环（远程）访问时，“当前设备浏览器”通道统一由浏览器扩展
+  // 桥接承接；回环访问的主路径是服务端本机 Chrome（startBrowserQRLogin）。
   const startClientBrowserLogin = (mode: 'qr' | 'sms' | 'password') => (
-    startNativeBrowserLoginFlow(mode)
+    startExtensionClientBrowserLogin(mode)
   );
 
   const saveRenewalBinding = async () => {
@@ -1732,7 +1563,10 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     clearQRPolling();
     setQrInteraction(null);
     if (sessionId) {
-      const cancelled = await cancelQRSessionById(sessionId, 'switched_to_extension');
+      const cancelled = await cancelQRSessionById(
+        sessionId,
+        canUseServerBrowser ? 'switched_method' : 'switched_to_extension',
+      );
       if (!cancelled) {
         setQrStatus('error');
         setQrMessage('结束网页二维码会话失败，请重试');
@@ -1740,7 +1574,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       }
       setQrSessionId('');
     }
-    await startClientBrowserLogin('qr');
+    // 本机场景直接弹本机 Chrome 窗口完成风控验证；陌生域名远程访问走扩展桥接。
+    if (canUseServerBrowser) {
+      await startBrowserQRLogin();
+    } else {
+      await startClientBrowserLogin('qr');
+    }
   };
 
   const handleAddMethodChange = async (method: AddLoginMethod) => {
@@ -1868,7 +1707,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       if (mode === 'qr') {
         setQrInteraction(null);
         setQrStatus('success');
-        setQrMessage(status.message || '服务器运维登录成功');
+        setQrMessage(status.message || '本机 Chrome 登录成功');
       } else {
         setOfficialInteraction(null);
         setOfficialWindowStatus('success');
@@ -1890,7 +1729,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       if (mode === 'qr') {
         setQrInteraction(null);
         setQrStatus('error');
-        setQrMessage(status.message || '服务器运维登录未完成，请重新发起');
+        setQrMessage(status.message || '本机 Chrome 登录未完成，请重新发起');
       } else {
         setOfficialInteraction(null);
         setOfficialWindowStatus('failed');
@@ -1934,11 +1773,9 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
   const startBrowserQRLogin = async () => {
     if (!canUseServerBrowser) {
       setQrStatus('error');
-      setQrMessage('服务器 Chrome 仅供本机管理员使用');
+      setQrMessage('本机 Chrome 登录仅在本机监控台（127.0.0.1）可用；远程访问请改用网页二维码或浏览器扩展');
       return;
     }
-    if (!window.confirm('服务器运维登录会在运行网站的这台 Mac 上打开 Chrome。仅用于本机管理员排障，是否继续？')) return;
-    if (!window.confirm('再次确认：此窗口不是客户自己的浏览器。继续启动服务器运维登录？')) return;
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     clearQRPolling();
@@ -1958,7 +1795,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     setQrStatus('loading');
     setQrCodeUrl('');
     setQrSessionId('');
-    setQrMessage('正在打开服务器 Chrome 运维窗口');
+    setQrMessage('正在本机打开 Chrome 登录窗口');
     setQrVerificationImage('');
     setQrInteraction(null);
     try {
@@ -1972,7 +1809,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       }
       if (!result.success || !result.session_id) {
         setQrStatus('error');
-        setQrMessage(result.message || '服务器运维登录启动失败');
+        setQrMessage(result.message || '本机 Chrome 登录启动失败');
         return;
       }
       activeOfficialSessionRef.current = result.session_id;
@@ -1983,7 +1820,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     } catch (error) {
       if (flowGeneration !== loginFlowGenerationRef.current) return;
       setQrStatus('error');
-      setQrMessage(error instanceof Error ? error.message : '服务器运维登录请求失败');
+      setQrMessage(error instanceof Error ? error.message : '本机 Chrome 登录请求失败');
     }
   };
 
@@ -2018,7 +1855,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
   const handleOfficialWindowLogin = async () => {
     setOfficialWindowSubmitting(true);
     try {
-      await startClientBrowserLogin('sms');
+      // 本机场景弹本机 Chrome 官方登录页（页内可选手机号验证码方式）；远程走扩展。
+      if (canUseServerBrowser) {
+        await startBrowserQRLogin();
+      } else {
+        await startClientBrowserLogin('sms');
+      }
     } finally {
       setOfficialWindowSubmitting(false);
     }
@@ -2098,7 +1940,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
     resetPasswordStatus();
     setPasswordSubmitting(true);
     try {
-      await startClientBrowserLogin('password');
+      // 本机场景弹本机 Chrome 官方登录页（页内可选账号密码方式）；远程走扩展。
+      if (canUseServerBrowser) {
+        await startBrowserQRLogin();
+      } else {
+        await startClientBrowserLogin('password');
+      }
     } finally {
       setPasswordSubmitting(false);
     }
@@ -2131,7 +1978,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
 
   const clientBrowserConnectionPanel = (allowWebQR = false) => (
     <div className={'rounded-xl border p-4 text-sm ' + (
-      ['connected', 'helper_connected'].includes(clientBrowserConnection.state)
+      clientBrowserConnection.state === 'connected'
         ? 'border-green-200 bg-green-50 text-green-800'
         : clientBrowserConnection.state === 'detecting'
           ? 'border-blue-200 bg-blue-50 text-blue-800'
@@ -2146,14 +1993,10 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       <p className="mt-1">{clientBrowserConnection.detail}</p>
       {!clientBrowserDevice && (
         <>
-          {['helper_missing', 'helper_outdated', 'detecting', 'idle'].includes(clientBrowserConnection.state) ? (
-            <p className="mt-2 text-xs text-gray-500">首次使用安装并启动一次本机助手；后续点击本机 Chrome 登录即可打开你电脑上的官方页面。</p>
-          ) : (
-            <p className="mt-2 text-xs text-gray-500">扩展导入是独立入口，不会影响本机助手登录。</p>
-          )}
+          <p className="mt-2 text-xs text-gray-500">当前设备浏览器登录由扩展承接：安装并启用扩展后，重新点击登录入口即可。</p>
           <div className="mt-3 flex flex-wrap gap-2">
-            <button type="button" onClick={() => setShowClientBrowserInstallGuide(true)} className="min-h-11 rounded-lg bg-gray-900 px-4 py-3 font-bold text-white">安装本机助手</button>
-            <button type="button" onClick={() => { setShowAdvancedLogin(true); setActiveAddMethod('extension'); }} className="min-h-11 rounded-lg border border-gray-300 bg-white px-4 py-3 font-bold text-gray-700">改用浏览器扩展</button>
+            <button type="button" onClick={() => setShowClientBrowserInstallGuide(true)} className="min-h-11 rounded-lg bg-gray-900 px-4 py-3 font-bold text-white">安装浏览器扩展</button>
+            <button type="button" onClick={() => { setShowAdvancedLogin(true); setActiveAddMethod('extension'); }} className="min-h-11 rounded-lg border border-gray-300 bg-white px-4 py-3 font-bold text-gray-700">打开扩展导入入口</button>
             {allowWebQR && <button type="button" onClick={() => void startApiQRLogin()} className="min-h-11 rounded-lg border border-gray-300 bg-white px-4 font-bold">改用网页二维码</button>}
           </div>
         </>
@@ -2517,7 +2360,11 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                   <div className="modal-header">
                     <div>
                       <h3 id="add-account-title" className="text-2xl font-extrabold text-gray-900">添加账号</h3>
-                      <p className="text-sm text-gray-500 mt-1">登录和安全验证在你当前的 Chrome 或 Edge 中完成。</p>
+                      <p className="text-sm text-gray-500 mt-1">
+                        {canUseServerBrowser
+                          ? '推荐用手机扫“网页二维码”登录，零安装最稳定；也可用“本机 Chrome 登录”窗口作为备选。'
+                          : '登录和安全验证在你当前的 Chrome 或 Edge 中完成。'}
+                      </p>
                     </div>
                     <button
                       type="button"
@@ -2589,15 +2436,6 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           >
                             <Upload className="h-4 w-4" /> 手填 Cookie
                           </button>
-                          {canUseServerBrowser && (
-                            <button
-                              type="button"
-                              onClick={() => void startBrowserQRLogin()}
-                              className="flex min-h-11 items-center justify-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 text-sm font-bold text-red-700"
-                            >
-                              <AlertTriangle className="h-4 w-4" /> 服务器运维登录
-                            </button>
-                          )}
                         </div>
                       )}
                     </div>
@@ -2609,33 +2447,37 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                             <QrCode className="mt-0.5 h-5 w-5 shrink-0 text-yellow-700" />
                             <div>
 	                              <h4 className="font-bold text-gray-900">选择扫码方式</h4>
-	                              <p className="mt-1 text-sm leading-6 text-gray-600">当前设备入口会在你的 Chrome 或 Edge 打开官方页面；网页二维码可直接用手机扫描。</p>
+	                              <p className="mt-1 text-sm leading-6 text-gray-600">推荐用手机扫网页二维码，零安装、最稳定，不受浏览器风控影响；本机 Chrome 登录作为备选（适合账号密码，遇滑块/人脸可能不稳）。</p>
                             </div>
                           </div>
                         </div>
 	                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                           <button
                             type="button"
-                            aria-label="本机 Chrome 登录"
-                            onClick={() => void startClientBrowserLogin('qr')}
+                            aria-label="网页二维码"
+                            onClick={() => void startApiQRLogin()}
                             className="ios-btn-primary flex min-h-11 items-start gap-3 rounded-2xl p-4 text-left"
                           >
-                            <Chrome className="mt-0.5 h-5 w-5 shrink-0" />
+                            <Smartphone className="mt-0.5 h-5 w-5 shrink-0" />
                             <span>
-                              <span className="block font-bold">本机 Chrome 登录</span>
-                              <span className="mt-1 block text-xs font-medium opacity-70">打开你电脑上的 Chrome 或 Edge，完成扫码和全部验证</span>
+                              <span className="block font-bold">网页二维码（推荐）</span>
+                              <span className="mt-1 block text-xs font-medium opacity-70">用手机闲鱼 App 扫一下即可，零安装、最稳定，不受浏览器风控影响</span>
                             </span>
                           </button>
                           <button
                             type="button"
-                            aria-label="网页二维码"
-                            onClick={() => void startApiQRLogin()}
+                            aria-label="本机 Chrome 登录"
+                            onClick={() => void (canUseServerBrowser ? startBrowserQRLogin() : startClientBrowserLogin('qr'))}
                             className="flex min-h-11 items-start gap-3 rounded-2xl border border-gray-200 bg-white p-4 text-left text-gray-900 transition-colors hover:bg-gray-50"
                           >
-                            <Smartphone className="mt-0.5 h-5 w-5 shrink-0 text-gray-600" />
+                            <Chrome className="mt-0.5 h-5 w-5 shrink-0 text-gray-600" />
                             <span>
-                              <span className="block font-bold">网页二维码</span>
-                              <span className="mt-1 block text-xs font-medium text-gray-500">直接在网页显示二维码，用手机闲鱼扫描</span>
+                              <span className="block font-bold">本机 Chrome 登录（备选）</span>
+                              <span className="mt-1 block text-xs font-medium text-gray-500">
+                                {canUseServerBrowser
+                                  ? '在本机打开 Chrome 官方登录页；适合账号密码，遇滑块 / 人脸时可能不稳定'
+                                  : '打开你电脑上的 Chrome 或 Edge，完成扫码和全部验证'}
+                              </span>
                             </span>
                           </button>
                         </div>
@@ -2699,7 +2541,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                               className="ios-btn-primary inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-bold"
                             >
                               <Chrome className="h-4 w-4" />
-                              在当前设备浏览器继续
+                              {canUseServerBrowser ? '在本机 Chrome 窗口继续' : '在当前设备浏览器继续'}
                             </button>
                           )}
 	                          {qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus) && (
@@ -2729,7 +2571,9 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           </button>
                         </div>
                         <p className="mt-4 rounded-xl bg-gray-50 py-2 text-xs font-medium text-gray-400">
-                          手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证转到当前设备浏览器。
+                          {canUseServerBrowser
+                            ? '手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证会在本机自动弹出的 Chrome 窗口中完成。'
+                            : '手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证转到当前设备浏览器。'}
                         </p>
                       </div>
                     )}
@@ -2762,8 +2606,8 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           <div className="flex items-start gap-3">
                             <Chrome className="mt-0.5 h-5 w-5 shrink-0 text-yellow-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">服务器 Chrome 运维窗口</h4>
-                              <p className="mt-1 text-sm leading-6 text-gray-600">窗口已打开在运行服务的 Mac 上。请在该窗口使用闲鱼 App 扫码，并按官方页面提示完成验证。</p>
+                              <h4 className="font-bold text-gray-900">本机 Chrome 登录窗口</h4>
+                              <p className="mt-1 text-sm leading-6 text-gray-600">Chrome 窗口会在运行服务的这台 Mac 上打开。请在该窗口用闲鱼 App 扫码（或在官方页切换短信 / 密码），并按提示完成滑块、人脸等验证；账号落库并确认后窗口会自动关闭。</p>
                             </div>
                           </div>
                         </div>
@@ -2794,7 +2638,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                                 : 'bg-blue-50 text-blue-700'
                         }`}>
                           {qrStatus === 'loading' && <Loader2 className="mr-2 inline h-4 w-4 animate-spin" />}
-                          {qrMessage || '正在准备服务器运维登录会话'}
+                          {qrMessage || '正在准备本机 Chrome 登录会话'}
                         </div>
 
                         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
@@ -2845,8 +2689,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           <div className="flex items-start gap-3">
                             <Smartphone className="mt-0.5 h-5 w-5 shrink-0 text-blue-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">在当前设备浏览器完成手机号验证码登录</h4>
-                              <p className="mt-1 text-sm leading-6 text-gray-600">将在你的 Chrome 或 Edge 打开官方页面；手机号、验证码、滑块和后续验证都只在该页面输入。</p>
+                              <h4 className="font-bold text-gray-900">{canUseServerBrowser ? '在本机 Chrome 窗口完成手机号验证码登录' : '在当前设备浏览器完成手机号验证码登录'}</h4>
+                              <p className="mt-1 text-sm leading-6 text-gray-600">
+                                {canUseServerBrowser
+                                  ? '会在运行服务的这台 Mac 上弹出 Chrome 官方登录页；手机号、验证码、滑块和后续验证都只在该窗口输入。'
+                                  : '将在你的 Chrome 或 Edge 打开官方页面；手机号、验证码、滑块和后续验证都只在该页面输入。'}
+                              </p>
                             </div>
                           </div>
                         </div>
@@ -2874,7 +2722,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                               : <Smartphone className="h-4 w-4" />}
                             {['processing', 'verification_required'].includes(officialWindowStatus)
                               ? '等待登录完成'
-                              : '在当前设备浏览器继续'}
+                              : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
                           </button>
                           {['processing', 'verification_required'].includes(officialWindowStatus) && (
                             <button
@@ -2979,8 +2827,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                         <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
                           <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
                           <div>
-                            <h4 className="font-bold text-gray-900">在当前设备浏览器完成账号密码登录</h4>
-                            <p className="mt-1 text-sm text-gray-600">普通用户的账号、密码、滑块和人脸验证只在你的 Chrome 或 Edge 官方页面输入。登录成功后不会自动保存密码。</p>
+                            <h4 className="font-bold text-gray-900">{canUseServerBrowser ? '在本机 Chrome 窗口完成账号密码登录' : '在当前设备浏览器完成账号密码登录'}</h4>
+                            <p className="mt-1 text-sm text-gray-600">
+                              {canUseServerBrowser
+                                ? '会在运行服务的这台 Mac 上弹出 Chrome 官方登录页；账号、密码、滑块和人脸验证只在该窗口输入。登录成功后不会自动保存密码。'
+                                : '普通用户的账号、密码、滑块和人脸验证只在你的 Chrome 或 Edge 官方页面输入。登录成功后不会自动保存密码。'}
+                            </p>
                           </div>
                         </div>
                         {passwordMessage && (
@@ -3029,7 +2881,9 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           </div>
                         )}
                         {passwordStatus === 'verification_required' && (
-                          <p className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-800">请回到当前设备浏览器完成官方验证。</p>
+                          <p className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-800">
+                            {canUseServerBrowser ? '请在本机弹出的 Chrome 窗口完成官方验证。' : '请回到当前设备浏览器完成官方验证。'}
+                          </p>
                         )}
                         {(passwordStatus === 'processing' || passwordStatus === 'verification_required') && (
                           <div className="flex flex-wrap gap-2">
@@ -3049,7 +2903,7 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
                           className="w-full ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 disabled:opacity-60"
                         >
                           {passwordSubmitting || passwordStatus === 'processing' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
-                          {passwordSubmitting || passwordStatus === 'processing' ? '等待登录完成' : '在当前设备浏览器继续'}
+                          {passwordSubmitting || passwordStatus === 'processing' ? '等待登录完成' : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
                         </button>
                       </form>
                     )}
@@ -3519,12 +3373,12 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
       )}
 
       {showClientBrowserInstallGuide && createPortal(
-        <div className="modal-overlay-centered" role="dialog" aria-modal="true" aria-label="安装本机浏览器助手">
+        <div className="modal-overlay-centered" role="dialog" aria-modal="true" aria-label="安装浏览器扩展">
           <div className="modal-card-centered max-w-xl">
             <div className="modal-header">
               <div>
-                <h3 className="text-lg font-bold text-gray-900">安装本机浏览器助手</h3>
-                <p className="mt-1 text-sm text-gray-500">版本 {NATIVE_HELPER_VERSION} · 运行在你自己的 macOS 或 Windows 电脑</p>
+                <h3 className="text-lg font-bold text-gray-900">安装浏览器扩展</h3>
+                <p className="mt-1 text-sm text-gray-500">版本 {CLIENT_BROWSER_EXTENSION_VERSION} · 安装在你自己的 Chrome 或 Edge</p>
               </div>
               <button type="button" onClick={() => setShowClientBrowserInstallGuide(false)} aria-label="关闭安装引导" className="icon-button">
                 <X className="h-5 w-5" />
@@ -3532,25 +3386,17 @@ const AccountList: React.FC<AccountListProps> = ({ isAdmin = false }) => {
             </div>
             <div className="modal-body space-y-4">
               <ol className="list-decimal space-y-3 pl-5 text-sm leading-6 text-gray-700">
-                <li>下载并解压后打开本机助手；首次打开会安装到当前用户并注册开机启动。</li>
-                <li>助手只绑定本机回环地址，不会把密码或验证码放进监控台页面。</li>
-                <li>看到“安装完成”后回到此页面，再次点击“本机 Chrome 登录”；以后重启电脑也会自动运行。</li>
+                <li>下载并解压扩展包。</li>
+                <li>在 Chrome 打开 chrome://extensions（Edge 打开 edge://extensions），开启“开发者模式”，点击“加载已解压的扩展程序”并选择解压后的目录。</li>
+                <li>回到此页面重新点击登录入口；扩展只把登录 Cookie 交给监控台，密码和验证码不经过本页面。</li>
               </ol>
               <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600">
                 <p className="font-bold text-gray-900">当前状态：{clientBrowserConnection.title}</p>
                 <p className="mt-1">{clientBrowserConnection.detail}</p>
               </div>
-              <a href={NATIVE_HELPER_MACOS_URL} download className="ios-btn-primary inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl px-4 font-bold">
-                <Upload className="h-4 w-4" />
-                下载 macOS 助手（Apple 芯片）
-              </a>
-              <a href={NATIVE_HELPER_WINDOWS_URL} download className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-gray-300 bg-white px-4 font-bold text-gray-700">
-                <Upload className="h-4 w-4" />
-                下载 Windows 助手（x64）
-              </a>
-              <a href={CLIENT_BROWSER_EXTENSION_URL} download className="inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl border border-gray-300 bg-white px-4 font-bold text-gray-700">
+              <a href={CLIENT_BROWSER_EXTENSION_URL} download className="ios-btn-primary inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl px-4 font-bold">
                 <Chrome className="h-4 w-4" />
-                改用浏览器扩展导入
+                下载浏览器扩展 {CLIENT_BROWSER_EXTENSION_VERSION}
               </a>
             </div>
             <div className="modal-footer flex gap-3">
