@@ -2657,6 +2657,49 @@ class XianyuLive:
             # 发送Cookie更新失败通知
             await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
 
+    async def _recover_via_slider_password_login(
+        self,
+        username: str,
+        password: str,
+        trigger_reason: str = "",
+    ) -> str:
+        """后台用账密 + 滑块隐身自动重登，返回新的 Cookie 字符串（失败返回空串）。
+
+        复用移植自上游的 XianyuSliderStealth（隐身启动参数 + 人性化滑块轨迹），以同步
+        Playwright 跑在独立线程里。带 60s 冷却，避免过期风暴时反复拉起浏览器。能否真正
+        过闲鱼当前滑块由运行时决定；未过或需人脸验证时返回空串，交由调用方回落兜底。
+        """
+        del trigger_reason
+        now = time.time()
+        last = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
+        if now - last < XianyuLive._password_login_cooldown:
+            remaining = int(XianyuLive._password_login_cooldown - (now - last))
+            logger.info(f"【{self.cookie_id}】密码自愈重登冷却中（{remaining}s），跳过本次")
+            return ""
+        XianyuLive._last_password_login_time[self.cookie_id] = now
+
+        def _run() -> dict:
+            from utils.xianyu_slider_stealth import XianyuSliderStealth
+            slider = XianyuSliderStealth(user_id=self.cookie_id, headless=True)
+            result = slider.login_with_password_playwright(
+                username,
+                password,
+                show_browser=False,
+            )
+            return result or {}
+
+        try:
+            cookies = await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】滑块密码自愈重登异常: {type(exc).__name__}")
+            return ""
+        if not cookies or not str(cookies.get("unb") or "").strip():
+            logger.warning(
+                f"【{self.cookie_id}】滑块密码自愈重登未拿到有效 Cookie（可能未过滑块或需人脸验证）"
+            )
+            return ""
+        return "; ".join(f"{key}={value}" for key, value in cookies.items() if key and value)
+
     async def _try_password_login_refresh(
         self,
         trigger_reason: str = "令牌/Session过期",
@@ -2796,6 +2839,37 @@ class XianyuLive:
             )
             logger.warning(f"【{self.cookie_id}】平台状态检查为临时异常，保留原 Cookie 并进入退避")
             return False
+
+        # 平台会话确已失效。优先用账密 + 滑块隐身在后台自动重登：成功即免去人工重扫；
+        # 未过滑块/需人脸时回落到下面的官方验证会话（可远程接管）或人工态护栏。
+        recover_username = str(account_info.get("username") or "").strip()
+        recover_password = str(account_info.get("password") or "")
+        if is_valid_account_login_username(recover_username) and recover_password:
+            slider_cookie = await self._recover_via_slider_password_login(
+                recover_username,
+                recover_password,
+                trigger_reason,
+            )
+            if slider_cookie:
+                updated = await self._update_cookies_and_restart(
+                    slider_cookie,
+                    browser_user_agent=browser_user_agent or detect_default_browser_user_agent(),
+                    expected_revision=refresh_revision,
+                    expected_xianyu_unb=profile_unb,
+                )
+                if updated:
+                    db_manager.update_account_session_refresh(
+                        self.cookie_id,
+                        state="success",
+                        trigger=trigger_reason,
+                        message="账密 + 滑块隐身后台自动重登成功",
+                    )
+                    db_manager.mark_cookie_validated(self.cookie_id)
+                    logger.info(f"【{self.cookie_id}】滑块隐身密码自愈重登成功，已交接新监听")
+                    return True
+                logger.warning(
+                    f"【{self.cookie_id}】滑块登录拿到 Cookie 但监听交接失败，回落官方验证会话"
+                )
 
         worker = OfficialLoginWorker()
         if reuse_active_registration:

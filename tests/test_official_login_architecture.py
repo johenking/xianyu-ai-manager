@@ -17,14 +17,18 @@ class OfficialLoginArchitectureTests(unittest.TestCase):
         self.assertNotIn('/qr-login/cooldown-status', source)
         self.assertNotIn("refresh_cookies_from_qr_login(", source)
 
-    def test_runtime_refresh_cannot_pass_legacy_server_browser_capability_gate(self):
+    def test_runtime_refresh_capability_gate_requires_saved_credentials(self):
         source = inspect.getsource(XianyuLive._try_password_login_refresh)
 
         self.assertIn("supports_automatic_refresh", source)
         self.assertIn('account_info.get("password")', source)
         self.assertIn("manual_reauth_required", source)
         from account_session_refresh import supports_automatic_refresh
-        self.assertFalse(supports_automatic_refresh("password", "fixture", True))
+        # 2026-08-14 语义反转：有账密（用户名合法）即通过自动续期门禁；
+        # 无密码或用户名非法仍被拒并走人工重登。
+        self.assertTrue(supports_automatic_refresh("password", "fixture", True))
+        self.assertFalse(supports_automatic_refresh("password", "fixture", False))
+        self.assertFalse(supports_automatic_refresh("password", "", True))
 
     def test_diagnostics_do_not_claim_saved_password_is_required_for_refresh(self):
         source = inspect.getsource(reply_server.diagnose_auto_reply)

@@ -209,7 +209,9 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         active_refresh_registry.unregister("account-1")
         active_refresh_registry.consume_cancelled("account-1")
 
-    async def test_saved_password_never_restores_server_browser_refresh(self):
+    async def test_saved_password_probe_expired_triggers_slider_self_recovery(self):
+        # 2026-08-14 语义反转：有账密账号 probe 判定过期后，先走滑块隐身密码自愈；
+        # 滑块成功即完成续期，不再进入人工重登，也不启动官方验证会话。
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
@@ -217,6 +219,9 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         live.cookies = {"unb": "9988", "cookie2": "old"}
         live.pending_verification_url = ""
         live._update_cookies_and_restart = AsyncMock(return_value=True)
+        live._recover_via_slider_password_login = AsyncMock(
+            return_value="unb=9988; cookie2=slider-renewed"
+        )
         live.send_token_refresh_notification = AsyncMock()
         database = FakeRefreshDatabase()
         probe = AsyncMock(return_value=SessionProbeResult(
@@ -234,14 +239,18 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             success = await live._try_password_login_refresh("手动立即刷新")
 
-        self.assertFalse(success)
+        self.assertTrue(success)
+        probe.assert_awaited_once()
+        live._recover_via_slider_password_login.assert_awaited_once()
+        self.assertEqual(
+            live._recover_via_slider_password_login.await_args.args[:2],
+            ("seller@example.com", "secret"),
+        )
+        live._update_cookies_and_restart.assert_awaited_once()
+        # 滑块自愈成功后不应再启动官方验证会话（服务端浏览器）
         self.assertEqual(FakeOfficialRefreshService.calls, [])
-        live._update_cookies_and_restart.assert_not_awaited()
-        probe.assert_not_awaited()
-        self.assertEqual(database.updates[-1][1]["state"], "manual_reauth_required")
-        self.assertEqual(database.updates[-1][1]["error_code"], "manual_reauth_required")
-        self.assertIn("绑定当前设备", database.updates[-1][1]["message"])
-        self.assertEqual(database.validated_calls, 0)
+        self.assertEqual(database.status["state"], "success")
+        self.assertEqual(database.validated_calls, 1)
 
     async def test_non_password_login_freezes_without_probe_or_browser(self):
         live = object.__new__(XianyuLive)
@@ -279,13 +288,17 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         live.send_token_refresh_notification.assert_awaited_once()
         self.assertIn("重新扫码", live.send_token_refresh_notification.await_args.args[0])
 
-    async def test_repeated_password_refresh_requests_never_start_server_browser(self):
+    async def test_invalid_credentials_enter_manual_reauth_once_without_retry_storm(self):
+        # 2026-08-14 语义反转：有账密账号 probe 过期后允许一次完整自愈（滑块失败 ->
+        # 官方验证会话）。凭据类失败（invalid_credentials）落入 manual_reauth_required
+        # 单向态；第二次触发必须被人工态护栏拦下，不得再拉起滑块或官方浏览器。
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
         live.cookies_str = "unb=9988; cookie2=old"
         live.cookies = {"unb": "9988", "cookie2": "old"}
         live.pending_verification_url = ""
+        live._recover_via_slider_password_login = AsyncMock(return_value="")
         live.send_token_refresh_notification = AsyncMock()
         database = FakeRefreshDatabase()
         probe = AsyncMock(return_value=SessionProbeResult(
@@ -307,18 +320,23 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(first)
         self.assertFalse(second)
-        self.assertEqual(FailingOfficialRefreshService.calls, [])
+        # 第一次允许尝试一次官方验证会话；第二次被 manual_reauth_required 护栏拦截
+        self.assertEqual(len(FailingOfficialRefreshService.calls), 1)
+        live._recover_via_slider_password_login.assert_awaited_once()
         self.assertEqual(database.status["state"], "manual_reauth_required")
         self.assertEqual(database.status["error_code"], "manual_reauth_required")
         self.assertEqual(database.expired_calls, 1)
 
-    async def test_legacy_transient_path_does_not_restore_server_browser_refresh(self):
+    async def test_transient_official_failure_stays_retryable_for_password_accounts(self):
+        # 2026-08-14 语义反转：有账密账号的临时性失败（profile_in_use）保持可重试的
+        # failed 态，不落入 manual_reauth_required 单向门，后续触发允许再次自愈。
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.user_id = 7
         live.cookies_str = "unb=9988; cookie2=old"
         live.cookies = {"unb": "9988", "cookie2": "old"}
         live.pending_verification_url = ""
+        live._recover_via_slider_password_login = AsyncMock(return_value="")
         live.send_token_refresh_notification = AsyncMock()
         database = FakeRefreshDatabase()
         probe = AsyncMock(return_value=SessionProbeResult(
@@ -344,10 +362,11 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(first)
         self.assertFalse(second)
-        self.assertEqual(FailingOfficialRefreshService.calls, [])
-        self.assertEqual(database.status["state"], "manual_reauth_required")
-        self.assertEqual(database.status["error_code"], "manual_reauth_required")
-        self.assertEqual(database.expired_calls, 1)
+        # 临时失败不冻结账号：两次触发都完整走到官方验证会话
+        self.assertEqual(len(FailingOfficialRefreshService.calls), 2)
+        self.assertEqual(database.status["state"], "failed")
+        self.assertEqual(database.status["error_code"], "profile_in_use")
+        self.assertEqual(database.expired_calls, 0)
 
     async def test_message_token_probe_uses_persisted_browser_ua_and_never_starts_browser(self):
         live = object.__new__(XianyuLive)

@@ -123,12 +123,13 @@ def supports_automatic_refresh(
 ) -> bool:
     """Return whether legacy server-side browser refresh may run.
 
-    Password material, a valid username, and an old enable flag are no longer
-    authority to launch Playwright on the service host. Client-device renewal
-    is evaluated separately against a verified device binding.
+    2026-08-14：移植滑块隐身密码登录栈（utils/xianyu_slider_stealth.py）后，服务端可在
+    后台用账号密码自动重登并过滑块，因此对"配置了有效登录用户名 + 密码"的账号重新开启
+    自动续期——免去扫码 Cookie 约 10 小时过期后必须人工重扫的痛点。仅凭旧的启用开关或
+    仅有密码但用户名非法时不放行。
     """
-    del login_method, username, has_password
-    return False
+    del login_method
+    return bool(has_password and is_valid_account_login_username(username))
 
 
 def password_refresh_requires_manual_reauth(error_code: Optional[str]) -> bool:

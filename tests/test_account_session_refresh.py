@@ -53,9 +53,14 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
         self.db.conn.close()
         os.unlink(self.db_path)
 
-    def test_saved_password_never_enables_server_browser_refresh(self):
-        self.assertFalse(
+    def test_saved_password_enables_automatic_refresh(self):
+        # 2026-08-14 语义反转：移植滑块隐身密码登录栈后，有密码且用户名合法的账号
+        # 重新支持服务端自动续期；无密码仍然不放行。
+        self.assertTrue(
             supports_automatic_refresh("password", "seller@example.com", True)
+        )
+        self.assertFalse(
+            supports_automatic_refresh("password", "seller@example.com", False)
         )
 
     def test_cookie_upsert_only_updates_cookie_and_preserves_account_data(self):
