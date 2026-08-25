@@ -7,6 +7,7 @@ interface ProxyImageRequest {
   key: string;
   orderId: string;
   token: string;
+  retry: boolean;
   controller: AbortController;
   consumers: number;
   state: 'queued' | 'active' | 'settled';
@@ -83,7 +84,7 @@ const pumpProxyQueue = () => {
     void (async () => {
       try {
         const response = await fetch(
-          `/api/orders/${encodeURIComponent(request.orderId)}/item-image`,
+          `/api/orders/${encodeURIComponent(request.orderId)}/item-image${request.retry ? '?retry=true' : ''}`,
           {
             headers: { Authorization: `Bearer ${request.token}` },
             signal: request.controller.signal,
@@ -177,6 +178,7 @@ const acquireProxyImage = (
       key,
       orderId,
       token,
+      retry: force,
       controller: new AbortController(),
       consumers: 0,
       state: 'queued',

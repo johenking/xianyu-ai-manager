@@ -122,5 +122,9 @@ describe('OrderItemImage request scheduling', () => {
 
     fireEvent.click(retry);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/orders/order-missing/item-image?retry=true',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 });
