@@ -1,10 +1,18 @@
 # Handoff
 
+## 2026-08-25 扫码免密自动续签（L3 登录五阶段）发布
+
+本轮把扫码免密自动续签五阶段（`7055de7`）连同审查优化（`330ab1c`）发布到生产：扫码成功落持久浏览器档案 `browser_data/user_<unb>` 并在 DB 标记 L3 记忆（迁移 `2026082502` 为 `cookies` 加 `has_l3_memory/l3_memory_at` 两列）；续签失效时免密快速进入优先于账密路径；`supports_automatic_refresh` 与 `auto_refresh_supported` 接受 L3 记忆为合法条件；失败纳入既有分层错误；CDP 接管仅在配置 `XIANYU_CHROME_CDP_ENDPOINT` 时启用，连不上或身份不符一律失败关闭。审查优化堵住四个缺口：免密续签以进浏览器前 Cookie 为基线，`cookie2` 与 `_m_h5_tk` 均未换新判 `session_not_renewed`（可重试），杜绝断网时旧 Cookie 被当成续签成功；「快速进入」按钮先探测存在性，iframe 加载而按钮缺失判 `fast_entry_unavailable`（单向 manual + 一次性告警），点击超时才可重试；CDP 建档失败不再 `mark_profile_ready` 虚标 L3，`has_l3_memory` 如实回写；浏览器启动失败的 `profile_in_use` 分类收窄到 ProcessSingleton/SingletonLock。
+
+发布替换 8 个后端文件、新增 `utils/xianyu_l3_memory.py` 与 `utils/xianyu_slider_stealth.py`（2026-08-19 的滑块隐身账密自愈 `10fe06a` 随本轮一并上线，结束 Bundle A 的显式排除状态），`global_config.yml` 的 `TOKEN_REFRESH_INTERVAL` 3600→1800；前端静态整代切换，产物由 git worktree 检出 `330ab1c` 干净构建，未混入并行工作树改动。门禁：后端全量 `1016 passed / 201 subtests`（含 5 个新增优化回归）、Ruff 全绿、前端 tsc 零错误、L3 定向三文件 57 passed；迁移在生产数据库在线副本演练 `2026082401→2026082502`，integrity ok、外键违规 0。生产核验：PID `17178`（18:41 kickstart）、单 `8091` listener、本地/公网 readiness `ready`、迁移 `2026082502`、两账号 listener 心跳正常、重启窗口 8 处瞬时 WS 连接 ERROR 自愈、无 Traceback。真人 canary 按用户指令调整为部署后首次真实观察（下次扫码建档 → 约 10 小时后首次免密续签），观察项见 `BLOCKED.md`。证据与可执行回滚位于 `outputs/l3-login-deploy-20260825T183702+0800/`（`rollback/rollback.sh` + `db-backup` + `static-original`）。
+
+同日 19:09 并行会话完成商品管理/知识档案全局 Toast 反馈的纯静态发布（`874a29a`，零停机、不重启、无迁移）：公网入口前移至 `assets/index-DX2cSsFw.js` 与 `assets/index-BsM2xUcO.css`，PID 不变，L3 的 AccountList UI 保留；证据位于 `outputs/knowledge-toast-20260825T190639+0800/`。
+
 ## 2026-08-25 Bundle A：AI 订单作用域回复、订单业务分类与告警收窄发布
 
 本轮把维护源积压的后端能力按 7 文件候选（`XianyuAutoAsync.py`、`ai_reply_engine.py`、`db_manager.py`、`reply_server.py`、`schema_migrations.py`、`order_sync_service.py`、`invite_bridge_poller.py`）发布到生产：AI 回复引擎新增订单作用域对话（迁移 `2026081801` 为 `ai_conversations` 补插 `order_id/source/delivery_state` 三列、3 个索引并把存量行标记 `legacy`）、shadow 双跑指标与模型调用预算；订单同步新增 `classify_order_business_type`，自动发货与邀请轮询对非 `ordinary` 订单失败关闭；2026-08-19 的告警策略收窄正式上线（普通客户聊天静默，失败/拦截/人工复核与会话终态告警保留）。
 
-候选从生产原件派生并保留当日上午的生产热修：消息 Token 探测透传 listener `device_id`（根治 `device_id_or_appkey_is_not_equal` 401，热修后零复发）、AI 出站失败日志记录 `OutboundRequestError.code`、仪表盘状态校验统一 `DASHBOARD_ANALYTICS_STATUSES`。滑块隐身账密自愈重登按失败关闭原则显式排除：候选移除 `_recover_via_slider_password_login` 及调用点，`account_session_refresh.py` 保持生产旧语义，`utils/xianyu_slider_stealth.py` 不部署；该特性继续留在维护源等待真机金丝雀。热修已回写维护源（含 `utils/xianyu_session_probe.py` 显式 `device_id` 支持）并补 2 个回归测试。
+候选从生产原件派生并保留当日上午的生产热修：消息 Token 探测透传 listener `device_id`（根治 `device_id_or_appkey_is_not_equal` 401，热修后零复发）、AI 出站失败日志记录 `OutboundRequestError.code`、仪表盘状态校验统一 `DASHBOARD_ANALYTICS_STATUSES`。滑块隐身账密自愈重登按失败关闭原则显式排除：候选移除 `_recover_via_slider_password_login` 及调用点，`account_session_refresh.py` 保持生产旧语义，`utils/xianyu_slider_stealth.py` 不部署；该特性当时留在维护源等待真机金丝雀（同日晚间的 L3 发布已将其随 `10fe06a` 一并上线，见上一节）。热修已回写维护源（含 `utils/xianyu_session_probe.py` 显式 `device_id` 支持）并补 2 个回归测试。
 
 门禁：维护源全量 `996 passed / 201 subtests`、Ruff 全绿；候选 `py_compile` 通过；隔离树（生产代码 + 候选 7 文件 + 维护源 tests）`985 passed / 11 failed`，11 个失败全部映射到有意排除的滑块特性，零意外失败。生产核验：新 PID `79093`（14:16:27）、单 `8091` listener、本地/公网 readiness `ready`、迁移 `2026081801` 已应用且 health 仍报 MAX 版本 `2026082401`、SQLite `integrity_check=ok`、外键违规 0、存量 37302 行 legacy 回填、新语义对话行已实时写入、4 个账号 listener 重连、`AI_SHADOW_METRIC` 指标流正常、日志无 Traceback。
 

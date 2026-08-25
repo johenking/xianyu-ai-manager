@@ -64,7 +64,7 @@
 
 ## 自动续期与人工重登
 
-密码账号续期仍可由已绑定的当前设备扩展执行。扫码账号优先使用持久浏览器档案免密续签：打开 `browser_data/user_<unb>`，如出现 passport 弹窗则点击「快速进入」，再访问 `/bought` 取得完整会话 Cookie（必须含 `_m_h5_tk`、`unb`、`cookie2`）。服务端 Playwright 不把未验证结果当成功。
+密码账号续期仍可由已绑定的当前设备扩展执行。扫码账号优先使用持久浏览器档案免密续签：打开 `browser_data/user_<unb>`，如出现 passport 弹窗则点击「快速进入」，再访问 `/bought` 取得完整会话 Cookie（必须含 `_m_h5_tk`、`unb`、`cookie2`）。服务端 Playwright 不把未验证结果当成功：免密续签以进入浏览器前的 Cookie 为基线，`cookie2` 与 `_m_h5_tk` 均未换新时判 `session_not_renewed` 并保持可重试；passport iframe 已加载但「快速进入」按钮缺失时判 `fast_entry_unavailable`，进入人工重登并发送一次性告警。
 
 非密码且无 L3 记忆的来源调用 `POST /api/accounts/{cookie_id}/session-refresh` 时，后端直接返回 `manual_reauth_required`。密码或免密续期遇到以下终态时也进入稳定人工重登状态：
 
@@ -72,8 +72,9 @@
 - 稳定身份缺失或不一致。
 - 人工验证或官方登录超时。
 - 官方登录页面结构失配。
+- 免密续签「快速进入」按钮缺失（`fast_entry_unavailable`，需重新扫码建立记忆）。
 
-已进入 `manual_reauth_required` 后，账号监听进入被动等待，不再建立 WebSocket、探测消息 Token 或启动浏览器；定时刷新、运行时过期处理和手动刷新也不会重复执行。`profile_in_use`、临时平台错误和用户取消仍保持可重试。成功完成对应登录后清除过期状态并恢复监听。
+已进入 `manual_reauth_required` 后，账号监听进入被动等待，不再建立 WebSocket、探测消息 Token 或启动浏览器；定时刷新、运行时过期处理和手动刷新也不会重复执行。`profile_in_use`、`session_not_renewed`、临时平台错误和用户取消仍保持可重试。成功完成对应登录后清除过期状态并恢复监听。
 
 `reauth_action` 可能为 `qr_login`、`sms_login`、`password_login`、`chrome_extension_import`、`manual_cookie` 或 `choose_login`。账号页按 `account_id + last_expired_at` 记录一次性提醒，同一次过期不重复弹窗；账号卡持续显示对应入口。
 

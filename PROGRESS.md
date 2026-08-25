@@ -7,12 +7,12 @@
 
 # 当前生产状态
 
-- 最终复核时间：2026-08-25 18:43（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `17178`（18:41 kickstart）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`（`cookies.has_l3_memory/l3_memory_at` 加列），SQLite 迁移演练与部署均 integrity ok。
-- 当前生产 = Bundle A + 滑块隐身账密自愈（`10fe06a`）+ 扫码免密续签五阶段（`7055de7`）+ 审查优化（`330ab1c`）：替换 8 个后端文件、新增 `utils/xianyu_l3_memory.py` 与 `utils/xianyu_slider_stealth.py`、`global_config.yml` 的 `TOKEN_REFRESH_INTERVAL` 3600→1800。生产运行时文件与源码 main（`330ab1c`）对齐。
-- 前端静态资源整代切换：公网入口 `assets/index-B2WW7m1I.js`（AccountList 增加 L3 记忆标识与免密续签开关）；产物由 git worktree 检出 `330ab1c` 干净构建，未混入工作树并行改动。
+- 最终复核时间：2026-08-25 19:19（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `17178`（18:41 kickstart）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`（`cookies.has_l3_memory/l3_memory_at` 加列），SQLite 迁移演练与部署均 integrity ok。
+- 当前生产 = Bundle A + 滑块隐身账密自愈（`10fe06a`）+ 扫码免密续签五阶段（`7055de7`）+ 审查优化（`330ab1c`）+ 知识档案/商品 Toast 静态发布（`874a29a`）：后端与源码 `330ab1c` 对齐（替换 8 个后端文件、新增 `utils/xianyu_l3_memory.py` 与 `utils/xianyu_slider_stealth.py`、`global_config.yml` 的 `TOKEN_REFRESH_INTERVAL` 3600→1800），前端与源码 `874a29a` 对齐。
+- 前端公网入口现为 `assets/index-DX2cSsFw.js` / `assets/index-BsM2xUcO.css`：L3 发布（18:42，worktree 检出 `330ab1c` 干净构建，入口 `index-B2WW7m1I.js`，AccountList 增加 L3 记忆标识与免密续签开关）之后，同日 19:09 并行会话以纯静态方式发布 Toast 反馈（零停机、PID 不变、L3 UI 保留）。
 - 重启后两账号 listener 心跳与消息接收正常；重启窗口 8 处瞬时 WS 连接 ERROR 已自愈，无 Traceback。
 - listener 注册隔离仍有效；`runtime_sessions` 只记录带 TTL 的临时操作，不代表 listener 数量。
-- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。当前工作树含用户资产（并行会话的 Toast/ItemList 前端改动），禁止 reset、checkout 覆盖、clean 或未经确认的清理。
+- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。并行会话的 Toast/ItemList 前端改动已随 `874a29a` 提交并发布，工作树现仅剩未跟踪的 `.cursor/`（用户配置资产，禁止清理或提交）。
 
 ## 部署后观察（替代真人 canary）
 
@@ -22,7 +22,8 @@
 
 ## 证据路由
 
-- 当前发布：`outputs/l3-login-deploy-20260825T183702+0800/`（evidence/verification-record.md、original/、candidate/、rollback/rollback.sh + db-backup + static-original）。
+- L3 发布：`outputs/l3-login-deploy-20260825T183702+0800/`（evidence/verification-record.md、original/、candidate/、rollback/rollback.sh + db-backup + static-original）。
+- Toast 静态发布：`outputs/knowledge-toast-20260825T190639+0800/`（并行会话，纯前端）。
 - 上一发布：`outputs/bundle-a-20260825T133612+0800/`（evidence/verification-record.md、patch、rollback）。
 - 当前发布、历史发布与回滚：`docs/handoff.md`。
 - 尚未闭合的外部门禁：`BLOCKED.md`。
