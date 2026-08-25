@@ -10322,18 +10322,65 @@ ORDER_ITEM_IMAGE_CACHE_DIR = os.path.join(
 ORDER_ITEM_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 ORDER_ITEM_IMAGE_TIMEOUT_SECONDS = 10
 ORDER_ITEM_IMAGE_MAX_REDIRECTS = 3
+ORDER_ITEM_IMAGE_FAILURE_TTL_SECONDS = 300
+ORDER_ITEM_IMAGE_FAILURE_CACHE_MAX_ENTRIES = 512
+ORDER_ITEM_IMAGE_MAX_CONCURRENT_DOWNLOADS = 4
 ORDER_ITEM_IMAGE_TRUSTED_HOST_SUFFIXES = (
     'alicdn.com',
     'goofish.com',
     'tbcdn.cn',
 )
 _ORDER_ITEM_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_ORDER_ITEM_IMAGE_FAILURE_CACHE: OrderedDict[str, Tuple[float, int, str]] = (
+    OrderedDict()
+)
+_ORDER_ITEM_IMAGE_INFLIGHT: Dict[Tuple[int, str], asyncio.Task] = {}
+_ORDER_ITEM_IMAGE_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
+_ORDER_ITEM_IMAGE_STATE_LOCK = threading.Lock()
 
 
 def _order_item_image_cache_path(image_url: str) -> Tuple[str, str]:
     """由源地址导出确定性缓存键与落盘路径（重编码后统一为 JPEG）。"""
     cache_key = hashlib.sha256(image_url.encode('utf-8')).hexdigest()[:32] + '.jpg'
     return cache_key, os.path.join(ORDER_ITEM_IMAGE_CACHE_DIR, cache_key)
+
+
+def _get_order_item_image_failure(cache_key: str) -> Optional[Tuple[int, str]]:
+    now = time.monotonic()
+    with _ORDER_ITEM_IMAGE_STATE_LOCK:
+        cached = _ORDER_ITEM_IMAGE_FAILURE_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        expires_at, status_code, reason = cached
+        if expires_at <= now:
+            _ORDER_ITEM_IMAGE_FAILURE_CACHE.pop(cache_key, None)
+            return None
+        _ORDER_ITEM_IMAGE_FAILURE_CACHE.move_to_end(cache_key)
+        return status_code, reason
+
+
+def _remember_order_item_image_failure(
+    cache_key: str,
+    status_code: int,
+    reason: str,
+) -> None:
+    with _ORDER_ITEM_IMAGE_STATE_LOCK:
+        _ORDER_ITEM_IMAGE_FAILURE_CACHE[cache_key] = (
+            time.monotonic() + ORDER_ITEM_IMAGE_FAILURE_TTL_SECONDS,
+            status_code,
+            reason,
+        )
+        _ORDER_ITEM_IMAGE_FAILURE_CACHE.move_to_end(cache_key)
+        while (
+            len(_ORDER_ITEM_IMAGE_FAILURE_CACHE)
+            > ORDER_ITEM_IMAGE_FAILURE_CACHE_MAX_ENTRIES
+        ):
+            _ORDER_ITEM_IMAGE_FAILURE_CACHE.popitem(last=False)
+
+
+def _forget_order_item_image_failure(cache_key: str) -> None:
+    with _ORDER_ITEM_IMAGE_STATE_LOCK:
+        _ORDER_ITEM_IMAGE_FAILURE_CACHE.pop(cache_key, None)
 
 
 def _trusted_order_image_url(image_url: str) -> Tuple[str, int]:
@@ -10506,8 +10553,123 @@ def _publish_order_item_image_atomically(image: Any, cache_path: str) -> None:
         Path(temporary_path).unlink(missing_ok=True)
 
 
+def _transcode_order_item_image(raw: bytes, cache_path: str) -> None:
+    from PIL import Image as PILImage, UnidentifiedImageError
+
+    try:
+        image = PILImage.open(io.BytesIO(raw))
+        image = image.convert('RGB')
+        _publish_order_item_image_atomically(image, cache_path)
+    except UnidentifiedImageError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "unsupported_format"},
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"reason": "unsupported_format"},
+        ) from exc
+
+
+async def _materialize_order_item_image(
+    cache_key: str,
+    image_url: str,
+    cache_path: str,
+) -> None:
+    import aiohttp
+
+    loop_id = id(asyncio.get_running_loop())
+    semaphore = _ORDER_ITEM_IMAGE_SEMAPHORES.setdefault(
+        loop_id,
+        asyncio.Semaphore(ORDER_ITEM_IMAGE_MAX_CONCURRENT_DOWNLOADS),
+    )
+    try:
+        async with semaphore:
+            if os.path.isfile(cache_path):
+                return
+            timeout = aiohttp.ClientTimeout(
+                total=ORDER_ITEM_IMAGE_TIMEOUT_SECONDS,
+            )
+            connector = await _build_pinned_order_image_connector(image_url)
+            resolver = getattr(connector, '_order_image_resolver')
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    connector_owner=False,
+                ) as session:
+                    raw = await _download_order_item_image(
+                        session,
+                        image_url,
+                        resolver,
+                    )
+            finally:
+                await connector.close()
+            await asyncio.to_thread(
+                _transcode_order_item_image,
+                raw,
+                cache_path,
+            )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        reason = str(detail.get('reason') or 'source_expired')
+        status_code = 422 if exc.status_code == 422 else 404
+        _remember_order_item_image_failure(
+            cache_key,
+            status_code,
+            reason,
+        )
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _remember_order_item_image_failure(
+            cache_key,
+            404,
+            'source_expired',
+        )
+        raise HTTPException(
+            status_code=404,
+            detail={"reason": "source_expired"},
+        ) from exc
+    else:
+        _forget_order_item_image_failure(cache_key)
+
+
+async def _ensure_order_item_image(
+    cache_key: str,
+    image_url: str,
+    cache_path: str,
+) -> None:
+    if os.path.isfile(cache_path):
+        return
+    loop = asyncio.get_running_loop()
+    inflight_key = (id(loop), cache_key)
+    task = _ORDER_ITEM_IMAGE_INFLIGHT.get(inflight_key)
+    if task is None or task.done():
+        task = loop.create_task(
+            _materialize_order_item_image(
+                cache_key,
+                image_url,
+                cache_path,
+            )
+        )
+        _ORDER_ITEM_IMAGE_INFLIGHT[inflight_key] = task
+
+        def forget(completed: asyncio.Task) -> None:
+            if _ORDER_ITEM_IMAGE_INFLIGHT.get(inflight_key) is completed:
+                _ORDER_ITEM_IMAGE_INFLIGHT.pop(inflight_key, None)
+
+        task.add_done_callback(forget)
+    await asyncio.shield(task)
+
+
 @orders_router.get('/api/orders/{order_id}/item-image')
 async def get_order_item_image(order_id: str,
+                               retry: bool = Query(False),
                                current_user: Dict[str, Any] = Depends(get_current_user),
                                orders_db: Any = Depends(get_orders_db)):
     """返回订单商品图的应用内缓存字节流；失败返回机读原因。
@@ -10516,10 +10678,6 @@ async def get_order_item_image(order_id: str,
     失败区分：not_saved（无可用图源）/ source_expired（源站拉取失败）/
     unsupported_format（源不是可解码图片，含 HEIC）。
     """
-    import aiohttp
-    from PIL import Image as PILImage, UnidentifiedImageError
-    from fastapi.responses import FileResponse
-
     user_id = current_user['user_id']
     user_cookies = orders_db.get_all_cookies(user_id)
     order = orders_db.get_order_by_id(order_id, cookie_ids=list(user_cookies))
@@ -10544,33 +10702,18 @@ async def get_order_item_image(order_id: str,
     response_headers = {"Cache-Control": "private, max-age=86400"}
     if os.path.isfile(cache_path):
         return FileResponse(cache_path, media_type='image/jpeg', headers=response_headers)
+    if retry:
+        _forget_order_item_image_failure(cache_key)
+    else:
+        cached_failure = _get_order_item_image_failure(cache_key)
+        if cached_failure is not None:
+            status_code, reason = cached_failure
+            raise HTTPException(
+                status_code=status_code,
+                detail={"reason": reason},
+            )
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=ORDER_ITEM_IMAGE_TIMEOUT_SECONDS)
-        connector = await _build_pinned_order_image_connector(image_url)
-        resolver = getattr(connector, '_order_image_resolver')
-        try:
-            async with aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                connector_owner=False,
-            ) as session:
-                raw = await _download_order_item_image(session, image_url, resolver)
-        finally:
-            await connector.close()
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=404, detail={"reason": "source_expired"})
-
-    try:
-        image = PILImage.open(io.BytesIO(raw))
-        image = image.convert('RGB')
-        _publish_order_item_image_atomically(image, cache_path)
-    except UnidentifiedImageError:
-        raise HTTPException(status_code=422, detail={"reason": "unsupported_format"})
-    except Exception:
-        raise HTTPException(status_code=422, detail={"reason": "unsupported_format"})
+    await _ensure_order_item_image(cache_key, image_url, cache_path)
 
     # 缓存键只在图源仍是订单快照时回写（目录兜底图不建立订单级联）
     if image_url == snapshot_image:

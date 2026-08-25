@@ -459,12 +459,18 @@ class OrderApiContractTests(unittest.TestCase):
         self.assertEqual(expired.json()["detail"]["reason"], "source_expired")
 
         with _public_image_network(error=OSError("network down")):
-            network = self.client.get("/api/orders/order-1/item-image", headers=headers)
+            network = self.client.get(
+                "/api/orders/order-1/item-image?retry=true",
+                headers=headers,
+            )
         self.assertEqual(network.status_code, 404)
         self.assertEqual(network.json()["detail"]["reason"], "source_expired")
 
         with _public_image_network(status=200, body=b"not an image / heic-like"):
-            bad_format = self.client.get("/api/orders/order-1/item-image", headers=headers)
+            bad_format = self.client.get(
+                "/api/orders/order-1/item-image?retry=true",
+                headers=headers,
+            )
         self.assertEqual(bad_format.status_code, 422)
         self.assertEqual(bad_format.json()["detail"]["reason"], "unsupported_format")
 
@@ -492,12 +498,24 @@ class OrderApiContractTests(unittest.TestCase):
         with _public_image_network(status=404, calls=calls):
             first = self.client.get("/api/orders/order-1/item-image", headers=headers)
             second = self.client.get("/api/orders/order-1/item-image", headers=headers)
+            retried = self.client.get(
+                "/api/orders/order-1/item-image?retry=true",
+                headers=headers,
+            )
 
         self.assertEqual(first.status_code, 404)
         self.assertEqual(second.status_code, 404)
+        self.assertEqual(retried.status_code, 404)
         self.assertEqual(first.json()["detail"]["reason"], "source_expired")
         self.assertEqual(second.json()["detail"]["reason"], "source_expired")
-        self.assertEqual(calls, ["https://img.alicdn.com/item-1.png"])
+        self.assertEqual(retried.json()["detail"]["reason"], "source_expired")
+        self.assertEqual(
+            calls,
+            [
+                "https://img.alicdn.com/item-1.png",
+                "https://img.alicdn.com/item-1.png",
+            ],
+        )
 
     def test_item_image_concurrent_misses_share_one_download(self):
         self._attach_snapshot_image()
@@ -705,7 +723,10 @@ class OrderApiContractTests(unittest.TestCase):
             body=b"x" * (reply_server.ORDER_ITEM_IMAGE_MAX_BYTES + 1),
             headers={"Content-Type": "image/png"},
         ):
-            streamed = self.client.get("/api/orders/order-1/item-image", headers=headers)
+            streamed = self.client.get(
+                "/api/orders/order-1/item-image?retry=true",
+                headers=headers,
+            )
         self.assertEqual(streamed.status_code, 422)
         self.assertEqual(streamed.json()["detail"]["reason"], "unsupported_format")
 
