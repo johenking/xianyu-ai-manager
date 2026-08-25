@@ -1,7 +1,16 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { get, post } from '../request';
-import { deleteReplyRule, getReplyRules, updateReplyRule } from './catalog';
+import { get, post, put } from '../request';
+import {
+  deleteReplyRule,
+  getFulfillmentRecords,
+  getReplyRules,
+  resendFulfillmentRecord,
+  updateItemDeliveryMode,
+  updateItemDeliveryModesBatch,
+  updateReplyRule,
+  validateCardApi,
+} from './catalog';
 
 vi.mock('../request', () => ({
   del: vi.fn(),
@@ -95,5 +104,50 @@ describe('关键词回复规则按内容定位（防下标漂移误删/误改）
       keyword: 'A',
       reply: 'ra',
     });
+  });
+});
+
+describe('交付中心 API 客户端合同', () => {
+  afterEach(() => vi.clearAllMocks());
+
+  it('single and batch mode writes use the atomic resource contract', async () => {
+    vi.mocked(put).mockResolvedValue({ message: 'ok', item_id: 'i-1' });
+    vi.mocked(post).mockResolvedValue({ updated: ['i-1'], failed: [] });
+
+    await updateItemDeliveryMode('acct-1', 'i-1', 'resource', 7);
+    await updateItemDeliveryModesBatch('acct-1', ['i-1'], 'resource', 7);
+
+    expect(put).toHaveBeenCalledWith('/items/acct-1/i-1/delivery-mode', {
+      mode: 'resource',
+      card_id: 7,
+    });
+    expect(post).toHaveBeenCalledWith('/items/delivery-modes/batch', {
+      cookie_id: 'acct-1',
+      item_ids: ['i-1'],
+      mode: 'resource',
+      card_id: 7,
+    });
+  });
+
+  it('API validation sends api_token and never the legacy token field', async () => {
+    vi.mocked(post).mockResolvedValue({ status: 'validated', message: 'ok' });
+
+    await validateCardApi(9, 'fresh-secret');
+
+    expect(post).toHaveBeenCalledWith('/cards/9/api/validate', {
+      api_token: 'fresh-secret',
+    });
+    expect(vi.mocked(post).mock.calls[0][1]).not.toHaveProperty('token');
+  });
+
+  it('record filters and immutable-payload resend use the dedicated endpoints', async () => {
+    vi.mocked(get).mockResolvedValue({ items: [], total: 0 });
+    vi.mocked(post).mockResolvedValue({ status: 'succeeded', event_id: 3 });
+
+    await getFulfillmentRecords('manual_review');
+    await resendFulfillmentRecord(77);
+
+    expect(get).toHaveBeenCalledWith('/fulfillment-records?state=manual_review');
+    expect(post).toHaveBeenCalledWith('/fulfillment-records/77/resend', {});
   });
 });

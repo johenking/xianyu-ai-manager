@@ -17,6 +17,12 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     cookie: item.value,
     enabled: item.enabled,
     auto_confirm: item.auto_confirm,
+    auto_rate_enabled: Boolean(item.auto_rate_enabled),
+    auto_rate_enabled_at: item.auto_rate_enabled_at ?? null,
+    auto_rate_pending_count: Number(item.auto_rate_pending_count || 0),
+    auto_rate_success_count: Number(item.auto_rate_success_count || 0),
+    auto_rate_failed_count: Number(item.auto_rate_failed_count || 0),
+    auto_rate_needs_reconcile_count: Number(item.auto_rate_needs_reconcile_count || 0),
     remark: item.remark,
     note: item.remark,
     pause_duration: item.pause_duration,
@@ -378,6 +384,10 @@ export const updateAccountRemark = async (id: string, remark: string): Promise<a
 
 export const updateAccountAutoConfirm = async (id: string, autoConfirm: boolean): Promise<any> => {
   return put(`/cookies/${id}/auto-confirm`, { auto_confirm: autoConfirm });
+};
+
+export const updateAccountAutoRate = async (id: string, enabled: boolean): Promise<any> => {
+  return put(`/cookies/${id}/auto-rate`, { auto_rate_enabled: enabled });
 };
 
 export const updateAccountPauseDuration = async (id: string, pauseDuration: number): Promise<any> => {

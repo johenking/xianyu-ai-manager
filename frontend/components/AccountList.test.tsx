@@ -30,6 +30,7 @@ import {
   refreshAccountSession,
   showAccountSessionRefreshBrowser,
   showOfficialLoginBrowser,
+  updateAccountAutoRate,
   updateAccountCookieRefreshSettings,
   getAccountAISettings,
   getAIProviders,
@@ -65,6 +66,7 @@ vi.mock('../services/api', () => ({
   showAccountSessionRefreshBrowser: vi.fn(),
   updateAccountRemark: vi.fn(),
   updateAccountAutoConfirm: vi.fn(),
+  updateAccountAutoRate: vi.fn(),
   updateAccountPauseDuration: vi.fn(),
   updateAccountCookie: vi.fn(),
   updateAccountLoginInfo: vi.fn(),
@@ -157,6 +159,8 @@ describe('AccountList session verification UI', () => {
         nickname: '验证账号',
         avatar_url: '',
         ai_enabled: false,
+        auto_rate_enabled: true,
+        auto_rate_success_count: 3,
         cookie_refresh_enabled: false,
         cookie_refresh_interval_minutes: 1440,
         username: 'seller@example.com',
@@ -414,6 +418,27 @@ describe('AccountList session verification UI', () => {
         cookie_refresh_interval_minutes: 360,
       });
     });
+  });
+
+  it('saves seller auto-review as an explicit per-account opt-in', async () => {
+    render(<AccountList />);
+
+    const accountCard = (await screen.findByRole('heading', { name: '其他账号' })).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('编辑账号'));
+    fireEvent.click(await screen.findByLabelText('卖家自动好评'));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(updateAccountAutoRate).toHaveBeenCalledWith('account-2', true);
+    });
+  });
+
+  it('shows completed auto-reviews without a fixed denominator', async () => {
+    render(<AccountList />);
+
+    expect(await screen.findByText('自动好评 已成功 3 条')).toBeInTheDocument();
+    expect(screen.queryByText('自动好评 3/3')).not.toBeInTheDocument();
   });
 
   it('shows the bound-device renewal state without exposing stored credentials', async () => {

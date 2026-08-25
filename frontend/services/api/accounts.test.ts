@@ -19,6 +19,8 @@ describe('getAccountDetails', () => {
       value: 'cookie',
       enabled: false,
       auto_confirm: false,
+      auto_rate_enabled: true,
+      auto_rate_success_count: 2,
       remark: '测试账号',
       pause_duration: 0,
     }]);
@@ -26,5 +28,7 @@ describe('getAccountDetails', () => {
     const [account] = await getAccountDetails();
 
     expect(account.avatar_url).toBeUndefined();
+    expect(account.auto_rate_enabled).toBe(true);
+    expect(account.auto_rate_success_count).toBe(2);
   });
 });

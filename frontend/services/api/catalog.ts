@@ -1,5 +1,17 @@
 import { del, get, post, put } from '../request';
-import type { ApiResponse, Card, Item, ReplyRule, ShippingRule } from '../../types';
+import type {
+  ApiResponse,
+  ApiValidationResult,
+  Card,
+  DeliveryModeBatchResult,
+  FulfillmentRecordList,
+  FulfillmentResendResult,
+  Item,
+  ItemDeliveryMode,
+  ReplyRule,
+  ShippingRule,
+  StockImportResult,
+} from '../../types';
 
 // Cards
 export const getCards = async (): Promise<Card[]> => {
@@ -22,6 +34,21 @@ export const deleteCard = async (cardId: string | number): Promise<ApiResponse> 
 export const getCardDetails = async (cardId: string | number): Promise<any> => {
   return get(`/cards/${cardId}`);
 };
+
+export type StockImportFormat = 'lines' | 'txt' | 'csv';
+
+export const importCardStock = async (
+  cardId: string | number,
+  payload: { format: StockImportFormat; content: string },
+): Promise<StockImportResult> => post(`/cards/${cardId}/stock/import`, payload);
+
+export const validateCardApi = async (
+  cardId: string | number,
+  token?: string,
+): Promise<ApiValidationResult> => post(
+  `/cards/${cardId}/api/validate`,
+  token ? { api_token: token } : {},
+);
 
 // Items
 export const getItems = async (): Promise<Item[]> => {
@@ -79,6 +106,44 @@ export const updateItemInviteAutoFulfillment = async (
 ): Promise<any> => {
     return put(`/items/${cookieId}/${itemId}/invite-auto-fulfillment`, { invite_auto_fulfillment: enabled });
 }
+
+// 新工作台只走原子三态合同；旧接口仅保留给历史调用方。
+export const updateItemDeliveryMode = async (
+  cookieId: string,
+  itemId: string,
+  mode: ItemDeliveryMode,
+  cardId: number | null = null,
+): Promise<{ message?: string; item_id?: string }> => put(
+  `/items/${cookieId}/${itemId}/delivery-mode`,
+  { mode, ...(mode === 'resource' ? { card_id: cardId } : {}) },
+);
+
+export const updateItemDeliveryModesBatch = async (
+  cookieId: string,
+  itemIds: string[],
+  mode: ItemDeliveryMode,
+  cardId: number | null = null,
+): Promise<DeliveryModeBatchResult> => post('/items/delivery-modes/batch', {
+  cookie_id: cookieId,
+  item_ids: itemIds,
+  mode,
+  ...(mode === 'resource' ? { card_id: cardId } : {}),
+});
+
+export const getFulfillmentRecords = async (
+  state?: string,
+): Promise<FulfillmentRecordList> => {
+  const query = state && state !== 'all' ? `?state=${encodeURIComponent(state)}` : '';
+  const res = await get<any>(`/fulfillment-records${query}`);
+  return {
+    items: Array.isArray(res) ? res : (res.items || []),
+    total: Array.isArray(res) ? res.length : Number(res.total || 0),
+  };
+};
+
+export const resendFulfillmentRecord = async (
+  recordId: string | number,
+): Promise<FulfillmentResendResult> => post(`/fulfillment-records/${recordId}/resend`, {});
 
 // Rules - 发货规则 (使用正确的后端API)
 export const getShippingRules = async (): Promise<ShippingRule[]> => {

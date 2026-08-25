@@ -15,6 +15,7 @@
     "test:extension": "node --test ../browser_extension/tests/*.test.mjs"
   },
   "dependencies": {
+    "@number-flow/react": "0.6.2",
     "axios": "^1.18.1",
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",

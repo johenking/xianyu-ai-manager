@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, OrderSyncResponse, AccountDetail } from '../types';
-import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails } from '../services/api';
+import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails, getShippingRules } from '../services/api';
 import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload, LogIn } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
 import { PANEL_CLASS, StatusBadge, formatCount, formatMoney, itemDisplayName } from './ui/dashboardParts';
 import OrderItemImage from './ui/OrderItemImage';
 import BuyerAvatar from './ui/BuyerAvatar';
+import { deliveryModeOf } from './ui/DeliveryMode';
 
 /** 工具栏与弹窗内的输入控件统一样式：细边、连续表面，聚焦时描边加深 */
 const FIELD_CLASS = 'rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-gray-700 outline-none transition-colors focus:border-gray-900';
@@ -69,6 +70,7 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
   const [orders, setOrders] = useState<Order[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
+  const [shippingRules, setShippingRules] = useState<Array<{ item_keyword?: string; card_group_id?: number; enabled?: boolean }>>([]);
   const [accountFilter, setAccountFilter] = useState('');
   const [startDate, setStartDate] = useState(''); // 成交时间区间起（YYYY-MM-DD，含）
   const [endDate, setEndDate] = useState('');       // 成交时间区间止（YYYY-MM-DD，含）
@@ -118,6 +120,39 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
     ),
     [accounts]
   );
+
+  const shipOrder = useMemo(
+    () => orders.find((order) => order.order_id === shipOrderId) || null,
+    [orders, shipOrderId],
+  );
+
+  const shipItem = useMemo(
+    () => shipOrder
+      ? items.find((item) => item.cookie_id === shipOrder.cookie_id && item.item_id === shipOrder.item_id) || null
+      : null,
+    [items, shipOrder],
+  );
+
+  // Only expose local full delivery when the current item has a usable source.
+  // Invite fulfillment is owned by the bridge; keyword fallback needs one unique rule.
+  const fullDeliveryAvailable = useMemo(() => {
+    if (!shipItem) return false;
+    const mode = deliveryModeOf(shipItem);
+    if (mode === 'invite') return false;
+    if (mode === 'card') return true;
+    const searchText = [shipOrder?.item_title, shipItem.item_title, shipItem.item_detail]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .join(' ');
+    if (!searchText) return false;
+    return shippingRules.filter((rule) => {
+      const keyword = String(rule.item_keyword || '').trim();
+      return rule.enabled !== false
+        && Number(rule.card_group_id || 0) > 0
+        && keyword
+        && (searchText.includes(keyword) || keyword.includes(searchText));
+    }).length === 1;
+  }, [shipItem, shipOrder, shippingRules]);
 
   // 仅多账号用户在行内显示账号标识（与筛选下拉一致）；单账号无歧义则不占用视觉空间
   const accountLabelOf = (order: Order): string => {
@@ -224,6 +259,9 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
     });
     getAccountDetails().then(setAccounts).catch((e) => {
       console.error('加载账号列表失败:', e);
+    });
+    getShippingRules().then(setShippingRules).catch((e) => {
+      console.error('加载发货规则失败:', e);
     });
   }, []);
 
@@ -1081,6 +1119,18 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
             <div className="modal-body space-y-4">
               <p className="text-sm text-gray-600">请选择发货方式：</p>
 
+              {shipItem && deliveryModeOf(shipItem) === 'invite' && (
+                <p className="rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm text-violet-800">
+                  该商品由邀请服务履约，本地不重复发送卡券。
+                </p>
+              )}
+
+              {shipItem && deliveryModeOf(shipItem) === 'off' && !fullDeliveryAvailable && (
+                <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  该商品未配置可用的自动发货内容，仅可修改闲鱼发货状态。
+                </p>
+              )}
+
               {/* 选项A: 仅修改发货状态 */}
               <button
                 onClick={() => executeShip('status_only')}
@@ -1101,25 +1151,27 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
                 </div>
               </button>
 
-              {/* 选项B: 完整发货流程 */}
-              <button
-                onClick={() => executeShip('full_delivery')}
-                disabled={shipLoading}
-                className="w-full rounded-xl border border-gray-200 p-4 text-left transition-colors hover:border-[#FFE815] hover:bg-[#FFFDE7]/60 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-[#FFF6BF] text-[#8A6D00]">
-                    <PackageCheck className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className="font-bold text-gray-900 text-sm">完整发货（匹配卡券并发送）</div>
-                    <div className="text-xs text-gray-500 mt-1 leading-relaxed">
-                      自动匹配发货规则、获取卡券、发送卡券信息给买家，并修改发货状态。
-                      适用于订单既没有发送卡券给买家、也没有修改发货状态的情况。
+              {/* 选项B: 完整发货流程，仅对当前订单存在可用本地内容时展示 */}
+              {fullDeliveryAvailable && (
+                <button
+                  onClick={() => executeShip('full_delivery')}
+                  disabled={shipLoading}
+                  className="w-full rounded-xl border border-gray-200 p-4 text-left transition-colors hover:border-[#FFE815] hover:bg-[#FFFDE7]/60 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <div className="flex items-start gap-3">
+                    <div className="mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl bg-[#FFF6BF] text-[#8A6D00]">
+                      <PackageCheck className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="font-bold text-gray-900 text-sm">完整发货（匹配卡券并发送）</div>
+                      <div className="text-xs text-gray-500 mt-1 leading-relaxed">
+                        自动匹配发货规则、获取卡券、发送卡券信息给买家，并修改发货状态。
+                        适用于订单既没有发送卡券给买家、也没有修改发货状态的情况。
+                      </div>
                     </div>
                   </div>
-                </div>
-              </button>
+                </button>
+              )}
 
               {/* 加载状态 */}
               {shipLoading && (

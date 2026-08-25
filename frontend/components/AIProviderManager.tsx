@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { CheckCircle2, Eye, EyeOff, Loader2, Pencil, Plus, RefreshCw, TestTube2, Trash2, X } from 'lucide-react';
 import {
   createAIProvider,
+  discoverAIProviderModels,
   deleteAIProvider,
   getAIProviders,
   refreshAIProviderModels,
@@ -11,6 +12,7 @@ import {
 import { AIProviderPreset, AIProviderProfile } from '../types';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import { IconAction } from './ui/ProtectedPage';
+import ModelSelector from './ModelSelector';
 
 type ProviderForm = {
   id?: number;
@@ -21,6 +23,7 @@ type ProviderForm = {
   api_key: string;
   api_key_action: 'keep' | 'set' | 'clear';
   default_model: string;
+  models: string[];
   is_default: boolean;
 };
 
@@ -32,6 +35,7 @@ const emptyForm = (preset?: AIProviderPreset): ProviderForm => ({
   api_key: '',
   api_key_action: 'keep',
   default_model: preset?.default_model || '',
+  models: [],
   is_default: false,
 });
 
@@ -66,6 +70,7 @@ const AIProviderManager: React.FC = () => {
       provider_type: preset.provider_type,
       base_url: preset.base_url,
       default_model: preset.default_model,
+      models: current.id ? current.models : [],
       name: current.id ? current.name : preset.label,
     }) : current);
   };
@@ -79,11 +84,46 @@ const AIProviderManager: React.FC = () => {
     api_key: '',
     api_key_action: 'keep',
     default_model: provider.default_model,
+    models: provider.models || [],
     is_default: provider.is_default,
   });
 
+  const discover = async () => {
+    if (!form) return;
+    setBusy('discover');
+    setNotice(null);
+    try {
+      const result = await discoverAIProviderModels({
+        profile_id: form.id,
+        provider_type: form.provider_type,
+        preset: form.preset,
+        base_url: form.base_url,
+        api_key: form.api_key || undefined,
+      });
+      const models = result.models || [];
+      if (models.length === 0) {
+        setNotice({ tone: 'info', text: '平台未返回可用模型，已保留当前列表；仍可手填模型 ID。' });
+        return;
+      }
+      setForm((current) => current ? {
+        ...current,
+        models,
+        default_model: models.includes(current.default_model) ? current.default_model : models[0],
+      } : current);
+      setNotice({ tone: 'success', text: `已获取 ${models.length} 个模型，请从默认模型下拉列表选择。` });
+    } catch (error) {
+      setNotice({ tone: 'error', text: error instanceof Error ? error.message : '模型列表获取失败' });
+    } finally {
+      setBusy('');
+    }
+  };
+
   const save = async () => {
     if (!form) return;
+    if (!form.default_model.trim()) {
+      setNotice({ tone: 'error', text: '请先选择或填写默认模型' });
+      return;
+    }
     setBusy('save');
     setNotice(null);
     try {
@@ -96,6 +136,7 @@ const AIProviderManager: React.FC = () => {
           api_key: form.api_key,
           api_key_action: form.api_key ? 'set' : form.api_key_action,
           default_model: form.default_model,
+          models: form.models,
           is_default: form.is_default,
         });
       } else {
@@ -106,6 +147,7 @@ const AIProviderManager: React.FC = () => {
           base_url: form.base_url,
           api_key: form.api_key,
           default_model: form.default_model,
+          models: form.models,
           is_default: form.is_default,
         });
       }
@@ -194,7 +236,19 @@ const AIProviderManager: React.FC = () => {
     {form && <div className="space-y-4 rounded-xl border border-yellow-200 bg-yellow-50/60 p-4">
       <div className="flex items-center justify-between"><strong>{form.id ? '编辑平台' : '添加平台'}</strong><button type="button" aria-label="关闭平台编辑" onClick={() => setForm(null)} className="rounded-md p-1.5 hover:bg-white"><X className="h-4 w-4" /></button></div>
       <label className="block text-sm font-bold text-gray-800">平台预设<select value={form.preset} onChange={(e) => choosePreset(e.target.value)} className="ios-input mt-2 h-11 w-full rounded-xl px-3 font-normal">{presetEntries.map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}</select></label>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2"><TextField label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} /><TextField label="默认模型" value={form.default_model} onChange={(default_model) => setForm({ ...form, default_model })} placeholder="可刷新后选择或手填" /></div>
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <TextField label="配置名称" value={form.name} onChange={(name) => setForm({ ...form, name })} />
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <span className="text-sm font-bold text-gray-800">默认模型</span>
+            <button type="button" disabled={busy === 'discover'} onClick={() => void discover()} className="inline-flex items-center gap-1 text-xs font-bold text-gray-700 hover:text-black disabled:opacity-50">
+              {busy === 'discover' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              获取模型
+            </button>
+          </div>
+          <ModelSelector models={form.models} value={form.default_model} onChange={(default_model) => setForm({ ...form, default_model })} disabled={busy === 'save'} />
+        </div>
+      </div>
       <TextField label="API 地址" value={form.base_url} onChange={(base_url) => setForm({ ...form, base_url })} />
       <label className="block text-sm font-bold text-gray-800">API Key<div className="relative mt-2"><input type={showKey ? 'text' : 'password'} value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value, api_key_action: e.target.value ? 'set' : 'keep' })} placeholder={form.id ? '留空保持原 Key' : '输入平台 API Key'} className="ios-input h-11 w-full rounded-xl px-3 pr-11 font-mono font-normal" /><button type="button" aria-label={showKey ? '隐藏平台密钥' : '显示平台密钥'} onClick={() => setShowKey(!showKey)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg p-2 text-gray-500 hover:bg-gray-100">{showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}</button></div></label>
       <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2"><span className="text-sm font-bold text-gray-800">设为默认平台</span><ToggleControl checked={form.is_default} onChange={(is_default) => setForm({ ...form, is_default })} label="默认平台" /></div>

@@ -1,8 +1,9 @@
 import React from 'react';
 import {
   Area,
-  AreaChart,
+  Bar,
   CartesianGrid,
+  ComposedChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -17,12 +18,18 @@ import {
   RankList,
   ShareBars,
   formatMoney,
+  getTrendHighlights,
   itemDisplayName,
   statusMetaOf,
   type DailyPoint,
 } from './ui/dashboardParts';
 
 const CHART_INITIAL_DIMENSION = { width: 320, height: 180 } as const;
+
+export const formatHeroAxisTick = (value: number): string => {
+  if (Math.abs(value) < 1000) return String(value);
+  return `${Number((value / 1000).toFixed(1))}k`;
+};
 
 /* ---------------- 深色 hero 区的营收趋势图（品牌黄线 + 渐变，日期已按范围补零） ---------------- */
 
@@ -41,7 +48,27 @@ const HeroTrendTooltip: React.FC<{
   );
 };
 
-export const HeroTrend: React.FC<{ points: DailyPoint[] }> = ({ points }) => {
+const TrendHighlight: React.FC<{
+  label: string;
+  point: DailyPoint | null;
+  value: string;
+  tone: string;
+  testId: string;
+}> = ({ label, point, value, tone, testId }) => (
+  <div className="min-w-0 px-2 py-1.5 first:pl-0 sm:border-l sm:border-white/10 sm:first:border-l-0" data-testid={testId}>
+    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</p>
+    <p className={`mt-0.5 truncate text-xs font-bold ${tone}`} title={point ? `${point.label} ${value}` : value}>
+      {point ? `${point.label} · ${value}` : '--'}
+    </p>
+  </div>
+);
+
+export const HeroTrend: React.FC<{
+  points: DailyPoint[];
+  highlightPoints?: DailyPoint[];
+  granularity?: 'hour' | 'day';
+  timeCoverage?: { total_orders: number; with_ordered_at: number; coverage_rate: number };
+}> = ({ points, highlightPoints = points, granularity = 'day', timeCoverage }) => {
   const hasData = points.some((point) => point.amount > 0 || point.orders > 0);
   if (!points.length || !hasData) {
     return (
@@ -51,10 +78,15 @@ export const HeroTrend: React.FC<{ points: DailyPoint[] }> = ({ points }) => {
     );
   }
   const dense = points.length > 12;
+  const highlights = getTrendHighlights(highlightPoints);
+  const prefersReducedMotion = typeof window !== 'undefined'
+    && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  const coverageRate = timeCoverage?.coverage_rate;
   return (
-    <div className="h-[180px] w-full">
+    <div className="w-full" data-testid="hero-trend">
+      <div className="h-[158px] w-full sm:h-[174px]">
       <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
-        <AreaChart data={points} margin={{ top: 6, right: 4, left: -16, bottom: 0 }}>
+        <ComposedChart data={points} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
           <defs>
             <linearGradient id="heroRevenue" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#FFE815" stopOpacity={0.32} />
@@ -68,12 +100,78 @@ export const HeroTrend: React.FC<{ points: DailyPoint[] }> = ({ points }) => {
             tickLine={false}
             tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 11 }}
             interval={dense ? Math.ceil(points.length / 8) : 0}
+            padding={{ left: 8, right: 8 }}
           />
-          <YAxis axisLine={false} tickLine={false} tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 11 }} width={44} />
+          <YAxis
+            yAxisId="amount"
+            axisLine={false}
+            tickLine={false}
+            tick={{ fill: 'rgba(255,255,255,0.45)', fontSize: 11 }}
+            tickFormatter={formatHeroAxisTick}
+            width={48}
+          />
+          <YAxis yAxisId="orders" orientation="right" hide domain={[0, 'auto']} />
           <Tooltip content={<HeroTrendTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.2)' }} />
-          <Area type="monotone" dataKey="amount" name="销售额" stroke="#FFE815" strokeWidth={2.5} fill="url(#heroRevenue)" />
-        </AreaChart>
+          <Bar
+            yAxisId="orders"
+            dataKey="orders"
+            name="订单数"
+            fill="#38BDF8"
+            fillOpacity={0.28}
+            radius={[3, 3, 0, 0]}
+            isAnimationActive={!prefersReducedMotion}
+            animationDuration={650}
+          />
+          <Area
+            yAxisId="amount"
+            type="monotone"
+            dataKey="amount"
+            name="销售额"
+            stroke="#FFE815"
+            strokeWidth={2.5}
+            fill="url(#heroRevenue)"
+            isAnimationActive={!prefersReducedMotion}
+            animationDuration={650}
+            animationEasing="ease-out"
+          />
+        </ComposedChart>
       </ResponsiveContainer>
+      </div>
+      <div className="mt-2 grid grid-cols-2 border-t border-white/10 pt-1 sm:grid-cols-4">
+        <TrendHighlight
+          label="订单峰值"
+          point={highlights.peakOrders}
+          value={`${highlights.peakOrders?.orders || 0} 单`}
+          tone="text-sky-300"
+          testId="trend-peak-orders"
+        />
+        <TrendHighlight
+          label="订单低谷"
+          point={highlights.lowOrders}
+          value={`${highlights.lowOrders?.orders || 0} 单`}
+          tone="text-slate-300"
+          testId="trend-low-orders"
+        />
+        <TrendHighlight
+          label="营收上升最快"
+          point={highlights.fastestGrowth?.to || null}
+          value={highlights.fastestGrowth ? `+¥${formatMoney(highlights.fastestGrowth.delta)}` : '--'}
+          tone="text-emerald-300"
+          testId="trend-fastest-growth"
+        />
+        <TrendHighlight
+          label="营收回落最大"
+          point={highlights.slowestGrowth?.to || null}
+          value={highlights.slowestGrowth ? `${highlights.slowestGrowth.delta >= 0 ? '+' : '-'}¥${formatMoney(Math.abs(highlights.slowestGrowth.delta))}` : '--'}
+          tone={highlights.slowestGrowth && highlights.slowestGrowth.delta < 0 ? 'text-red-300' : 'text-slate-300'}
+          testId="trend-slowest-growth"
+        />
+      </div>
+      {granularity === 'hour' && timeCoverage && coverageRate !== undefined && coverageRate < 1 && (
+        <p className="mt-2 text-[10px] text-slate-500">
+          时段覆盖 {Math.round(coverageRate * 100)}% · {timeCoverage.total_orders - timeCoverage.with_ordered_at} 笔订单缺少下单时间
+        </p>
+      )}
     </div>
   );
 };
@@ -172,7 +270,7 @@ const DashboardCharts: React.FC<{
         </div>
         <div className="grid grid-cols-1 gap-x-10 gap-y-8 lg:grid-cols-2">
           <div>
-            <PanelTitle title="订单状态分布" sub="仅统计待发货/已发货/已完成订单" />
+            <PanelTitle title="订单状态分布" sub="按订单量统计 · 退款完成订单已扣除" />
             <ShareBars rows={statusRows} emptyText="暂无数据" labelWidthClass="w-16" />
           </div>
           <div>

@@ -216,6 +216,32 @@ export interface DailyPoint {
   label: string;
   amount: number;
   orders: number;
+  /** 小时趋势用于 tooltip 的完整时间标签 */
+  tooltipLabel?: string;
+}
+
+export interface HourlyStat {
+  hour: number | string;
+  amount: number;
+  order_count?: number;
+}
+
+export interface TrendDelta {
+  from: DailyPoint;
+  to: DailyPoint;
+  delta: number;
+}
+
+export interface TrendHighlights {
+  peakOrders: DailyPoint | null;
+  lowOrders: DailyPoint | null;
+  fastestGrowth: TrendDelta | null;
+  slowestGrowth: TrendDelta | null;
+}
+
+export interface TrendPointSelection {
+  chartPoints: DailyPoint[];
+  highlightPoints: DailyPoint[];
 }
 
 const MAX_FILL_DAYS = 366;
@@ -250,4 +276,89 @@ export const fillDailySeries = (
     cursor.setDate(cursor.getDate() + 1);
   }
   return points;
+};
+
+const parseHour = (value: number | string): number | null => {
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    return value >= 0 && value < 24 ? value : null;
+  }
+  const text = String(value).trim();
+  const match = text.match(/(?:^|[T\s])(\d{1,2})(?::\d{2})?(?:$|[+-])/)
+    || text.match(/^(\d{1,2})(?::\d{2})?$/);
+  const hour = Number(match?.[1]);
+  return Number.isInteger(hour) && hour >= 0 && hour < 24 ? hour : null;
+};
+
+/** 将单日 hourly_stats 补齐为稳定的 24 个小时桶，缺口明确显示为 0。 */
+export const fillHourlySeries = (
+  hourlyStats: HourlyStat[] | undefined,
+  date: string,
+): DailyPoint[] => {
+  const byHour = new Map<number, { amount: number; orders: number }>();
+  for (const entry of hourlyStats || []) {
+    const hour = parseHour(entry.hour);
+    if (hour === null) continue;
+    const previous = byHour.get(hour) || { amount: 0, orders: 0 };
+    byHour.set(hour, {
+      // Repeated buckets should not make the chart lose an otherwise valid aggregate.
+      amount: previous.amount + (Number(entry.amount) || 0),
+      orders: previous.orders + (Number(entry.order_count) || 0),
+    });
+  }
+  return Array.from({ length: 24 }, (_, hour) => {
+    const value = byHour.get(hour) || { amount: 0, orders: 0 };
+    const label = `${String(hour).padStart(2, '0')}:00`;
+    return { date: `${date} ${label}`, label, amount: value.amount, orders: value.orders };
+  });
+};
+
+/**
+ * 当前周期仍在进行时，图表保留最新的部分时段，峰谷/涨跌只比较已结束时段。
+ * 历史周期直接返回完整点集。
+ */
+export const selectTrendPoints = (
+  points: DailyPoint[],
+  granularity: 'hour' | 'day',
+  rangeEndDate: string,
+  currentDate: string,
+  currentHour: number,
+): TrendPointSelection => {
+  if (rangeEndDate !== currentDate) {
+    return { chartPoints: points, highlightPoints: points };
+  }
+  if (granularity === 'hour') {
+    const safeHour = Math.min(23, Math.max(0, Math.trunc(currentHour)));
+    return {
+      chartPoints: points.slice(0, safeHour + 1),
+      highlightPoints: points.slice(0, safeHour),
+    };
+  }
+  return {
+    chartPoints: points,
+    highlightPoints: points.slice(0, -1),
+  };
+};
+
+/** 返回订单量峰低点及相邻时段销售额变化的最快/最慢区间。并列时保留较早区间。 */
+export const getTrendHighlights = (points: DailyPoint[]): TrendHighlights => {
+  if (points.length < 2) {
+    return { peakOrders: null, lowOrders: null, fastestGrowth: null, slowestGrowth: null };
+  }
+  let peakOrders = points[0];
+  let lowOrders = points[0];
+  for (const point of points.slice(1)) {
+    if (point.orders > peakOrders.orders) peakOrders = point;
+    if (point.orders < lowOrders.orders) lowOrders = point;
+  }
+  let fastestGrowth: TrendDelta | null = null;
+  let slowestGrowth: TrendDelta | null = null;
+  for (let index = 1; index < points.length; index += 1) {
+    const from = points[index - 1];
+    const to = points[index];
+    const delta = to.amount - from.amount;
+    const candidate = { from, to, delta };
+    if (delta > 0 && (!fastestGrowth || delta > fastestGrowth.delta)) fastestGrowth = candidate;
+    if (delta < 0 && (!slowestGrowth || delta < slowestGrowth.delta)) slowestGrowth = candidate;
+  }
+  return { peakOrders, lowOrders, fastestGrowth, slowestGrowth };
 };

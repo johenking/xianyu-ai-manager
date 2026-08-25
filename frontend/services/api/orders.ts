@@ -145,8 +145,8 @@ export const getDashboardSummary = async (params: {
   range: 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
   start_date?: string;
   end_date?: string;
-}): Promise<DashboardSummary> => {
-  return get('/api/dashboard/summary', params);
+}, signal?: AbortSignal): Promise<DashboardSummary> => {
+  return get('/api/dashboard/summary', params, signal);
 };
 
 export const getOrderAnalytics = async (daysOrParams: number | {start_date: string; end_date: string} = 7): Promise<OrderAnalytics> => {

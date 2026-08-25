@@ -27,6 +27,7 @@ vi.mock('../services/api', () => ({
   setRegistrationLimit: vi.fn(),
   setRegistrationUserActive: vi.fn(),
   getAIProviders: vi.fn(),
+  discoverAIProviderModels: vi.fn(),
   createAIProvider: vi.fn(),
   updateAIProvider: vi.fn(),
   deleteAIProvider: vi.fn(),

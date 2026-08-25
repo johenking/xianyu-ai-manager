@@ -45,3 +45,15 @@ export const hasKnowledgeContent = (knowledge: AIItemKnowledge): boolean => (
   knowledge.pricing.length + knowledge.process.length + knowledge.after_sales.length +
   knowledge.forbidden.length + knowledge.faqs.length + knowledge.notes.length > 0
 );
+
+// 商品档案状态：已发布 > 仅草稿 > 无档案（数据来自商品列表接口聚合字段）
+export type ItemKnowledgeState = 'published' | 'draft' | 'none';
+
+export const knowledgeStateOf = (item: {
+  knowledge_has_draft?: boolean;
+  knowledge_published_version?: number;
+}): ItemKnowledgeState => {
+  if ((item.knowledge_published_version ?? 0) > 0) return 'published';
+  if (item.knowledge_has_draft) return 'draft';
+  return 'none';
+};

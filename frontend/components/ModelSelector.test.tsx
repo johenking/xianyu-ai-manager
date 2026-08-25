@@ -44,4 +44,40 @@ describe('ModelSelector', () => {
 
     expect(onChange).toHaveBeenCalledWith('vendor/custom-model');
   });
+
+  it('returns to the fetched list when the current model becomes available', () => {
+    const onChange = vi.fn();
+    const view = render(
+      <ModelSelector
+        models={['other-model']}
+        value="model-a"
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByLabelText('自定义模型 ID')).toBeInTheDocument();
+    view.rerender(
+      <ModelSelector
+        models={['model-a', 'other-model']}
+        value="model-a"
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /model-a/ })).toBeInTheDocument();
+  });
+
+  it('keeps the custom entry available when no models are cached', () => {
+    render(
+      <ModelSelector
+        models={[]}
+        value="preset-model"
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /preset-model/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '自定义模型 ID' }));
+    expect(screen.getByLabelText('自定义模型 ID')).toBeInTheDocument();
+  });
 });

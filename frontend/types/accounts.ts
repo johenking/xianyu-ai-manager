@@ -5,6 +5,12 @@ export interface AccountDetail {
   cookie?: string; // alias for value
   enabled: boolean;
   auto_confirm: boolean;
+  auto_rate_enabled?: boolean;
+  auto_rate_enabled_at?: number | null;
+  auto_rate_pending_count?: number;
+  auto_rate_success_count?: number;
+  auto_rate_failed_count?: number;
+  auto_rate_needs_reconcile_count?: number;
   remark?: string;
   note?: string; // alias for remark
   pause_duration?: number;
@@ -121,4 +127,3 @@ export interface AccountSessionRefreshStatus {
   updated_at?: number | null;
   last_expired_at?: number | null;
 }
-

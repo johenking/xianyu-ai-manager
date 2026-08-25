@@ -5,7 +5,7 @@ import React from 'react';
 import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OrderAnalytics } from '../types';
-import DashboardCharts from './DashboardCharts';
+import DashboardCharts, { formatHeroAxisTick, HeroTrend } from './DashboardCharts';
 
 // recharts 的 ResponsiveContainer 在 jsdom 下拿不到尺寸会告警但不影响断言，
 // 这里用固定尺寸桩替换，聚焦业务渲染逻辑。
@@ -45,7 +45,7 @@ describe('DashboardCharts 状态与地区分布', () => {
     render(<DashboardCharts analytics={baseAnalytics} itemNames={{ A1: '测试商品' }} />);
     // recharts 图表内部在 jsdom 下不渲染，这里断言区块标题与说明（图表外部元素）
     expect(screen.getByText('订单状态分布')).toBeInTheDocument();
-    expect(screen.getByText('仅统计待发货/已发货/已完成订单')).toBeInTheDocument();
+    expect(screen.getByText('按订单量统计 · 退款完成订单已扣除')).toBeInTheDocument();
     expect(screen.getByText('地区分布')).toBeInTheDocument();
     expect(screen.getByText('收货城市订单量 Top 10')).toBeInTheDocument();
     // 有城市数据时不应出现城市空态
@@ -60,6 +60,26 @@ describe('DashboardCharts 状态与地区分布', () => {
     render(<DashboardCharts analytics={empty} itemNames={{}} />);
     expect(screen.getByText('订单状态分布')).toBeInTheDocument();
     expect(screen.getByText('暂无收货城市数据')).toBeInTheDocument();
+  });
+});
+
+describe('HeroTrend 坐标轴', () => {
+  it('压缩千位金额并保留三位数原值', () => {
+    expect(formatHeroAxisTick(3800)).toBe('3.8k');
+    expect(formatHeroAxisTick(950)).toBe('950');
+  });
+
+  it('使用已完成点计算洞察，不把当前未结束点当成回落', () => {
+    const points = [
+      { date: '2026-08-18 08:00', label: '08:00', amount: 20, orders: 2 },
+      { date: '2026-08-18 09:00', label: '09:00', amount: 40, orders: 4 },
+      { date: '2026-08-18 10:00', label: '10:00', amount: 1, orders: 0 },
+    ];
+    render(<HeroTrend points={points} highlightPoints={points.slice(0, 2)} granularity="hour" />);
+
+    expect(screen.getByTestId('trend-peak-orders')).toHaveTextContent('09:00 · 4 单');
+    expect(screen.getByTestId('trend-fastest-growth')).toHaveTextContent('09:00 · +¥20.00');
+    expect(screen.getByTestId('trend-slowest-growth')).toHaveTextContent('--');
   });
 });
 

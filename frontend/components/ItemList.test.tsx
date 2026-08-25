@@ -27,6 +27,13 @@ vi.mock('../services/api', () => ({
   updateItemInviteAutoFulfillment: vi.fn(),
 }));
 
+// 知识档案弹窗有独立测试；这里只验证 ItemList 与它的开关/刷新协作
+vi.mock('./ItemKnowledgeModal', () => ({
+  default: ({ onClose }: { onClose: () => void }) => (
+    <button onClick={onClose}>关闭知识档案弹窗</button>
+  ),
+}));
+
 const accounts = [
   {
     id: 'account-1',
@@ -56,6 +63,36 @@ const accountOneItems = [
     item_title: '账号一商品',
     item_price: '145',
     item_image: 'https://img.alicdn.com/account-one.jpg',
+  },
+] as any;
+
+const knowledgeItems = [
+  {
+    id: 11,
+    cookie_id: 'account-1',
+    item_id: 'item-published',
+    item_title: '已发布档案商品',
+    item_price: '145',
+    knowledge_has_draft: true,
+    knowledge_published_version: 3,
+  },
+  {
+    id: 12,
+    cookie_id: 'account-1',
+    item_id: 'item-draft',
+    item_title: '草稿档案商品',
+    item_price: '155',
+    knowledge_has_draft: true,
+    knowledge_published_version: 0,
+  },
+  {
+    id: 13,
+    cookie_id: 'account-1',
+    item_id: 'item-none',
+    item_title: '未建档商品',
+    item_price: '165',
+    knowledge_has_draft: false,
+    knowledge_published_version: 0,
   },
 ] as any;
 
@@ -137,5 +174,51 @@ describe('ItemList account filtering', () => {
       'src',
       'https://img.alicdn.com/account-one-new.jpg',
     );
+  });
+
+  it('marks knowledge state on each card and filters by knowledge presence', async () => {
+    vi.mocked(getItemsByCookie).mockResolvedValue(knowledgeItems);
+
+    render(<ItemList />);
+    await screen.findByText('已发布档案商品');
+
+    expect(screen.getByRole('button', { name: /知识档案 · 已发布 v3/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /知识档案 · 草稿未发布/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /知识档案 · 未建档/ })).toBeInTheDocument();
+    expect(screen.getByText('档案 v3')).toBeInTheDocument();
+    expect(screen.getByText('档案草稿')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '有档案 (2)' }));
+    expect(screen.getByText('已发布档案商品')).toBeInTheDocument();
+    expect(screen.getByText('草稿档案商品')).toBeInTheDocument();
+    expect(screen.queryByText('未建档商品')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '无档案 (1)' }));
+    expect(screen.getByText('未建档商品')).toBeInTheDocument();
+    expect(screen.queryByText('已发布档案商品')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '全部 (3)' }));
+    expect(screen.getByText('已发布档案商品')).toBeInTheDocument();
+    expect(screen.getByText('未建档商品')).toBeInTheDocument();
+  });
+
+  it('refreshes items after closing the knowledge modal so badges stay current', async () => {
+    vi.mocked(getItemsByCookie)
+      .mockResolvedValueOnce(knowledgeItems)
+      .mockResolvedValueOnce([
+        { ...knowledgeItems[2], knowledge_has_draft: true },
+        ...knowledgeItems.slice(0, 2),
+      ] as any);
+
+    render(<ItemList />);
+    await screen.findByText('未建档商品');
+
+    fireEvent.click(screen.getByRole('button', { name: /知识档案 · 未建档/ }));
+    fireEvent.click(await screen.findByRole('button', { name: '关闭知识档案弹窗' }));
+
+    await waitFor(() => expect(getItemsByCookie).toHaveBeenCalledTimes(2));
+    // 刷新后原“未建档”商品变为草稿态，列表里出现两个草稿标识、不再有未建档
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /知识档案 · 草稿未发布/ })).toHaveLength(2));
+    expect(screen.queryByRole('button', { name: /知识档案 · 未建档/ })).not.toBeInTheDocument();
   });
 });

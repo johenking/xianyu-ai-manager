@@ -126,6 +126,7 @@ export const createAIProvider = async (data: {
   base_url: string;
   api_key: string;
   default_model: string;
+  models?: string[];
   is_default?: boolean;
 }): Promise<AIProviderProfile> => post('/api/ai/providers', data);
 
@@ -137,14 +138,23 @@ export const updateAIProvider = async (id: number, data: Partial<{
   api_key: string;
   api_key_action: 'keep' | 'set' | 'clear';
   default_model: string;
+  models: string[];
   is_default: boolean;
 }>): Promise<AIProviderProfile> => put(`/api/ai/providers/${id}`, data);
 
 export const deleteAIProvider = async (id: number): Promise<ApiResponse> => del(`/api/ai/providers/${id}`);
 
-export const refreshAIProviderModels = async (id: number): Promise<{ models: string[]; cached_at: number }> => (
+export const refreshAIProviderModels = async (id: number): Promise<{ models: string[]; cached_at: number | null }> => (
   post(`/api/ai/providers/${id}/models/refresh`, {})
 );
+
+export const discoverAIProviderModels = async (data: {
+  profile_id?: number;
+  provider_type?: 'openai_compatible' | 'gemini';
+  preset?: string;
+  base_url?: string;
+  api_key?: string;
+}): Promise<{ models: string[] }> => post('/api/ai/providers/discover-models', data);
 
 export const testAIProvider = async (id: number, modelName: string): Promise<{
   message: string;
@@ -323,7 +333,7 @@ export const getAIItemKnowledge = async (cookieId: string, itemId: string): Prom
 export const generateAIItemKnowledge = async (
   cookieId: string,
   itemId: string,
-  data: { overview: string; profile: AIItemKnowledge }
+  data: { overview: string }
 ): Promise<{ message: string; draft: AIItemKnowledge; source_detail_hash: string }> => {
   return post(`/ai-item-knowledge/${cookieId}/${itemId}/generate`, data);
 }
@@ -331,8 +341,7 @@ export const generateAIItemKnowledge = async (
 export const copyAIItemKnowledge = async (
   cookieId: string,
   sourceItemId: string,
-  targetItemIds: string[],
-  overwrite = false
+  targetItemIds: string[]
 ): Promise<{
   message: string;
   copied_item_ids: string[];
@@ -345,7 +354,6 @@ export const copyAIItemKnowledge = async (
   skipped_reasons?: Record<string, string>;
 }> => post(`/ai-item-knowledge/${cookieId}/${sourceItemId}/copy`, {
   target_item_ids: targetItemIds,
-  overwrite,
 });
 
 export const saveAIItemKnowledgeDraft = async (cookieId: string, itemId: string, profile: AIItemKnowledge): Promise<ApiResponse & AIItemKnowledgeProfile> => {

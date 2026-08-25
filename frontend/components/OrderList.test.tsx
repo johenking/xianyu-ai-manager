@@ -3,7 +3,7 @@ import React from 'react';
 import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { deleteOrder, getOrderDetail, getOrders, getAccountDetails, syncOrders, syncSingleOrder } from '../services/api';
+import { deleteOrder, getOrderDetail, getOrders, getAccountDetails, getItems, getShippingRules, manualShipOrder, syncOrders, syncSingleOrder } from '../services/api';
 import OrderList from './OrderList';
 import { clearOrderItemImageCache } from './ui/OrderItemImage';
 
@@ -12,6 +12,7 @@ vi.mock('../services/api', () => ({
   getOrderDetail: vi.fn(),
   getItems: vi.fn().mockResolvedValue([]),
   getAccountDetails: vi.fn().mockResolvedValue([]),
+  getShippingRules: vi.fn().mockResolvedValue([]),
   syncOrders: vi.fn(),
   syncSingleOrder: vi.fn(),
   manualShipOrder: vi.fn(),
@@ -485,6 +486,41 @@ describe('OrderList request races and media failures', () => {
     ) as HTMLImageElement;
     fireEvent.error(avatar);
     expect((await screen.findAllByLabelText('买家头像占位')).length).toBeGreaterThan(0);
+  });
+});
+
+describe('OrderList manual shipping choices', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    clearOrderItemImageCache();
+    localStorage.clear();
+    vi.unstubAllGlobals();
+  });
+
+  it('does not offer local full delivery for an invite item', async () => {
+    const pendingOrder = {
+      ...refundOrder,
+      status: 'pending_ship',
+      item_id: 'invite-item',
+      item_title: '邀请商品',
+    };
+    vi.mocked(getOrders).mockResolvedValue(pageOf([pendingOrder]) as any);
+    vi.mocked(getItems).mockResolvedValue([{
+      id: 'invite-item',
+      cookie_id: 'account-1',
+      item_id: 'invite-item',
+      item_title: '邀请商品',
+      invite_auto_fulfillment: true,
+    }] as any);
+    vi.mocked(getShippingRules).mockResolvedValue([]);
+
+    render(<OrderList />);
+    fireEvent.click((await screen.findAllByRole('button', { name: '立即发货' }))[0]);
+
+    expect(await screen.findByText('该商品由邀请服务履约，本地不重复发送卡券。')).toBeInTheDocument();
+    expect(screen.queryByText('完整发货（匹配卡券并发送）')).toBeNull();
+    expect(manualShipOrder).not.toHaveBeenCalled();
   });
 });
 

@@ -31,6 +31,7 @@ import {
   addAccountCookie,
   updateAccountRemark,
   updateAccountAutoConfirm,
+  updateAccountAutoRate,
   updateAccountPauseDuration,
   updateAccountCookie,
   updateAccountCookieRefreshSettings,
@@ -227,7 +228,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     timer: number;
   }>>(new Map());
   const clientBrowserContentReadyRef = useRef(false);
-  const clientBrowserErrorRef = useRef('请先启动一次本机浏览器助手');
+  const clientBrowserErrorRef = useRef('请先安装并启用浏览器连接扩展');
   const clientBrowserDetectionRef = useRef<Promise<ClientBrowserDevicePublic | null> | null>(null);
   const activeClientBrowserSessionRef = useRef('');
   const clientBrowserStartInFlightRef = useRef(false);
@@ -236,7 +237,7 @@ const AccountList: React.FC<AccountListProps> = () => {
   const [clientBrowserConnection, setClientBrowserConnection] = useState<ClientBrowserConnectionState>({
     state: 'idle',
     title: '本机 Chrome 登录已就绪',
-    detail: '点击主登录按钮时会启动你电脑上的本机助手，并打开官方登录页。',
+    detail: '点击主登录按钮后，会打开当前设备浏览器的官方登录页。',
   });
   const [clientBrowserStep, setClientBrowserStep] = useState<ClientBrowserLoginStep>('idle');
   const [showClientBrowserInstallGuide, setShowClientBrowserInstallGuide] = useState(false);
@@ -292,6 +293,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     remark: '',
     cookie: '',
     auto_confirm: false,
+    auto_rate_enabled: false,
     pause_duration: 0,
     cookie_refresh_enabled: false,
     cookie_refresh_interval_minutes: DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
@@ -970,6 +972,7 @@ const AccountList: React.FC<AccountListProps> = () => {
       remark: account.remark || account.note || '',
       cookie: account.cookie || account.value || '',
       auto_confirm: account.auto_confirm || false,
+      auto_rate_enabled: Boolean(account.auto_rate_enabled),
       pause_duration: account.pause_duration || 0,
       cookie_refresh_enabled: account.cookie_refresh_enabled || false,
       cookie_refresh_interval_minutes: account.cookie_refresh_interval_minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
@@ -1143,6 +1146,10 @@ const AccountList: React.FC<AccountListProps> = () => {
       // 更新自动确认
       if (editForm.auto_confirm !== editingAccount.auto_confirm) {
         promises.push(updateAccountAutoConfirm(editingAccount.id, editForm.auto_confirm));
+      }
+
+      if (editForm.auto_rate_enabled !== Boolean(editingAccount.auto_rate_enabled)) {
+        promises.push(updateAccountAutoRate(editingAccount.id, editForm.auto_rate_enabled));
       }
 
       // 更新暂停时长
@@ -2146,6 +2153,15 @@ const AccountList: React.FC<AccountListProps> = () => {
                 <p className="text-sm text-gray-500 font-medium mb-3">{account.remark || account.note || '暂无备注'}</p>
                 <div className="flex flex-wrap gap-2">
                    <StatusBadge state={account.auto_confirm ? 'ready' : 'idle'} label={account.auto_confirm ? '自动确认开启' : '自动确认关闭'} />
+                   <StatusBadge
+                    state={account.auto_rate_enabled ? 'ready' : 'idle'}
+                    label={account.auto_rate_enabled
+                      ? `自动好评 已成功 ${account.auto_rate_success_count || 0} 条`
+                      : '自动好评关闭'}
+                   />
+                   {(account.auto_rate_needs_reconcile_count || 0) > 0 && (
+                    <StatusBadge state="warning" label={`评价待核对 ${account.auto_rate_needs_reconcile_count}`} />
+                   )}
                    <StatusBadge state="idle" label={`登录：${account.login_method_label || '历史登录'}`} />
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
                    <StatusBadge
@@ -3009,6 +3025,22 @@ const AccountList: React.FC<AccountListProps> = () => {
                   checked={editForm.auto_confirm}
                   onChange={(checked) => setEditForm({ ...editForm, auto_confirm: checked })}
                   label="自动确认收货"
+                />
+              </div>
+
+              {/* 卖家自动好评 */}
+              <div className="flex items-center justify-between gap-4 p-4 bg-gray-50 rounded-xl">
+                <div>
+                  <div className="font-bold text-gray-900 flex items-center gap-2">
+                    <Check className="w-4 h-4 text-green-500" />
+                    卖家自动好评
+                  </div>
+                  <div className="text-xs text-gray-500">仅处理开启后新增且平台显示可评价的订单，随机延迟 5–15 分钟</div>
+                </div>
+                <ToggleControl
+                  checked={editForm.auto_rate_enabled}
+                  onChange={(checked) => setEditForm({ ...editForm, auto_rate_enabled: checked })}
+                  label="卖家自动好评"
                 />
               </div>
 

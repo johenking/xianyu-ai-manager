@@ -13,7 +13,7 @@ interface ModelSelectorProps {
 const ModelSelector: React.FC<ModelSelectorProps> = ({ models, value, onChange, disabled }) => {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [customMode, setCustomMode] = useState(Boolean(value && !models.includes(value)));
+  const [customMode, setCustomMode] = useState(Boolean(value && models.length > 0 && !models.includes(value)));
   const containerRef = useRef<HTMLDivElement>(null);
   const uniqueModels = useMemo(() => [...new Set(models)].sort(), [models]);
   const visibleModels = uniqueModels.filter((model) => model.toLowerCase().includes(query.toLowerCase()));
@@ -25,6 +25,14 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ models, value, onChange, 
     document.addEventListener('mousedown', closeOnOutsideClick);
     return () => document.removeEventListener('mousedown', closeOnOutsideClick);
   }, []);
+
+  useEffect(() => {
+    if (uniqueModels.length === 0) {
+      setCustomMode(false);
+      return;
+    }
+    if (value && uniqueModels.includes(value)) setCustomMode(false);
+  }, [uniqueModels, value]);
 
   if (customMode) {
     return (

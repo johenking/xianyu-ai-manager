@@ -22,10 +22,13 @@ import {
   DeliverySettingModal,
   deliveryModeOf,
 } from './ui/DeliveryMode';
+import { knowledgeStateOf } from '../utils/itemKnowledge';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
 const ALL_ACCOUNTS_VALUE = '__all__';
+
+type KnowledgeFilter = 'all' | 'has' | 'none';
 
 const ItemList: React.FC = () => {
   const [items, setItems] = useState<Item[]>([]);
@@ -39,6 +42,7 @@ const ItemList: React.FC = () => {
   const [cards, setCards] = useState<Card[]>([]);
   const [deliveryItem, setDeliveryItem] = useState<Item | null>(null);
   const [savingDelivery, setSavingDelivery] = useState(false);
+  const [knowledgeFilter, setKnowledgeFilter] = useState<KnowledgeFilter>('all');
 
   useEffect(() => {
     loadData();
@@ -207,10 +211,26 @@ const ItemList: React.FC = () => {
     }
   };
 
+  // 知识档案弹窗关闭后静默刷新，让档案标识立即反映最新状态
+  const refreshItemsSilently = async () => {
+    try {
+      await loadItemsForAccount(selectedAccount);
+    } catch {
+      // 静默刷新失败不打断当前视图，下一次手动刷新会重试
+    }
+  };
+
   const selectedAccountLabel = selectedAccount === ALL_ACCOUNTS_VALUE
     ? null
     : accounts.find(account => account.id === selectedAccount);
   const canSyncSelectedAccount = Boolean(selectedAccount && selectedAccount !== ALL_ACCOUNTS_VALUE);
+
+  const knowledgeCount = items.filter(item => knowledgeStateOf(item) !== 'none').length;
+  const visibleItems = items.filter(item => {
+    if (knowledgeFilter === 'all') return true;
+    const hasKnowledge = knowledgeStateOf(item) !== 'none';
+    return knowledgeFilter === 'has' ? hasKnowledge : !hasKnowledge;
+  });
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -268,9 +288,40 @@ const ItemList: React.FC = () => {
         </div>
       )}
 
+      {items.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="知识档案筛选">
+          {([
+            ['all', `全部 (${items.length})`],
+            ['has', `有档案 (${knowledgeCount})`],
+            ['none', `无档案 (${items.length - knowledgeCount})`],
+          ] as Array<[KnowledgeFilter, string]>).map(([value, label]) => (
+            <button
+              key={value}
+              onClick={() => setKnowledgeFilter(value)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                knowledgeFilter === value
+                  ? 'bg-gray-900 text-white'
+                  : 'bg-white border border-gray-200 text-gray-500 hover:bg-gray-50'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-          {items.map(item => (
-              <div key={`${item.cookie_id}-${item.item_id}`} className="ios-card p-4 rounded-3xl hover:shadow-lg transition-all group relative">
+          {visibleItems.map(item => (
+              <div
+                key={`${item.cookie_id}-${item.item_id}`}
+                className={`ios-card p-4 rounded-3xl hover:shadow-lg transition-all group relative ${
+                  knowledgeStateOf(item) === 'published'
+                    ? 'ring-2 ring-green-300/70'
+                    : knowledgeStateOf(item) === 'draft'
+                      ? 'ring-2 ring-yellow-300/70'
+                      : ''
+                }`}
+              >
                   <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity z-10">
                       <button
                         onClick={() => handleDelete(item)}
@@ -295,6 +346,16 @@ const ItemList: React.FC = () => {
                       <div className="absolute top-2 left-2 bg-black/50 backdrop-blur-md text-white text-xs font-bold px-2 py-1 rounded-lg">
                           ¥{item.item_price}
                       </div>
+                      {knowledgeStateOf(item) === 'published' && (
+                        <div className="absolute bottom-2 left-2 bg-green-500/90 backdrop-blur-md text-white text-[11px] font-bold px-2 py-1 rounded-lg flex items-center gap-1">
+                            <BookOpen className="w-3 h-3" />档案 v{item.knowledge_published_version}
+                        </div>
+                      )}
+                      {knowledgeStateOf(item) === 'draft' && (
+                        <div className="absolute bottom-2 left-2 bg-yellow-400/90 backdrop-blur-md text-yellow-950 text-[11px] font-bold px-2 py-1 rounded-lg flex items-center gap-1">
+                            <BookOpen className="w-3 h-3" />档案草稿
+                        </div>
+                      )}
                   </div>
                   <h3 className="font-bold text-gray-900 line-clamp-2 text-sm mb-2 h-10">{item.item_title}</h3>
                   <div className="flex justify-between items-center text-xs text-gray-500 mb-2">
@@ -310,9 +371,20 @@ const ItemList: React.FC = () => {
                   </button>
                   <button
                     onClick={() => setKnowledgeItem(item)}
-                    className="w-full mb-2 px-3 py-2 rounded-lg bg-yellow-100 text-yellow-900 text-xs font-bold flex items-center justify-center gap-2 hover:bg-yellow-200"
+                    className={`w-full mb-2 px-3 py-2 rounded-lg text-xs font-bold flex items-center justify-center gap-2 ${
+                      knowledgeStateOf(item) === 'published'
+                        ? 'bg-green-100 text-green-900 hover:bg-green-200'
+                        : knowledgeStateOf(item) === 'draft'
+                          ? 'bg-yellow-100 text-yellow-900 hover:bg-yellow-200'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    }`}
                   >
-                    <BookOpen className="w-4 h-4" />知识档案
+                    <BookOpen className="w-4 h-4" />
+                    {knowledgeStateOf(item) === 'published'
+                      ? `知识档案 · 已发布 v${item.knowledge_published_version}`
+                      : knowledgeStateOf(item) === 'draft'
+                        ? '知识档案 · 草稿未发布'
+                        : '知识档案 · 未建档'}
                   </button>
                   <div className="flex gap-2">
                       <button
@@ -346,6 +418,12 @@ const ItemList: React.FC = () => {
                  暂无商品数据，请选择账号进行同步
              </div>
           )}
+          {items.length > 0 && visibleItems.length === 0 && (
+             <div className="col-span-full py-20 text-center text-gray-400">
+                 <BookOpen className="w-12 h-12 mx-auto mb-4 opacity-30" />
+                 当前筛选下没有商品，可切换回“全部”查看
+             </div>
+          )}
       </div>
 
       {deliveryItem && (
@@ -364,10 +442,14 @@ const ItemList: React.FC = () => {
       {knowledgeItem && (
         <ItemKnowledgeModal
           item={knowledgeItem}
-          onClose={() => setKnowledgeItem(null)}
+          onClose={() => {
+            setKnowledgeItem(null);
+            void refreshItemsSilently();
+          }}
           onTrain={() => {
             setTrainingItem(knowledgeItem);
             setKnowledgeItem(null);
+            void refreshItemsSilently();
           }}
         />
       )}

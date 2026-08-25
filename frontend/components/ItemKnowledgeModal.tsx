@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import {
   countPendingKnowledge, emptyItemKnowledge, hasKnowledgeContent,
-  newKnowledgeEntry, normalizeItemKnowledge,
+  knowledgeStateOf, newKnowledgeEntry, normalizeItemKnowledge,
 } from '../utils/itemKnowledge';
 
 type ListSection = 'pricing' | 'process' | 'after_sales' | 'forbidden' | 'faqs' | 'notes';
@@ -54,8 +54,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   const [copyOpen, setCopyOpen] = useState(false);
   const [availableItems, setAvailableItems] = useState<Item[]>([]);
   const [copyTargetIds, setCopyTargetIds] = useState<string[]>([]);
-  const [copyTargetKnowledge, setCopyTargetKnowledge] = useState<Record<string, { hasArchive: boolean; loading: boolean }>>({});
-  const [overwriteTargets, setOverwriteTargets] = useState(false);
+  const [copySearch, setCopySearch] = useState('');
   const [dirty, setDirty] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -65,16 +64,17 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
     () => availableItems.filter((candidate) => candidate.item_id !== item.item_id),
     [availableItems, item.item_id]
   );
-  const selectedExistingCount = useMemo(
-    () => copyTargetIds.filter((targetId) => copyTargetKnowledge[targetId]?.hasArchive).length,
-    [copyTargetIds, copyTargetKnowledge]
-  );
-  const selectedUnknownCount = useMemo(
-    () => copyTargetIds.filter((targetId) => !copyTargetKnowledge[targetId] || copyTargetKnowledge[targetId].loading).length,
-    [copyTargetIds, copyTargetKnowledge]
-  );
-  const willSkipCount = overwriteTargets ? 0 : selectedExistingCount;
-  const willCopyCount = overwriteTargets ? copyTargetIds.length : Math.max(0, copyTargetIds.length - selectedExistingCount);
+  const visibleCopyCandidates = useMemo(() => {
+    const keyword = copySearch.trim().toLowerCase();
+    if (!keyword) return copyCandidates;
+    return copyCandidates.filter((candidate) => (
+      (candidate.item_title || '').toLowerCase().includes(keyword) ||
+      candidate.item_id.toLowerCase().includes(keyword)
+    ));
+  }, [copyCandidates, copySearch]);
+  const selectedWithKnowledgeCount = useMemo(() => copyCandidates.filter((candidate) => (
+    copyTargetIds.includes(candidate.item_id) && knowledgeStateOf(candidate) !== 'none'
+  )).length, [copyCandidates, copyTargetIds]);
 
   const loadProfile = async () => {
     setLoading(true);
@@ -100,34 +100,6 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       .catch(() => { if (mounted) setAvailableItems([]); });
     return () => { mounted = false; };
   }, [item.cookie_id]);
-
-  useEffect(() => {
-    if (!copyOpen || copyTargetIds.length === 0) return;
-    copyTargetIds.forEach((targetId) => {
-      if (copyTargetKnowledge[targetId]) return;
-      setCopyTargetKnowledge((current) => ({
-        ...current,
-        [targetId]: { hasArchive: false, loading: true },
-      }));
-      getAIItemKnowledge(item.cookie_id, targetId)
-        .then((targetProfile) => {
-          setCopyTargetKnowledge((current) => ({
-            ...current,
-            [targetId]: {
-              hasArchive: hasKnowledgeContent(normalizeItemKnowledge(targetProfile.draft))
-                || hasKnowledgeContent(normalizeItemKnowledge(targetProfile.published)),
-              loading: false,
-            },
-          }));
-        })
-        .catch(() => {
-          setCopyTargetKnowledge((current) => ({
-            ...current,
-            [targetId]: { hasArchive: false, loading: false },
-          }));
-        });
-    });
-  }, [copyOpen, copyTargetIds, copyTargetKnowledge, item.cookie_id]);
 
   const updateKnowledge = (updater: (current: AIItemKnowledge) => AIItemKnowledge) => {
     setKnowledge((current) => updater(current));
@@ -189,16 +161,12 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       setError('请先填写商品概览，再生成结构化草稿');
       return;
     }
-    const hasDetailedContent = knowledge.pricing.length + knowledge.process.length + knowledge.after_sales.length +
-      knowledge.forbidden.length + knowledge.faqs.length + knowledge.notes.length > 0;
-    if (hasDetailedContent && !window.confirm('AI会保留人工和已确认内容，并替换未确认的AI内容。继续吗？')) return;
     setGenerating(true);
     setError('');
     setMessage('');
     try {
       const result = await generateAIItemKnowledge(item.cookie_id, item.item_id, {
         overview,
-        profile: knowledge,
       });
       setKnowledge(normalizeItemKnowledge(result.draft));
       setProfile((current) => current ? {
@@ -207,7 +175,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
         source_detail_hash: result.source_detail_hash,
       } : current);
       setDirty(false);
-      setMessage(result.message || '概览已保存，AI草稿已生成，黄色内容需要确认');
+      setMessage(result.message || '旧草稿已替换，新的AI草稿已生成，黄色内容需要确认');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'AI草稿生成失败');
     } finally {
@@ -222,7 +190,13 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   };
 
   const selectAllCopyTargets = () => {
-    setCopyTargetIds(copyCandidates.map((candidate) => candidate.item_id));
+    setCopyTargetIds(visibleCopyCandidates.map((candidate) => candidate.item_id));
+  };
+
+  const selectCopyTargetsWithoutKnowledge = () => {
+    setCopyTargetIds(visibleCopyCandidates
+      .filter((candidate) => knowledgeStateOf(candidate) === 'none')
+      .map((candidate) => candidate.item_id));
   };
 
   const clearCopyTargets = () => {
@@ -249,21 +223,18 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
         setDirty(false);
       }
       const result = await copyAIItemKnowledge(
-        item.cookie_id, item.item_id, copyTargetIds, overwriteTargets
+        item.cookie_id, item.item_id, copyTargetIds
       );
       const copiedCount = result.copied_count ?? result.copied_item_ids.length;
-      const skippedCount = result.skipped_count ?? result.skipped_item_ids.length;
       const missingCount = result.missing_count ?? result.missing_item_ids.length;
       const sourceLabel = result.source_kind === 'published' ? '已发布版本' : '草稿';
       const details = [
         `来源：${sourceLabel}`,
-        `已复制 ${copiedCount}`,
-        skippedCount > 0 ? `已跳过 ${skippedCount}` : '',
+        `已覆盖 ${copiedCount}`,
         missingCount > 0 ? `不存在 ${missingCount}` : '',
       ].filter(Boolean).join('，');
       setMessage(`${result.message}（${details}）`);
       setCopyTargetIds([]);
-      setCopyTargetKnowledge({});
       setCopyOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : '复制知识档案失败');
@@ -406,45 +377,63 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
                 {copyOpen && (
                   <div className="border-l-4 border-yellow-400 pl-3 space-y-3">
                     <div className="text-xs text-gray-600 leading-5">
-                      复制当前完整知识档案到目标商品草稿，不会自动发布，也不会复制历史版本。
+                      复制当前完整知识档案并覆盖目标商品草稿；不会自动发布，也不影响目标已发布版本和历史版本。
                       {dirty && <span className="block mt-1 font-bold text-orange-700">当前草稿有未保存修改，执行复制时会先保存当前草稿。</span>}
                     </div>
+                    <input
+                      value={copySearch}
+                      onChange={(event) => setCopySearch(event.target.value)}
+                      className="ios-input w-full px-3 py-2 rounded-lg text-xs"
+                      placeholder="搜索商品标题或ID"
+                      aria-label="搜索复制目标商品"
+                    />
                     <div className="flex items-center justify-between gap-2 text-xs">
-                      <span className="text-gray-500">可选目标 {copyCandidates.length} 个，已选 {copyTargetIds.length} 个</span>
+                      <span className="text-gray-500">可选目标 {visibleCopyCandidates.length} 个，已选 {copyTargetIds.length} 个</span>
                       <div className="flex gap-2">
-                        <button type="button" onClick={selectAllCopyTargets} className="font-bold text-blue-700 disabled:text-gray-400" disabled={copyCandidates.length === 0}>全选</button>
+                        <button type="button" onClick={selectAllCopyTargets} className="font-bold text-blue-700 disabled:text-gray-400" disabled={visibleCopyCandidates.length === 0}>全选</button>
+                        <button type="button" onClick={selectCopyTargetsWithoutKnowledge} className="font-bold text-green-700 disabled:text-gray-400" disabled={visibleCopyCandidates.length === 0}>只选无档案</button>
                         <button type="button" onClick={clearCopyTargets} className="font-bold text-gray-600 disabled:text-gray-400" disabled={copyTargetIds.length === 0}>清空</button>
                       </div>
                     </div>
                     <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
-                      {copyCandidates.map((candidate) => (
-                        <label key={candidate.item_id} className="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={copyTargetIds.includes(candidate.item_id)}
-                            onChange={() => toggleCopyTarget(candidate.item_id)}
-                            aria-label={`${candidate.item_title || candidate.item_id} ${candidate.item_price || ''} ${candidate.item_id.slice(-6)}`}
-                            className="mt-0.5"
-                          />
-                          <span className="min-w-0">
-                            <b className="block truncate">{candidate.item_title || candidate.item_id}</b>
-                            <span className="text-gray-400">{candidate.item_price || '-'} · …{candidate.item_id.slice(-6)}</span>
-                            {copyTargetKnowledge[candidate.item_id]?.hasArchive && <span className="ml-1 text-orange-600">已有档案</span>}
-                          </span>
-                        </label>
-                      ))}
-                      {copyCandidates.length === 0 && <div className="text-xs text-gray-400 py-2">当前账号没有其他可复制的商品。</div>}
+                      {visibleCopyCandidates.map((candidate) => {
+                        const candidateState = knowledgeStateOf(candidate);
+                        return (
+                          <label key={candidate.item_id} className="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={copyTargetIds.includes(candidate.item_id)}
+                              onChange={() => toggleCopyTarget(candidate.item_id)}
+                              aria-label={`${candidate.item_title || candidate.item_id} ${candidate.item_price || ''} ${candidate.item_id.slice(-6)}`}
+                              className="mt-0.5"
+                            />
+                            <span className="min-w-0 flex-1">
+                              <b className="block truncate">{candidate.item_title || candidate.item_id}</b>
+                              <span className="text-gray-400">{candidate.item_price || '-'} · …{candidate.item_id.slice(-6)}</span>
+                            </span>
+                            {candidateState === 'published' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-bold">已发布 v{candidate.knowledge_published_version}</span>}
+                            {candidateState === 'draft' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-800 font-bold">已有草稿</span>}
+                            {candidateState === 'none' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 font-bold">无档案</span>}
+                          </label>
+                        );
+                      })}
+                      {visibleCopyCandidates.length === 0 && (
+                        <div className="text-xs text-gray-400 py-2">
+                          {copyCandidates.length === 0 ? '当前账号没有其他可复制的商品。' : '没有匹配搜索条件的商品。'}
+                        </div>
+                      )}
                     </div>
-                    <label className="flex items-center gap-2 text-xs text-orange-700">
-                      <input type="checkbox" checked={overwriteTargets} onChange={(event) => setOverwriteTargets(event.target.checked)} />
-                      覆盖目标商品已有草稿；不勾选时已有草稿或已发布档案会跳过
-                    </label>
                     <div className="sticky bottom-0 bg-white pt-2 pb-1 border-t border-gray-100 space-y-2">
                       <div className="text-xs text-gray-500">
-                        预计复制 {willCopyCount} 个{willSkipCount > 0 ? `，跳过 ${willSkipCount} 个已有档案` : ''}{selectedUnknownCount > 0 ? `，${selectedUnknownCount} 个状态检查中` : ''}
+                        将覆盖 {copyTargetIds.length} 个目标商品草稿，已发布版本保持不变
+                        {selectedWithKnowledgeCount > 0 && (
+                          <span className="block mt-1 font-bold text-orange-700">
+                            其中 {selectedWithKnowledgeCount} 个目标已有档案，其草稿将被本档案覆盖
+                          </span>
+                        )}
                       </div>
                       <button onClick={() => void copyKnowledge()} disabled={copying || copyTargetIds.length === 0 || !hasKnowledgeContent(knowledge)} className="w-full px-3 py-2 rounded-lg bg-black text-white text-xs font-bold disabled:opacity-50">
-                        {copying ? '复制中...' : dirty ? '保存当前草稿并复制到所选草稿' : '复制到所选草稿'}
+                        {copying ? '覆盖中...' : dirty ? '保存当前草稿并覆盖所选草稿' : '覆盖所选商品草稿'}
                       </button>
                     </div>
                   </div>
@@ -467,7 +456,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
                   <button onClick={generateDraft} disabled={generating || !knowledge.overview?.text?.trim()} className="mt-3 w-full px-4 py-3 rounded-lg bg-black text-white font-bold flex items-center justify-center gap-2 disabled:opacity-40">
                     {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Bot className="w-4 h-4" />}第 2 步 · AI 生成结构化草稿
                   </button>
-                  <div className="text-xs text-gray-500 leading-5 mt-2">人工概览会先保存并作为最高优先级事实；AI只展开详细字段，生成内容仍需确认。</div>
+                  <div className="text-xs text-gray-500 leading-5 mt-2">每次生成都会用本次概览和商品详情重建完整草稿，旧草稿内容会被替换；已发布版本不变。</div>
                 </section>
 
                 {(Object.keys(SECTION_LABELS) as ListSection[]).map((section) => (

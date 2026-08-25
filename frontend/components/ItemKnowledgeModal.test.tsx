@@ -50,7 +50,7 @@ describe('ItemKnowledgeModal overview workflow', () => {
       { ...sourceItem, id: 2, item_id: 'item-b', item_title: 'Claude商品B', item_price: '155' },
     ]);
     vi.mocked(generateAIItemKnowledge).mockResolvedValue({
-      message: '概览已保存，AI结构化草稿已生成',
+      message: '旧草稿已替换，新的AI结构化草稿已生成',
       source_detail_hash: 'hash-a',
       draft: {
         overview: { text: '卖家填写的概览', source: 'user', status: 'confirmed' },
@@ -59,7 +59,7 @@ describe('ItemKnowledgeModal overview workflow', () => {
       },
     });
     vi.mocked(copyAIItemKnowledge).mockResolvedValue({
-      message: '已复制到 1 个商品草稿',
+      message: '已覆盖 1 个商品草稿',
       copied_item_ids: ['item-b'],
       skipped_item_ids: [],
       missing_item_ids: [],
@@ -95,14 +95,9 @@ describe('ItemKnowledgeModal overview workflow', () => {
     await waitFor(() => expect(generateAIItemKnowledge).toHaveBeenCalledWith(
       'account-1',
       'item-a',
-      expect.objectContaining({
-        overview: '卖家填写的概览',
-        profile: expect.objectContaining({
-          overview: expect.objectContaining({ text: '卖家填写的概览' }),
-        }),
-      }),
+      { overview: '卖家填写的概览' },
     ));
-    expect(await screen.findByText('概览已保存，AI结构化草稿已生成')).toBeTruthy();
+    expect(await screen.findByText('旧草稿已替换，新的AI结构化草稿已生成')).toBeTruthy();
   });
 
   it('copies the current archive to selected product drafts only', async () => {
@@ -117,12 +112,13 @@ describe('ItemKnowledgeModal overview workflow', () => {
     await screen.findByText('草稿档案');
     fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: /Claude商品B/ }));
-    fireEvent.click(screen.getByRole('button', { name: '复制到所选草稿' }));
+    fireEvent.click(screen.getByRole('button', { name: '覆盖所选商品草稿' }));
 
     await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
-      'account-1', 'item-a', ['item-b'], false
+      'account-1', 'item-a', ['item-b']
     ));
-    expect(await screen.findByText(/已复制到 1 个商品草稿/)).toBeTruthy();
+    expect(getAIItemKnowledge).not.toHaveBeenCalledWith('account-1', 'item-b');
+    expect(await screen.findByText(/已覆盖 1 个商品草稿/)).toBeTruthy();
   });
 
   it('can select all targets and saves dirty draft before copying', async () => {
@@ -141,12 +137,61 @@ describe('ItemKnowledgeModal overview workflow', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
     fireEvent.click(screen.getByRole('button', { name: '全选' }));
-    fireEvent.click(screen.getByLabelText(/覆盖目标商品已有草稿/));
-    fireEvent.click(screen.getByRole('button', { name: '保存当前草稿并复制到所选草稿' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存当前草稿并覆盖所选草稿' }));
 
     await waitFor(() => expect(saveAIItemKnowledgeDraft).toHaveBeenCalled());
     await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
-      'account-1', 'item-a', ['item-b'], true
+      'account-1', 'item-a', ['item-b']
+    ));
+  });
+
+  it('shows knowledge state per copy target and can select only items without archives', async () => {
+    vi.mocked(getAIItemKnowledge).mockResolvedValue({
+      ...emptyProfile,
+      draft: {
+        overview: { text: '同款Claude代充', source: 'user', status: 'confirmed' },
+        pricing: [], process: [], after_sales: [], forbidden: [], faqs: [], notes: [],
+      },
+    });
+    vi.mocked(getItemsByCookie).mockResolvedValue([
+      sourceItem,
+      {
+        ...sourceItem, id: 2, item_id: 'item-published', item_title: '已发布商品',
+        knowledge_has_draft: true, knowledge_published_version: 2,
+      },
+      {
+        ...sourceItem, id: 3, item_id: 'item-draft', item_title: '草稿商品',
+        knowledge_has_draft: true, knowledge_published_version: 0,
+      },
+      {
+        ...sourceItem, id: 4, item_id: 'item-none', item_title: '空白商品',
+        knowledge_has_draft: false, knowledge_published_version: 0,
+      },
+    ] as any);
+
+    render(<ItemKnowledgeModal item={sourceItem as any} onClose={() => undefined} />);
+    await screen.findByText('草稿档案');
+    fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
+
+    expect(await screen.findByText('已发布 v2')).toBeTruthy();
+    expect(screen.getByText('已有草稿')).toBeTruthy();
+    expect(screen.getByText('无档案')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '只选无档案' }));
+    expect((screen.getByRole('checkbox', { name: /空白商品/ }) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByRole('checkbox', { name: /已发布商品/ }) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByRole('checkbox', { name: /草稿商品/ }) as HTMLInputElement).checked).toBe(false);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /已发布商品/ }));
+    expect(screen.getByText(/其中 1 个目标已有档案，其草稿将被本档案覆盖/)).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText('搜索复制目标商品'), { target: { value: '草稿商品' } });
+    expect(screen.queryByRole('checkbox', { name: /空白商品/ })).toBeNull();
+    expect(screen.getByRole('checkbox', { name: /草稿商品/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '覆盖所选商品草稿' }));
+    await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
+      'account-1', 'item-a', ['item-none', 'item-published']
     ));
   });
 });

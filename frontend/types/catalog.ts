@@ -12,13 +12,23 @@ export interface Card {
   // API 类型配置
   api_config?: {
     url: string;
-    method: 'GET' | 'POST';
+    method?: 'GET' | 'POST';
+    protocol?: 'fulfillment_api_v1';
+    spec?: Record<string, unknown>;
     timeout?: number;
     headers?: string;
     params?: string;
   };
   // 图片类型
   image_url?: string;
+  low_stock_threshold?: number;
+  api_token_configured?: boolean;
+  token_preview?: string;
+  api_validation_status?: 'validated' | 'unvalidated' | 'failed' | 'manual_only';
+  api_validated_at?: number | null;
+  stats?: CardStockStats;
+  // 兼容早期候选字段；新合同固定返回 stats。
+  stock_stats?: CardStockStats;
   // 通用配置
   delay_seconds?: number;
   // 多规格配置
@@ -27,6 +37,72 @@ export interface Card {
   spec_value?: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface CardStockStats {
+  available: number;
+  reserved: number;
+  used: number;
+  review: number;
+  bound: number;
+  low_stock: boolean;
+}
+
+export interface StockImportResult {
+  added: number;
+  duplicates: number;
+  blank: number;
+  invalid: number;
+  total: number;
+  stats?: CardStockStats;
+}
+
+export interface ApiValidationResult {
+  status: 'validated';
+  operation_id?: string;
+  message: string;
+}
+
+export type ItemDeliveryMode = 'off' | 'resource' | 'invite';
+
+export interface DeliveryModeFailure {
+  item_id: string;
+  error: string;
+}
+
+export interface DeliveryModeBatchResult {
+  updated: string[];
+  failed: DeliveryModeFailure[];
+}
+
+export interface FulfillmentRecordList {
+  items: FulfillmentRecord[];
+  total: number;
+}
+
+export interface FulfillmentResendResult {
+  status: 'succeeded' | 'failed' | 'ambiguous';
+  event_id?: string | number;
+  reason_code?: string;
+}
+
+export interface FulfillmentRecord {
+  id: string | number;
+  attempt_id?: string | number;
+  order_id?: string;
+  item_id?: string;
+  cookie_id?: string;
+  resource_id?: number | null;
+  resource_name?: string;
+  source_type?: 'text' | 'data' | 'image' | 'api_v1' | string;
+  reason_code?: string;
+  status: 'succeeded' | 'pending' | 'failed' | 'manual_review' | 'ambiguous';
+  quantity?: number;
+  payload_preview?: string;
+  can_resend?: boolean;
+  latest_resend_status?: 'prepared' | 'succeeded' | 'failed' | 'ambiguous' | null;
+  created_at?: string;
+  updated_at?: string;
 }
 
 // Items
@@ -46,9 +122,14 @@ export interface Item {
   item_detail?: string;
   is_multi_spec?: number | boolean;
   multi_quantity_delivery?: number | boolean;
-  // 自动发货：绑定卡密（商品级）与邀请重置互斥，都未开启时回落关键词兜底规则
+  // 自动发货：资源与邀请重置互斥；显式关闭或失效绑定都不会回落到关键词资源。
   delivery_card_id?: number | null;
+  delivery_mode?: ItemDeliveryMode;
+  delivery_resource_id?: number | null;
   invite_auto_fulfillment?: number | boolean;
+  // 知识档案状态：后端按账号聚合返回，用于列表标识与复制目标提示
+  knowledge_has_draft?: boolean;
+  knowledge_published_version?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -88,13 +169,21 @@ export interface OrderAnalytics {
     total_orders: number;
   };
   daily_stats: Array<{ date: string; amount: number; order_count?: number }>;
+  // 单日趋势按东八区小时聚合；缺口由前端补齐为 24 个桶。
+  hourly_stats?: Array<{ hour: number | string; amount: number; order_count?: number }>;
+  // 缺少 ordered_at 的订单仍计入累计金额，但不进入小时趋势。
+  time_coverage?: {
+    total_orders: number;
+    with_ordered_at: number;
+    coverage_rate: number;
+  };
   item_stats?: Array<{
     item_id: string;
     order_count: number;
     total_amount: number;
     avg_amount: number;
   }>;
-  // 按订单状态聚合（受仪表盘 include_statuses 限定为待发货/已发货/已完成）
+  // 按仪表盘净销售额口径聚合，退款完成/关闭订单已排除。
   status_stats?: Array<{ status: string; count: number; amount: number }>;
   // 按收货城市聚合的地区分布（后端按订单量降序 Top 50，仅运营地理统计）
   city_stats?: Array<{ city: string; order_count: number; total_amount: number }>;
@@ -109,6 +198,7 @@ export interface DashboardSummary {
     previous_start_date: string;
     previous_end_date: string;
   };
+  trend_granularity?: 'hour' | 'day';
   stats: AdminStats;
   current: OrderAnalytics;
   previous: OrderAnalytics;
