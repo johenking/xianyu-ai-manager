@@ -38,6 +38,7 @@ import {
   InlineNote,
   PANEL_CLASS,
   PanelTitle,
+  ShareBars,
   formatCount,
   formatMoney,
   itemDisplayName,
@@ -116,7 +117,7 @@ const PeakBarChart: React.FC<{
   return (
     <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
       <BarChart data={plotted} margin={{ top: 18, right: 8, left: -20, bottom: 0 }}>
-        <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+        <CartesianGrid vertical={false} stroke="#F3F4F6" />
         <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} interval={interval} />
         <YAxis
           allowDecimals={false}
@@ -154,7 +155,9 @@ const PeakBarChart: React.FC<{
 
 const BusinessInsights: React.FC<{
   range: { start_date: string; end_date: string };
-}> = ({ range }) => {
+  /** 摘要数据版本号：变化时静默跟刷各分析区（保留已渲染内容，不闪骨架） */
+  refreshSignal?: number;
+}> = ({ range, refreshSignal = 0 }) => {
   const [timing, setTiming] = useState<TrafficAnalytics | null>(null);
   const [buyers, setBuyers] = useState<BuyerBehaviorAnalytics | null>(null);
   const [performance, setPerformance] = useState<ItemPerformanceAnalytics | null>(null);
@@ -170,20 +173,29 @@ const BusinessInsights: React.FC<{
   const [errors, setErrors] = useState<Partial<Record<InsightKey, string>>>({});
   const requestGeneration = useRef(0);
   const [reloadGeneration, setReloadGeneration] = useState(0);
+  const lastForegroundKey = useRef('');
 
   useEffect(() => {
     if (!range.start_date || !range.end_date) return;
+    // 范围切换/手动重试 = 前台加载（显示骨架并清空错误）；
+    // 仅 refreshSignal 变化 = 静默跟刷（保留现有内容，失败不打扰）。
+    const foregroundKey = `${range.start_date}|${range.end_date}|${reloadGeneration}`;
+    const isForeground = lastForegroundKey.current !== foregroundKey;
+    lastForegroundKey.current = foregroundKey;
+
     const generation = requestGeneration.current + 1;
     requestGeneration.current = generation;
     const controller = new AbortController();
-    setLoading({
-      timing: true,
-      buyers: true,
-      performance: true,
-      itemTraffic: true,
-      metricStatus: true,
-    });
-    setErrors({});
+    if (isForeground) {
+      setLoading({
+        timing: true,
+        buyers: true,
+        performance: true,
+        itemTraffic: true,
+        metricStatus: true,
+      });
+      setErrors({});
+    }
 
     const run = async <T,>(
       key: InsightKey,
@@ -194,12 +206,21 @@ const BusinessInsights: React.FC<{
         const value = await request();
         if (requestGeneration.current !== generation || controller.signal.aborted) return;
         setter(value);
+        // 静默刷新成功后清除该区块的历史错误提示
+        setErrors((current) => {
+          if (!(key in current)) return current;
+          const next = { ...current };
+          delete next[key];
+          return next;
+        });
       } catch (reason) {
         if (requestGeneration.current !== generation || controller.signal.aborted) return;
+        // 静默刷新失败不清空已渲染的数据，等下一轮再试
+        if (!isForeground) return;
         setter(null);
         setErrors((current) => ({ ...current, [key]: errorMessage(reason) }));
       } finally {
-        if (requestGeneration.current === generation && !controller.signal.aborted) {
+        if (isForeground && requestGeneration.current === generation && !controller.signal.aborted) {
           setLoading((current) => ({ ...current, [key]: false }));
         }
       }
@@ -212,7 +233,7 @@ const BusinessInsights: React.FC<{
     void run('metricStatus', setMetricStatus, () => getItemMetricStatus(controller.signal));
 
     return () => controller.abort();
-  }, [range, reloadGeneration]);
+  }, [range, refreshSignal, reloadGeneration]);
 
   const hourlyData = useMemo(() => {
     const byHour = new Map<number, TrafficAnalytics['hourly'][number]>();
@@ -274,7 +295,6 @@ const BusinessInsights: React.FC<{
   const hasPerformance = (performance?.items.length || 0) > 0;
   const hasItemTraffic = (itemTraffic?.snapshot_count || 0) > 0;
   const metricAdapterUnavailable = metricStatus?.adapter_available === false;
-  const maxFrequency = Math.max(...frequencyData.map((entry) => entry.buyer_count), 1);
 
   const allAnalyticsLoading = loading.timing
     && loading.buyers
@@ -311,7 +331,7 @@ const BusinessInsights: React.FC<{
       {/* 订单时段分析 */}
       <section className={`${PANEL_CLASS} p-6`}>
         <PanelTitle
-          icon={<Clock className="h-5 w-5 text-[#D6B500]" />}
+          icon={<Clock className="h-5 w-5 text-gray-400" />}
           title="订单时段分析"
           badge="订单时间快照"
           sub="按平台订单时间快照统计的时段规律（东八区）"
@@ -371,10 +391,9 @@ const BusinessInsights: React.FC<{
       {/* 成交商品表现 */}
       <section className={`${PANEL_CLASS} p-6`}>
         <PanelTitle
-          icon={<PackageSearch className="h-5 w-5 text-blue-600" />}
+          icon={<PackageSearch className="h-5 w-5 text-gray-400" />}
           title="成交商品表现"
           badge="成交订单"
-          badgeClass="bg-blue-50 text-blue-700"
           sub="按成交订单数与实付金额排序"
         />
 
@@ -441,10 +460,9 @@ const BusinessInsights: React.FC<{
       {/* 商品流量 */}
       <section className={`${PANEL_CLASS} p-6`}>
         <PanelTitle
-          icon={<Eye className="h-5 w-5 text-emerald-600" />}
+          icon={<Eye className="h-5 w-5 text-gray-400" />}
           title="商品流量"
           badge="卖家后台已验证快照"
-          badgeClass="bg-emerald-50 text-emerald-700"
           sub="相邻卖家后台快照之间的累计增量，定时采样约每 4 小时一次"
         />
 
@@ -508,12 +526,12 @@ const BusinessInsights: React.FC<{
                 <div className="h-[230px]">
                   <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
                     <BarChart data={itemTrafficWindows} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
-                      <CartesianGrid vertical={false} stroke="#F3F4F6" strokeDasharray="3 3" />
+                      <CartesianGrid vertical={false} stroke="#F3F4F6" />
                       <XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} interval={2} />
                       <YAxis allowDecimals={false} axisLine={false} tickLine={false} tick={{ fill: '#9CA3AF', fontSize: 11 }} />
                       <Tooltip content={<LightTooltip />} cursor={{ fill: 'rgba(17, 24, 39, 0.03)' }} />
-                      <Bar dataKey="exposure_delta" name="曝光增量" fill="#10B981" radius={[3, 3, 0, 0]} maxBarSize={18} />
-                      <Bar dataKey="view_delta" name="浏览增量" fill="#3B82F6" radius={[3, 3, 0, 0]} maxBarSize={18} />
+                      <Bar dataKey="exposure_delta" name="曝光增量" fill="#111827" radius={[3, 3, 0, 0]} maxBarSize={18} />
+                      <Bar dataKey="view_delta" name="浏览增量" fill="#94A3B8" radius={[3, 3, 0, 0]} maxBarSize={18} />
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
@@ -548,7 +566,7 @@ const BusinessInsights: React.FC<{
       {/* 买家行为分析 */}
       <section className={`${PANEL_CLASS} p-6`}>
         <PanelTitle
-          icon={<Users className="h-5 w-5 text-[#D6B500]" />}
+          icon={<Users className="h-5 w-5 text-gray-400" />}
           title="买家行为分析"
           sub="复购与下单频次（仅统计下单行为，不涉及客户画像）"
         />
@@ -574,17 +592,17 @@ const BusinessInsights: React.FC<{
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
               <div>
                 <p className="mb-3 text-xs font-bold text-gray-500">下单频次分布</p>
-                <div className="space-y-2.5">
-                  {frequencyData.map((entry) => (
-                    <div key={entry.label} className="flex items-center gap-3">
-                      <div className="w-16 shrink-0 text-[13px] text-gray-600">{entry.label}</div>
-                      <div className="h-4 min-w-0 flex-1 overflow-hidden rounded bg-gray-100">
-                        <div className="h-full rounded bg-emerald-500" style={{ width: `${Math.max(3, (entry.buyer_count / maxFrequency) * 100)}%` }} />
-                      </div>
-                      <div className="w-16 shrink-0 text-right text-[13px] text-gray-600">{formatCount(entry.buyer_count)} 人</div>
-                    </div>
-                  ))}
-                </div>
+                <ShareBars
+                  rows={frequencyData.map((entry) => ({
+                    key: entry.label,
+                    label: entry.label,
+                    count: entry.buyer_count,
+                    color: '#111827',
+                  }))}
+                  unit="人"
+                  emptyText="暂无数据"
+                  labelWidthClass="w-16"
+                />
               </div>
               <div>
                 <p className="mb-3 text-xs font-bold text-gray-500">买家贡献榜</p>

@@ -135,6 +135,8 @@ const Dashboard: React.FC = () => {
   const [validOrders, setValidOrders] = useState<Order[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  // 摘要数据实际变化时递增，驱动经营分析静默跟刷（数据不变时不打扰）
+  const [summaryVersion, setSummaryVersion] = useState(0);
   const summaryRequestGeneration = useRef(0);
   const summaryAbortController = useRef<AbortController | null>(null);
   const summaryFingerprint = useRef('');
@@ -173,6 +175,7 @@ const Dashboard: React.FC = () => {
       if (summaryFingerprint.current !== fingerprint) {
         summaryFingerprint.current = fingerprint;
         setSummary(result);
+        setSummaryVersion((version) => version + 1);
       }
       setRefreshDelayed(false);
       return true;
@@ -496,12 +499,18 @@ const Dashboard: React.FC = () => {
       )}
 
       <Suspense fallback={<div className={`${PANEL_CLASS} flex h-[420px] items-center justify-center text-sm text-gray-400`}>图表加载中...</div>}>
-        <DashboardCharts analytics={summary.current} previous={summary.previous} itemNames={summary.item_names} />
+        <DashboardCharts
+          analytics={summary.current}
+          previous={summary.previous}
+          itemNames={summary.item_names}
+          orders={validOrders}
+          ordersLoading={ordersLoading}
+        />
       </Suspense>
 
       {!isEmpty && (
         <Suspense fallback={<div className={`${PANEL_CLASS} flex h-[520px] items-center justify-center text-sm text-gray-400`}>经营分析加载中...</div>}>
-          <BusinessInsights range={insightRange} />
+          <BusinessInsights range={insightRange} refreshSignal={summaryVersion} />
         </Suspense>
       )}
 

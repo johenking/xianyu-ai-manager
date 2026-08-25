@@ -217,7 +217,7 @@ describe('Dashboard summary loading', () => {
     expect(screen.queryByLabelText('昨日营收 ¥11.00')).not.toBeInTheDocument();
   });
 
-  it('refreshes after 15 seconds without reloading business insights', async () => {
+  it('refreshes after 15 seconds without reloading business insights when data is unchanged', async () => {
     const timeoutSpy = vi.spyOn(window, 'setTimeout');
     render(<Dashboard />);
 
@@ -236,6 +236,33 @@ describe('Dashboard summary loading', () => {
     expect(getItemPerformanceAnalytics).toHaveBeenCalledTimes(1);
     expect(getItemTrafficAnalytics).toHaveBeenCalledTimes(1);
     expect(getItemMetricStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('silently refreshes business insights when summary data actually changes', async () => {
+    const timeoutSpy = vi.spyOn(window, 'setTimeout');
+    vi.mocked(getDashboardSummary)
+      .mockResolvedValueOnce(summary)
+      .mockResolvedValueOnce({
+        ...summary,
+        current: {
+          ...summary.current,
+          revenue_stats: { total_amount: 120, total_orders: 3 },
+        },
+      });
+    render(<Dashboard />);
+
+    expect(await screen.findByLabelText('今日营收 ¥88.50')).toBeInTheDocument();
+    await waitFor(() => expect(getTrafficAnalytics).toHaveBeenCalledTimes(1));
+
+    const scheduled = timeoutSpy.mock.calls.find(([, delay]) => delay === DASHBOARD_REFRESH_MS);
+    await act(async () => {
+      (scheduled![0] as () => void)();
+    });
+
+    expect(await screen.findByLabelText('今日营收 ¥120.00')).toBeInTheDocument();
+    // 摘要指纹变化 → 经营分析静默跟刷一轮
+    await waitFor(() => expect(getTrafficAnalytics).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(getBuyerBehaviorAnalytics).toHaveBeenCalledTimes(2));
   });
 
   it('rolls the revenue and order totals in both directions when live data changes', async () => {

@@ -145,7 +145,8 @@ describe('BusinessInsights', () => {
     expect(screen.getByText('复古相机')).toBeInTheDocument();
     expect(screen.getByText('商品流量')).toBeInTheDocument();
     expect(screen.getByText('真实商品流量采集尚未启用')).toBeInTheDocument();
-    expect(screen.getByText('37.5%')).toBeInTheDocument();
+    // 37.5% 同时出现在复购率徽章与频次分布占比列（3/8 巧合同值）
+    expect(screen.getAllByText('37.5%').length).toBeGreaterThan(0);
     expect(screen.getByText('老客甲')).toBeInTheDocument();
     expect(screen.getByText('b2')).toBeInTheDocument();
     expect(screen.queryByText('时段流量分析')).not.toBeInTheDocument();
@@ -324,6 +325,36 @@ describe('BusinessInsights', () => {
     expect(await screen.findByText('分析接口暂时不可用')).toBeInTheDocument();
     screen.getByRole('button', { name: '重试' }).click();
     expect(await screen.findByText('订单时段分析')).toBeInTheDocument();
+  });
+
+  it('refreshSignal 变化时静默跟刷：重新请求但不回到骨架态', async () => {
+    const { rerender } = render(<BusinessInsights range={range} refreshSignal={1} />);
+    expect(await screen.findByText('复古相机')).toBeInTheDocument();
+    expect(getTrafficAnalytics).toHaveBeenCalledTimes(1);
+
+    vi.mocked(getBuyerBehaviorAnalytics).mockResolvedValue({
+      ...fullBuyers,
+      summary: { total_buyers: 9, repeat_buyers: 4, repeat_rate: 0.444 },
+    });
+    rerender(<BusinessInsights range={range} refreshSignal={2} />);
+
+    // 静默刷新期间旧内容保持可见，不出现整块加载骨架
+    expect(screen.getByText('复古相机')).toBeInTheDocument();
+    expect(screen.queryByText('正在加载...')).not.toBeInTheDocument();
+    expect(await screen.findByText('44.4%')).toBeInTheDocument();
+    expect(getTrafficAnalytics).toHaveBeenCalledTimes(2);
+  });
+
+  it('静默跟刷失败时保留已渲染数据而不显示错误', async () => {
+    const { rerender } = render(<BusinessInsights range={range} refreshSignal={1} />);
+    expect(await screen.findByText('复古相机')).toBeInTheDocument();
+
+    vi.mocked(getItemPerformanceAnalytics).mockRejectedValue(new Error('临时网络抖动'));
+    rerender(<BusinessInsights range={range} refreshSignal={2} />);
+
+    await waitFor(() => expect(getItemPerformanceAnalytics).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('复古相机')).toBeInTheDocument();
+    expect(screen.queryByText('临时网络抖动')).not.toBeInTheDocument();
   });
 
   it('keeps only the latest response when range changes', async () => {

@@ -64,9 +64,12 @@ export const itemDisplayName = (itemId: string, title?: string | null): string =
   return tail ? `未命名商品 · 尾号${tail}` : '未命名商品';
 };
 
-/* ---------------- 类目区分色（非语义场景，避免品牌黄大面积作数据色） ---------------- */
+/* ---------------- 类目区分色（非语义场景，收敛为墨色阶梯 + 少量点缀，贴近原生质感） ---------------- */
 
-export const CATEGORY_COLORS = ['#111827', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316'];
+export const CATEGORY_COLORS = ['#111827', '#334155', '#0EA5E9', '#10B981', '#64748B', '#94A3B8', '#CBD5E1', '#F59E0B'];
+
+/** 排行/贡献类列表的单色阶梯：第一名最深，依次变浅，避免彩虹配色 */
+export const RANK_SHADES = ['#111827', '#374151', '#6B7280', '#9CA3AF', '#C4C9D1', '#D8DCE1'];
 
 /* ---------------- 面板与标题 ---------------- */
 
@@ -126,26 +129,26 @@ export const ShareBars: React.FC<{
     return <div className="flex h-24 items-center justify-center text-sm text-gray-400">{emptyText}</div>;
   }
   return (
-    <div className="space-y-2.5">
+    <div className="space-y-3">
       {rows.map((row) => (
         <div key={row.key} className="flex items-center gap-3">
           <div className={`${labelWidthClass} shrink-0 truncate text-[13px] font-medium text-gray-700`} title={row.label}>
             {row.label}
           </div>
-          <div className="h-4 min-w-0 flex-1 overflow-hidden rounded bg-gray-100">
+          <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-gray-100">
             <div
-              className="h-full rounded"
-              style={{ width: `${Math.max(2, (row.count / total) * 100)}%`, background: row.color }}
+              className="h-full rounded-full transition-[width] duration-500 ease-out motion-reduce:transition-none"
+              style={{ width: `${Math.max(1.5, (row.count / total) * 100)}%`, background: row.color }}
             />
           </div>
-          <div className="w-20 shrink-0 text-right text-[13px] text-gray-600">
+          <div className="w-20 shrink-0 text-right text-[13px] font-semibold tabular-nums text-gray-700">
             {formatCount(row.count)} {unit}
           </div>
-          <div className="w-14 shrink-0 text-right text-xs text-gray-400">
+          <div className="w-14 shrink-0 text-right text-xs tabular-nums text-gray-400">
             {((row.count / total) * 100).toFixed(1)}%
           </div>
           {row.hint !== undefined && (
-            <div className="hidden w-24 shrink-0 text-right text-xs text-gray-400 xl:block">{row.hint}</div>
+            <div className="hidden w-24 shrink-0 text-right text-xs tabular-nums text-gray-400 xl:block">{row.hint}</div>
           )}
         </div>
       ))}
@@ -181,12 +184,188 @@ export const RankList: React.FC<{ rows: RankRow[]; emptyText?: string }> = ({ ro
               <div className="h-full rounded bg-gray-900" style={{ width: `${Math.max(2, (row.value / max) * 100)}%` }} />
             </div>
           </div>
-          <div className="w-16 shrink-0 text-right text-[13px] font-bold text-gray-900">{row.valueLabel}</div>
+          <div className="w-24 shrink-0 text-right text-[13px] font-bold tabular-nums text-gray-900">{row.valueLabel}</div>
           {row.hint !== undefined && (
-            <div className="hidden w-32 shrink-0 text-right text-xs text-gray-400 lg:block">{row.hint}</div>
+            <div className="hidden w-20 shrink-0 text-right text-xs tabular-nums text-gray-400 lg:block">{row.hint}</div>
           )}
         </div>
       ))}
+    </div>
+  );
+};
+
+/* ---------------- 分桶直方图（客单价分布等：HTML 柱列，主力桶深色强调） ---------------- */
+
+export interface HistogramBin {
+  key: string;
+  label: string;
+  count: number;
+  /** 桶内营收，用于「订单占比 vs 营收占比」的footer说明 */
+  amount: number;
+}
+
+export const Histogram: React.FC<{
+  bins: HistogramBin[];
+  unit?: string;
+  emptyText?: string;
+}> = ({ bins, unit = '单', emptyText = '暂无数据' }) => {
+  const totalCount = bins.reduce((sum, bin) => sum + bin.count, 0);
+  const totalAmount = bins.reduce((sum, bin) => sum + bin.amount, 0);
+  if (!bins.length || totalCount <= 0) {
+    return <div className="flex h-24 items-center justify-center text-sm text-gray-400">{emptyText}</div>;
+  }
+  const maxCount = Math.max(...bins.map((bin) => bin.count), 1);
+  const topBin = bins.reduce((best, bin) => (bin.count > best.count ? bin : best), bins[0]);
+  return (
+    <div>
+      <div className="flex h-[168px] items-end gap-2.5 sm:gap-3">
+        {bins.map((bin) => {
+          const isTop = bin === topBin;
+          const heightPct = (bin.count / maxCount) * 100;
+          return (
+            <div
+              key={bin.key}
+              className="flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-1.5"
+              title={`${bin.label}：${formatCount(bin.count)} ${unit} · 营收 ¥${formatMoney(bin.amount)}`}
+            >
+              <span className={`text-xs font-bold tabular-nums ${isTop ? 'text-gray-900' : 'text-gray-500'}`}>
+                {formatCount(bin.count)}
+              </span>
+              <div
+                className={`w-full max-w-[52px] rounded-t-md transition-[height] duration-500 ease-out motion-reduce:transition-none ${isTop ? 'bg-gray-900' : 'bg-gray-200'}`}
+                style={{ height: `${Math.max(bin.count > 0 ? 4 : 2, heightPct)}%` }}
+              />
+              <span className={`truncate text-[11px] ${isTop ? 'font-bold text-gray-900' : 'text-gray-400'}`}>{bin.label}</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-3 border-t border-gray-100 pt-2.5 text-xs text-gray-400">
+        主力价格带 <span className="font-bold text-gray-700">{topBin.label}</span>
+        ：订单占 <span className="font-semibold tabular-nums text-gray-600">{((topBin.count / totalCount) * 100).toFixed(0)}%</span>
+        {totalAmount > 0 && (
+          <>
+            ，营收占 <span className="font-semibold tabular-nums text-gray-600">{((topBin.amount / totalAmount) * 100).toFixed(0)}%</span>
+          </>
+        )}
+      </p>
+    </div>
+  );
+};
+
+/* ---------------- 双色环形（买家构成等：深色为强调项，浅色为余量） ---------------- */
+
+export const DonutMix: React.FC<{
+  total: number;
+  totalLabel: string;
+  /** 深色强调项（如复购买家） */
+  primary: { label: string; count: number; hint?: string };
+  /** 浅色余量项（如新买家） */
+  secondary: { label: string; count: number; hint?: string };
+  footnote?: React.ReactNode;
+  emptyText?: string;
+}> = ({ total, totalLabel, primary, secondary, footnote, emptyText = '暂无数据' }) => {
+  if (total <= 0) {
+    return <div className="flex h-24 items-center justify-center text-sm text-gray-400">{emptyText}</div>;
+  }
+  const primaryPct = Math.min(100, Math.max(0, (primary.count / total) * 100));
+  const rows = [
+    { ...primary, swatch: '#111827', pct: primaryPct },
+    { ...secondary, swatch: '#E5E7EB', pct: 100 - primaryPct },
+  ];
+  return (
+    <div>
+      <div className="flex items-center gap-5">
+        <svg width="124" height="124" viewBox="0 0 42 42" role="img" aria-label={`${totalLabel} ${formatCount(total)}`}>
+          <circle cx="21" cy="21" r="15.9" fill="none" stroke="#E5E7EB" strokeWidth="4.6" />
+          {primaryPct > 0 && (
+            <circle
+              cx="21"
+              cy="21"
+              r="15.9"
+              fill="none"
+              stroke="#111827"
+              strokeWidth="4.6"
+              strokeLinecap={primaryPct >= 100 ? 'butt' : 'round'}
+              strokeDasharray={`${primaryPct} ${100 - primaryPct}`}
+              strokeDashoffset="25"
+            />
+          )}
+          <text x="21" y="20.2" textAnchor="middle" className="fill-gray-900" fontSize="8" fontWeight="800">
+            {formatCount(total)}
+          </text>
+          <text x="21" y="26.8" textAnchor="middle" className="fill-gray-400" fontSize="3.4">
+            {totalLabel}
+          </text>
+        </svg>
+        <div className="min-w-0 flex-1 space-y-2.5">
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-baseline gap-2 text-[13px]">
+              <span className="h-2.5 w-2.5 shrink-0 self-center rounded-[4px]" style={{ background: row.swatch }} />
+              <span className="shrink-0 font-medium text-gray-700">{row.label}</span>
+              <span className="ml-auto shrink-0 font-bold tabular-nums text-gray-900">{formatCount(row.count)}</span>
+              <span className="w-12 shrink-0 text-right text-xs tabular-nums text-gray-400">{row.pct.toFixed(1)}%</span>
+            </div>
+          ))}
+          {(primary.hint || secondary.hint) && (
+            <p className="text-xs leading-relaxed text-gray-400">{primary.hint || secondary.hint}</p>
+          )}
+        </div>
+      </div>
+      {footnote && <p className="mt-3 border-t border-gray-100 pt-2.5 text-xs text-gray-400">{footnote}</p>}
+    </div>
+  );
+};
+
+/* ---------------- 贡献列表（账号贡献等：金额占比条 + 墨色阶梯） ---------------- */
+
+export interface ContributionRow {
+  key: string;
+  label: string;
+  amount: number;
+  count: number;
+  /** 阶梯色索引；不传按行序取 RANK_SHADES */
+  shadeIndex?: number;
+}
+
+export const ContributionList: React.FC<{
+  rows: ContributionRow[];
+  emptyText?: string;
+}> = ({ rows, emptyText = '暂无数据' }) => {
+  const totalAmount = rows.reduce((sum, row) => sum + row.amount, 0);
+  const totalCount = rows.reduce((sum, row) => sum + row.count, 0);
+  if (!rows.length || (totalAmount <= 0 && totalCount <= 0)) {
+    return <div className="flex h-24 items-center justify-center text-sm text-gray-400">{emptyText}</div>;
+  }
+  // 金额缺失时退回订单量占比，保证条形仍然可读
+  const shareOf = (row: ContributionRow) => (
+    totalAmount > 0 ? row.amount / totalAmount : row.count / Math.max(totalCount, 1)
+  );
+  return (
+    <div className="space-y-3">
+      {rows.map((row, index) => {
+        const share = shareOf(row);
+        return (
+          <div key={row.key} className="flex items-center gap-3">
+            <div className="w-20 shrink-0 truncate text-[13px] font-medium text-gray-700" title={row.label}>
+              {row.label}
+            </div>
+            <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-gray-100">
+              <div
+                className="h-full rounded-full transition-[width] duration-500 ease-out motion-reduce:transition-none"
+                style={{
+                  width: `${Math.max(1.5, share * 100)}%`,
+                  background: RANK_SHADES[Math.min(row.shadeIndex ?? index, RANK_SHADES.length - 1)],
+                }}
+              />
+            </div>
+            <div className="w-[104px] shrink-0 text-right">
+              <div className="text-[13px] font-bold tabular-nums leading-tight text-gray-900">¥{formatMoney(row.amount)}</div>
+              <div className="text-[11px] tabular-nums leading-tight text-gray-400">{formatCount(row.count)} 单 · {(share * 100).toFixed(1)}%</div>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 };

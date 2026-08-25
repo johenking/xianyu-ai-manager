@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Area,
   Bar,
@@ -10,9 +10,11 @@ import {
   YAxis,
 } from 'recharts';
 import { Flame, Layers, TrendingDown, TrendingUp } from 'lucide-react';
-import type { OrderAnalytics } from '../types';
+import type { Order, OrderAnalytics } from '../types';
 import {
-  CATEGORY_COLORS,
+  ContributionList,
+  DonutMix,
+  Histogram,
   PANEL_CLASS,
   PanelTitle,
   RankList,
@@ -22,6 +24,7 @@ import {
   itemDisplayName,
   statusMetaOf,
   type DailyPoint,
+  type HistogramBin,
 } from './ui/dashboardParts';
 
 const CHART_INITIAL_DIMENSION = { width: 320, height: 180 } as const;
@@ -89,11 +92,11 @@ export const HeroTrend: React.FC<{
         <ComposedChart data={points} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
           <defs>
             <linearGradient id="heroRevenue" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#FFE815" stopOpacity={0.32} />
+              <stop offset="0%" stopColor="#FFE815" stopOpacity={0.26} />
               <stop offset="100%" stopColor="#FFE815" stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.07)" strokeDasharray="3 3" />
+          <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.06)" />
           <XAxis
             dataKey="label"
             axisLine={false}
@@ -111,14 +114,14 @@ export const HeroTrend: React.FC<{
             width={48}
           />
           <YAxis yAxisId="orders" orientation="right" hide domain={[0, 'auto']} />
-          <Tooltip content={<HeroTrendTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.2)' }} />
+          <Tooltip content={<HeroTrendTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.16)' }} />
           <Bar
             yAxisId="orders"
             dataKey="orders"
             name="订单数"
             fill="#38BDF8"
-            fillOpacity={0.28}
-            radius={[3, 3, 0, 0]}
+            fillOpacity={0.24}
+            radius={[2, 2, 0, 0]}
             isAnimationActive={!prefersReducedMotion}
             animationDuration={650}
           />
@@ -128,8 +131,9 @@ export const HeroTrend: React.FC<{
             dataKey="amount"
             name="销售额"
             stroke="#FFE815"
-            strokeWidth={2.5}
+            strokeWidth={2}
             fill="url(#heroRevenue)"
+            activeDot={{ r: 3.5, fill: '#FFE815', stroke: '#111827', strokeWidth: 1.5 }}
             isAnimationActive={!prefersReducedMotion}
             animationDuration={650}
             animationEasing="ease-out"
@@ -176,6 +180,75 @@ export const HeroTrend: React.FC<{
   );
 };
 
+/* ---------------- 客单价分桶（从订单明细在前端聚合，与后端口径一致的实付金额） ---------------- */
+
+export const PRICE_BANDS = [
+  { key: 'lt10', label: '<¥10', min: 0, max: 10 },
+  { key: '10to20', label: '¥10-20', min: 10, max: 20 },
+  { key: '20to50', label: '¥20-50', min: 20, max: 50 },
+  { key: '50to100', label: '¥50-100', min: 50, max: 100 },
+  { key: 'gte100', label: '≥¥100', min: 100, max: Number.POSITIVE_INFINITY },
+] as const;
+
+/** 订单实付金额（元）：规范化分值优先，缺失时回退解析展示金额；均不可用返回 null 不冒充 0 */
+export const orderAmountOf = (order: Order): number | null => {
+  if (typeof order.paid_amount_fen === 'number' && Number.isFinite(order.paid_amount_fen)) {
+    return order.paid_amount_fen / 100;
+  }
+  const parsed = Number.parseFloat(String(order.amount ?? ''));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
+export interface PriceBinsResult {
+  bins: HistogramBin[];
+  /** 金额缺失、未计入分布的订单数 */
+  excluded: number;
+}
+
+export const buildPriceBins = (orders: Order[]): PriceBinsResult => {
+  const bins: HistogramBin[] = PRICE_BANDS.map((band) => ({
+    key: band.key,
+    label: band.label,
+    count: 0,
+    amount: 0,
+  }));
+  let excluded = 0;
+  for (const order of orders) {
+    const amount = orderAmountOf(order);
+    if (amount === null) {
+      excluded += 1;
+      continue;
+    }
+    const index = PRICE_BANDS.findIndex((band) => amount >= band.min && amount < band.max);
+    const bin = bins[index === -1 ? bins.length - 1 : index];
+    bin.count += 1;
+    bin.amount += amount;
+  }
+  return { bins, excluded };
+};
+
+/* ---------------- 买家构成（按所选周期内下单次数区分复购/单次） ---------------- */
+
+export interface BuyerMix {
+  total: number;
+  repeat: number;
+  single: number;
+}
+
+export const buildBuyerMix = (orders: Order[]): BuyerMix => {
+  const counts = new Map<string, number>();
+  for (const order of orders) {
+    const buyer = String(order.buyer_id || '').trim();
+    if (!buyer) continue;
+    counts.set(buyer, (counts.get(buyer) || 0) + 1);
+  }
+  let repeat = 0;
+  for (const count of counts.values()) {
+    if (count >= 2) repeat += 1;
+  }
+  return { total: counts.size, repeat, single: counts.size - repeat };
+};
+
 /* ---------------- 成交爆品榜（当期 vs 上一周期环比） ---------------- */
 
 interface HotItemRow {
@@ -192,29 +265,32 @@ const formatGrowth = (rate: number) => `${rate >= 0 ? '+' : ''}${Math.round(rate
 
 /* ---------------- 浅色分析区：订单与商品 + 成交爆品榜 ---------------- */
 
+type ItemSortMode = 'amount' | 'count';
+
 const DashboardCharts: React.FC<{
   analytics: OrderAnalytics;
   itemNames: Record<string, string>;
   previous?: OrderAnalytics;
-}> = ({ analytics, itemNames, previous }) => {
+  /** 参与统计的订单明细（客单价分布/买家构成在前端聚合） */
+  orders?: Order[];
+  ordersLoading?: boolean;
+}> = ({ analytics, itemNames, previous, orders = [], ordersLoading = false }) => {
   const itemStats = analytics.item_stats || [];
+  const [itemSort, setItemSort] = useState<ItemSortMode>('amount');
 
-  // 商品销量排行（HTML 条形列表，名称完整显示，前 10）
-  const rankRows = itemStats.slice(0, 10).map((entry) => ({
-    key: entry.item_id,
-    label: itemDisplayName(entry.item_id, itemNames[entry.item_id]),
-    value: entry.order_count,
-    valueLabel: `${entry.order_count} 单`,
-  }));
-
-  // 商品下单占比（水平占比条，前 6，附金额说明）
-  const shareRows = itemStats.slice(0, 6).map((entry, index) => ({
-    key: entry.item_id,
-    label: itemDisplayName(entry.item_id, itemNames[entry.item_id]),
-    count: entry.order_count,
-    color: CATEGORY_COLORS[index % CATEGORY_COLORS.length],
-    hint: `¥${formatMoney(entry.total_amount)}`,
-  }));
+  // 商品成交榜（销量/销售额双维度合并为一个榜单，前 8）
+  const rankRows = useMemo(() => {
+    const sorted = [...itemStats].sort((a, b) => (itemSort === 'amount'
+      ? b.total_amount - a.total_amount || b.order_count - a.order_count
+      : b.order_count - a.order_count || b.total_amount - a.total_amount));
+    return sorted.slice(0, 8).map((entry) => ({
+      key: entry.item_id,
+      label: itemDisplayName(entry.item_id, itemNames[entry.item_id]),
+      value: itemSort === 'amount' ? entry.total_amount : entry.order_count,
+      valueLabel: itemSort === 'amount' ? `¥${formatMoney(entry.total_amount)}` : `${entry.order_count} 单`,
+      hint: itemSort === 'amount' ? `${entry.order_count} 单` : `¥${formatMoney(entry.total_amount)}`,
+    }));
+  }, [itemNames, itemSort, itemStats]);
 
   // 订单状态分布（语义色占比条）
   const statusRows = (analytics.status_stats || []).map((entry) => {
@@ -222,12 +298,17 @@ const DashboardCharts: React.FC<{
     return { key: entry.status, label: meta.label, count: entry.count, color: meta.bar };
   });
 
-  // 地区分布（收货城市 Top 10 占比条）
-  const cityRows = (analytics.city_stats || []).slice(0, 10).map((entry) => ({
-    key: entry.city,
-    label: entry.city,
+  // 客单价分布与买家构成从订单明细聚合；明细尚未到达时显示加载占位
+  const ordersPending = ordersLoading && orders.length === 0;
+  const priceBins = useMemo(() => buildPriceBins(orders), [orders]);
+  const buyerMix = useMemo(() => buildBuyerMix(orders), [orders]);
+
+  // 账号贡献（后端按金额降序 Top 20，这里取前 6）
+  const accountRows = (analytics.account_stats || []).slice(0, 6).map((entry) => ({
+    key: entry.cookie_id,
+    label: entry.account_name,
+    amount: entry.total_amount,
     count: entry.order_count,
-    color: '#3B82F6',
   }));
 
   // 成交爆品榜：以当期商品为基准，与上一周期订单量做环比
@@ -261,36 +342,78 @@ const DashboardCharts: React.FC<{
     })
     .slice(0, 8);
 
+  const loadingPlaceholder = (
+    <div className="flex h-24 items-center justify-center text-sm text-gray-400">数据加载中...</div>
+  );
+
   return (
     <div className="space-y-5">
       <section className={`${PANEL_CLASS} p-6`}>
         <div className="mb-5 flex items-center gap-2">
-          <Layers className="h-5 w-5 text-blue-600" />
+          <Layers className="h-5 w-5 text-gray-400" />
           <h3 className="text-base font-extrabold text-gray-900">订单与商品</h3>
         </div>
         <div className="grid grid-cols-1 gap-x-10 gap-y-8 lg:grid-cols-2">
-          <div>
-            <PanelTitle title="订单状态分布" sub="按订单量统计 · 退款完成订单已扣除" />
-            <ShareBars rows={statusRows} emptyText="暂无数据" labelWidthClass="w-16" />
-          </div>
-          <div>
-            <PanelTitle title="商品销量排行" sub="按成交订单量排序 · 前 10" />
+          <div className="lg:row-span-2" data-testid="item-rank-panel">
+            <div className="flex items-start justify-between gap-3">
+              <PanelTitle
+                title="商品成交榜"
+                sub={itemSort === 'amount' ? '按销售额排序 · 前 8' : '按订单量排序 · 前 8'}
+              />
+              <div className="flex shrink-0 items-center rounded-lg bg-gray-100 p-0.5" role="group" aria-label="商品成交榜排序方式">
+                {([['amount', '销售额'], ['count', '订单量']] as Array<[ItemSortMode, string]>).map(([mode, label]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setItemSort(mode)}
+                    aria-pressed={itemSort === mode}
+                    className={`rounded-md px-2.5 py-1 text-xs font-bold transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-gray-900 ${
+                      itemSort === mode ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-400 hover:text-gray-600'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <RankList rows={rankRows} emptyText="暂无数据" />
           </div>
           <div>
-            <PanelTitle title="商品下单占比" sub="按订单量占比 · 前 6" />
-            <ShareBars rows={shareRows} emptyText="暂无数据" labelWidthClass="w-36" />
+            <PanelTitle
+              title="客单价分布"
+              sub={`按订单实付金额分桶${priceBins.excluded > 0 ? ` · ${priceBins.excluded} 笔金额缺失未计入` : ''}`}
+            />
+            {ordersPending ? loadingPlaceholder : <Histogram bins={priceBins.bins} emptyText="暂无订单明细" />}
           </div>
           <div>
-            <PanelTitle title="地区分布" sub="收货城市订单量 Top 10" />
-            <ShareBars rows={cityRows} emptyText="暂无收货城市数据" labelWidthClass="w-16" />
+            <PanelTitle title="买家构成" sub="所选周期内下单 ≥ 2 次计为复购" />
+            {ordersPending ? loadingPlaceholder : (
+              <DonutMix
+                total={buyerMix.total}
+                totalLabel="下单买家"
+                primary={{ label: '复购买家', count: buyerMix.repeat }}
+                secondary={{ label: '单次买家', count: buyerMix.single }}
+                footnote={buyerMix.total > 0
+                  ? <>周期内复购率 <span className="font-bold text-gray-700">{((buyerMix.repeat / buyerMix.total) * 100).toFixed(1)}%</span>，按下单次数统计，不涉及客户画像</>
+                  : undefined}
+                emptyText="暂无买家数据"
+              />
+            )}
+          </div>
+          <div>
+            <PanelTitle title="账号贡献" sub="按销售额降序 · 前 6" />
+            <ContributionList rows={accountRows} emptyText="暂无账号成交数据" />
+          </div>
+          <div>
+            <PanelTitle title="订单状态分布" sub="按订单量统计 · 退款完成订单已扣除" />
+            <ShareBars rows={statusRows} emptyText="暂无数据" labelWidthClass="w-16" />
           </div>
         </div>
       </section>
 
       <section className={`${PANEL_CLASS} p-6`} data-testid="hot-items-panel">
         <div className="mb-4 flex flex-wrap items-center gap-2">
-          <Flame className="h-5 w-5 text-orange-500" />
+          <Flame className="h-5 w-5 text-gray-400" />
           <h3 className="text-base font-extrabold text-gray-900">成交爆品榜</h3>
           <span className="text-sm text-gray-400">当期订单量 ≥ 2，按环比增长排序</span>
         </div>
@@ -316,19 +439,19 @@ const DashboardCharts: React.FC<{
                     <td className="max-w-[300px] py-3 pr-4">
                       <span className="block truncate font-medium text-gray-900" title={item.name}>{item.name}</span>
                     </td>
-                    <td className="py-3 text-right text-gray-700">{item.orderCount} 单</td>
+                    <td className="py-3 text-right tabular-nums text-gray-700">{item.orderCount} 单</td>
                     <td className="py-3 text-right">
                       {item.isNew ? (
                         <span className="inline-flex items-center rounded-md bg-gray-900 px-2 py-0.5 text-xs font-bold text-white">新品</span>
                       ) : (
-                        <span className={`inline-flex items-center gap-1 font-bold ${item.growthRate! >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                        <span className={`inline-flex items-center gap-1 font-bold tabular-nums ${item.growthRate! >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
                           {item.growthRate! >= 0 ? <TrendingUp className="h-3.5 w-3.5" /> : <TrendingDown className="h-3.5 w-3.5" />}
                           {formatGrowth(item.growthRate!)}
                         </span>
                       )}
                     </td>
-                    <td className="py-3 text-right text-gray-700">¥{formatMoney(item.totalAmount)}</td>
-                    <td className="py-3 text-right text-gray-700">¥{formatMoney(item.avgAmount)}</td>
+                    <td className="py-3 text-right tabular-nums text-gray-700">¥{formatMoney(item.totalAmount)}</td>
+                    <td className="py-3 text-right tabular-nums text-gray-700">¥{formatMoney(item.avgAmount)}</td>
                   </tr>
                 ))}
               </tbody>
