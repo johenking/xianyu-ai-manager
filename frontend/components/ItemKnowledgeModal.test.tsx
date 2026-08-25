@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   copyAIItemKnowledge,
@@ -10,6 +10,7 @@ import {
   saveAIItemKnowledgeDraft,
 } from '../services/api';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
+import ToastViewport, { clearToasts } from './ui/Toast';
 
 vi.mock('../services/api', () => ({
   getAIItemKnowledge: vi.fn(),
@@ -78,7 +79,11 @@ describe('ItemKnowledgeModal overview workflow', () => {
     });
   });
 
-  afterEach(() => cleanup());
+  afterEach(() => {
+    clearToasts();
+    cleanup();
+    vi.clearAllMocks();
+  });
 
   it('requires and sends the seller overview before generating details', async () => {
     render(<ItemKnowledgeModal item={sourceItem as any} onClose={() => undefined} />);
@@ -193,5 +198,51 @@ describe('ItemKnowledgeModal overview workflow', () => {
     await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
       'account-1', 'item-a', ['item-none', 'item-published']
     ));
+  });
+
+  it('pops a toast and refreshes target states after copying', async () => {
+    vi.mocked(getAIItemKnowledge).mockResolvedValue({
+      ...emptyProfile,
+      draft: {
+        overview: { text: '同款Claude代充', source: 'user', status: 'confirmed' },
+        pricing: [], process: [], after_sales: [], forbidden: [], faqs: [], notes: [],
+      },
+    });
+    const blankTarget = {
+      ...sourceItem, id: 5, item_id: 'item-b', item_title: 'Claude商品B',
+      knowledge_has_draft: false, knowledge_published_version: 0,
+    };
+    vi.mocked(getItemsByCookie)
+      .mockResolvedValueOnce([sourceItem, blankTarget] as any)
+      .mockResolvedValueOnce([
+        sourceItem,
+        { ...blankTarget, knowledge_has_draft: true },
+      ] as any);
+
+    render(
+      <>
+        <ItemKnowledgeModal item={sourceItem as any} onClose={() => undefined} />
+        <ToastViewport />
+      </>
+    );
+    await screen.findByText('草稿档案');
+    fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
+    expect(await screen.findByText('无档案')).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Claude商品B/ }));
+    fireEvent.click(screen.getByRole('button', { name: '覆盖所选商品草稿' }));
+
+    await waitFor(() => expect(copyAIItemKnowledge).toHaveBeenCalledWith(
+      'account-1', 'item-a', ['item-b']
+    ));
+    // 弹窗反馈 + 面板内目标状态刷新
+    await waitFor(() => expect(
+      within(screen.getByRole('status')).getByText(/已覆盖 1 个商品草稿/)
+    ).toBeTruthy());
+    await waitFor(() => expect(getItemsByCookie).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole('button', { name: '复制到其他商品' }));
+    expect(await screen.findByText('已有草稿')).toBeTruthy();
+    expect(screen.queryByText('无档案')).toBeNull();
   });
 });

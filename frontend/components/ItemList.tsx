@@ -23,6 +23,7 @@ import {
   deliveryModeOf,
 } from './ui/DeliveryMode';
 import { knowledgeStateOf } from '../utils/itemKnowledge';
+import { pushToast } from './ui/Toast';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
@@ -76,6 +77,7 @@ const ItemList: React.FC = () => {
     } catch (error) {
       const message = error instanceof Error ? error.message : '加载商品数据失败';
       setStatusText(message);
+      pushToast('error', message);
     } finally {
       setLoading(false);
     }
@@ -93,6 +95,7 @@ const ItemList: React.FC = () => {
     } catch (error) {
       const message = error instanceof Error ? error.message : '加载商品数据失败';
       setStatusText(message);
+      pushToast('error', message);
     } finally {
       setLoading(false);
     }
@@ -101,6 +104,7 @@ const ItemList: React.FC = () => {
   const handleSync = async () => {
     if (!selectedAccount || selectedAccount === ALL_ACCOUNTS_VALUE) {
       setStatusText('请先选择单个账号再同步商品');
+      pushToast('error', '请先选择单个账号再同步商品');
       return;
     }
     setLoading(true);
@@ -111,10 +115,13 @@ const ItemList: React.FC = () => {
         throw new Error(result.message || '同步商品失败');
       }
       await loadItemsForAccount(selectedAccount);
-      setStatusText(result?.message || '商品同步完成');
+      const message = result?.message || '商品同步完成';
+      setStatusText(message);
+      pushToast('success', message);
     } catch (error) {
       const message = error instanceof Error ? error.message : '同步商品失败';
       setStatusText(message);
+      pushToast('error', message);
     } finally {
       setLoading(false);
     }
@@ -130,9 +137,11 @@ const ItemList: React.FC = () => {
           !(i.cookie_id === item.cookie_id && i.item_id === item.item_id)
         ));
         setStatusText('商品已删除');
+        pushToast('success', `商品「${item.item_title || item.item_id}」已删除`);
       } catch (error) {
         const message = error instanceof Error ? error.message : '删除失败，请重试';
         setStatusText(message);
+        pushToast('error', message);
       } finally {
         setActionKey('');
       }
@@ -152,9 +161,11 @@ const ItemList: React.FC = () => {
           : i
       ));
       setStatusText(`多规格已${nextValue ? '开启' : '关闭'}`);
+      pushToast('success', `多规格已${nextValue ? '开启' : '关闭'}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : '切换多规格失败';
       setStatusText(message);
+      pushToast('error', message);
     } finally {
       setActionKey('');
     }
@@ -173,9 +184,11 @@ const ItemList: React.FC = () => {
           : i
       ));
       setStatusText(`多数量发货已${nextValue ? '开启' : '关闭'}`);
+      pushToast('success', `多数量发货已${nextValue ? '开启' : '关闭'}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : '切换多数量发货失败';
       setStatusText(message);
+      pushToast('error', message);
     } finally {
       setActionKey('');
     }
@@ -202,10 +215,14 @@ const ItemList: React.FC = () => {
           ? { ...i, delivery_card_id: mode === 'card' ? cardId : null, invite_auto_fulfillment: mode === 'invite' }
           : i
       ));
-      setStatusText(`发货方式已更新：${mode === 'card' ? '发送卡密' : mode === 'invite' ? '邀请重置' : '关键词兜底'}`);
+      const message = `发货方式已更新：${mode === 'card' ? '发送卡密' : mode === 'invite' ? '邀请重置' : '关键词兜底'}`;
+      setStatusText(message);
+      pushToast('success', message);
       setDeliveryItem(null);
     } catch (error) {
-      setStatusText(error instanceof Error ? error.message : '保存发货设置失败');
+      const message = error instanceof Error ? error.message : '保存发货设置失败';
+      setStatusText(message);
+      pushToast('error', message);
     } finally {
       setSavingDelivery(false);
     }

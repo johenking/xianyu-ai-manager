@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ItemList from './ItemList';
+import ToastViewport, { clearToasts } from './ui/Toast';
 import {
   getAccountDetails,
   getItems,
@@ -120,6 +121,7 @@ describe('ItemList account filtering', () => {
   });
 
   afterEach(() => {
+    clearToasts();
     cleanup();
     vi.clearAllMocks();
   });
@@ -200,6 +202,45 @@ describe('ItemList account filtering', () => {
     fireEvent.click(screen.getByRole('button', { name: '全部 (3)' }));
     expect(screen.getByText('已发布档案商品')).toBeInTheDocument();
     expect(screen.getByText('未建档商品')).toBeInTheDocument();
+  });
+
+  it('pops toast feedback for sync and toggle operations', async () => {
+    render(
+      <>
+        <ItemList />
+        <ToastViewport />
+      </>
+    );
+    await screen.findByText('账号一商品');
+
+    fireEvent.click(screen.getByRole('button', { name: '多规格' }));
+    await waitFor(() => expect(updateItemMultiSpec).toHaveBeenCalled());
+    await waitFor(() => expect(
+      within(screen.getByRole('status')).getByText('多规格已开启')
+    ).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /同步商品/ }));
+    await waitFor(() => expect(syncItemsFromAccount).toHaveBeenCalled());
+    await waitFor(() => expect(
+      within(screen.getByRole('status')).getByText('商品同步完成')
+    ).toBeInTheDocument());
+  });
+
+  it('pops an error toast when an operation fails', async () => {
+    vi.mocked(updateItemMultiQuantityDelivery).mockRejectedValueOnce(new Error('切换多数量发货失败：网络异常'));
+
+    render(
+      <>
+        <ItemList />
+        <ToastViewport />
+      </>
+    );
+    await screen.findByText('账号一商品');
+
+    fireEvent.click(screen.getByRole('button', { name: '多数量发货' }));
+    await waitFor(() => expect(
+      within(screen.getByRole('status')).getByText('切换多数量发货失败：网络异常')
+    ).toBeInTheDocument());
   });
 
   it('refreshes items after closing the knowledge modal so badges stay current', async () => {

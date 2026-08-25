@@ -23,6 +23,7 @@ import {
   countPendingKnowledge, emptyItemKnowledge, hasKnowledgeContent,
   knowledgeStateOf, newKnowledgeEntry, normalizeItemKnowledge,
 } from '../utils/itemKnowledge';
+import { pushToast } from './ui/Toast';
 
 type ListSection = 'pricing' | 'process' | 'after_sales' | 'forbidden' | 'faqs' | 'notes';
 
@@ -85,7 +86,9 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       setKnowledge(normalizeItemKnowledge(result.draft));
       setDirty(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '商品知识档案加载失败');
+      const text = err instanceof Error ? err.message : '商品知识档案加载失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setLoading(false);
     }
@@ -100,6 +103,16 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       .catch(() => { if (mounted) setAvailableItems([]); });
     return () => { mounted = false; };
   }, [item.cookie_id]);
+
+  // 复制成功后重新拉取同账号商品，让复制面板里目标行的档案标识立即更新
+  const refreshCopyCandidates = async () => {
+    try {
+      const items = await getItemsByCookie(item.cookie_id);
+      setAvailableItems(items);
+    } catch {
+      // 静默失败：下次打开弹窗或手动刷新时会重新拉取
+    }
+  };
 
   const updateKnowledge = (updater: (current: AIItemKnowledge) => AIItemKnowledge) => {
     setKnowledge((current) => updater(current));
@@ -159,6 +172,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
     const overview = knowledge.overview?.text?.trim() || '';
     if (!overview) {
       setError('请先填写商品概览，再生成结构化草稿');
+      pushToast('error', '请先填写商品概览，再生成结构化草稿');
       return;
     }
     setGenerating(true);
@@ -175,9 +189,13 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
         source_detail_hash: result.source_detail_hash,
       } : current);
       setDirty(false);
-      setMessage(result.message || '旧草稿已替换，新的AI草稿已生成，黄色内容需要确认');
+      const text = result.message || '旧草稿已替换，新的AI草稿已生成，黄色内容需要确认';
+      setMessage(text);
+      pushToast('success', text);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'AI草稿生成失败');
+      const text = err instanceof Error ? err.message : 'AI草稿生成失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setGenerating(false);
     }
@@ -206,10 +224,12 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   const copyKnowledge = async () => {
     if (!hasKnowledgeContent(knowledge)) {
       setError('当前商品还没有可复制的知识档案');
+      pushToast('error', '当前商品还没有可复制的知识档案');
       return;
     }
     if (copyTargetIds.length === 0) {
       setError('请选择至少一个目标商品');
+      pushToast('error', '请选择至少一个目标商品');
       return;
     }
     setCopying(true);
@@ -233,11 +253,16 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
         `已覆盖 ${copiedCount}`,
         missingCount > 0 ? `不存在 ${missingCount}` : '',
       ].filter(Boolean).join('，');
-      setMessage(`${result.message}（${details}）`);
+      const text = `${result.message}（${details}）`;
+      setMessage(text);
+      pushToast('success', text);
       setCopyTargetIds([]);
       setCopyOpen(false);
+      await refreshCopyCandidates();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '复制知识档案失败');
+      const text = err instanceof Error ? err.message : '复制知识档案失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setCopying(false);
     }
@@ -252,8 +277,11 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       setKnowledge(normalizeItemKnowledge(result.draft));
       setDirty(false);
       setMessage('草稿已保存，可进入训练测试');
+      pushToast('success', '草稿已保存，可进入训练测试');
     } catch (err) {
-      setError(err instanceof Error ? err.message : '保存草稿失败');
+      const text = err instanceof Error ? err.message : '保存草稿失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setSaving(false);
     }
@@ -262,6 +290,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   const publish = async () => {
     if (dirty) {
       setError('请先保存当前草稿，再发布到真实AI');
+      pushToast('error', '请先保存当前草稿，再发布到真实AI');
       return;
     }
     setPublishing(true);
@@ -269,10 +298,14 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
     try {
       const result = await publishAIItemKnowledge(item.cookie_id, item.item_id);
       setProfile((current) => current ? { ...current, ...result } : current);
-      setMessage(result.message || '知识档案已发布');
+      const text = result.message || '知识档案已发布';
+      setMessage(text);
+      pushToast('success', text);
       if (showVersions) await loadVersions();
     } catch (err) {
-      setError(err instanceof Error ? err.message : '发布失败');
+      const text = err instanceof Error ? err.message : '发布失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setPublishing(false);
     }
@@ -283,7 +316,9 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       const result = await getAIItemKnowledgeVersions(item.cookie_id, item.item_id);
       setVersions(result.versions);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '版本记录加载失败');
+      const text = err instanceof Error ? err.message : '版本记录加载失败';
+      setError(text);
+      pushToast('error', text);
     }
   };
 
@@ -300,9 +335,13 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       const result = await rollbackAIItemKnowledge(item.cookie_id, item.item_id, version);
       await loadProfile();
       await loadVersions();
-      setMessage(result.message || '版本已回滚');
+      const text = result.message || '版本已回滚';
+      setMessage(text);
+      pushToast('success', text);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '回滚失败');
+      const text = err instanceof Error ? err.message : '回滚失败';
+      setError(text);
+      pushToast('error', text);
     } finally {
       setPublishing(false);
     }
