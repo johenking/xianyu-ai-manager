@@ -870,3 +870,9 @@ read-only checked before and after the cutover: it remained `pending_ship` and
 hashes, patch replay, failure-recovery rehearsal, production backup, and the
 executable rollback are recorded in
 `outputs/lead-order-guard-20260819T204757+0800/evidence/verification-record.md`.
+
+## 2026-08-26 前端关键路径性能优化（仅维护源）
+
+本轮完成订单与账号读取超时止损、订单图片直链优先与代理回退背压、页面按意图加载，以及账号状态自适应轮询。订单图片代理前后端均限制为 4 并发，并具备同订单 single-flight、失败负缓存和显式重试绕过；账号稳定态每 15 秒检查，刷新或验证活跃态保持 3 秒，页面隐藏时暂停并取消在途请求，任何批次未结束前不会叠加下一轮。
+
+维护源提交为 `508b91a`、`f7afdbc`、`2f07bf1`、`946ba80`、`8a7dc8a`、`8e693dc`，均已推送 `origin/main`。低优先级单 worker 定向门禁为前端关键路径 5 文件 `80 passed`、TypeScript 零错误、Vite build 通过、构建校验 `orphaned=0`。本轮未替换生产文件、未重载服务、未运行数据库写入或迁移；生产状态保持不变。
