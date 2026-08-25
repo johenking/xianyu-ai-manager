@@ -12,7 +12,7 @@ import {
   updateItemDeliveryBinding,
   updateItemInviteAutoFulfillment
 } from '../services/api';
-import { BookOpen, Box, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
+import { BookOpen, Box, Loader2, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 import AITrainingLab from './AITrainingLab';
 import RemoteImage from './ui/RemoteImage';
@@ -253,7 +253,7 @@ const ItemList: React.FC = () => {
     <div className="space-y-6 animate-fade-in">
       <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
         <div>
-          <h2 className="text-2xl sm:text-3xl font-bold text-gray-900">商品管理</h2>
+          <h2 className="text-2xl sm:text-3xl font-extrabold text-gray-900 tracking-tight">商品管理</h2>
           <p className="text-gray-500 mt-2 text-sm">从闲鱼账号同步商品，并管理自动发货相关状态。</p>
         </div>
         <div className="flex flex-col sm:flex-row gap-3 w-full lg:w-auto">
@@ -271,7 +271,7 @@ const ItemList: React.FC = () => {
             value={selectedAccount}
             onChange={e => void handleAccountChange(e.target.value)}
           >
-            {accounts.length === 0 && <option value="">暂无账号</option>}
+            {accounts.length === 0 && <option value="">{loading ? '正在加载账号…' : '暂无账号'}</option>}
             {accounts.map(acc => (
               <option key={acc.id} value={acc.id}>{acc.nickname || acc.remark || acc.id}</option>
             ))}
@@ -306,7 +306,7 @@ const ItemList: React.FC = () => {
       )}
 
       {items.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2" role="group" aria-label="知识档案筛选">
+        <div className="inline-flex max-w-full gap-1 overflow-x-auto rounded-xl bg-gray-100 p-1" role="group" aria-label="知识档案筛选">
           {([
             ['all', `全部 (${items.length})`],
             ['has', `有档案 (${knowledgeCount})`],
@@ -315,10 +315,10 @@ const ItemList: React.FC = () => {
             <button
               key={value}
               onClick={() => setKnowledgeFilter(value)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+              className={`whitespace-nowrap rounded-lg px-4 py-2 text-[13px] font-bold transition-colors ${
                 knowledgeFilter === value
-                  ? 'bg-gray-900 text-white'
-                  : 'bg-white border border-gray-200 text-gray-500 hover:bg-gray-50'
+                  ? 'bg-white text-gray-900 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-800'
               }`}
             >
               {label}
@@ -429,7 +429,13 @@ const ItemList: React.FC = () => {
                   </div>
               </div>
           ))}
-          {items.length === 0 && (
+          {loading && items.length === 0 && (
+             <div className="col-span-full flex flex-col items-center justify-center gap-3 py-20 text-center" role="status" aria-label="商品加载中">
+                 <Loader2 className="w-8 h-8 animate-spin text-[#FFE815]" />
+                 <p className="text-sm text-gray-500">正在加载商品…</p>
+             </div>
+          )}
+          {!loading && items.length === 0 && (
              <div className="col-span-full py-20 text-center text-gray-400">
                  <ShoppingBag className="w-12 h-12 mx-auto mb-4 opacity-30" />
                  暂无商品数据，请选择账号进行同步

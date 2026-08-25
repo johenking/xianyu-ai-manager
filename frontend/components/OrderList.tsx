@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderStatus, Item, OrderSyncResponse, AccountDetail } from '../types';
 import { getOrders, getOrderDetail, syncOrders, syncSingleOrder, manualShipOrder, updateOrder, deleteOrder, importOrders, getItems, getAccountDetails, getShippingRules } from '../services/api';
-import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Plus, Save, X, ExternalLink, Trash2, Upload, LogIn } from 'lucide-react';
+import { Search, Truck, RefreshCw, ChevronLeft, ChevronRight, PackageCheck, Edit, Eye, Loader2, Plus, Save, ShoppingBag, X, ExternalLink, Trash2, Upload, LogIn } from 'lucide-react';
 import { InlineNotice } from './ui/StatusControls';
 import { PANEL_CLASS, StatusBadge, formatCount, formatMoney, itemDisplayName } from './ui/dashboardParts';
 import OrderItemImage from './ui/OrderItemImage';
@@ -705,6 +705,19 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
               </div>
             </div>
           ))}
+          {loading && orders.length === 0 && (
+            <div className="flex flex-col items-center justify-center gap-3 py-20 text-center" role="status" aria-label="订单加载中">
+              <Loader2 className="h-8 w-8 animate-spin text-[#FFE815]" />
+              <p className="text-sm text-gray-500">正在加载订单…</p>
+            </div>
+          )}
+          {!loading && orders.length === 0 && (
+            <div className="flex flex-col items-center justify-center gap-2 py-20 text-center text-gray-400">
+              <ShoppingBag className="h-12 w-12 opacity-30" />
+              <p className="text-sm font-bold text-gray-500">暂无订单</p>
+              <p className="text-xs">调整筛选条件，或点击右上角同步订单</p>
+            </div>
+          )}
         </div>
 
         {/* Desktop table */}
@@ -788,6 +801,27 @@ const OrderList: React.FC<{ onNavigateAccounts?: () => void }> = ({ onNavigateAc
                   </td>
                 </tr>
               ))}
+              {loading && orders.length === 0 && (
+                <tr>
+                  <td colSpan={5}>
+                    <div className="flex flex-col items-center justify-center gap-3 py-24 text-center" role="status" aria-label="订单加载中">
+                      <Loader2 className="h-8 w-8 animate-spin text-[#FFE815]" />
+                      <p className="text-sm text-gray-500">正在加载订单…</p>
+                    </div>
+                  </td>
+                </tr>
+              )}
+              {!loading && orders.length === 0 && (
+                <tr>
+                  <td colSpan={5}>
+                    <div className="flex flex-col items-center justify-center gap-2 py-24 text-center text-gray-400">
+                      <ShoppingBag className="h-12 w-12 opacity-30" />
+                      <p className="text-sm font-bold text-gray-500">暂无订单</p>
+                      <p className="text-xs">调整筛选条件，或点击右上角同步订单</p>
+                    </div>
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

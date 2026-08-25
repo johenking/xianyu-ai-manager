@@ -393,7 +393,7 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
         </div>
 
         <div className="modal-body">
-          {loading ? <div className="h-96 flex items-center justify-center"><Loader2 className="w-6 h-6 animate-spin text-yellow-500" /></div> : (
+          {loading ? <div className="h-96 flex items-center justify-center"><Loader2 className="w-6 h-6 animate-spin text-[#FFE815]" /></div> : (
             <div className="grid grid-cols-1 lg:grid-cols-[330px_1fr] gap-6">
               <aside className="lg:border-r lg:border-gray-200 lg:pr-6 space-y-5">
                 <div>

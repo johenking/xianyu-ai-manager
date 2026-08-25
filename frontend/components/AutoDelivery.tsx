@@ -324,7 +324,7 @@ const AutoDelivery: React.FC = () => {
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-xs font-bold uppercase tracking-[0.18em] text-gray-400">Delivery Center</p>
-          <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-gray-950 sm:text-3xl">自动发货</h2>
+          <h2 className="mt-2 text-2xl font-extrabold tracking-tight text-gray-900 sm:text-3xl">自动发货</h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
             先准备可交付资源，再为商品选择唯一发货方式；每次交付都留下可追溯记录。
           </p>
@@ -378,7 +378,7 @@ const AutoDelivery: React.FC = () => {
               value={selectedAccount}
               onChange={(event) => setSelectedAccount(event.target.value)}
             >
-              {accounts.length === 0 && <option value="">暂无账号</option>}
+              {accounts.length === 0 && <option value="">{baseLoading ? '正在加载账号…' : '暂无账号'}</option>}
               {accounts.map((account) => (
                 <option key={account.id} value={account.id}>{accountNames[account.id]}</option>
               ))}

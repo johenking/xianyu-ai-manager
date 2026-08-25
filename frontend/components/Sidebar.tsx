@@ -15,9 +15,9 @@ const Sidebar: React.FC<SidebarProps> = ({ activeTab, setActiveTab, onPreloadTab
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: '仪表盘' },
     { id: 'accounts', icon: Users, label: '账号管理' },
-    { id: 'orders', icon: ShoppingBag, label: '订单管理' },
+    { id: 'orders', icon: ShoppingBag, label: '订单中心' },
     { id: 'delivery', icon: PackageCheck, label: '自动发货' },
-    { id: 'items', icon: Box, label: '商品列表' },
+    { id: 'items', icon: Box, label: '商品管理' },
     { id: 'keywords', icon: MessageSquare, label: '关键词管理' },
     { id: 'settings', icon: Settings, label: '系统与AI' },
   ];

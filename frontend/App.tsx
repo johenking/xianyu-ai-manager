@@ -49,7 +49,7 @@ const preloadAppPages = () => {
 
 const PageLoading: React.FC = () => (
   <div className="flex min-h-[50vh] items-center justify-center" role="status" aria-label="页面加载中">
-    <Loader2 className="h-8 w-8 animate-spin text-[#D6B500]" />
+    <Loader2 className="h-8 w-8 animate-spin text-[#FFE815]" />
   </div>
 );
 
@@ -148,7 +148,7 @@ const App: React.FC = () => {
 
   if (checkingAuth) {
       return (
-          <div className="min-h-screen flex items-center justify-center bg-[#f5f5f7]">
+          <div className="min-h-screen flex items-center justify-center bg-[#F4F5F7]">
               <Loader2 className="w-8 h-8 text-[#FFE815] animate-spin" />
           </div>
       );
@@ -156,7 +156,7 @@ const App: React.FC = () => {
 
   if (authError && localStorage.getItem('auth_token')) {
       return (
-          <div className="flex min-h-screen items-center justify-center bg-[#f5f5f7] p-6">
+          <div className="flex min-h-screen items-center justify-center bg-[#F4F5F7] p-6">
               <div className="max-w-md text-center">
                   <AlertCircle className="mx-auto h-10 w-10 text-amber-500" />
                   <h1 className="mt-4 text-xl font-extrabold text-gray-900">身份验证暂时不可用</h1>

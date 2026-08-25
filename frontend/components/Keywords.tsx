@@ -552,7 +552,7 @@ const Keywords: React.FC = () => {
           // 关键词回复列表
           loading ? (
             <div className="flex flex-col items-center justify-center gap-3 px-6 py-20 text-center">
-              <Loader2 className="h-8 w-8 animate-spin text-gray-300" />
+              <Loader2 className="h-8 w-8 animate-spin text-[#FFE815]" />
               <p className="text-sm text-gray-500">加载中...</p>
             </div>
           ) : loadErrors.keywords ? (
@@ -860,7 +860,7 @@ const Keywords: React.FC = () => {
                 </button>
                 <button
                   onClick={handleSaveDelivery}
-                  className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 px-6 py-3 font-bold text-white transition-colors hover:bg-gray-800"
+                  className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-xl px-6 py-3 font-bold"
                 >
                   <Save className="h-4 w-4" />
                   保存发货规则
@@ -972,7 +972,7 @@ const Keywords: React.FC = () => {
                 </button>
                 <button
                   onClick={handleSaveDefault}
-                  className="flex flex-1 items-center justify-center gap-2 rounded-xl bg-gray-900 px-6 py-3 font-bold text-white transition-colors hover:bg-gray-800"
+                  className="ios-btn-primary flex flex-1 items-center justify-center gap-2 rounded-xl px-6 py-3 font-bold"
                 >
                   <Save className="h-4 w-4" />
                   保存默认回复
