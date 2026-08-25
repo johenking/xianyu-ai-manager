@@ -491,7 +491,7 @@ const Dashboard: React.FC = () => {
                 <span className="inline-flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-sm bg-sky-300" />订单</span>
               </div>
             </div>
-            <Suspense fallback={<div className="h-[176px] animate-pulse rounded-xl bg-white/[0.04] motion-reduce:animate-none sm:h-[192px]" />}>
+            <Suspense fallback={<div className="h-[158px] animate-pulse rounded-xl bg-white/[0.04] motion-reduce:animate-none sm:h-[174px]" />}>
               <HeroTrend
                 points={heroPoints}
                 highlightPoints={highlightPoints}

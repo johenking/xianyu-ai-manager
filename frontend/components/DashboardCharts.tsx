@@ -4,7 +4,6 @@ import {
   Bar,
   CartesianGrid,
   ComposedChart,
-  ReferenceDot,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -52,28 +51,6 @@ const HeroTrendTooltip: React.FC<{
   );
 };
 
-/** 图内峰/谷标注文字：跟随 ReferenceDot 的 viewBox 定位，靠边时自动换锚点防溢出 */
-const TrendMarkerLabel: React.FC<{
-  viewBox?: { x?: number; y?: number };
-  text: string;
-  fill: string;
-  anchor: 'start' | 'middle' | 'end';
-  testId: string;
-}> = ({ viewBox, text, fill, anchor, testId }) => (
-  <text
-    data-testid={testId}
-    x={viewBox?.x ?? 0}
-    y={(viewBox?.y ?? 0) - 9}
-    textAnchor={anchor}
-    fill={fill}
-    fontSize={10}
-    fontWeight={700}
-    style={{ fontVariantNumeric: 'tabular-nums' }}
-  >
-    {text}
-  </text>
-);
-
 const TrendHighlight: React.FC<{
   label: string;
   point: DailyPoint | null;
@@ -108,24 +85,18 @@ export const HeroTrend: React.FC<{
   const prefersReducedMotion = typeof window !== 'undefined'
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
   const coverageRate = timeCoverage?.coverage_rate;
-  const anchorFor = (point: DailyPoint): 'start' | 'middle' | 'end' => {
-    const index = points.findIndex((candidate) => candidate.label === point.label);
-    if (index <= 1) return 'start';
-    if (index >= points.length - 2) return 'end';
-    return 'middle';
-  };
   return (
     <div className="w-full" data-testid="hero-trend">
-      <div className="h-[176px] w-full sm:h-[192px]">
+      <div className="h-[158px] w-full sm:h-[174px]">
       <ResponsiveContainer width="100%" height="100%" initialDimension={CHART_INITIAL_DIMENSION}>
-        <ComposedChart data={points} margin={{ top: 18, right: 12, left: 0, bottom: 0 }}>
+        <ComposedChart data={points} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
           <defs>
             <linearGradient id="heroRevenue" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#FFE815" stopOpacity={0.26} />
+              <stop offset="0%" stopColor="#FFE815" stopOpacity={0.32} />
               <stop offset="100%" stopColor="#FFE815" stopOpacity={0} />
             </linearGradient>
           </defs>
-          <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.06)" />
+          <CartesianGrid vertical={false} stroke="rgba(255,255,255,0.07)" strokeDasharray="3 3" />
           <XAxis
             dataKey="label"
             axisLine={false}
@@ -143,70 +114,29 @@ export const HeroTrend: React.FC<{
             width={48}
           />
           <YAxis yAxisId="orders" orientation="right" hide domain={[0, 'auto']} />
-          <Tooltip content={<HeroTrendTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.16)' }} />
+          <Tooltip content={<HeroTrendTooltip />} cursor={{ stroke: 'rgba(255,255,255,0.2)' }} />
           <Bar
             yAxisId="orders"
             dataKey="orders"
             name="订单数"
             fill="#38BDF8"
-            fillOpacity={0.24}
-            radius={[2, 2, 0, 0]}
+            fillOpacity={0.28}
+            radius={[3, 3, 0, 0]}
             isAnimationActive={!prefersReducedMotion}
             animationDuration={650}
           />
           <Area
             yAxisId="amount"
-            type="linear"
+            type="monotone"
             dataKey="amount"
             name="销售额"
             stroke="#FFE815"
-            strokeWidth={2}
+            strokeWidth={2.5}
             fill="url(#heroRevenue)"
-            activeDot={{ r: 3.5, fill: '#FFE815', stroke: '#111827', strokeWidth: 1.5 }}
             isAnimationActive={!prefersReducedMotion}
             animationDuration={650}
             animationEasing="ease-out"
           />
-          {highlights.peakAmount && (
-            <ReferenceDot
-              x={highlights.peakAmount.label}
-              y={highlights.peakAmount.amount}
-              yAxisId="amount"
-              r={4}
-              fill="#FFE815"
-              stroke="#111827"
-              strokeWidth={1.5}
-              isFront
-              label={(
-                <TrendMarkerLabel
-                  text={`¥${formatMoney(highlights.peakAmount.amount)}`}
-                  fill="#FFE815"
-                  anchor={anchorFor(highlights.peakAmount)}
-                  testId="hero-peak-marker"
-                />
-              )}
-            />
-          )}
-          {highlights.lowAmount && (
-            <ReferenceDot
-              x={highlights.lowAmount.label}
-              y={highlights.lowAmount.amount}
-              yAxisId="amount"
-              r={3.5}
-              fill="#94A3B8"
-              stroke="#111827"
-              strokeWidth={1.5}
-              isFront
-              label={(
-                <TrendMarkerLabel
-                  text={`¥${formatMoney(highlights.lowAmount.amount)}`}
-                  fill="#94A3B8"
-                  anchor={anchorFor(highlights.lowAmount)}
-                  testId="hero-low-marker"
-                />
-              )}
-            />
-          )}
         </ComposedChart>
       </ResponsiveContainer>
       </div>
