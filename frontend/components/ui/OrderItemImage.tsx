@@ -277,13 +277,8 @@ const OrderItemImage: React.FC<OrderItemImageProps> = ({ orderId, directSrc, alt
         onClick={() => {
           setFailure(null);
           setAttempt((value) => value + 1);
-          if (directSrc) {
-            setSrc(directSrc);
-            setProxyRequested(false);
-          } else {
-            setSrc(undefined);
-            setProxyRequested(true);
-          }
+          setSrc(undefined);
+          setProxyRequested(true);
         }}
       >
         {fallback}
