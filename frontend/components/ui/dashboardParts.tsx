@@ -414,6 +414,10 @@ export interface TrendDelta {
 export interface TrendHighlights {
   peakOrders: DailyPoint | null;
   lowOrders: DailyPoint | null;
+  /** 营收最高的时段（图上直接标注） */
+  peakAmount: DailyPoint | null;
+  /** 营收最低的时段（与 peakAmount 相同金额时为 null，避免无意义标注） */
+  lowAmount: DailyPoint | null;
   fastestGrowth: TrendDelta | null;
   slowestGrowth: TrendDelta | null;
 }
@@ -521,14 +525,20 @@ export const selectTrendPoints = (
 /** 返回订单量峰低点及相邻时段销售额变化的最快/最慢区间。并列时保留较早区间。 */
 export const getTrendHighlights = (points: DailyPoint[]): TrendHighlights => {
   if (points.length < 2) {
-    return { peakOrders: null, lowOrders: null, fastestGrowth: null, slowestGrowth: null };
+    return { peakOrders: null, lowOrders: null, peakAmount: null, lowAmount: null, fastestGrowth: null, slowestGrowth: null };
   }
   let peakOrders = points[0];
   let lowOrders = points[0];
+  let peakAmountPoint = points[0];
+  let lowAmountPoint = points[0];
   for (const point of points.slice(1)) {
     if (point.orders > peakOrders.orders) peakOrders = point;
     if (point.orders < lowOrders.orders) lowOrders = point;
+    if (point.amount > peakAmountPoint.amount) peakAmountPoint = point;
+    if (point.amount < lowAmountPoint.amount) lowAmountPoint = point;
   }
+  const peakAmount = peakAmountPoint.amount > 0 ? peakAmountPoint : null;
+  const lowAmount = peakAmount && lowAmountPoint.amount < peakAmount.amount ? lowAmountPoint : null;
   let fastestGrowth: TrendDelta | null = null;
   let slowestGrowth: TrendDelta | null = null;
   for (let index = 1; index < points.length; index += 1) {
@@ -539,5 +549,5 @@ export const getTrendHighlights = (points: DailyPoint[]): TrendHighlights => {
     if (delta > 0 && (!fastestGrowth || delta > fastestGrowth.delta)) fastestGrowth = candidate;
     if (delta < 0 && (!slowestGrowth || delta < slowestGrowth.delta)) slowestGrowth = candidate;
   }
-  return { peakOrders, lowOrders, fastestGrowth, slowestGrowth };
+  return { peakOrders, lowOrders, peakAmount, lowAmount, fastestGrowth, slowestGrowth };
 };

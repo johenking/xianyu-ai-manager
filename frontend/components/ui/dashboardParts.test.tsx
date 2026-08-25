@@ -68,8 +68,26 @@ describe('订单状态语义色唯一真源', () => {
     const highlights = getTrendHighlights(points);
     expect(highlights.peakOrders?.label).toBe('10:00');
     expect(highlights.lowOrders?.label).toBe('09:00');
+    expect(highlights.peakAmount?.label).toBe('10:00');
+    expect(highlights.lowAmount?.label).toBe('09:00');
     expect(highlights.fastestGrowth?.delta).toBe(25);
     expect(highlights.slowestGrowth?.delta).toBe(-15);
+  });
+
+  it('营收全为 0 时不给峰谷点，金额全相等时只保留峰值点', () => {
+    const zeroAmounts = getTrendHighlights([
+      { date: '2026-07-10 09:00', label: '09:00', amount: 0, orders: 1 },
+      { date: '2026-07-10 10:00', label: '10:00', amount: 0, orders: 3 },
+    ]);
+    expect(zeroAmounts.peakAmount).toBeNull();
+    expect(zeroAmounts.lowAmount).toBeNull();
+
+    const flatAmounts = getTrendHighlights([
+      { date: '2026-07-10 09:00', label: '09:00', amount: 50, orders: 1 },
+      { date: '2026-07-10 10:00', label: '10:00', amount: 50, orders: 3 },
+    ]);
+    expect(flatAmounts.peakAmount?.label).toBe('09:00');
+    expect(flatAmounts.lowAmount).toBeNull();
   });
 
   it('当前小时只展示已发生点，洞察排除未结束小时', () => {
@@ -104,6 +122,8 @@ describe('订单状态语义色唯一真源', () => {
     ])).toEqual({
       peakOrders: null,
       lowOrders: null,
+      peakAmount: null,
+      lowAmount: null,
       fastestGrowth: null,
       slowestGrowth: null,
     });

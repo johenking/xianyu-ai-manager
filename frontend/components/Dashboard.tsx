@@ -348,6 +348,8 @@ const Dashboard: React.FC = () => {
     && summary.current.revenue_stats.total_orders === 0;
   const currentRevenue = summary.current.revenue_stats.total_amount;
   const previousRevenue = summary.previous.revenue_stats.total_amount;
+  const currentOrders = summary.current.revenue_stats.total_orders;
+  const avgOrderValue = currentOrders > 0 ? currentRevenue / currentOrders : 0;
   const refreshBusy = loading || refreshing;
   const refreshLabel = refreshBusy ? '更新中' : refreshDelayed ? '更新延迟' : '实时';
   const dateLabel = rangeDateLabel(timeRange, summary.range.start_date, summary.range.end_date);
@@ -422,23 +424,23 @@ const Dashboard: React.FC = () => {
           </div>
         )}
 
-        <div className="mt-5 grid grid-cols-1 items-end gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:gap-8">
-          <div className="min-w-0">
+        <div className="mt-5 grid grid-cols-1 items-stretch gap-6 lg:grid-cols-[minmax(0,4.5fr)_minmax(0,7.5fr)] lg:gap-8">
+          <div className="flex min-w-0 flex-col">
             <p className="text-xs font-bold tracking-wide text-slate-400">{revenueLabel} (CNY)</p>
-            <div className="mt-2 flex min-w-0 items-end gap-2.5">
+            <div className="mt-2.5 flex min-w-0 items-end gap-2.5">
               <NumberFlow
                 {...NUMBER_FLOW_MOTION}
                 value={currentRevenue}
                 format={MONEY_FORMAT}
                 aria-label={`${revenueLabel} ¥${formatMoney(currentRevenue)}`}
-                className="whitespace-nowrap tabular-nums text-[40px] font-extrabold leading-none sm:text-[48px] lg:text-[52px]"
+                className="whitespace-nowrap tabular-nums text-[40px] font-extrabold leading-none sm:text-[48px] lg:text-[52px] xl:text-[56px]"
               />
               <CompareBadge current={currentRevenue} previous={previousRevenue} periodLabel={previousLabel} />
             </div>
-            <p className="mt-2 text-xs text-slate-400">{previousLabel} ¥{formatMoney(previousRevenue)}</p>
+            <p className="mt-2.5 text-xs text-slate-400">{previousLabel} ¥{formatMoney(previousRevenue)}</p>
 
-            <div className="mt-5 grid grid-cols-3 divide-x divide-white/10">
-              <div className="min-w-0 pr-3 sm:pr-5">
+            <div className="mt-auto grid grid-cols-2 gap-y-4 divide-white/10 pt-6 sm:grid-cols-4 sm:divide-x">
+              <div className="min-w-0 pr-3 sm:pr-4">
                 <p className="truncate text-[11px] text-slate-400">活跃账号 / 总数</p>
                 <p className="mt-1.5 flex items-center gap-1 text-xl font-extrabold" aria-label={`活跃账号 ${summary.stats.active_cookies}，总数 ${summary.stats.total_cookies}`}>
                   <NumberFlow {...NUMBER_FLOW_MOTION} value={summary.stats.active_cookies} format={COUNT_FORMAT} aria-hidden="true" />
@@ -446,7 +448,7 @@ const Dashboard: React.FC = () => {
                   <NumberFlow {...NUMBER_FLOW_MOTION} value={summary.stats.total_cookies} format={COUNT_FORMAT} aria-hidden="true" />
                 </p>
               </div>
-              <div className="min-w-0 px-3 sm:px-5">
+              <div className="min-w-0 sm:px-4">
                 <p className="text-[11px] text-slate-400">订单数</p>
                 <NumberFlow
                   {...NUMBER_FLOW_MOTION}
@@ -456,7 +458,17 @@ const Dashboard: React.FC = () => {
                   className="mt-1.5 tabular-nums text-xl font-extrabold"
                 />
               </div>
-              <div className="min-w-0 pl-3 sm:pl-5">
+              <div className="min-w-0 pr-3 sm:px-4 sm:pr-0">
+                <p className="text-[11px] text-slate-400">客单价</p>
+                <NumberFlow
+                  {...NUMBER_FLOW_MOTION}
+                  value={avgOrderValue}
+                  format={MONEY_FORMAT}
+                  aria-label={`客单价 ¥${formatMoney(avgOrderValue)}`}
+                  className="mt-1.5 tabular-nums text-xl font-extrabold"
+                />
+              </div>
+              <div className="min-w-0 sm:pl-4">
                 <p className="text-[11px] text-slate-400">库存卡密</p>
                 <NumberFlow
                   {...NUMBER_FLOW_MOTION}
@@ -479,7 +491,7 @@ const Dashboard: React.FC = () => {
                 <span className="inline-flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-sm bg-sky-300" />订单</span>
               </div>
             </div>
-            <Suspense fallback={<div className="h-[158px] animate-pulse rounded-xl bg-white/[0.04] motion-reduce:animate-none sm:h-[174px]" />}>
+            <Suspense fallback={<div className="h-[176px] animate-pulse rounded-xl bg-white/[0.04] motion-reduce:animate-none sm:h-[192px]" />}>
               <HeroTrend
                 points={heroPoints}
                 highlightPoints={highlightPoints}

@@ -13,14 +13,18 @@ import DashboardCharts, {
   orderAmountOf,
 } from './DashboardCharts';
 
-// recharts 的 ResponsiveContainer 在 jsdom 下拿不到尺寸会告警但不影响断言，
-// 这里用固定尺寸桩替换，聚焦业务渲染逻辑。
+// recharts 的 ResponsiveContainer 在 jsdom 下测不到尺寸，图表不会渲染 SVG；
+// 这里用固定尺寸桩替换并把宽高直接传给子图表，让峰谷标注等 SVG 内容可被断言。
 vi.mock('recharts', async () => {
   const actual = await vi.importActual<typeof import('recharts')>('recharts');
   return {
     ...actual,
     ResponsiveContainer: ({ children }: { children: React.ReactNode }) => (
-      <div style={{ width: 400, height: 240 }}>{children}</div>
+      <div style={{ width: 400, height: 240 }}>
+        {React.isValidElement(children)
+          ? React.cloneElement(children as React.ReactElement<{ width?: number; height?: number }>, { width: 400, height: 240 })
+          : children}
+      </div>
     ),
   };
 });
@@ -170,6 +174,29 @@ describe('HeroTrend 坐标轴', () => {
     expect(screen.getByTestId('trend-peak-orders')).toHaveTextContent('09:00 · 4 单');
     expect(screen.getByTestId('trend-fastest-growth')).toHaveTextContent('09:00 · +¥20.00');
     expect(screen.getByTestId('trend-slowest-growth')).toHaveTextContent('--');
+  });
+
+  it('图上标注营收最高与最低点金额', () => {
+    const points = [
+      { date: '2026-08-18 08:00', label: '08:00', amount: 20, orders: 2 },
+      { date: '2026-08-18 09:00', label: '09:00', amount: 40, orders: 4 },
+      { date: '2026-08-18 10:00', label: '10:00', amount: 5, orders: 1 },
+    ];
+    render(<HeroTrend points={points} highlightPoints={points} granularity="hour" />);
+
+    expect(screen.getByTestId('hero-peak-marker')).toHaveTextContent('¥40.00');
+    expect(screen.getByTestId('hero-low-marker')).toHaveTextContent('¥5.00');
+  });
+
+  it('营收全为 0 时不渲染峰谷标注', () => {
+    const points = [
+      { date: '2026-08-18 08:00', label: '08:00', amount: 0, orders: 2 },
+      { date: '2026-08-18 09:00', label: '09:00', amount: 0, orders: 4 },
+    ];
+    render(<HeroTrend points={points} highlightPoints={points} granularity="hour" />);
+
+    expect(screen.queryByTestId('hero-peak-marker')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('hero-low-marker')).not.toBeInTheDocument();
   });
 });
 
