@@ -62,6 +62,19 @@ PROVIDER_MODEL_MAX_COUNT = 500
 PROVIDER_MODEL_NAME_MAX_LENGTH = 200
 
 
+def normalize_provider_models(values: Any) -> List[str]:
+    """Keep provider model IDs bounded, unique, non-empty, and stable."""
+    models = set()
+    for value in values if isinstance(values, list) else []:
+        name = str(value or "").strip()
+        if not name or len(name) > PROVIDER_MODEL_NAME_MAX_LENGTH:
+            continue
+        models.add(name)
+        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
+            break
+    return sorted(models, key=str.lower)
+
+
 def _local_encryption_secret() -> str:
     db_path = Path(os.getenv("DB_PATH", "data/xianyu_data.db"))
     key_path = Path(os.getenv("AI_PROVIDER_KEY_FILE", str(db_path.parent / ".ai_provider_key")))
@@ -113,35 +126,20 @@ def mask_provider_key(value: str) -> str:
 
 
 def extract_openai_models(payload: Dict[str, Any]) -> List[str]:
-    models = set()
-    for item in payload.get("data", []):
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("id") or "").strip()
-        if not name or len(name) > PROVIDER_MODEL_NAME_MAX_LENGTH:
-            continue
-        models.add(name)
-        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
-            break
-    return sorted(models, key=str.lower)
+    return normalize_provider_models([
+        item.get("id")
+        for item in payload.get("data", [])
+        if isinstance(item, dict)
+    ])
 
 
 def extract_gemini_models(payload: Dict[str, Any]) -> List[str]:
-    models = set()
-    for item in payload.get("models", []):
-        if not isinstance(item, dict):
-            continue
-        methods = item.get("supportedGenerationMethods") or []
-        if "generateContent" not in methods:
-            continue
-        name = str(item.get("name") or "").strip()
-        if name.startswith("models/"):
-            name = name[7:]
-        if name and len(name) <= PROVIDER_MODEL_NAME_MAX_LENGTH:
-            models.add(name)
-        if len(models) >= PROVIDER_MODEL_MAX_COUNT:
-            break
-    return sorted(models, key=str.lower)
+    return normalize_provider_models([
+        str(item.get("name") or "").strip().removeprefix("models/")
+        for item in payload.get("models", [])
+        if isinstance(item, dict)
+        and "generateContent" in (item.get("supportedGenerationMethods") or [])
+    ])
 
 
 def _openai_endpoint(base_url: str, suffix: str) -> str:

@@ -15,6 +15,7 @@ from ai_provider_service import (
     discover_provider_models,
     extract_gemini_models,
     extract_openai_models,
+    normalize_provider_models,
     test_provider_reply as run_provider_reply_test,
 )
 from ai_reply_engine import AIReplyEngine
@@ -87,6 +88,34 @@ class AIProviderDatabaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "正在被账号使用"):
             self.db.delete_ai_provider_profile(profile_id, 1)
+
+    def test_model_cache_is_persisted_and_scoped(self):
+        profile_id = self.db.create_ai_provider_profile(1, {
+            "name": "Cached",
+            "provider_type": "openai_compatible",
+            "preset": "custom",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "sk-cache",
+            "default_model": "model-a",
+            "models": ["model-z", "model-a", "model-a", "", "x" * 201],
+        })
+
+        profile = self.db.get_ai_provider_profile(profile_id, 1)
+        self.assertEqual(profile["models"], ["model-a", "model-z"])
+        self.assertIsNotNone(profile["models_cached_at"])
+
+        updated = self.db.update_ai_provider_profile(profile_id, 1, {
+            "models": ["model-c", "model-b", "model-c"],
+            "default_model": "model-b",
+        })
+        self.assertEqual(updated["models"], ["model-b", "model-c"])
+        preserved = self.db.update_ai_provider_profile(profile_id, 1, {"models": []})
+        self.assertEqual(preserved["models"], ["model-b", "model-c"])
+        self.assertIsNone(self.db.get_ai_provider_profile(profile_id, 2))
+
+    def test_model_normalizer_handles_non_lists_without_leaking_values(self):
+        self.assertEqual(normalize_provider_models(None), [])
+        self.assertEqual(normalize_provider_models([" z ", "z", None]), ["z"])
 
     def test_legacy_migration_preserves_effective_account_configuration(self):
         self.db.set_system_setting("ai_api_key", "sk-legacy")
@@ -187,6 +216,118 @@ class AIProviderServiceTests(unittest.TestCase):
         self.assertTrue(
             all(call.kwargs["require_https"] for call in request_mock.call_args_list)
         )
+
+
+class AIProviderRouteTests(unittest.TestCase):
+    def _existing_profile(self):
+        return {
+            "id": 9,
+            "user_id": 7,
+            "name": "Saved provider",
+            "provider_type": "openai_compatible",
+            "preset": "custom",
+            "base_url": "https://provider.example.test/v1",
+            "default_model": "model-a",
+            "api_key": "sk-saved",
+            "models": ["model-a"],
+        }
+
+    def test_discovery_reuses_saved_key_and_returns_clean_models_only(self):
+        payload = reply_server.AIProviderModelDiscoveryRequest(
+            profile_id=9,
+            provider_type="openai_compatible",
+            base_url="https://provider.example.test/v1",
+        )
+        captured = {}
+
+        def discover(profile):
+            captured.update(profile)
+            return ["model-z", "model-z", "", "x" * 201]
+
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile", return_value=self._existing_profile()) as get_profile,
+            patch.object(reply_server, "discover_provider_models", side_effect=discover),
+            patch.object(reply_server, "_run_bounded_ai_call", side_effect=lambda _user_id, operation: operation()),
+        ):
+            result = reply_server.discover_ai_provider_models(payload, {"user_id": 7})
+
+        get_profile.assert_called_once_with(9, 7, include_secret=True)
+        self.assertEqual(result, {"models": ["model-z"]})
+        self.assertEqual(captured["api_key"], "sk-saved")
+        self.assertNotIn("api_key", result)
+
+    def test_discovery_accepts_new_profile_credentials(self):
+        payload = reply_server.AIProviderModelDiscoveryRequest(
+            provider_type="openai_compatible",
+            preset="custom",
+            base_url="https://provider.example.test/v1",
+            api_key="sk-new",
+        )
+        captured = {}
+
+        def discover(profile):
+            captured.update(profile)
+            return ["model-a"]
+
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile") as get_profile,
+            patch.object(reply_server, "discover_provider_models", side_effect=discover),
+            patch.object(reply_server, "_run_bounded_ai_call", side_effect=lambda _user_id, operation: operation()),
+        ):
+            result = reply_server.discover_ai_provider_models(payload, {"user_id": 7})
+
+        get_profile.assert_not_called()
+        self.assertEqual(result, {"models": ["model-a"]})
+        self.assertEqual(captured["api_key"], "sk-new")
+
+    def test_discovery_rejects_cross_user_profile_before_network_call(self):
+        payload = reply_server.AIProviderModelDiscoveryRequest(profile_id=9)
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile", return_value=None),
+            patch.object(reply_server, "discover_provider_models") as discover,
+            self.assertRaises(reply_server.HTTPException) as raised,
+        ):
+            reply_server.discover_ai_provider_models(payload, {"user_id": 8})
+
+        self.assertEqual(raised.exception.status_code, 404)
+        discover.assert_not_called()
+
+    def test_empty_or_failed_discovery_does_not_write_cache(self):
+        payload = reply_server.AIProviderModelDiscoveryRequest(profile_id=9)
+        existing = self._existing_profile()
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile", return_value=existing),
+            patch.object(reply_server, "_run_bounded_ai_call", return_value=[]),
+            patch.object(reply_server.db_manager, "update_ai_provider_models") as update_cache,
+        ):
+            self.assertEqual(
+                reply_server.discover_ai_provider_models(payload, {"user_id": 7}),
+                {"models": []},
+            )
+            update_cache.assert_not_called()
+
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile", return_value=existing),
+            patch.object(reply_server, "_run_bounded_ai_call", side_effect=RuntimeError("provider down")),
+            patch.object(reply_server.db_manager, "update_ai_provider_models") as update_cache,
+            self.assertRaises(reply_server.HTTPException) as raised,
+        ):
+            reply_server.discover_ai_provider_models(payload, {"user_id": 7})
+
+        self.assertEqual(raised.exception.status_code, 400)
+        update_cache.assert_not_called()
+
+    def test_legacy_refresh_keeps_cached_models_on_empty_response(self):
+        existing = {**self._existing_profile(), "models_cached_at": 123.0}
+        with (
+            patch.object(reply_server.db_manager, "get_ai_provider_profile", return_value=existing),
+            patch.object(reply_server, "_run_bounded_ai_call", return_value=[]),
+            patch.object(reply_server.db_manager, "update_ai_provider_models") as update_cache,
+        ):
+            result = reply_server.refresh_ai_provider_models(9, {"user_id": 7})
+
+        self.assertEqual(result, {"models": ["model-a"], "cached_at": 123.0})
+        update_cache.assert_not_called()
 
     def test_plaintext_provider_target_is_rejected_before_resolution(self):
         with self.assertRaises(OutboundRequestError) as raised:
@@ -368,6 +509,7 @@ class LiveAIReplyTests(unittest.IsolatedAsyncioTestCase):
             patch("ai_reply_engine.ai_reply_engine", engine),
             patch("db_manager.db_manager.get_item_info", return_value=None),
             patch("XianyuAutoAsync.pause_manager.is_chat_paused", return_value=False),
+            patch("XianyuAutoAsync.AI_REPLY_SHADOW_ENABLED", False),
             patch.dict("XianyuAutoAsync.AUTO_REPLY", {"enabled": True}),
         ):
             await live._process_chat_message_reply(

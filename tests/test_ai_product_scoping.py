@@ -6,6 +6,7 @@ from unittest.mock import patch
 import ai_reply_engine as ai_module
 from ai_reply_engine import AIReplyEngine
 from db_manager import DBManager
+import reply_server
 
 
 class AIProductScopingTests(unittest.TestCase):
@@ -224,7 +225,7 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertEqual(draft["faqs"][0]["status"], "pending")
         self.assertEqual(draft["after_sales"], [])
 
-    def test_seed_overview_is_authoritative_and_manual_entries_survive_generation(self):
+    def test_generation_keeps_current_overview_and_replaces_every_old_detail(self):
         seed = self._knowledge("这是卖家亲自填写的商品概览")
         seed["process"] = [{
             "id": "manual-process",
@@ -252,9 +253,91 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertEqual(merged["overview"]["text"], "这是卖家亲自填写的商品概览")
         self.assertEqual(merged["overview"]["source"], "user")
         self.assertEqual(merged["overview"]["status"], "confirmed")
-        self.assertEqual(merged["process"][0]["text"], "人工确认的交付流程")
+        self.assertEqual(merged["process"], [])
         self.assertEqual(merged["pricing"][0]["text"] if "text" in merged["pricing"][0] else merged["pricing"][0]["label"], "Pro")
         self.assertEqual(merged["notes"], [])
+
+    def test_generation_failure_does_not_write_a_partial_draft(self):
+        request = reply_server.AIItemKnowledgeGenerateRequest(
+            overview="新概览",
+            profile=self._knowledge("应被忽略的旧档案"),
+        )
+        with patch.object(reply_server, "_get_ai_knowledge_item", return_value={
+            "item_title": "测试商品",
+            "item_price": "135",
+            "item_detail": "测试详情",
+        }), patch.object(
+            reply_server.ai_reply_engine,
+            "generate_item_knowledge_draft",
+            side_effect=ValueError("provider unavailable"),
+        ), patch.object(reply_server.db_manager, "save_ai_item_knowledge_draft") as save:
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                reply_server.generate_ai_item_knowledge(
+                    "account-1", "item-a", request, current_user={"user_id": 1}
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        save.assert_not_called()
+
+    def test_generation_route_saves_only_fresh_result(self):
+        request = reply_server.AIItemKnowledgeGenerateRequest(
+            overview="新概览",
+            profile={
+                "overview": {"text": "新概览"},
+                "process": [{"text": "旧人工规则"}],
+            },
+        )
+        generated = {
+            "overview": {"text": "模型概览", "source": "ai", "status": "pending"},
+            "pricing": [],
+            "process": [{"text": "新流程", "source": "ai", "status": "pending"}],
+            "after_sales": [],
+            "forbidden": [],
+            "faqs": [],
+            "notes": [],
+        }
+        with patch.object(reply_server, "_get_ai_knowledge_item", return_value={
+            "item_title": "测试商品",
+            "item_price": "135",
+            "item_detail": "测试详情",
+        }), patch.object(
+            reply_server.ai_reply_engine,
+            "generate_item_knowledge_draft",
+            return_value=generated,
+        ), patch.object(
+            reply_server.db_manager,
+            "save_ai_item_knowledge_draft",
+            return_value={},
+        ) as save:
+            result = reply_server.generate_ai_item_knowledge(
+                "account-1", "item-a", request, current_user={"user_id": 1}
+            )
+
+        saved_draft = save.call_args.args[2]
+        self.assertEqual(saved_draft["overview"]["text"], "新概览")
+        self.assertEqual(saved_draft["process"][0]["text"], "新流程")
+        self.assertEqual(result["draft"], saved_draft)
+
+    def test_copy_route_always_uses_replacement_mode(self):
+        request = reply_server.AIItemKnowledgeCopyRequest(
+            target_item_ids=["item-b"], overwrite=False
+        )
+        copy_result = {
+            "copied_item_ids": ["item-b"],
+            "skipped_item_ids": [],
+            "missing_item_ids": [],
+        }
+        with patch.object(reply_server, "_get_ai_knowledge_item", return_value={}), patch.object(
+            reply_server.db_manager,
+            "copy_ai_item_knowledge_draft",
+            return_value=copy_result,
+        ) as copy:
+            result = reply_server.copy_ai_item_knowledge(
+                "account-1", "item-a", request, current_user={"user_id": 1}
+            )
+
+        copy.assert_called_once_with("account-1", "item-a", ["item-b"])
+        self.assertEqual(result["copied_item_ids"], ["item-b"])
 
     def test_generation_prompt_contains_seller_overview(self):
         self._insert_item()
@@ -294,22 +377,38 @@ class AIProductScopingTests(unittest.TestCase):
         self.assertEqual(target["draft"]["overview"]["text"], "同款Claude代充服务")
         self.assertEqual(target["published"], {})
 
-    def test_copy_knowledge_does_not_overwrite_existing_target_without_confirmation(self):
+    def test_copy_knowledge_replaces_target_draft_but_keeps_published_history(self):
         self._insert_item("item-a", "源商品")
         self._insert_item("item-b", "目标商品")
         self.db.save_ai_item_knowledge_draft("account-1", "item-a", self._knowledge("源档案"), "hash-a")
-        self.db.save_ai_item_knowledge_draft("account-1", "item-b", self._knowledge("目标原档案"), "hash-b")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-b", self._knowledge("目标已发布档案"), "hash-b")
+        published = self.db.publish_ai_item_knowledge("account-1", "item-b")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-b", self._knowledge("目标未发布草稿"), "hash-c")
+        versions_before = self.db.get_ai_item_knowledge_versions("account-1", "item-b")
 
         result = self.db.copy_ai_item_knowledge_draft(
             "account-1", "item-a", ["item-b"], overwrite=False
         )
         target = self.db.get_ai_item_knowledge_profile("account-1", "item-b")
+        versions_after = self.db.get_ai_item_knowledge_versions("account-1", "item-b")
+
+        self.assertEqual(result["copied_item_ids"], ["item-b"])
+        self.assertEqual(result["skipped_item_ids"], [])
+        self.assertEqual(target["draft"]["overview"]["text"], "源档案")
+        self.assertEqual(target["published"]["overview"]["text"], "目标已发布档案")
+        self.assertEqual(target["published_version"], published["version"])
+        self.assertEqual(versions_after, versions_before)
+
+    def test_copy_knowledge_still_reports_missing_targets(self):
+        self._insert_item("item-a", "源商品")
+        self.db.save_ai_item_knowledge_draft("account-1", "item-a", self._knowledge("源档案"), "hash-a")
+
+        result = self.db.copy_ai_item_knowledge_draft(
+            "account-1", "item-a", ["missing-item"]
+        )
 
         self.assertEqual(result["copied_item_ids"], [])
-        self.assertEqual(result["skipped_item_ids"], ["item-b"])
-        self.assertEqual(result["skipped_count"], 1)
-        self.assertEqual(result["skipped_reasons"]["item-b"], "目标已有草稿或已发布知识档案，未开启覆盖")
-        self.assertEqual(target["draft"]["overview"]["text"], "目标原档案")
+        self.assertEqual(result["missing_item_ids"], ["missing-item"])
 
     def test_copy_knowledge_falls_back_to_published_when_source_has_no_draft(self):
         self._insert_item("item-a", "源商品")
