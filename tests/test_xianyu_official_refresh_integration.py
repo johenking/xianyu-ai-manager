@@ -448,6 +448,45 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(database.cas_calls, 1)
         self.assertIn("x5sec=verification-cookie", database.details["value"])
 
+    async def test_message_token_probe_passes_the_listener_device_id_through(self):
+        # 探测与 WS 注册必须共用 listener 的 device_id，避免平台
+        # device_id_or_appkey_is_not_equal 401。
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=token_1"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "token_1"}
+        live.myid = "9988"
+        live.user_id = 7
+        live.browser_user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0"
+        live.last_message_received_time = 0
+        live.message_cookie_refresh_cooldown = 300
+        live.last_token_refresh_status = ""
+        live.current_token = None
+        live.device_id = "listener-device-9988"
+        database = FakeRefreshDatabase()
+        details = database.get_cookie_details("account-1")
+        details["browser_user_agent"] = live.browser_user_agent
+        database.get_cookie_details = lambda _cookie_id: dict(details)
+        database.update_cookie_account_info = unittest.mock.Mock(return_value=True)
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_SUCCESS,
+            cookies=dict(live.cookies),
+            access_token="message-access-token",
+        ))
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            token = await live.refresh_token()
+
+        self.assertEqual(token, "message-access-token")
+        self.assertEqual(probe.await_count, 1)
+        self.assertEqual(
+            probe.await_args.kwargs,
+            {"device_id": "listener-device-9988"},
+        )
+
     async def test_transient_message_token_probe_failure_is_retryable_and_does_not_require_human_action(self):
         live = object.__new__(XianyuLive)
         live.cookie_id = "account-1"

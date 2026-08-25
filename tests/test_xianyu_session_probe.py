@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import httpx
@@ -110,6 +111,45 @@ class XianyuSessionProbeTests(unittest.TestCase):
         self.assertEqual(headers["user-agent"], user_agent)
         self.assertNotIn("sec-ch-ua", headers)
         self.assertNotIn("sec-ch-ua-platform", headers)
+
+    def test_probe_payload_prefers_the_listener_device_id_over_derived_one(self):
+        # 探测必须与 WebSocket 注册使用同一 device_id，否则平台返回
+        # device_id_or_appkey_is_not_equal 拒绝注册。
+        cookie_string = "unb=9988; _m_h5_tk=token_123; cookie2=session"
+        user_agent = "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36"
+        _, _, explicit_data, _ = build_probe_request(
+            cookie_string,
+            user_agent,
+            device_id="listener-device-9988",
+            timestamp_ms=1_700_000_000_000,
+        )
+        _, _, derived_data, _ = build_probe_request(
+            cookie_string,
+            user_agent,
+            timestamp_ms=1_700_000_000_000,
+        )
+        _, _, blank_data, _ = build_probe_request(
+            cookie_string,
+            user_agent,
+            device_id="   ",
+            timestamp_ms=1_700_000_000_000,
+        )
+
+        def payload_device_id(data: dict) -> str:
+            return json.loads(data["data"])["deviceId"]
+
+        self.assertEqual(
+            payload_device_id(explicit_data), "listener-device-9988"
+        )
+        # 未显式传入或传空白时回退为按 unb 派生（随机 UUID + unb 后缀）。
+        self.assertTrue(payload_device_id(derived_data).endswith("-9988"))
+        self.assertNotEqual(
+            payload_device_id(derived_data), "listener-device-9988"
+        )
+        self.assertTrue(payload_device_id(blank_data).endswith("-9988"))
+        self.assertNotEqual(
+            payload_device_id(blank_data), "listener-device-9988"
+        )
 
     def test_sync_probe_resigns_once_with_fresh_h5_token_and_keeps_all_cookies(self):
         client = ScriptedSyncClient([

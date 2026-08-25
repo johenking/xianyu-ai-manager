@@ -246,14 +246,16 @@ def build_probe_request(
     cookie_string: str,
     browser_user_agent: str,
     *,
+    device_id: Optional[str] = None,
     timestamp_ms: Optional[int] = None,
 ) -> tuple[str, dict[str, str], dict[str, str], dict[str, str]]:
     cookies = parse_cookie_string(cookie_string)
     unb = str(cookies.get("unb") or "").strip()
+    request_device_id = str(device_id or "").strip() or generate_device_id(unb)
     timestamp = str(timestamp_ms or int(time.time() * 1000))
     data_value = (
         '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"'
-        + generate_device_id(unb)
+        + request_device_id
         + '"}'
     )
     token = str(cookies.get("_m_h5_tk") or "").split("_", 1)[0]
@@ -365,9 +367,14 @@ def _probe_message_session_with_sync_client(
     client: Any,
     cookie_string: str,
     browser_user_agent: str,
+    device_id: str,
 ) -> SessionProbeResult:
     cookies = parse_cookie_string(cookie_string)
-    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
+    url, params, data, headers = build_probe_request(
+        cookie_string,
+        browser_user_agent,
+        device_id=device_id,
+    )
     response = client.post(url, params=params, data=data, headers=headers)
     payload, result = _classify_probe_http_response(response, cookies)
     if not _should_retry_with_fresh_h5_token(payload, cookies, result.cookies):
@@ -377,6 +384,7 @@ def _probe_message_session_with_sync_client(
     retry_url, retry_params, retry_data, retry_headers = build_probe_request(
         refreshed_cookie_string,
         browser_user_agent,
+        device_id=device_id,
         timestamp_ms=_next_probe_timestamp_ms(params),
     )
     try:
@@ -401,9 +409,14 @@ async def _probe_message_session_with_async_client(
     client: Any,
     cookie_string: str,
     browser_user_agent: str,
+    device_id: str,
 ) -> SessionProbeResult:
     cookies = parse_cookie_string(cookie_string)
-    url, params, data, headers = build_probe_request(cookie_string, browser_user_agent)
+    url, params, data, headers = build_probe_request(
+        cookie_string,
+        browser_user_agent,
+        device_id=device_id,
+    )
     response = await client.post(url, params=params, data=data, headers=headers)
     payload, result = _classify_probe_http_response(response, cookies)
     if not _should_retry_with_fresh_h5_token(payload, cookies, result.cookies):
@@ -413,6 +426,7 @@ async def _probe_message_session_with_async_client(
     retry_url, retry_params, retry_data, retry_headers = build_probe_request(
         refreshed_cookie_string,
         browser_user_agent,
+        device_id=device_id,
         timestamp_ms=_next_probe_timestamp_ms(params),
     )
     try:
@@ -437,6 +451,7 @@ def probe_message_session_sync(
     cookie_string: str,
     browser_user_agent: str,
     *,
+    device_id: Optional[str] = None,
     timeout: float = 25.0,
     client_factory: Optional[Callable[[], Any]] = None,
 ) -> SessionProbeResult:
@@ -444,6 +459,9 @@ def probe_message_session_sync(
     if preflight:
         return preflight
     cookies = parse_cookie_string(cookie_string)
+    probe_device_id = str(device_id or "").strip() or generate_device_id(
+        str(cookies.get("unb") or "").strip()
+    )
     try:
         if client_factory is None:
             with httpx.Client(timeout=timeout, follow_redirects=False) as client:
@@ -451,11 +469,13 @@ def probe_message_session_sync(
                     client,
                     cookie_string,
                     browser_user_agent,
+                    probe_device_id,
                 )
         return _probe_message_session_with_sync_client(
             client_factory(),
             cookie_string,
             browser_user_agent,
+            probe_device_id,
         )
     except Exception:
         return SessionProbeResult(
@@ -470,6 +490,7 @@ async def probe_message_session_async(
     cookie_string: str,
     browser_user_agent: str,
     *,
+    device_id: Optional[str] = None,
     timeout: float = 25.0,
     client_factory: Optional[Callable[[], Any]] = None,
 ) -> SessionProbeResult:
@@ -477,6 +498,9 @@ async def probe_message_session_async(
     if preflight:
         return preflight
     cookies = parse_cookie_string(cookie_string)
+    probe_device_id = str(device_id or "").strip() or generate_device_id(
+        str(cookies.get("unb") or "").strip()
+    )
     try:
         if client_factory is None:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
@@ -484,11 +508,13 @@ async def probe_message_session_async(
                     client,
                     cookie_string,
                     browser_user_agent,
+                    probe_device_id,
                 )
         return await _probe_message_session_with_async_client(
             client_factory(),
             cookie_string,
             browser_user_agent,
+            probe_device_id,
         )
     except Exception:
         return SessionProbeResult(

@@ -2290,9 +2290,11 @@ class XianyuLive:
                 self.browser_user_agent = persisted_user_agent
 
             logger.info(f"【{self.cookie_id}】开始探测消息 Token")
+            device_id = str(getattr(self, "device_id", "") or "").strip()
             probe = await probe_message_session_async(
                 self.cookies_str,
                 self.browser_user_agent,
+                **({"device_id": device_id} if device_id else {}),
             )
             if not probe.succeeded:
                 if probe.status in {PROBE_EXPIRED, PROBE_VERIFICATION_REQUIRED}:
@@ -2879,9 +2881,11 @@ class XianyuLive:
             return False
 
         browser_user_agent = str(account_info.get("browser_user_agent") or "").strip()
+        device_id = str(getattr(self, "device_id", "") or "").strip()
         probe_result = await probe_message_session_async(
             db_cookie_value,
             browser_user_agent or detect_default_browser_user_agent(),
+            **({"device_id": device_id} if device_id else {}),
         )
         if probe_result.succeeded:
             refreshed_cookie = probe_cookies_to_string(probe_result.cookies)
