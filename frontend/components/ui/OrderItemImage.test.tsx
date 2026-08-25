@@ -25,6 +25,13 @@ const image = (orderId: string, directSrc?: string) => (
 
 describe('OrderItemImage request scheduling', () => {
   beforeEach(() => {
+    const values = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(),
+    });
     localStorage.setItem('auth_token', 'test-token');
     vi.stubGlobal('URL', {
       createObjectURL: vi.fn(() => 'blob:shared-order-image'),
