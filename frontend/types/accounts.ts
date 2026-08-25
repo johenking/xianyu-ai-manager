@@ -25,6 +25,7 @@ export interface AccountDetail {
   login_method?: 'qr' | 'password' | 'sms_window' | 'chrome_extension' | 'manual_cookie' | 'unknown';
   login_method_label?: string;
   auto_refresh_supported?: boolean;
+  has_l3_memory?: boolean;
   reauth_required?: boolean;
   reauth_action?: 'qr_login' | 'password_login' | 'sms_login' | 'chrome_extension_import' | 'manual_cookie' | 'choose_login';
   last_login_at?: number | null;

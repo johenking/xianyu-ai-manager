@@ -61,7 +61,7 @@ MANUAL_MODE:
   timeout: 3600
   toggle_keywords: []
 MESSAGE_EXPIRE_TIME: 300000
-TOKEN_REFRESH_INTERVAL: 3600  # 从3600秒(1小时)增加到72000秒(20小时)
+TOKEN_REFRESH_INTERVAL: 1800  # 30 分钟，保证 L1 签名令牌新鲜并尽早发现 L2 失效
 TOKEN_RETRY_INTERVAL: 600    # 从300秒(5分钟)增加到7200秒(2小时)
 SLIDER_VERIFICATION:
   max_concurrent: 3  # 滑块验证最大并发数

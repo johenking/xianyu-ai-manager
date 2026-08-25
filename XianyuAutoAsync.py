@@ -500,6 +500,8 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
+    _last_l3_refresh_time = {}
+    _l3_refresh_cooldown = 60
 
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -2784,6 +2786,78 @@ class XianyuLive:
             return ""
         return "; ".join(f"{key}={value}" for key, value in cookies.items() if key and value)
 
+    async def _recover_via_passwordless_refresh(
+        self,
+        profile_unb: str,
+        current_cookie: str,
+        trigger_reason: str = "",
+    ) -> str:
+        """用持久浏览器记忆免密续签，返回新 Cookie 字符串（失败返回空串）。"""
+        del trigger_reason
+        self._last_l3_error_code = ""
+        now = time.time()
+        last = XianyuLive._last_l3_refresh_time.get(self.cookie_id, 0)
+        if now - last < XianyuLive._l3_refresh_cooldown:
+            remaining = int(XianyuLive._l3_refresh_cooldown - (now - last))
+            logger.info(f"【{self.cookie_id}】免密续签冷却中（{remaining}s），跳过本次")
+            self._last_l3_error_code = "session_probe_retryable"
+            return ""
+        XianyuLive._last_l3_refresh_time[self.cookie_id] = now
+
+        def _run():
+            from utils.xianyu_l3_memory import passwordless_refresh
+
+            return passwordless_refresh(profile_unb, current_cookie)
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】免密续签异常: {type(exc).__name__}")
+            self._last_l3_error_code = "browser_error"
+            return ""
+        self._last_l3_error_code = str(getattr(result, "error_code", "") or "")
+        if not getattr(result, "succeeded", False):
+            logger.warning(
+                f"【{self.cookie_id}】免密续签未成功: "
+                f"{self._last_l3_error_code or 'unknown'}"
+            )
+            return ""
+        from utils.xianyu_l3_memory import cookies_to_string as l3_cookies_to_string
+
+        return l3_cookies_to_string(result.cookies)
+
+    async def _recover_via_cdp(
+        self,
+        profile_unb: str,
+        trigger_reason: str = "",
+    ) -> str:
+        """可选：接管本机已开调试端口的真实 Chrome，失败关闭。"""
+        del trigger_reason
+        from utils.xianyu_l3_memory import default_cdp_endpoint, import_from_cdp
+
+        if not default_cdp_endpoint():
+            return ""
+
+        def _run():
+            return import_from_cdp(expected_unb=profile_unb, persist_profile=True)
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】CDP 接管异常: {type(exc).__name__}")
+            return ""
+        if not getattr(result, "succeeded", False):
+            logger.warning(
+                f"【{self.cookie_id}】CDP 接管未成功: "
+                f"{getattr(result, 'error_code', '') or 'unknown'}"
+            )
+            return ""
+        from db_manager import db_manager
+        from utils.xianyu_l3_memory import cookies_to_string as l3_cookies_to_string
+
+        await asyncio.to_thread(db_manager.mark_l3_memory, self.cookie_id, ready=True)
+        return l3_cookies_to_string(result.cookies)
+
     async def _try_password_login_refresh(
         self,
         trigger_reason: str = "令牌/Session过期",
@@ -2845,6 +2919,7 @@ class XianyuLive:
             account_info.get("login_method"),
             account_info.get("username"),
             bool(account_info.get("password")),
+            bool(account_info.get("has_l3_memory")),
         ):
             login_method = normalize_login_method(account_info.get("login_method"))
             message = reauth_message_for(login_method)
@@ -2925,11 +3000,80 @@ class XianyuLive:
             )
             logger.warning(f"【{self.cookie_id}】平台状态检查为临时异常，保留原 Cookie 并进入退避")
             return False
+        if probe_result.status == PROBE_VERIFICATION_REQUIRED:
+            await asyncio.to_thread(db_manager.mark_cookie_expired, self.cookie_id)
+            await self._enter_manual_reauth_required(
+                trigger=trigger_reason,
+                message=probe_result.message or reauth_message_for(
+                    account_info.get("login_method")
+                ),
+            )
+            db_manager.update_account_session_refresh(
+                self.cookie_id,
+                state="manual_reauth_required",
+                trigger=trigger_reason,
+                message=probe_result.message or "平台要求人工验证，已停止自动续签",
+                error_code=probe_result.error_code or "human_verification_required",
+            )
+            logger.warning(f"【{self.cookie_id}】平台风控要求人工验证，未启动自动续签")
+            return False
 
-        # 平台会话确已失效。优先用账密 + 滑块隐身在后台自动重登：成功即免去人工重扫；
-        # 未过滑块/需人脸时回落到下面的官方验证会话（可远程接管）或人工态护栏。
+        # 平台会话确已失效。优先用 L3 浏览器记忆免密续签；失败再回落账密滑块。
         recover_username = str(account_info.get("username") or "").strip()
         recover_password = str(account_info.get("password") or "")
+        if bool(account_info.get("has_l3_memory")):
+            l3_cookie = await self._recover_via_passwordless_refresh(
+                profile_unb,
+                db_cookie_value,
+                trigger_reason,
+            )
+            if l3_cookie:
+                updated = await self._update_cookies_and_restart(
+                    l3_cookie,
+                    browser_user_agent=browser_user_agent or detect_default_browser_user_agent(),
+                    expected_revision=refresh_revision,
+                    expected_xianyu_unb=profile_unb,
+                )
+                if updated:
+                    db_manager.update_account_session_refresh(
+                        self.cookie_id,
+                        state="success",
+                        trigger=trigger_reason,
+                        message="浏览器记忆免密续签成功",
+                    )
+                    db_manager.mark_cookie_validated(self.cookie_id)
+                    logger.info(f"【{self.cookie_id}】免密续签成功，已交接新监听")
+                    return True
+                db_manager.update_account_session_refresh(
+                    self.cookie_id,
+                    state="failed",
+                    trigger=trigger_reason,
+                    message="免密续签已拿到 Cookie，但监听交接失败",
+                    error_code="listener_handoff_failed",
+                )
+                return False
+            l3_error = str(getattr(self, "_last_l3_error_code", "") or "")
+            if password_refresh_requires_manual_reauth(l3_error):
+                await asyncio.to_thread(db_manager.mark_l3_memory, self.cookie_id, ready=False)
+                await asyncio.to_thread(db_manager.mark_cookie_expired, self.cookie_id)
+                await self._enter_manual_reauth_required(
+                    trigger=trigger_reason,
+                    message=official_login_error_message(
+                        l3_error,
+                        fallback="浏览器免密记忆已失效，请重新扫码",
+                    ),
+                )
+                return False
+            if not (is_valid_account_login_username(recover_username) and recover_password):
+                db_manager.update_account_session_refresh(
+                    self.cookie_id,
+                    state="failed",
+                    trigger=trigger_reason,
+                    message="免密续签暂时失败，将稍后重试",
+                    error_code=l3_error or "session_probe_retryable",
+                )
+                return False
+
         if is_valid_account_login_username(recover_username) and recover_password:
             slider_cookie = await self._recover_via_slider_password_login(
                 recover_username,
@@ -2956,6 +3100,25 @@ class XianyuLive:
                 logger.warning(
                     f"【{self.cookie_id}】滑块登录拿到 Cookie 但监听交接失败，回落官方验证会话"
                 )
+
+        cdp_cookie = await self._recover_via_cdp(profile_unb, trigger_reason)
+        if cdp_cookie:
+            updated = await self._update_cookies_and_restart(
+                cdp_cookie,
+                browser_user_agent=browser_user_agent or detect_default_browser_user_agent(),
+                expected_revision=refresh_revision,
+                expected_xianyu_unb=profile_unb,
+            )
+            if updated:
+                db_manager.update_account_session_refresh(
+                    self.cookie_id,
+                    state="success",
+                    trigger=trigger_reason,
+                    message="已从本机 Chrome 接管闲鱼登录态",
+                )
+                db_manager.mark_cookie_validated(self.cookie_id)
+                logger.info(f"【{self.cookie_id}】CDP 接管成功，已交接新监听")
+                return True
 
         worker = OfficialLoginWorker()
         if reuse_active_registration:

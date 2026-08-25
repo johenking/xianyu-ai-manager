@@ -39,7 +39,9 @@ class FakeRefreshDatabase:
             "cookie_revision": 3,
             "login_method": login_method,
             "browser_user_agent": "",
+            "has_l3_memory": False,
         }
+        self.l3_marks = []
 
     def get_account_session_refresh(self, cookie_id):
         del cookie_id
@@ -62,6 +64,11 @@ class FakeRefreshDatabase:
     def mark_cookie_validated(self, cookie_id):
         del cookie_id
         self.validated_calls += 1
+        return True
+
+    def mark_l3_memory(self, cookie_id, *, ready):
+        self.l3_marks.append((cookie_id, ready))
+        self.details["has_l3_memory"] = bool(ready)
         return True
 
     def compare_and_swap_cookie_session(self, cookie_id, **kwargs):
@@ -846,6 +853,123 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         live.get_all_items.assert_awaited_once_with(page_size=20, max_pages=5)
         self.assertEqual(live.last_item_sync_time, 5001.0)
+
+    async def test_qr_account_with_l3_memory_recovers_without_password(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.user_id = 7
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=old"
+        live.cookies = {"unb": "9988", "cookie2": "old", "_m_h5_tk": "old"}
+        live._update_cookies_and_restart = AsyncMock(return_value=True)
+        live._recover_via_passwordless_refresh = AsyncMock(
+            return_value="unb=9988; cookie2=fresh; _m_h5_tk=fresh"
+        )
+        live._recover_via_slider_password_login = AsyncMock(return_value="")
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        database.details["has_l3_memory"] = True
+        database.details["value"] = "unb=9988; cookie2=old; _m_h5_tk=old"
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            cookies={"unb": "9988", "cookie2": "old"},
+            error_code="session_expired",
+        ))
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FakeOfficialRefreshService,
+            ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            success = await live._try_password_login_refresh("令牌/Session过期")
+
+        self.assertTrue(success)
+        live._recover_via_passwordless_refresh.assert_awaited_once()
+        live._recover_via_slider_password_login.assert_not_awaited()
+        live._update_cookies_and_restart.assert_awaited_once()
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
+        self.assertEqual(database.status["state"], "success")
+        self.assertEqual(database.validated_calls, 1)
+
+    async def test_passwordless_fast_entry_unavailable_is_manual_and_retryable_profile_stays_failed(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.user_id = 7
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=old"
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live._last_l3_error_code = "fast_entry_unavailable"
+        live._update_cookies_and_restart = AsyncMock(return_value=True)
+        live._recover_via_passwordless_refresh = AsyncMock(return_value="")
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        database.details["has_l3_memory"] = True
+        database.details["value"] = "unb=9988; cookie2=old; _m_h5_tk=old"
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            error_code="session_expired",
+        ))
+
+        async def fake_passwordless(*_args, **_kwargs):
+            live._last_l3_error_code = "fast_entry_unavailable"
+            return ""
+
+        live._recover_via_passwordless_refresh = AsyncMock(side_effect=fake_passwordless)
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FakeOfficialRefreshService,
+            ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            success = await live._try_password_login_refresh("令牌/Session过期")
+
+        self.assertFalse(success)
+        self.assertEqual(database.status["state"], "manual_reauth_required")
+        self.assertEqual(database.l3_marks, [("account-1", False)])
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
+
+    async def test_corrupt_l3_profile_stays_retryable_failed(self):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.user_id = 7
+        live.cookies_str = "unb=9988; cookie2=old; _m_h5_tk=old"
+        live.cookies = {"unb": "9988", "cookie2": "old"}
+        live._update_cookies_and_restart = AsyncMock()
+        live.send_token_refresh_notification = AsyncMock()
+        database = FakeRefreshDatabase(login_method="qr", username="", password="")
+        database.details["has_l3_memory"] = True
+        database.details["value"] = "unb=9988; cookie2=old; _m_h5_tk=old"
+        probe = AsyncMock(return_value=SessionProbeResult(
+            status=PROBE_EXPIRED,
+            error_code="session_expired",
+        ))
+
+        async def fake_passwordless(*_args, **_kwargs):
+            live._last_l3_error_code = "profile_corrupt"
+            return ""
+
+        live._recover_via_passwordless_refresh = AsyncMock(side_effect=fake_passwordless)
+
+        with (
+            patch("db_manager.db_manager", database),
+            patch(
+                "utils.xianyu_official_login.XianyuOfficialLoginService",
+                FakeOfficialRefreshService,
+            ),
+            patch("XianyuAutoAsync.probe_message_session_async", probe),
+        ):
+            success = await live._try_password_login_refresh("令牌/Session过期")
+
+        self.assertFalse(success)
+        self.assertEqual(database.status["state"], "failed")
+        self.assertEqual(database.status["error_code"], "profile_corrupt")
+        self.assertEqual(database.l3_marks, [])
+        live._update_cookies_and_restart.assert_not_awaited()
+        self.assertEqual(FakeOfficialRefreshService.calls, [])
 
 
 if __name__ == "__main__":

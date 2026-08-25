@@ -36,6 +36,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     login_method: item.login_method,
     login_method_label: item.login_method_label,
     auto_refresh_supported: Boolean(item.auto_refresh_supported),
+    has_l3_memory: Boolean(item.has_l3_memory),
     reauth_required: Boolean(item.reauth_required),
     reauth_action: item.reauth_action,
     last_login_at: item.last_login_at ?? null,

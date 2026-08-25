@@ -3069,11 +3069,19 @@ const AccountList: React.FC<AccountListProps> = () => {
                   当前设备续期
                 </h3>
                 <div className={`rounded-lg border p-4 ${editingAccount.auto_refresh_supported ? 'border-emerald-200 bg-emerald-50' : 'border-amber-200 bg-amber-50'}`}>
-                  <p className="font-bold text-gray-900">{editingAccount.auto_refresh_supported ? '已绑定一个当前设备浏览器' : '尚未绑定当前设备浏览器'}</p>
+                  <p className="font-bold text-gray-900">{
+                    editingAccount.has_l3_memory
+                      ? '已建立浏览器登录记忆'
+                      : editingAccount.auto_refresh_supported
+                        ? '已绑定一个当前设备浏览器'
+                        : '尚未绑定当前设备浏览器'
+                  }</p>
                   <p className="mt-1 text-sm leading-6 text-gray-600">
-                    {editingAccount.auto_refresh_supported
-                      ? '续期凭据只会通过一次性加密任务发给绑定设备；账号密码不会在此处展示或修改。'
-                      : '先在当前设备浏览器完成账号密码登录，登录成功后再单独授权保存续期凭据。'}
+                    {editingAccount.has_l3_memory
+                      ? '扫码留下的浏览器记忆可用于免密自动续签，账号密码不会在此处展示或修改。'
+                      : editingAccount.auto_refresh_supported
+                        ? '续期凭据只会通过一次性加密任务发给绑定设备；账号密码不会在此处展示或修改。'
+                        : '先完成一次扫码或账号密码登录以建立浏览器记忆；也可以在当前设备浏览器完成账号密码登录后授权绑定。'}
                   </p>
                   <button
                     type="button"
@@ -3095,7 +3103,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                   {!editingAccount.auto_refresh_supported && (
                     <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
                       <p className="font-bold text-gray-900">当前方式到期后需要人工重新登录</p>
-                      <p className="mt-1 text-sm text-gray-600">只有在当前设备浏览器完成账号密码登录，并在成功后明确授权绑定设备，才可开启自动定时续期。</p>
+                      <p className="mt-1 text-sm text-gray-600">扫码成功并留下浏览器记忆后，或在当前设备完成账号密码登录并绑定后，即可开启自动定时续期。</p>
                       <button
                         type="button"
                         onClick={() => openReauthMethod({ ...editingAccount, reauth_action: 'password_login' })}
@@ -3108,7 +3116,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                   <div className="flex items-center justify-between p-4 bg-cyan-50 rounded-xl">
                     <div>
                       <div className="font-bold text-gray-900">自动定时 Cookie 刷新</div>
-                      <div className="text-xs text-gray-500">{editingAccount.auto_refresh_supported ? '关闭后仍可手动刷新，可降低频繁触发验证的概率。' : '当前登录方式不提供后台自动续期。'}</div>
+                      <div className="text-xs text-gray-500">{editingAccount.auto_refresh_supported ? '关闭后仍可手动刷新，可降低频繁触发验证的概率。' : '当前还没有可用的浏览器登录记忆或续期绑定。'}</div>
                     </div>
                     <ToggleControl
                       checked={editForm.cookie_refresh_enabled}

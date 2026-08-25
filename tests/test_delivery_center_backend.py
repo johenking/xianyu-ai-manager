@@ -128,7 +128,7 @@ class DeliveryCenterBackendTests(unittest.TestCase):
             }
             <= tables
         )
-        self.assertEqual(self.db.schema_version, "2026082401")
+        self.assertEqual(self.db.schema_version, "2026082502")
 
     def test_api_token_is_encrypted_and_never_returned_by_public_card_reads(self) -> None:
         card_id = self.db.create_card(

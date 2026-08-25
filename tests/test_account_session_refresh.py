@@ -62,6 +62,12 @@ class AccountIdentityDatabaseTests(unittest.TestCase):
         self.assertFalse(
             supports_automatic_refresh("password", "seller@example.com", False)
         )
+        self.assertTrue(
+            supports_automatic_refresh("qr", "", False, True)
+        )
+        self.assertFalse(
+            supports_automatic_refresh("qr", "", False, False)
+        )
 
     def test_cookie_upsert_only_updates_cookie_and_preserves_account_data(self):
         self.assertTrue(
@@ -225,6 +231,25 @@ class AccountSessionRefreshDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(updated["username"], "13800138000")
         self.assertEqual(updated["password"], "secret")
+
+    def test_l3_memory_enables_refresh_without_password_or_device_binding(self):
+        self.assertFalse(
+            self.db.get_cookie_refresh_settings("account-1")["auto_refresh_supported"]
+        )
+        self.assertTrue(self.db.mark_l3_memory("account-1", ready=True))
+        settings = self.db.get_cookie_refresh_settings("account-1")
+        self.assertTrue(settings["auto_refresh_supported"])
+        self.assertTrue(
+            self.db.update_cookie_refresh_settings(
+                "account-1",
+                enabled=True,
+                interval_minutes=360,
+            )
+        )
+        details = self.db.get_cookie_details("account-1")
+        self.assertTrue(details["has_l3_memory"])
+        self.assertTrue(details["cookie_refresh_enabled"])
+        self.assertEqual(details["cookie_refresh_interval_minutes"], 360)
 
     def test_non_password_login_disables_existing_refresh_and_records_expiry_once(self):
         self.db.update_cookie_account_info(

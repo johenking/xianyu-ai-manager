@@ -1,3 +1,10 @@
+# 维护源进行中：扫码账号免密自动续签（五阶段）
+
+- 目标：扫码账号留下持久浏览器记忆（L3），cookie 失效后免密自动续签，不必再绑密码。
+- 顺序：0 基线 → 1 扫码落 profile/DB 标记 → 2 免密续签优先于账密 → 3 放开门槛 → 4 分层错误 → 5 CDP 接管。
+- 最大风险：闲鱼 passport「快速进入」和 CfT 指纹会漂移；代码测试不是真机证据，本轮不部署生产。
+- 生产实例 `/Users/mac/Library/Application Support/XianyuManager` 不动。
+
 # 当前生产状态
 
 - 最终复核时间：2026-08-25 14:55（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `79093`（14:16:27 启动）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，health 报告迁移 `2026082401`（MAX 口径），补插迁移 `2026081801` 已于 14:16:28 应用，SQLite `integrity_check=ok`。
@@ -10,7 +17,7 @@
 
 ## 维护源待发布
 
-- 无积压候选。维护源与生产的已知差异仅剩滑块自愈特性（`XianyuAutoAsync.py` 两个滑块 hunk、`account_session_refresh.py` 新语义、`utils/xianyu_slider_stealth.py`），该特性等待真机金丝雀后另行决策，不属于待发布队列。
+- 扫码账号免密自动续签（L3 持久 profile）已在维护源落地：扫码/官方窗口成功后写入 `has_l3_memory`，Cookie 失效优先走 passport「快速进入」，失败按可重试/单向人工分层；CDP 接管仅在配置了 endpoint 时启用。本轮不部署生产。滑块隐身账密自愈仍仅在维护源。真人 canary（扫码建档 → L2 过期 → 免密续签）仍 pending。
 
 ## 证据路由
 

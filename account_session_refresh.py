@@ -43,6 +43,8 @@ PASSWORD_MANUAL_REAUTH_ERROR_CODES = {
     "password_mode_missing",
     "credential_inputs_missing", "agreement_missing",
     "login_submit_missing", "login_state_unknown",
+    "fast_entry_unavailable", "human_verification_required",
+    "illegal_access", "cdp_identity_mismatch",
 }
 OFFICIAL_LOGIN_ERROR_MESSAGES = {
     "invalid_credentials": "闲鱼账号或密码错误，请重新登录",
@@ -59,6 +61,10 @@ OFFICIAL_LOGIN_ERROR_MESSAGES = {
     "agreement_missing": "闲鱼官方登录页面已变化，请重新登录",
     "login_submit_missing": "闲鱼官方登录页面已变化，请重新登录",
     "login_state_unknown": "闲鱼官方登录未能确认成功，请重新登录",
+    "fast_entry_unavailable": "浏览器免密记忆已失效，请重新扫码",
+    "human_verification_required": "需要在闲鱼官方页面完成人工验证",
+    "illegal_access": "平台判定当前访问非法，请重新登录",
+    "cdp_identity_mismatch": "本机 Chrome 登录账号与当前账号不一致，请重新登录",
     "profile_in_use": "闲鱼官方浏览器档案正在使用，请关闭对应窗口后重试",
     "browser_error": "闲鱼官方浏览器启动失败，请稍后重试",
     "profile_promotion_failed": "登录已完成，但专用浏览器档案保存失败",
@@ -78,6 +84,13 @@ RETRYABLE_SESSION_ERROR_CODES = {
     "token_probe_retry_exception",
     "cookie_persist_failed",
     "listener_handoff_failed",
+    "profile_missing",
+    "profile_corrupt",
+    "profile_in_use",
+    "browser_error",
+    "fast_entry_timeout",
+    "cdp_connect_failed",
+    "cdp_endpoint_missing",
 }
 
 
@@ -120,15 +133,16 @@ def supports_automatic_refresh(
     login_method: Optional[str],
     username: Optional[str],
     has_password: bool,
+    has_l3_memory: bool = False,
 ) -> bool:
-    """Return whether legacy server-side browser refresh may run.
+    """Return whether automatic session refresh may run.
 
-    2026-08-14：移植滑块隐身密码登录栈（utils/xianyu_slider_stealth.py）后，服务端可在
-    后台用账号密码自动重登并过滑块，因此对"配置了有效登录用户名 + 密码"的账号重新开启
-    自动续期——免去扫码 Cookie 约 10 小时过期后必须人工重扫的痛点。仅凭旧的启用开关或
-    仅有密码但用户名非法时不放行。
+    有可用 L3 浏览器记忆的扫码账号可以免密续签；没有记忆时仍要求合法用户名 + 密码，
+    以便走账密滑块自愈。仅凭旧的启用开关或仅有密码但用户名非法时不放行。
     """
     del login_method
+    if bool(has_l3_memory):
+        return True
     return bool(has_password and is_valid_account_login_username(username))
 
 

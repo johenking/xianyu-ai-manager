@@ -2149,6 +2149,9 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'login_method': login_method,
             'login_method_label': login_method_label(login_method),
             'auto_refresh_supported': auto_refresh_supported,
+            'has_l3_memory': bool(
+                cookie_details.get('has_l3_memory') if cookie_details else False
+            ),
             'reauth_required': reauth_required,
             'reauth_action': reauth_action_for(login_method),
             'last_login_at': cookie_details.get('last_login_at') if cookie_details else None,
@@ -3220,6 +3223,7 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         safe_details['auto_refresh_supported'] = bool(
             db_manager.get_cookie_refresh_settings(cid).get('auto_refresh_supported')
         )
+        safe_details['has_l3_memory'] = bool(details.get('has_l3_memory'))
         return safe_details
     except HTTPException:
         raise
@@ -3273,6 +3277,7 @@ async def _persist_validated_account_login(
     login_method: str = 'unknown',
     browser_user_agent: str = "",
     runtime_state: Optional[Dict[str, Any]] = None,
+    has_l3_memory: bool = False,
 ) -> Dict[str, Any]:
     """Persist one platform-validated identity and restart its listener once."""
     parsed = trans_cookies(cookies_str)
@@ -3305,6 +3310,7 @@ async def _persist_validated_account_login(
         browser_user_agent=browser_user_agent or None,
         login_method=login_method,
         login_validated=True,
+        has_l3_memory=True if has_l3_memory else None,
     )
     if not update_success:
         raise RuntimeError("已验证登录态保存失败")
@@ -3367,6 +3373,7 @@ async def _complete_official_login_session(
                 else "sms_window" if record.mode == "sms" else "qr"
             ),
             "login_validated": True,
+            "has_l3_memory": True,
         }
         if record.mode == "password":
             update_kwargs.update({
@@ -3958,6 +3965,7 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
                         'cookie_refresh_anchor': now,
                         'item_sync_anchor': now,
                     },
+                    has_l3_memory=bool(cookies_info.get('has_l3_memory')),
                 )
                 status_info['account_info'] = account_info
                 qr_login_manager.mark_persisted(session_id)
@@ -4022,6 +4030,7 @@ async def process_qr_login_cookies(
     current_user: Dict[str, Any],
     *,
     runtime_state: Optional[Dict[str, Any]] = None,
+    has_l3_memory: bool = False,
 ) -> Dict[str, Any]:
     """Persist only a Cookie already validated by the API QR manager."""
     return await _persist_validated_account_login(
@@ -4031,6 +4040,7 @@ async def process_qr_login_cookies(
         login_method='qr',
         browser_user_agent=detect_default_browser_user_agent(),
         runtime_state=runtime_state,
+        has_l3_memory=has_l3_memory,
     )
 
 

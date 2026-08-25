@@ -407,6 +407,8 @@ class DBManager:
                 last_login_at REAL,
                 last_validated_at REAL,
                 last_expired_at REAL,
+                has_l3_memory INTEGER NOT NULL DEFAULT 0,
+                l3_memory_at REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -2270,7 +2272,7 @@ class DBManager:
                     "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent, "
                     "cookie_revision, login_method, last_login_at, last_validated_at, "
                     "last_expired_at, avatar_url, xianyu_nick, "
-                    "auto_rate_enabled, auto_rate_enabled_at "
+                    "auto_rate_enabled, auto_rate_enabled_at, has_l3_memory, l3_memory_at "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -2307,6 +2309,8 @@ class DBManager:
                         'xianyu_nick': result[21] or '',
                         'auto_rate_enabled': bool(result[22]),
                         'auto_rate_enabled_at': result[23],
+                        'has_l3_memory': bool(result[24]),
+                        'l3_memory_at': result[25],
                     }
                 return None
             except Exception as e:
@@ -2577,7 +2581,8 @@ class DBManager:
                 cursor = self.conn.cursor()
                 self._execute_sql(
                     cursor,
-                    "SELECT login_method, username, password, password_encrypted "
+                    "SELECT login_method, username, password, password_encrypted, "
+                    "COALESCE(has_l3_memory, 0) "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -2595,10 +2600,11 @@ class DBManager:
                     (cookie_id,),
                 ).fetchone()
                 auto_refresh_supported = bool(
-                    binding and capability[1] and (capability[2] or capability[3])
+                    capability[4]
+                    or (binding and capability[1] and (capability[2] or capability[3]))
                 )
                 if enabled and not auto_refresh_supported:
-                    raise ValueError("当前账号尚未绑定可用的续期设备和凭据")
+                    raise ValueError("当前账号尚未建立浏览器登录记忆，也未绑定可用的续期设备和凭据")
                 self._execute_sql(
                     cursor,
                     "UPDATE cookies SET cookie_refresh_enabled = ?, "
@@ -2626,7 +2632,8 @@ class DBManager:
                 self._execute_sql(
                     cursor,
                     "SELECT cookie_refresh_enabled, cookie_refresh_interval_minutes, "
-                    "login_method, username, password, password_encrypted "
+                    "login_method, username, password, password_encrypted, "
+                    "COALESCE(has_l3_memory, 0) "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -2653,7 +2660,7 @@ class DBManager:
                     (cookie_id,),
                 ).fetchone()
                 auto_refresh_supported = bool(
-                    binding and row[3] and (row[4] or row[5])
+                    row[6] or (binding and row[3] and (row[4] or row[5]))
                 )
                 return {
                     'enabled': bool(row[0]) if row[0] is not None and auto_refresh_supported else False,
@@ -2667,6 +2674,27 @@ class DBManager:
                     'interval_minutes': COOKIE_REFRESH_DEFAULT_INTERVAL_MINUTES,
                     'auto_refresh_supported': False,
                 }
+
+    def mark_l3_memory(self, cookie_id: str, *, ready: bool) -> bool:
+        """Record whether this account has a reusable persistent-browser L3 memory."""
+        now = time.time() if ready else None
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET has_l3_memory = ?, l3_memory_at = ? WHERE id = ?",
+                    (1 if ready else 0, now, cookie_id),
+                )
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("更新账号 L3 记忆标记失败: {}", type(exc).__name__)
+                self.conn.rollback()
+                return False
 
     def update_account_session_refresh(
         self,
@@ -3155,6 +3183,7 @@ class DBManager:
         *,
         login_method: str = None,
         login_validated: bool = False,
+        has_l3_memory: bool = None,
     ) -> bool:
         """更新Cookie的账号信息（包括cookie值、用户名、密码和显示浏览器设置）
         如果记录不存在，会先创建记录（需要提供cookie_value和user_id）
@@ -3231,6 +3260,14 @@ class DBManager:
                             insert_values.append(now)
                             insert_placeholders.append('?')
 
+                    if has_l3_memory is not None:
+                        insert_fields.extend(['has_l3_memory', 'l3_memory_at'])
+                        insert_values.extend([
+                            1 if has_l3_memory else 0,
+                            time.time() if has_l3_memory else None,
+                        ])
+                        insert_placeholders.extend(['?', '?'])
+
                     sql = f"INSERT INTO cookies ({', '.join(insert_fields)}) VALUES ({', '.join(insert_placeholders)})"
                     self._execute_sql(cursor, sql, tuple(insert_values))
                     self.conn.commit()
@@ -3303,8 +3340,16 @@ class DBManager:
                             params.append(now)
                         else:
                             update_fields.append("last_validated_at = NULL")
-                        if normalized_method != 'password':
+                        keep_refresh = bool(has_l3_memory) or normalized_method == 'password'
+                        if not keep_refresh:
                             update_fields.append("cookie_refresh_enabled = 0")
+
+                    if has_l3_memory is not None:
+                        update_fields.extend(["has_l3_memory = ?", "l3_memory_at = ?"])
+                        params.extend([
+                            1 if has_l3_memory else 0,
+                            time.time() if has_l3_memory else None,
+                        ])
 
                     if not update_fields:
                         logger.warning(f"更新账号 {cookie_id} 信息时没有提供任何更新字段")

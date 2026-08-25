@@ -72,6 +72,8 @@ class SliderPasswordRecoveryTests(unittest.TestCase):
         self.assertTrue(supports_automatic_refresh("password", "13800138000", True))
         self.assertTrue(supports_automatic_refresh("qr", "seller@example.com", True))
         self.assertFalse(supports_automatic_refresh("password", "13800138000", False))  # 无密码
+        self.assertTrue(supports_automatic_refresh("qr", "", False, True))  # 有 L3 记忆
+        self.assertFalse(supports_automatic_refresh("qr", "", False, False))
         self.assertFalse(supports_automatic_refresh("password", "", True))  # 用户名空
         self.assertFalse(supports_automatic_refresh("password", "https://evil", True))  # 误粘 URL
 

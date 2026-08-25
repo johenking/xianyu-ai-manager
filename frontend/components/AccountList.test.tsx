@@ -420,6 +420,38 @@ describe('AccountList session verification UI', () => {
     });
   });
 
+  it('lets a QR account with browser memory enable scheduled refresh', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([
+      {
+        id: 'qr-l3',
+        enabled: true,
+        auto_confirm: false,
+        remark: '扫码记忆账号',
+        note: '扫码记忆账号',
+        pause_duration: 0,
+        nickname: '扫码记忆账号',
+        login_method: 'qr',
+        login_method_label: '扫码登录',
+        auto_refresh_supported: true,
+        has_l3_memory: true,
+        cookie_refresh_enabled: false,
+        cookie_refresh_interval_minutes: 1440,
+        reauth_required: false,
+        reauth_action: 'qr_login',
+      } as any,
+    ]);
+
+    render(<AccountList />);
+    await screen.findByText('可自动续期 · 定时关闭');
+
+    const accountCard = screen.getByRole('heading', { name: '扫码记忆账号' }).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('编辑账号'));
+
+    await screen.findByText('已建立浏览器登录记忆');
+    expect(screen.getByLabelText('自动定时 Cookie 刷新')).not.toBeDisabled();
+  });
+
   it('saves seller auto-review as an explicit per-account opt-in', async () => {
     render(<AccountList />);
 

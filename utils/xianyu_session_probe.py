@@ -47,6 +47,7 @@ _VERIFICATION_MARKERS = (
     "RGV587_ERROR",
     "punish?x5secdata",
     "captcha",
+    "ILLEGAL_ACCESS",
 )
 _EXPIRED_MARKERS = (
     "令牌过期",
@@ -191,12 +192,31 @@ def classify_probe_response(
 
     verification_url = _safe_verification_url(payload)
     if verification_url or any(marker in ret_text for marker in _VERIFICATION_MARKERS):
+        risk_code = (
+            "illegal_access"
+            if "ILLEGAL_ACCESS" in ret_text
+            else "human_verification_required"
+        )
         return SessionProbeResult(
             status=PROBE_VERIFICATION_REQUIRED,
             cookies=merged_cookies,
             verification_url=verification_url,
-            error_code="human_verification_required",
-            message="需要在闲鱼官方页面完成人工验证",
+            error_code=risk_code,
+            message=(
+                "平台判定当前访问非法，已停止自动续签"
+                if risk_code == "illegal_access"
+                else "需要在闲鱼官方页面完成人工验证"
+            ),
+        )
+
+    if any(marker in ret_text for marker in _TOKEN_EXPIRED_MARKERS) and not any(
+        marker in ret_text for marker in ("SESSION_EXPIRED", "Session过期")
+    ):
+        return SessionProbeResult(
+            status=PROBE_EXPIRED,
+            cookies=merged_cookies,
+            error_code="token_expired",
+            message="闲鱼签名令牌已过期",
         )
 
     if any(marker in ret_text for marker in _EXPIRED_MARKERS):

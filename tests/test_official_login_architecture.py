@@ -22,12 +22,15 @@ class OfficialLoginArchitectureTests(unittest.TestCase):
 
         self.assertIn("supports_automatic_refresh", source)
         self.assertIn('account_info.get("password")', source)
+        self.assertIn('has_l3_memory', source)
+        self.assertIn("_recover_via_passwordless_refresh", source)
         self.assertIn("manual_reauth_required", source)
         from account_session_refresh import supports_automatic_refresh
         # 2026-08-14 语义反转：有账密（用户名合法）即通过自动续期门禁；
         # 无密码或用户名非法仍被拒并走人工重登。
         self.assertTrue(supports_automatic_refresh("password", "fixture", True))
         self.assertFalse(supports_automatic_refresh("password", "fixture", False))
+        self.assertTrue(supports_automatic_refresh("qr", "", False, True))
         self.assertFalse(supports_automatic_refresh("password", "", True))
 
     def test_diagnostics_do_not_claim_saved_password_is_required_for_refresh(self):

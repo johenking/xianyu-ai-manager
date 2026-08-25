@@ -1971,6 +1971,21 @@ def _delivery_center_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
     )
 
 
+def _account_l3_memory_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Mark accounts that have a reusable persistent-browser L3 login memory."""
+    cookies_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cookies'"
+    ).fetchone()
+    if not cookies_exists:
+        return
+    _add_column(
+        cursor,
+        "cookies",
+        "has_l3_memory INTEGER NOT NULL DEFAULT 0 CHECK (has_l3_memory IN (0, 1))",
+    )
+    _add_column(cursor, "cookies", "l3_memory_at REAL")
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -2107,6 +2122,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026082401",
         "delivery_center_v1",
         _delivery_center_v1,
+    ),
+    Migration(
+        "2026082502",
+        "account_l3_memory_v1",
+        _account_l3_memory_v1,
     ),
 )
 

@@ -91,6 +91,7 @@ class QRLoginSession:
         self.validated = False
         self.terminal_at = None
         self.ended_by = ""
+        self.has_l3_memory = False
         self.interaction_channel = BrowserInteractionChannel()
 
     def is_expired(self) -> bool:
@@ -121,6 +122,7 @@ class QRLoginManager:
         verification_browser=None,
         session_validator=None,
         terminal_retention_seconds: float = 300.0,
+        l3_seeder=None,
     ):
         self.sessions: Dict[str, QRLoginSession] = {}
         self.headers = generate_headers()
@@ -139,6 +141,7 @@ class QRLoginManager:
         self.verification_browser = verification_browser or QRVerificationBrowser()
         self.session_validator = session_validator or probe_message_session_async
         self.terminal_retention_seconds = max(300.0, float(terminal_retention_seconds))
+        self.l3_seeder = l3_seeder
 
     @staticmethod
     def _mark_terminal(
@@ -498,6 +501,7 @@ class QRLoginManager:
             session.message = "扫码登录成功"
             session.validated = True
             session.ended_by = "session_validated"
+            session.has_l3_memory = await self._seed_l3_memory(session)
             return True
 
         if result.status == PROBE_VERIFICATION_REQUIRED:
@@ -530,6 +534,36 @@ class QRLoginManager:
         )
         session.validated = False
         return False
+
+    async def _seed_l3_memory(self, session: QRLoginSession) -> bool:
+        """Best-effort: persist the QR session into a reusable browser profile."""
+        unb = str(session.unb or "").strip()
+        if not unb or not session.cookies:
+            return False
+        seeder = self.l3_seeder
+        if seeder is None:
+            from utils.xianyu_l3_memory import seed_profile_from_cookies
+
+            seeder = seed_profile_from_cookies
+        try:
+            result = await asyncio.to_thread(seeder, unb, dict(session.cookies))
+        except Exception as exc:
+            logger.warning(
+                "扫码成功后建立浏览器记忆失败: session={}, error={}",
+                session.session_id,
+                type(exc).__name__,
+            )
+            return False
+        succeeded = bool(getattr(result, "succeeded", result))
+        if succeeded:
+            logger.info("扫码登录已写入浏览器记忆: session={}", session.session_id)
+        else:
+            logger.warning(
+                "扫码登录未能写入浏览器记忆: session={}, error={}",
+                session.session_id,
+                getattr(result, "error_code", "seed_failed"),
+            )
+        return succeeded
 
     async def _monitor_qr_status(self, session_id: str, max_wait_time: int = 300, preserve_verification: bool = False):
         """监控二维码状态"""
@@ -781,6 +815,7 @@ class QRLoginManager:
                         return
                     session.verification_browser_status = 'success'
                     session.verification_error = None
+                    session.has_l3_memory = True
                     remove_verification_screenshot(session.verification_screenshot_path)
                     session.verification_screenshot_path = None
                     logger.info(
@@ -1027,7 +1062,8 @@ class QRLoginManager:
         if session and session.status == 'success' and session.validated:
             return {
                 'cookies': self._cookie_marshal(session.cookies),
-                'unb': session.unb
+                'unb': session.unb,
+                'has_l3_memory': bool(session.has_l3_memory),
             }
         return None
 
