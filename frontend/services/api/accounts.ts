@@ -423,11 +423,14 @@ export const getAutoReplyDiagnostics = async (cookieId: string): Promise<AutoRep
   return res.data;
 };
 
-export const getAccountSessionStatus = async (cookieId: string): Promise<AccountSessionRefreshStatus> => {
+export const getAccountSessionStatus = async (
+  cookieId: string,
+  signal?: AbortSignal,
+): Promise<AccountSessionRefreshStatus> => {
   const res = await get<{ success: boolean; data: AccountSessionRefreshStatus }>(
     `/api/accounts/${cookieId}/session-status`,
     undefined,
-    undefined,
+    signal,
     12_000,
   );
   return res.data;

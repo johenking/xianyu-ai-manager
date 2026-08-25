@@ -124,6 +124,8 @@ const compareVersions = (left: string, right: string) => {
   return 0;
 };
 const ACTIVE_SESSION_REFRESH_STATES = new Set(['refreshing', 'verification_required']);
+const ACTIVE_SESSION_POLL_INTERVAL_MS = 3_000;
+const STABLE_SESSION_POLL_INTERVAL_MS = 15_000;
 const ACTIVE_BROWSER_QR_VIEW_STATES = new Set([
   'loading',
   'waiting',
@@ -328,21 +330,28 @@ const AccountList: React.FC<AccountListProps> = () => {
   const [savingReplyStrategies, setSavingReplyStrategies] = useState(false);
   const replyStrategiesBaselineRef = useRef('');
 
-  const loadSessionStatuses = async (targetAccounts: AccountDetail[] = accounts) => {
+  const loadSessionStatuses = async (
+    targetAccounts: AccountDetail[] = accounts,
+    signal?: AbortSignal,
+  ): Promise<AccountSessionRefreshStatus[]> => {
     const results = await Promise.all(targetAccounts.map(async (account) => {
       try {
-        return [account.id, await getAccountSessionStatus(account.id)] as const;
+        return [account.id, await getAccountSessionStatus(account.id, signal)] as const;
       } catch {
         return null;
       }
     }));
+    if (signal?.aborted) return [];
     const next = Object.fromEntries(results.filter((entry): entry is readonly [string, AccountSessionRefreshStatus] => Boolean(entry)));
     Object.entries(next).forEach(([accountId, status]) => {
       if (!ACTIVE_SESSION_REFRESH_STATES.has(status.state)) {
         manualRefreshFlightsRef.current.delete(accountId);
       }
     });
-    setSessionStatuses((current) => ({ ...current, ...next }));
+    if (Object.keys(next).length) {
+      setSessionStatuses((current) => ({ ...current, ...next }));
+    }
+    return Object.values(next);
   };
 
   const clearQRPolling = () => {
@@ -927,9 +936,60 @@ const AccountList: React.FC<AccountListProps> = () => {
   const accountIds = accounts.map((account) => account.id).join('|');
   useEffect(() => {
     if (!accounts.length) return undefined;
-    void loadSessionStatuses(accounts);
-    const timer = window.setInterval(() => void loadSessionStatuses(accounts), 3000);
-    return () => window.clearInterval(timer);
+
+    let stopped = false;
+    let inFlight = false;
+    let restartWhenVisible = false;
+    let timer: number | null = null;
+    let controller: AbortController | null = null;
+
+    const clearScheduledPoll = () => {
+      if (timer === null) return;
+      window.clearTimeout(timer);
+      timer = null;
+    };
+    const poll = async () => {
+      if (stopped || inFlight || document.visibilityState !== 'visible') return;
+      inFlight = true;
+      controller = new AbortController();
+      const statuses = await loadSessionStatuses(accounts, controller.signal);
+      controller = null;
+      inFlight = false;
+      if (stopped || document.visibilityState !== 'visible') return;
+      if (restartWhenVisible) {
+        restartWhenVisible = false;
+        void poll();
+        return;
+      }
+      const interval = statuses.some((status) => ACTIVE_SESSION_REFRESH_STATES.has(status.state))
+        ? ACTIVE_SESSION_POLL_INTERVAL_MS
+        : STABLE_SESSION_POLL_INTERVAL_MS;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void poll();
+      }, interval);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') {
+        clearScheduledPoll();
+        controller?.abort();
+        return;
+      }
+      if (inFlight) {
+        restartWhenVisible = true;
+        return;
+      }
+      void poll();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    if (document.visibilityState === 'visible') void poll();
+    return () => {
+      stopped = true;
+      clearScheduledPoll();
+      controller?.abort();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [accountIds]);
 
   useEffect(() => {

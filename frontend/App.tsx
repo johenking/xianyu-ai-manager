@@ -31,22 +31,6 @@ const preloadPage = (page: string) => {
   }
 };
 
-const preloadAppPages = () => {
-  const run = () => {
-    (Object.keys(pageLoaders) as PageKey[]).forEach((key) => {
-      if (key !== 'dashboard') {
-        void pageLoaders[key]();
-      }
-    });
-  };
-  if ('requestIdleCallback' in window) {
-    const handle = window.requestIdleCallback(run, { timeout: 2000 });
-    return () => window.cancelIdleCallback(handle);
-  }
-  const handle = globalThis.setTimeout(run, 500);
-  return () => globalThis.clearTimeout(handle);
-};
-
 const PageLoading: React.FC = () => (
   <div className="flex min-h-[50vh] items-center justify-center" role="status" aria-label="页面加载中">
     <Loader2 className="h-8 w-8 animate-spin text-[#FFE815]" />
@@ -133,11 +117,6 @@ const App: React.FC = () => {
           window.removeEventListener('storage', handleStorage);
       };
   }, [clearIdentity, hydrateIdentity]);
-
-  useEffect(() => {
-      if (!isLoggedIn) return undefined;
-      return preloadAppPages();
-  }, [isLoggedIn]);
 
   const publicDocument = window.location.pathname === '/terms'
     || window.location.pathname === '/privacy';
