@@ -192,6 +192,34 @@ class OrderApiContractTests(unittest.TestCase):
                 missing_dependency.append(route.path)
         self.assertEqual(missing_dependency, [])
 
+    def test_order_sync_reports_manual_reauth_as_a_successful_skip(self):
+        self.db.update_account_session_refresh(
+            "acct-one",
+            state="manual_reauth_required",
+            trigger="test",
+            error_code="session_expired",
+        )
+        with patch.object(
+            reply_server.XianyuOrderListClient,
+            "discover",
+            new=AsyncMock(),
+        ) as discover:
+            response = self.client.post(
+                "/api/orders/sync",
+                json={"days": 7},
+                headers=self.headers_for(self.user_one),
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["requires_login"], [])
+        self.assertEqual(payload["skipped_reauth"], ["acct-one"])
+        self.assertTrue(payload["accounts"][0]["skipped"])
+        self.assertEqual(payload["accounts"][0]["coverage"], "none")
+        discover.assert_not_awaited()
+
     def test_single_refresh_reports_unknown_status_as_partial_failure(self):
         headers = self.headers_for(self.user_one)
         with self.db.lock:

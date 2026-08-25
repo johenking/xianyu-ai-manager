@@ -1,8 +1,4 @@
-"""发货前付款核验的平台压力护栏测试。
-
-该核验在账号订单同步锁内运行，扫描页数直接决定锁占用时长与对平台的请求量。
-这里锁定两件事：核验路径不再按二十页扫描，以及翻页间隔带抖动。
-"""
+"""发货前付款核验的平台压力护栏测试。"""
 
 import unittest
 from types import SimpleNamespace
@@ -11,6 +7,40 @@ from unittest.mock import AsyncMock, patch
 import order_sync_service
 from order_sync_service import XianyuOrderListClient
 from XianyuAutoAsync import DELIVERY_VERIFY_MAX_PAGES, XianyuLive
+
+
+def _detail_payload(*, buyer_id="BUYER-1", business_type="ordinary"):
+    ut_args = {"orderStatusName": "买家已付款，请尽快发货"}
+    component = {
+        "data": {
+            "orderStatusInfo": {"title": "买家已付款，请尽快发货"},
+            "itemInfo": {"buyAmount": "1", "title": "Fixture item"},
+            "priceInfo": {"amount": {"value": "3.00"}},
+        },
+    }
+    if business_type == "ordinary":
+        ut_args["idleBizCode"] = "6"
+    elif business_type == "lead":
+        ut_args.update({
+            "xGlobalBizCode": "commer|leadReservation|onlineService",
+            "globalBizCode": "autotrade",
+            "idleBizCode": "7000",
+        })
+        component["render"] = "leadReservationPhoneInfoVO"
+        component["data"]["leadId"] = "lead-fixture"
+        component["data"]["priceInfo"]["amount"]["value"] = "0.00"
+    return {
+        "ret": ["SUCCESS::调用成功"],
+        "data": {
+            "orderId": "123456789012345678",
+            "itemId": "ITEM-1",
+            "peerUserId": buyer_id,
+            "status": "2",
+            "utArgs": ut_args,
+            "commonInfo": {"createTime": "2026-08-15 15:22:11"},
+            "components": [component],
+        },
+    }
 
 
 class DeliveryVerificationScanBoundTests(unittest.IsolatedAsyncioTestCase):
@@ -37,14 +67,18 @@ class DeliveryVerificationScanBoundTests(unittest.IsolatedAsyncioTestCase):
                                 "item_id": "ITEM-1",
                                 "buyer_id": "BUYER-1",
                                 "order_status": "pending_ship",
+                                "order_business_type": "ordinary",
                                 "platform_status_text": "等待卖家发货",
                             }
                         ],
                     }
                 )
 
+        detail_fetch = AsyncMock(side_effect=AssertionError("unexpected detail fallback"))
         live = self._make_live()
-        with patch.object(order_sync_service, "XianyuOrderListClient", RecordingClient):
+        with patch.object(
+            order_sync_service, "XianyuOrderListClient", RecordingClient
+        ), patch.object(order_sync_service, "fetch_xianyu_order_detail", detail_fetch):
             result = await live._verify_paid_order_for_delivery(
                 order_id="ORDER-1",
                 item_id="ITEM-1",
@@ -55,6 +89,58 @@ class DeliveryVerificationScanBoundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured.get("max_pages"), DELIVERY_VERIFY_MAX_PAGES)
         # 上限必须明显小于全量同步的二十页，否则锁占用回到原状
         self.assertLessEqual(DELIVERY_VERIFY_MAX_PAGES, 5)
+        detail_fetch.assert_not_awaited()
+
+    async def test_numeric_order_prefers_trusted_detail_without_waiting_for_list(self):
+        class UnexpectedClient:
+            def __init__(self, **_kwargs):
+                self.discover = AsyncMock(
+                    side_effect=AssertionError("unexpected order-list fallback")
+                )
+
+        detail_fetch = AsyncMock(return_value=_detail_payload())
+        live = self._make_live()
+        with patch.object(
+            order_sync_service, "XianyuOrderListClient", UnexpectedClient
+        ), patch.object(order_sync_service, "fetch_xianyu_order_detail", detail_fetch):
+            result = await live._verify_paid_order_for_delivery(
+                order_id="123456789012345678",
+                item_id="ITEM-1",
+                buyer_id="BUYER-1",
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["business_type"], "ordinary")
+        detail_fetch.assert_awaited_once()
+
+    async def test_lead_and_unknown_orders_fail_closed_without_list_fallback(self):
+        class UnexpectedClient:
+            def __init__(self, **_kwargs):
+                self.discover = AsyncMock(
+                    side_effect=AssertionError("unexpected order-list fallback")
+                )
+
+        live = self._make_live()
+        detail_fetch = AsyncMock()
+        with patch.object(
+            order_sync_service, "XianyuOrderListClient", UnexpectedClient
+        ), patch.object(order_sync_service, "fetch_xianyu_order_detail", detail_fetch):
+            for business_type, error_code in (
+                ("lead", "lead_order_not_fulfillable"),
+                ("unknown", "order_business_type_unconfirmed"),
+            ):
+                with self.subTest(business_type=business_type):
+                    detail_fetch.return_value = _detail_payload(
+                        business_type=business_type
+                    )
+                    result = await live._verify_paid_order_for_delivery(
+                        order_id="123456789012345678",
+                        item_id="ITEM-1",
+                        buyer_id="BUYER-1",
+                    )
+                    self.assertFalse(result["allowed"])
+                    self.assertEqual(result["business_type"], business_type)
+                    self.assertEqual(result["error_code"], error_code)
 
     async def test_verification_still_fails_closed_when_order_is_absent(self):
         class EmptyClient:
@@ -71,6 +157,48 @@ class DeliveryVerificationScanBoundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["allowed"])
         self.assertEqual(result["error_code"], "order_not_observed")
+
+    async def test_trusted_detail_requires_matching_identity_and_list_fallback_fails_closed(self):
+        class FailedClient:
+            error_code = "platform_permission_denied"
+
+            def __init__(self, **_kwargs):
+                self.discover = AsyncMock(return_value={
+                    "success": False,
+                    "error_code": self.error_code,
+                    "error": "fixture failure",
+                    "requires_login": False,
+                })
+
+        detail_fetch = AsyncMock(return_value=_detail_payload())
+        live = self._make_live()
+        with patch.object(
+            order_sync_service, "XianyuOrderListClient", FailedClient
+        ), patch.object(order_sync_service, "fetch_xianyu_order_detail", detail_fetch):
+            result = await live._verify_paid_order_for_delivery(
+                order_id="123456789012345678",
+                item_id="ITEM-1",
+                buyer_id="BUYER-1",
+            )
+            self.assertTrue(result["allowed"])
+            self.assertEqual(result["quantity"], 1)
+
+            detail_fetch.return_value = _detail_payload(buyer_id="OTHER-BUYER")
+            result = await live._verify_paid_order_for_delivery(
+                order_id="123456789012345678",
+                item_id="ITEM-1",
+                buyer_id="BUYER-1",
+            )
+            self.assertFalse(result["allowed"])
+
+            FailedClient.error_code = "platform_error"
+            detail_fetch.return_value = {"ret": ["FAIL::fixture"]}
+            result = await live._verify_paid_order_for_delivery(
+                order_id="123456789012345678",
+                item_id="ITEM-1",
+                buyer_id="BUYER-1",
+            )
+            self.assertFalse(result["allowed"])
 
 
 def _order_page(pages, order_prefix):

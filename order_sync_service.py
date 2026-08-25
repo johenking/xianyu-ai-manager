@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from account_session_refresh import is_retryable_session_error_code
+
 
 _ACCOUNT_SYNC_LOCKS: Dict[str, asyncio.Lock] = {}
 
@@ -40,9 +42,70 @@ ORDER_STATUSES = {
     "cancelled",
 }
 
-# 经营统计“有效订单”口径的唯一定义源：待发货/已发货/已完成。
-# dashboard、analytics、驾驶舱等所有统计端点必须引用此常量，禁止再散落硬编码。
+
+def session_refresh_blocks_order_requests(refresh_status: Dict[str, Any]) -> bool:
+    """Mirror the listener gate before any order-side platform request."""
+    state = str((refresh_status or {}).get("state") or "")
+    error_code = str((refresh_status or {}).get("error_code") or "")
+    if state not in {
+        "action_required",
+        "refreshing",
+        "verification_required",
+        "manual_reauth_required",
+    }:
+        return False
+    return not (
+        state == "action_required"
+        and (
+            error_code == "connection_failures"
+            or is_retryable_session_error_code(error_code)
+        )
+    )
+
+
+def skipped_reauth_order_result(message: str = "登录状态待恢复，已跳过订单同步") -> Dict[str, Any]:
+    return {
+        "success": True,
+        "partial": False,
+        "skipped": True,
+        "skip_reason": "skipped_reauth",
+        "requires_login": False,
+        "error_code": "skipped_reauth",
+        "message": message,
+        "coverage": "none",
+        "summary": new_order_sync_summary(),
+        "fields_obtained": [],
+        "errors": [],
+    }
+
+
+def mark_order_session_expired(db: Any, cookie_id: str) -> bool:
+    updater = getattr(db, "update_account_session_refresh", None)
+    if not callable(updater):
+        return False
+    try:
+        return bool(updater(
+            cookie_id,
+            state="manual_reauth_required",
+            trigger="order_sync",
+            message="订单接口确认登录状态已过期",
+            error_code="session_expired",
+        ))
+    except Exception:
+        return False
+
+# 通用订单列表/履约扫描的有效订单口径：待发货/已发货/已完成。
 VALID_ORDER_STATUSES: Tuple[str, ...] = ("pending_ship", "shipped", "completed")
+
+# 仪表盘净销售额口径：退款申请处理中仍保留销售额，平台确认退款完成后扣除；
+# 退款撤销回到有效状态时重新计入。其他订单/履约路径继续使用上面的通用口径。
+DASHBOARD_ANALYTICS_STATUSES: Tuple[str, ...] = (
+    "pending_ship",
+    "shipped",
+    "completed",
+    "refunding",
+    "refund_cancelled",
+)
 
 # 订单快照来源等级棘轮：空则写；非空仅当新来源等级“严格更高”才覆盖。
 # 因此目录类来源永远冲不掉已有快照（商品改图/改标题不影响成交记录），
@@ -299,6 +362,7 @@ def _find_order_list(data: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
     module = data.get("module") if isinstance(data.get("module"), dict) else {}
     candidates = (
         module.get("items"),
+        data.get("items"),
         data.get("orders"),
         data.get("orderList"),
         data.get("order_list"),
@@ -320,10 +384,85 @@ def extract_order_list(payload: Any) -> List[Dict[str, Any]]:
     return _find_order_list(parsed.get("data") or {})[1]
 
 
+ORDER_BUSINESS_ORDINARY = "ordinary"
+ORDER_BUSINESS_LEAD = "lead"
+ORDER_BUSINESS_UNKNOWN = "unknown"
+
+
+def classify_order_business_type(raw: Dict[str, Any]) -> str:
+    """Classify the platform order kind using positive, platform-owned markers."""
+    if not isinstance(raw, dict):
+        return ORDER_BUSINESS_UNKNOWN
+    existing = str(raw.get("order_business_type") or "").strip().lower()
+    if existing in {
+        ORDER_BUSINESS_ORDINARY,
+        ORDER_BUSINESS_LEAD,
+        ORDER_BUSINESS_UNKNOWN,
+    }:
+        return existing
+
+    common_data = raw.get("commonData") if isinstance(raw.get("commonData"), dict) else {}
+    ut_args = raw.get("utArgs") if isinstance(raw.get("utArgs"), dict) else {}
+    lead = False
+    ordinary = False
+
+    type_values = (
+        raw.get("xGlobalBizCode"),
+        raw.get("globalBizCode"),
+        raw.get("idleBizCode"),
+        common_data.get("xGlobalBizCode"),
+        common_data.get("globalBizCode"),
+        common_data.get("idleBizCode"),
+        ut_args.get("xGlobalBizCode"),
+        ut_args.get("globalBizCode"),
+        ut_args.get("idleBizCode"),
+    )
+    for value in type_values:
+        normalized = str(value or "").strip().lower()
+        if "leadreservation" in normalized:
+            lead = True
+        elif normalized == "7000":
+            lead = True
+        elif normalized == "6":
+            ordinary = True
+
+    components = raw.get("components") if isinstance(raw.get("components"), list) else []
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        render = str(component.get("render") or "").strip().lower()
+        component_data = component.get("data") if isinstance(component.get("data"), dict) else {}
+        if "leadreservation" in render or component_data.get("leadId"):
+            lead = True
+
+    right_info = raw.get("rightVO") if isinstance(raw.get("rightVO"), dict) else {}
+    button_list = right_info.get("btnList") if isinstance(right_info.get("btnList"), list) else []
+    for button in button_list:
+        if not isinstance(button, dict):
+            continue
+        action = str(button.get("tradeAction") or "").strip().upper()
+        name = str(button.get("name") or "").strip()
+        if action == "LOGISTICS_SEND":
+            ordinary = True
+        elif action == "CLOSE_ORDER" and "取消预约" in name:
+            lead = True
+
+    if lead == ordinary:
+        return ORDER_BUSINESS_UNKNOWN
+    return ORDER_BUSINESS_LEAD if lead else ORDER_BUSINESS_ORDINARY
+
+
 def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any]:
     common_data = raw.get("commonData") if isinstance(raw.get("commonData"), dict) else {}
     buyer_info = raw.get("buyerInfoVO") if isinstance(raw.get("buyerInfoVO"), dict) else {}
     price_info = raw.get("priceVO") if isinstance(raw.get("priceVO"), dict) else {}
+    right_info = raw.get("rightVO") if isinstance(raw.get("rightVO"), dict) else {}
+    button_list = right_info.get("btnList") if isinstance(right_info.get("btnList"), list) else []
+    trade_actions = [
+        str(button.get("tradeAction") or "").strip().upper()
+        for button in button_list
+        if isinstance(button, dict) and str(button.get("tradeAction") or "").strip()
+    ]
     order_id = common_data.get("orderId") or raw.get("order_id") or raw.get("orderId") or raw.get("bizOrderId") or raw.get("mainOrderId") or raw.get("id")
     raw_status = common_data.get("orderStatusCode") or raw.get("status") or raw.get("orderStatus") or raw.get("statusCode") or common_data.get("orderStatus") or ""
     status_text = common_data.get("orderStatus") or raw.get("status_text") or raw.get("statusText") or raw.get("status_desc") or raw.get("statusDesc") or ""
@@ -360,7 +499,110 @@ def normalize_order_record(raw: Dict[str, Any], cookie_id: str) -> Dict[str, Any
         "platform_status_code": str(raw_status or ""),
         "platform_status_text": str(status_text or ""),
         "created_at": common_data.get("createTime") or raw.get("createTime") or raw.get("created_at") or raw.get("gmtCreate"),
+        "trade_actions": trade_actions,
+        "can_rate": "RATE" in trade_actions,
+        "order_business_type": classify_order_business_type(raw),
         "cookie_id": cookie_id,
+    }
+
+
+def normalize_pending_order_record(
+    raw: Dict[str, Any],
+    cookie_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Validate the ordinary-seller pending payload used for fulfillment."""
+    status_code = raw.get("orderStatus") or raw.get("status") or ""
+    status_text = str(
+        raw.get("orderStatusMsg")
+        or raw.get("statusMsg")
+        or raw.get("orderStatusName")
+        or raw.get("statusText")
+        or raw.get("statusDesc")
+        or ""
+    )
+    if normalize_order_status(status_code, status_text) != "pending_ship":
+        return None
+
+    order_id = str(raw.get("bizOrderId") or "").strip()
+    item_id = str(raw.get("auctionId") or "").strip()
+    buyer_id = str(raw.get("buyerId") or "").strip()
+    quantity = parse_trusted_order_quantity(raw.get("buyAmount"))
+    amount = raw.get("totalFee")
+    if (
+        not order_id
+        or not item_id
+        or not buyer_id
+        or quantity is None
+        or parse_amount_fen(amount) is None
+    ):
+        return None
+    return {
+        "order_id": order_id,
+        "item_id": item_id,
+        "buyer_id": buyer_id,
+        "item_title": str(raw.get("auctionTitle") or ""),
+        "buyer_nickname": "",
+        "buyer_avatar_url": "",
+        "amount": str(amount),
+        "quantity": str(quantity),
+        "order_status": "pending_ship",
+        "platform_status_code": str(status_code or ""),
+        "platform_status_text": status_text,
+        "created_at": raw.get("createTime") or raw.get("gmtCreate"),
+        "trade_actions": [],
+        "can_rate": False,
+        "order_business_type": classify_order_business_type(raw),
+        "cookie_id": str(cookie_id),
+    }
+
+
+def parse_pending_order_api_payload(payload: Any, cookie_id: str) -> Dict[str, Any]:
+    parsed = parse_order_api_payload(payload)
+    if not parsed.get("success"):
+        return parsed
+    data = parsed.get("data") or {}
+    items = data.get("items")
+    if not isinstance(items, list) or any(not isinstance(row, dict) for row in items):
+        return {
+            "success": False,
+            "error_code": "invalid_response_schema",
+            "error": "普通账号待发货接口响应缺少订单列表结构",
+            "requires_login": False,
+            "retryable": False,
+        }
+
+    orders = []
+    invalid_pending_records = 0
+    for row in items:
+        status_code = row.get("orderStatus") or row.get("status") or ""
+        status_text = str(
+            row.get("orderStatusMsg")
+            or row.get("statusMsg")
+            or row.get("orderStatusName")
+            or row.get("statusText")
+            or row.get("statusDesc")
+            or ""
+        )
+        if normalize_order_status(status_code, status_text) != "pending_ship":
+            continue
+        order = normalize_pending_order_record(row, cookie_id)
+        if order is None:
+            invalid_pending_records += 1
+            continue
+        orders.append(order)
+    if invalid_pending_records and not orders:
+        return {
+            "success": False,
+            "error_code": "invalid_response_schema",
+            "error": "普通账号待发货订单缺少可信履约字段",
+            "requires_login": False,
+            "retryable": False,
+        }
+    return {
+        "success": True,
+        "requires_login": False,
+        "orders": orders,
+        "invalid_records": invalid_pending_records,
     }
 
 
@@ -444,6 +686,96 @@ def parse_order_time_utc(
 
 def _parse_order_timestamp(value: Any) -> Optional[float]:
     return parse_order_time_utc(value)[0]
+
+
+def parse_order_detail_payload(payload: Any, cookie_id: str) -> Dict[str, Any]:
+    """Normalize the personal order-detail response into one trusted order."""
+    parsed = parse_order_api_payload(payload)
+    if not parsed.get("success"):
+        return parsed
+
+    data = parsed.get("data") or {}
+    item_info: Dict[str, Any] = {}
+    price_info: Dict[str, Any] = {}
+    status_info: Dict[str, Any] = {}
+    for component in data.get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        component_data = component.get("data")
+        if not isinstance(component_data, dict):
+            continue
+        if not item_info and isinstance(component_data.get("itemInfo"), dict):
+            item_info = component_data["itemInfo"]
+        if not price_info and isinstance(component_data.get("priceInfo"), dict):
+            price_info = component_data["priceInfo"]
+        if not status_info and isinstance(component_data.get("orderStatusInfo"), dict):
+            status_info = component_data["orderStatusInfo"]
+
+    order_id = str(data.get("orderId") or "").strip()
+    item_id = str(data.get("itemId") or "").strip()
+    buyer_id = str(data.get("peerUserId") or "").strip()
+    quantity = parse_trusted_order_quantity(item_info.get("buyAmount"))
+    amount_info = price_info.get("amount")
+    amount = amount_info.get("value") if isinstance(amount_info, dict) else None
+    ut_args = data.get("utArgs") if isinstance(data.get("utArgs"), dict) else {}
+    status_text = next(
+        (
+            str(value).strip()
+            for value in (
+                ut_args.get("orderMainTitle"),
+                status_info.get("title"),
+                ut_args.get("orderStatusName"),
+            )
+            if str(value or "").strip()
+        ),
+        "",
+    )
+    raw_status = data.get("status")
+    text_status = normalize_order_status(None, status_text)
+    raw_status_normalized = normalize_order_status(raw_status)
+    if (
+        not order_id
+        or not item_id
+        or not buyer_id
+        or quantity is None
+        or amount in (None, "")
+        or parse_amount_fen(amount) is None
+        or raw_status in (None, "")
+        or text_status == "unknown"
+        or (
+            raw_status_normalized != "unknown"
+            and raw_status_normalized != text_status
+        )
+    ):
+        return {
+            "success": False,
+            "error_code": "invalid_response_schema",
+            "error": "闲鱼订单详情响应缺少可信订单字段",
+            "requires_login": False,
+            "retryable": False,
+        }
+    return {
+        "success": True,
+        "requires_login": False,
+        "orders": [{
+            "order_id": order_id,
+            "item_id": item_id,
+            "buyer_id": buyer_id,
+            "item_title": str(item_info.get("title") or ""),
+            "amount": str(amount),
+            "quantity": str(quantity),
+            "order_status": text_status,
+            "platform_status_code": str(raw_status or ""),
+            "platform_status_text": status_text,
+            "order_business_type": classify_order_business_type(data),
+            "created_at": (
+                (data.get("commonInfo") or {}).get("createTime")
+                if isinstance(data.get("commonInfo"), dict)
+                else None
+            ),
+            "cookie_id": str(cookie_id),
+        }],
+    }
 
 
 async def fetch_xianyu_order_list_page(
@@ -532,12 +864,154 @@ async def fetch_xianyu_order_list_page(
         return {"ret": [f"NETWORK_ERROR::{type(exc).__name__}"]}
 
 
+async def fetch_xianyu_pending_order_page(
+    *,
+    cookie_id: str,
+    cookie_string: str,
+    page_number: int,
+    page_size: int,
+    user_id: str,
+    user_agent: str = "",
+) -> Dict[str, Any]:
+    """Fetch one ordinary-seller pending-order page as a permission fallback."""
+    del cookie_id, page_number, page_size, user_id
+    from utils.xianyu_utils import generate_sign, trans_cookies
+
+    cookies = trans_cookies(cookie_string)
+    token = str(cookies.get("_m_h5_tk") or "").split("_", 1)[0]
+    if not token:
+        return {"ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"]}
+
+    timestamp = str(int(time.time() * 1000))
+    data_value = json.dumps(
+        {"pageNumber": 1, "orderStatus": "NOT_SHIP", "offsetRow": 0},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    params = {
+        "jsv": "2.7.2",
+        "appKey": "34839810",
+        "t": timestamp,
+        "sign": generate_sign(timestamp, token, data_value),
+        "v": "5.0",
+        "type": "originaljson",
+        "accountSite": "xianyu",
+        "dataType": "json",
+        "api": "mtop.taobao.idle.trade.sold.get",
+        "valueType": "original",
+        "sessionOption": "AutoLoginOnly",
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": cookie_string,
+        "Origin": "https://h5.m.goofish.com",
+        "Referer": "https://h5.m.goofish.com/",
+        "User-Agent": str(user_agent or DEFAULT_ORDER_USER_AGENT),
+    }
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
+            async with session.post(
+                "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.sold.get/5.0/",
+                params=params,
+                data={"data": data_value},
+                headers=headers,
+            ) as response:
+                cookie_updates = {}
+                try:
+                    set_cookie_values = response.headers.getall("Set-Cookie", [])
+                except Exception:
+                    set_cookie_values = []
+                for raw_cookie in set_cookie_values:
+                    first_segment = str(raw_cookie).split(";", 1)[0]
+                    if "=" not in first_segment:
+                        continue
+                    name, value = first_segment.split("=", 1)
+                    if name.strip():
+                        cookie_updates[name.strip()] = value.strip()
+                if response.status >= 400:
+                    return {"ret": [f"HTTP_{response.status}::订单接口请求失败"]}
+                payload = await response.json(content_type=None)
+                if isinstance(payload, dict) and cookie_updates:
+                    payload["_cookie_updates"] = cookie_updates
+                return payload
+    except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+        return {"ret": [f"NETWORK_ERROR::{type(exc).__name__}"]}
+
+
+async def fetch_xianyu_order_detail(
+    *,
+    cookie_id: str,
+    cookie_string: str,
+    order_id: str,
+    user_agent: str = "",
+) -> Dict[str, Any]:
+    """Fetch one order through the personal order-detail API."""
+    del cookie_id
+    from utils.xianyu_utils import generate_sign, trans_cookies
+
+    cookies = trans_cookies(cookie_string)
+    token = str(cookies.get("_m_h5_tk") or "").split("_", 1)[0]
+    if not token:
+        return {"ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"]}
+
+    timestamp = str(int(time.time() * 1000))
+    data_value = json.dumps(
+        {"tid": str(order_id)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    params = {
+        "jsv": "2.7.2",
+        "appKey": "34839810",
+        "t": timestamp,
+        "sign": generate_sign(timestamp, token, data_value),
+        "v": "1.0",
+        "type": "json",
+        "accountSite": "xianyu",
+        "dataType": "json",
+        "api": "mtop.idle.web.trade.order.detail",
+        "valueType": "string",
+        "sessionOption": "AutoLoginOnly",
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": cookie_string,
+        "Origin": "https://www.goofish.com",
+        "Referer": "https://www.goofish.com/",
+        "User-Agent": str(user_agent or DEFAULT_ORDER_USER_AGENT),
+    }
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
+            async with session.post(
+                "https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/",
+                params=params,
+                data={"data": data_value},
+                headers=headers,
+            ) as response:
+                if response.status >= 400:
+                    return {"ret": [f"HTTP_{response.status}::订单详情接口请求失败"]}
+                return await response.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+        return {"ret": [f"NETWORK_ERROR::{type(exc).__name__}"]}
+
+
 class XianyuOrderListClient:
     """Discover recent seller orders through the paginated platform endpoint."""
 
     def __init__(
         self,
         page_loader: Callable[..., Awaitable[Dict[str, Any]]] = fetch_xianyu_order_list_page,
+        pending_page_loader: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
         now_fn: Callable[[], float] = time.time,
         page_size: int = 20,
         max_pages: int = 20,
@@ -548,6 +1022,13 @@ class XianyuOrderListClient:
         jitter_fn: Callable[[float, float], float] = random.uniform,
     ):
         self.page_loader = page_loader
+        self.pending_page_loader = (
+            pending_page_loader
+            if pending_page_loader is not None
+            else fetch_xianyu_pending_order_page
+            if page_loader is fetch_xianyu_order_list_page
+            else None
+        )
         self.now_fn = now_fn
         self.page_size = max(1, min(int(page_size), 100))
         self.max_pages = max(1, min(int(max_pages), 100))
@@ -610,6 +1091,7 @@ class XianyuOrderListClient:
         current_cookie_string = cookie_string
         cookie_changed = False
         has_next_page = False
+        coverage = "full_recent"
 
         for page_number in range(1, self.max_pages + 1):
             if page_number > 1 and self.request_interval:
@@ -655,6 +1137,72 @@ class XianyuOrderListClient:
                 parsed = parse_order_api_payload(payload)
                 if parsed.get("success"):
                     break
+                if (
+                    parsed.get("error_code") == "platform_permission_denied"
+                    and page_number == 1
+                    and not orders
+                    and self.pending_page_loader is not None
+                ):
+                    fallback_payload = await self.pending_page_loader(
+                        cookie_id=cookie_id,
+                        cookie_string=current_cookie_string,
+                        page_number=1,
+                        page_size=self.page_size,
+                        user_id=user_id,
+                        user_agent=user_agent,
+                    )
+                    fallback_cookie_updates = (
+                        fallback_payload.get("_cookie_updates")
+                        if isinstance(fallback_payload, dict)
+                        and isinstance(fallback_payload.get("_cookie_updates"), dict)
+                        else {}
+                    )
+                    if fallback_cookie_updates:
+                        merged_cookie_string = self._merge_cookie_updates(
+                            current_cookie_string,
+                            fallback_cookie_updates,
+                        )
+                        merged_user_id = str(trans_cookies(merged_cookie_string).get("unb") or "")
+                        if merged_user_id != user_id:
+                            return {
+                                "success": False,
+                                "error_code": "account_identity_mismatch",
+                                "error": "订单接口返回的登录身份与当前账号不一致",
+                                "requires_login": True,
+                                "orders": orders,
+                                "pages_scanned": pages_scanned,
+                            }
+                        if merged_cookie_string != current_cookie_string:
+                            current_cookie_string = merged_cookie_string
+                            cookie_changed = True
+                    fallback = parse_pending_order_api_payload(
+                        fallback_payload,
+                        cookie_id,
+                    )
+                    if not fallback.get("success"):
+                        return {
+                            "success": False,
+                            "error_code": fallback.get("error_code") or "platform_error",
+                            "error": fallback.get("error") or "待发货订单获取失败",
+                            "requires_login": bool(fallback.get("requires_login")),
+                            "orders": orders,
+                            "pages_scanned": pages_scanned,
+                            "coverage": "pending_only",
+                            "fallback_from": "platform_permission_denied",
+                        }
+                    result = {
+                        "success": True,
+                        "requires_login": False,
+                        "orders": fallback.get("orders") or [],
+                        "pages_scanned": 1,
+                        "truncated": False,
+                        "partial": True,
+                        "coverage": "pending_only",
+                        "invalid_records": int(fallback.get("invalid_records") or 0),
+                    }
+                    if cookie_changed:
+                        result["updated_cookie_string"] = current_cookie_string
+                    return result
                 if parsed.get("requires_login") and cookie_updates and retry_count == 0:
                     retry_count += 1
                     continue
@@ -727,6 +1275,7 @@ class XianyuOrderListClient:
             "requires_login": False,
             "orders": orders,
             "pages_scanned": pages_scanned,
+            "coverage": coverage,
             "truncated": bool(
                 has_next_page
                 and not (target_order_id and target_order_id in seen_order_ids)
@@ -778,6 +1327,11 @@ class OrderSyncCoordinator:
         touched_order_ids: List[str] = []
         unconfirmed_order_ids: set[str] = set()
         obtained_fields: set[str] = set()
+        refresh_getter = getattr(self.db, "get_account_session_refresh", None)
+        if callable(refresh_getter) and session_refresh_blocks_order_requests(
+            refresh_getter(cookie_id) or {}
+        ):
+            return skipped_reauth_order_result()
         discovery = await self.discoverer(
             cookie_id=cookie_id,
             cookie_string=cookie_string,
@@ -785,12 +1339,18 @@ class OrderSyncCoordinator:
             user_agent=user_agent,
         )
         if not discovery.get("success"):
+            if discovery.get("error_code") == "session_expired":
+                mark_order_session_expired(self.db, cookie_id)
+                return skipped_reauth_order_result(
+                    discovery.get("error") or "登录状态已过期，已跳过订单同步"
+                )
             return {
                 "success": False,
                 "partial": False,
                 "requires_login": bool(discovery.get("requires_login")),
                 "error_code": discovery.get("error_code") or "discovery_failed",
                 "message": discovery.get("error") or "订单发现失败",
+                "coverage": discovery.get("coverage") or "full_recent",
                 "summary": summary,
                 "errors": [discovery.get("error") or "订单发现失败"],
             }
@@ -818,6 +1378,8 @@ class OrderSyncCoordinator:
 
         errors = []
         sync_limit_reached = bool(discovery.get("truncated"))
+        coverage = str(discovery.get("coverage") or "full_recent")
+        coverage_partial = bool(discovery.get("partial")) or coverage == "pending_only"
         if sync_limit_reached:
             errors.append("订单同步达到本轮请求上限，请缩短时间范围后重试")
         # 成交时从商品目录快照主图，避免商品后续下架导致订单图片失联
@@ -1113,13 +1675,20 @@ class OrderSyncCoordinator:
         partial = not success and bool(touched_order_ids)
         return {
             "success": success,
-            "partial": partial,
+            "partial": partial or coverage_partial,
             "requires_login": False,
             "error_code": "status_unconfirmed"
             if summary["status_unconfirmed"]
             else "sync_limit_reached" if sync_limit_reached
             else "sync_partial_failure" if not success else "",
-            "message": "订单同步完成" if success else "订单同步部分完成",
+            "message": (
+                "待发货订单同步完成"
+                if success and coverage == "pending_only"
+                else "订单同步完成"
+                if success
+                else "订单同步部分完成"
+            ),
+            "coverage": coverage,
             "summary": summary,
             "fields_obtained": [
                 field

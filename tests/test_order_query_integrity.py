@@ -186,7 +186,7 @@ class OrderQueryIntegrityTests(unittest.TestCase):
         list_sql = next(
             statement
             for statement in reversed(statements)
-            if " ORDER BY o.cookie_id ASC" in statement
+            if " ORDER BY o.ordered_at_utc DESC" in statement
             and " LEFT JOIN item_info ci" in statement
             and " LEFT JOIN customer_profiles cp" in statement
         )
@@ -225,7 +225,7 @@ class OrderQueryIntegrityTests(unittest.TestCase):
         self.assertNotIn("normalized-end", end_only_ids)
         self.assertNotIn("legacy-end", end_only_ids)
 
-    def test_sort_and_covering_index_follow_account_time_order_contract(self):
+    def test_sort_and_covering_index_follow_global_time_order_contract(self):
         self._insert_order("z-a-old", "acct-a", ordered_at_utc=100.0)
         self._insert_order("a-a-new", "acct-a", ordered_at_utc=200.0)
         self._insert_order("z-b-new", "acct-b", ordered_at_utc=300.0)
@@ -234,7 +234,7 @@ class OrderQueryIntegrityTests(unittest.TestCase):
         result = self.db.query_orders(["acct-b", "acct-a"], page_size=10)
         self.assertEqual(
             [row["order_id"] for row in result["items"]],
-            ["a-a-new", "z-a-old", "z-b-new", "a-b-old"],
+            ["z-b-new", "a-a-new", "z-a-old", "a-b-old"],
         )
 
         with self.db.lock:
@@ -278,14 +278,14 @@ class OrderQueryIntegrityTests(unittest.TestCase):
                 for row in page["items"]
             ],
             [
-                "order-a-3",
-                "order-a-2",
-                "order-a-1",
-                "legacy-a",
                 "order-b-3",
                 "order-b-2",
                 "order-b-1",
+                "order-a-3",
+                "order-a-2",
+                "order-a-1",
                 "legacy-b",
+                "legacy-a",
             ],
         )
 

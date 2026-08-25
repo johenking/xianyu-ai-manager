@@ -117,13 +117,18 @@ class ItemDeliveryBindingTests(unittest.TestCase):
             self.db.is_invite_auto_fulfillment_enabled("acct-one", "item-1")
         )
 
-    def test_clearing_the_binding_keeps_invite_choice_untouched(self):
+    def test_clearing_the_binding_sets_explicit_off(self):
         self.db.update_item_invite_auto_fulfillment_status("acct-one", "item-1", True)
         self.assertTrue(
             self.db.set_item_delivery_card("acct-one", "item-1", None, self.user["id"])
         )
         self.assertIsNone(self._bound_card_id("item-1"))
-        self.assertTrue(self.db.is_invite_auto_fulfillment_enabled("acct-one", "item-1"))
+        self.assertFalse(self.db.is_invite_auto_fulfillment_enabled("acct-one", "item-1"))
+        status = self.db.get_item_delivery_binding_status(
+            "acct-one", "item-1", self.user["id"]
+        )
+        self.assertEqual(status["mode"], "off")
+        self.assertEqual(status["status"], "explicit_off")
 
     def test_api_binds_clears_and_rejects_foreign_account(self):
         headers = self._headers()

@@ -15,6 +15,7 @@ from db_manager import db_manager
 from session_registry import initialize_session_registry
 from item_metric_scheduler import item_metric_scheduler
 from invite_bridge_poller import invite_bridge_poller
+from auto_rate_service import auto_rate_scheduler
 from account_session_refresh import (
     RETRYABLE_SESSION_ERROR_CODES,
     remove_verification_image,
@@ -119,11 +120,13 @@ async def start_runtime() -> cookie_manager_module.CookieManager:
 
     await item_metric_scheduler.start()
     await invite_bridge_poller.start()
+    await auto_rate_scheduler.start()
     logger.info(f"运行时启动完成，账号监听任务: {len(manager.tasks)}")
     return manager
 
 
 async def stop_runtime() -> None:
+    await auto_rate_scheduler.stop()
     await item_metric_scheduler.stop()
     await invite_bridge_poller.stop()
 

@@ -27,6 +27,7 @@ import re
 import uvicorn
 import pandas as pd
 import io
+import csv
 import asyncio
 import importlib.util
 import sqlite3
@@ -35,12 +36,20 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 import cookie_manager
-from db_manager import AccountIdentityMismatchError, db_manager, mask_secret_preview
+from db_manager import (
+    CARD_STOCK_IMPORT_MAX_ITEMS,
+    CARD_STOCK_ITEM_MAX_BYTES,
+    FULFILLMENT_API_PROTOCOL,
+    AccountIdentityMismatchError,
+    db_manager,
+    mask_secret_preview,
+)
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
 from ai_provider_service import (
     PROVIDER_PRESETS,
     discover_provider_models,
+    normalize_provider_models,
     provider_test_tokens,
     test_provider_reply,
 )
@@ -85,6 +94,7 @@ from utils.verification_images import (
 from order_sync_service import (
     OrderSyncCoordinator,
     SYNC_COVERAGE_FIELDS,
+    DASHBOARD_ANALYTICS_STATUSES,
     VALID_ORDER_STATUSES,
     XianyuOrderListClient,
     new_order_sync_summary,
@@ -2085,6 +2095,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     for cookie_id, cookie_value in user_cookies.items():
         cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
+        auto_rate = db_manager.get_auto_rate_settings(cookie_id, user_id) or {}
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
@@ -2113,6 +2124,12 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'id': cookie_id,
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
+            'auto_rate_enabled': bool(auto_rate.get('enabled')),
+            'auto_rate_enabled_at': auto_rate.get('enabled_at'),
+            'auto_rate_pending_count': int(auto_rate.get('pending_count') or 0),
+            'auto_rate_success_count': int(auto_rate.get('success_count') or 0),
+            'auto_rate_failed_count': int(auto_rate.get('failed_count') or 0),
+            'auto_rate_needs_reconcile_count': int(auto_rate.get('needs_reconcile_count') or 0),
             'remark': remark,
             'avatar_url': cookie_details.get('avatar_url', '') if cookie_details else '',
             'xianyu_nick': cookie_details.get('xianyu_nick', '') if cookie_details else '',
@@ -5017,6 +5034,10 @@ class AutoConfirmUpdate(BaseModel):
     auto_confirm: bool
 
 
+class AutoRateUpdate(BaseModel):
+    auto_rate_enabled: bool
+
+
 class RemarkUpdate(BaseModel):
     remark: str
 
@@ -5083,6 +5104,33 @@ def get_auto_confirm(cid: str, current_user: Dict[str, Any] = Depends(get_curren
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@accounts_router.put("/cookies/{cid}/auto-rate")
+def update_auto_rate(
+    cid: str,
+    update_data: AutoRateUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Enable seller reviews only for platform-rateable orders created afterward."""
+    from db_manager import db_manager
+
+    user_id = int(current_user['user_id'])
+    if cid not in db_manager.get_all_cookies(user_id):
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+    if update_data.auto_rate_enabled:
+        readiness = db_manager.get_owned_cookie_search_context(user_id, cid)
+        if readiness.get('state') != 'ready':
+            raise HTTPException(status_code=409, detail="账号身份未就绪，请先完成登录恢复")
+    if not db_manager.update_auto_rate(cid, user_id, update_data.auto_rate_enabled):
+        raise HTTPException(status_code=500, detail="更新自动好评设置失败")
+    settings = db_manager.get_auto_rate_settings(cid, user_id) or {}
+    return {
+        "msg": "success",
+        "auto_rate_enabled": bool(settings.get("enabled")),
+        "auto_rate_enabled_at": settings.get("enabled_at"),
+        "message": f"自动好评已{'开启' if update_data.auto_rate_enabled else '关闭'}",
+    }
 
 
 @accounts_router.put("/cookies/{cid}/remark")
@@ -5826,7 +5874,6 @@ def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current
 def get_cards(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的卡券列表"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
         cards = db_manager.get_all_cards(user_id)
         return cards
@@ -5838,9 +5885,10 @@ def get_cards(current_user: Dict[str, Any] = Depends(get_current_user)):
 def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建新卡券"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
-        card_name = card_data.get('name', '未命名卡券')
+        card_name = str(card_data.get('name') or '').strip()
+        if not card_name:
+            raise HTTPException(status_code=400, detail="请输入资源名称")
 
         log_with_user('info', f"创建卡券: {card_name}", current_user)
 
@@ -5850,24 +5898,86 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
+        card_type = str(card_data.get('type') or '').strip()
+        if card_type not in {'text', 'data', 'image', 'api'}:
+            raise HTTPException(status_code=400, detail="资源类型无效")
+        api_config = card_data.get('api_config')
+        if card_type == 'api' and (
+            not isinstance(api_config, dict)
+            or api_config.get('protocol') != FULFILLMENT_API_PROTOCOL
+        ):
+            raise HTTPException(status_code=400, detail="新 API 资源只支持幂等 API v1")
+        legacy_content = card_data.get('content')
+        text_content = card_data.get('text_content')
+        data_content = card_data.get('data_content')
+        image_url = card_data.get('image_url')
+        if legacy_content is not None:
+            if card_type == 'text' and text_content is None:
+                text_content = legacy_content
+            elif card_type == 'data' and data_content is None:
+                data_content = legacy_content
+            elif card_type == 'image' and image_url is None:
+                image_url = legacy_content
+
+        if card_type == 'text':
+            text_content = str(text_content or '').strip()
+            if not text_content:
+                raise HTTPException(status_code=400, detail="固定资料内容不能为空")
+        elif card_type == 'data':
+            raw_values = str(data_content or '').splitlines()
+            if len(raw_values) > CARD_STOCK_IMPORT_MAX_ITEMS:
+                raise HTTPException(status_code=400, detail="单批库存不能超过 10000 条")
+            normalized_values: List[str] = []
+            seen_values: set[str] = set()
+            for raw_value in raw_values:
+                value = str(raw_value or '').strip()
+                if not value:
+                    continue
+                if len(value.encode('utf-8')) > CARD_STOCK_ITEM_MAX_BYTES:
+                    raise HTTPException(status_code=400, detail="单条库存不能超过 2048 字节")
+                if value not in seen_values:
+                    seen_values.add(value)
+                    normalized_values.append(value)
+            if not normalized_values:
+                raise HTTPException(status_code=400, detail="一次一密初始库存不能为空")
+            data_content = '\n'.join(normalized_values)
+        elif card_type == 'image':
+            image_url = str(image_url or '').strip()
+            if not image_url:
+                raise HTTPException(status_code=400, detail="图片地址不能为空")
+        elif card_type == 'api':
+            api_token = str(card_data.get('api_token') or '').strip()
+            if (
+                not isinstance(api_config, dict)
+                or not str(api_config.get('url') or '').lower().startswith('https://')
+                or not api_token
+            ):
+                raise HTTPException(status_code=400, detail="请填写 HTTPS 地址和 API Token")
+
         card_id = db_manager.create_card(
-            name=card_data.get('name'),
-            card_type=card_data.get('type'),
-            api_config=card_data.get('api_config'),
-            text_content=card_data.get('text_content'),
-            data_content=card_data.get('data_content'),
-            image_url=card_data.get('image_url'),
+            name=card_name,
+            card_type=card_type,
+            api_config=api_config,
+            api_token=card_data.get('api_token'),
+            text_content=text_content,
+            data_content=data_content,
+            image_url=image_url,
             description=card_data.get('description'),
             enabled=card_data.get('enabled', True),
             delay_seconds=card_data.get('delay_seconds', 0),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name') if is_multi_spec else None,
             spec_value=card_data.get('spec_value') if is_multi_spec else None,
-            user_id=user_id
+            user_id=user_id,
+            low_stock_threshold=card_data.get('low_stock_threshold', 5),
         )
 
         log_with_user('info', f"卡券创建成功: {card_name} (ID: {card_id})", current_user)
         return {"id": card_id, "message": "卡券创建成功"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log_with_user('error', f"创建卡券失败: {card_data.get('name', '未知')} - {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5877,22 +5987,128 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
 def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取单个卡券详情"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
         card = db_manager.get_card_by_id(card_id, user_id)
         if card:
             return card
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CardStockImportRequest(BaseModel):
+    format: Literal['lines', 'txt', 'csv'] = 'lines'
+    content: str = Field(..., max_length=24 * 1024 * 1024)
+
+
+class CardApiValidateRequest(BaseModel):
+    api_token: Optional[str] = Field(default=None, max_length=8192)
+    token: Optional[str] = Field(default=None, max_length=8192)
+
+
+@content_router.post("/cards/{card_id}/stock/import")
+def import_card_stock(
+    card_id: int,
+    payload: CardStockImportRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    values: List[str]
+    if payload.format == 'csv':
+        try:
+            reader = csv.DictReader(io.StringIO(payload.content))
+            if not reader.fieldnames or 'secret' not in reader.fieldnames:
+                raise HTTPException(status_code=400, detail="CSV 必须包含 secret 列")
+            values = [str(row.get('secret') or '') for row in reader]
+        except csv.Error as exc:
+            raise HTTPException(status_code=400, detail="CSV 内容格式无效") from exc
+    else:
+        values = payload.content.splitlines()
+    try:
+        return db_manager.import_card_stock(
+            card_id,
+            current_user['user_id'],
+            values,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@content_router.post("/cards/{card_id}/api/validate")
+def validate_card_api(
+    card_id: int,
+    payload: CardApiValidateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    card = db_manager.get_card_by_id(card_id, user_id)
+    if not card or card.get('type') != 'api':
+        raise HTTPException(status_code=404, detail="API 资源不存在")
+    runtime = db_manager.get_card_api_runtime_config(card_id, user_id) or {}
+    supplied_token = payload.api_token if payload.api_token is not None else payload.token
+    token = str(supplied_token if supplied_token is not None else runtime.get('api_token') or '').strip()
+    if (
+        runtime.get('protocol') != FULFILLMENT_API_PROTOCOL
+        or not str(runtime.get('url') or '').lower().startswith('https://')
+        or not token
+    ):
+        raise HTTPException(status_code=400, detail="请先填写 HTTPS 地址和 API Token")
+    validation_key = hashlib.sha256(
+        f"validate:{card_id}:{runtime.get('url')}:{token}".encode('utf-8')
+    ).hexdigest()
+    try:
+        response = request_public_http_sync(
+            'POST',
+            runtime['url'],
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Idempotency-Key': validation_key,
+            },
+            json_body={
+                'action': 'validate',
+                'spec': runtime.get('spec') or {},
+            },
+            timeout_seconds=int(runtime.get('timeout') or 10),
+            max_response_bytes=64 * 1024,
+            allowed_methods=('POST',),
+            require_https=True,
+        )
+        try:
+            body = json.loads(response.text)
+        except (TypeError, ValueError):
+            body = None
+        validated = (
+            response.status == 200
+            and isinstance(body, dict)
+            and set(body) == {'status'}
+            and body.get('status') == 'validated'
+        )
+        if not validated:
+            db_manager.set_card_api_validation(card_id, user_id, 'failed')
+            raise HTTPException(status_code=502, detail="供应方未通过幂等 API v1 校验")
+        if not db_manager.set_card_api_validation(
+            card_id,
+            user_id,
+            'validated',
+            api_token=token,
+        ):
+            raise HTTPException(status_code=404, detail="API 资源不存在")
+        return {"status": "validated", "message": "连接校验通过，可以绑定商品"}
+    except HTTPException:
+        raise
+    except OutboundRequestError as exc:
+        db_manager.set_card_api_validation(card_id, user_id, 'failed')
+        raise HTTPException(status_code=502, detail="供应方连接校验失败") from exc
 
 
 @content_router.put("/cards/{card_id}")
 def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新卡券"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
         # 验证多规格字段
         is_multi_spec = card_data.get('is_multi_spec')
@@ -5900,21 +6116,37 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
+        card_type = card_data.get('type')
+        api_config = card_data.get('api_config')
+        if card_type == 'api' and api_config is not None and (
+            not isinstance(api_config, dict)
+            or api_config.get('protocol') != FULFILLMENT_API_PROTOCOL
+        ):
+            raise HTTPException(status_code=400, detail="新 API 资源只支持幂等 API v1")
+        for field_name, label in (
+            ('text_content', '固定资料内容'),
+            ('data_content', '一次一密库存'),
+            ('image_url', '图片地址'),
+        ):
+            if field_name in card_data and not str(card_data.get(field_name) or '').strip():
+                raise HTTPException(status_code=400, detail=f"{label}不能为空")
         success = db_manager.update_card(
             card_id=card_id,
             name=card_data.get('name'),
-            card_type=card_data.get('type'),
-            api_config=card_data.get('api_config'),
+            card_type=card_type,
+            api_config=api_config,
+            api_token=card_data.get('api_token') if 'api_token' in card_data else None,
             text_content=card_data.get('text_content'),
             data_content=card_data.get('data_content'),
             image_url=card_data.get('image_url'),
             description=card_data.get('description'),
-            enabled=card_data.get('enabled', True),
+            enabled=card_data.get('enabled') if 'enabled' in card_data else None,
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
             spec_value=card_data.get('spec_value'),
-            user_id=user_id
+            user_id=user_id,
+            low_stock_threshold=card_data.get('low_stock_threshold'),
         )
         if success:
             return {"message": "卡券更新成功"}
@@ -5922,6 +6154,8 @@ def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = De
             raise HTTPException(status_code=404, detail="卡券不存在")
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5945,6 +6179,8 @@ async def update_card_with_image(
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
 
         # 必须先验证资源所有权，再读取 multipart 文件体。
+        # 保留动态导入：该旧 multipart 路由的安全测试和插件调用方通过
+        # db_manager 模块注入隔离数据库，普通 JSON 卡券路由则使用模块全局实例。
         from db_manager import db_manager
         existing_card = db_manager.get_card_by_id(
             card_id,
@@ -6091,15 +6327,68 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
 def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除卡券"""
     try:
-        success = db_manager.delete_card(card_id, user_id=current_user['user_id'])
+        user_id = current_user['user_id']
+        blockers = db_manager.get_card_delete_blockers(card_id, user_id)
+        if blockers == ['not_found']:
+            raise HTTPException(status_code=404, detail="资源不存在")
+        if blockers:
+            raise HTTPException(
+                status_code=409,
+                detail="资源已有商品绑定或履约历史，请先停用并保留记录",
+            )
+        success = db_manager.delete_card(card_id, user_id=user_id)
         if success:
-            return {"message": "卡券删除成功"}
+            return {"message": "资源删除成功"}
         else:
-            raise HTTPException(status_code=404, detail="卡券不存在")
+            raise HTTPException(status_code=409, detail="资源状态已变化，请刷新后重试")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@content_router.get("/fulfillment-records")
+def get_fulfillment_records(
+    state: Optional[Literal['all', 'succeeded', 'pending', 'failed', 'manual_review', 'ambiguous']] = None,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    return db_manager.list_fulfillment_records(
+        current_user['user_id'],
+        state=state,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@content_router.post("/fulfillment-records/{payload_id}/resend")
+async def resend_fulfillment_record(
+    payload_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    payload = db_manager.get_fulfillment_delivery_payload(payload_id, user_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="发货记录不存在")
+    attempt = db_manager.get_fulfillment_attempt(payload['attempt_id'])
+    if not attempt or int(attempt.get('user_id') or 0) != int(user_id):
+        raise HTTPException(status_code=404, detail="发货记录不存在")
+    if attempt.get('state') != 'committed':
+        raise HTTPException(status_code=409, detail="只有已成功提交的原始内容可以重发")
+    from XianyuAutoAsync import XianyuLive
+
+    live = XianyuLive.get_instance(str(attempt.get('cookie_id') or ''))
+    if not live or not live.ws or getattr(live.ws, 'closed', False):
+        raise HTTPException(status_code=409, detail="账号当前不在线，请等待重连后再试")
+    result = await live.resend_fulfillment_payload(
+        payload_id=payload_id,
+        user_id=user_id,
+        database=db_manager,
+    )
+    if not result:
+        raise HTTPException(status_code=409, detail="重发未完成，请查看记录状态")
+    return result
 
 
 @content_router.delete("/delivery-rules/{rule_id}")
@@ -6213,6 +6502,17 @@ def reload_cache(_: Dict[str, Any] = Depends(require_admin)):
 
 # ==================== 商品管理 API ====================
 
+def _attach_item_knowledge_status(cookie_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给商品列表附加知识档案状态，用于前端标识与复制目标提示。"""
+    from db_manager import db_manager
+    status_map = db_manager.get_ai_item_knowledge_status_by_cookie(cookie_id)
+    for entry in items:
+        info = status_map.get(str(entry.get('item_id') or ''))
+        entry['knowledge_has_draft'] = bool(info and info.get('has_draft'))
+        entry['knowledge_published_version'] = int(info.get('published_version') or 0) if info else 0
+    return items
+
+
 @content_router.get("/items")
 def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取当前用户的所有商品信息"""
@@ -6225,6 +6525,7 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
         all_items = []
         for cookie_id in user_cookies.keys():
             items = db_manager.get_items_by_cookie(cookie_id, include_inactive=False)
+            _attach_item_knowledge_status(cookie_id, items)
             all_items.extend(items)
 
         return {"items": all_items}
@@ -6294,6 +6595,7 @@ def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(g
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
         items = db_manager.get_items_by_cookie(cookie_id, include_inactive=False)
+        _attach_item_knowledge_status(cookie_id, items)
         return {"items": items}
     except HTTPException:
         raise
@@ -6408,6 +6710,7 @@ class AIProviderProfileCreate(BaseModel):
     base_url: str = Field(default="", max_length=2048)
     api_key: str = Field(default="", max_length=8192)
     default_model: str = Field(default="", max_length=AI_MODEL_NAME_MAX_LENGTH)
+    models: List[str] = Field(default_factory=list, max_length=500)
     is_default: bool = False
 
 
@@ -6422,7 +6725,16 @@ class AIProviderProfileUpdate(BaseModel):
         default=None,
         max_length=AI_MODEL_NAME_MAX_LENGTH,
     )
+    models: Optional[List[str]] = Field(default=None, max_length=500)
     is_default: Optional[bool] = None
+
+
+class AIProviderModelDiscoveryRequest(BaseModel):
+    profile_id: Optional[int] = Field(default=None, ge=1)
+    provider_type: Optional[str] = Field(default=None, max_length=50)
+    preset: Optional[str] = Field(default=None, max_length=50)
+    base_url: Optional[str] = Field(default=None, max_length=2048)
+    api_key: str = Field(default="", max_length=8192)
 
 
 class AIProviderTestRequest(BaseModel):
@@ -6518,12 +6830,14 @@ class AIItemKnowledgeDraftRequest(BaseModel):
 
 class AIItemKnowledgeGenerateRequest(BaseModel):
     overview: str = ""
+    # Backward-compatible input only; generation now replaces the draft.
     profile: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AIItemKnowledgeCopyRequest(BaseModel):
     target_item_ids: List[str] = Field(default_factory=list)
-    overwrite: bool = False
+    # Kept for older clients. Copying always replaces target drafts.
+    overwrite: bool = True
 
 
 def _mask_secret(value: str) -> str:
@@ -6750,8 +7064,17 @@ def _normalize_provider_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail='AI 平台 API 地址必须使用 HTTPS')
     if urlsplit(base_url).query:
         raise HTTPException(status_code=400, detail='AI 平台 API 基础地址不能包含查询参数')
-    return {**data, 'name': name, 'preset': preset, 'provider_type': provider_type,
-            'base_url': base_url, 'default_model': default_model}
+    normalized = {
+        **data,
+        'name': name,
+        'preset': preset,
+        'provider_type': provider_type,
+        'base_url': base_url,
+        'default_model': default_model,
+    }
+    if 'models' in data:
+        normalized['models'] = normalize_provider_models(data.get('models'))
+    return normalized
 
 
 def _provider_public_payload(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -6762,6 +7085,35 @@ def _provider_public_payload(profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _provider_discovery_profile(
+    payload: AIProviderModelDiscoveryRequest,
+    user_id: int,
+) -> Dict[str, Any]:
+    existing = None
+    if payload.profile_id:
+        existing = db_manager.get_ai_provider_profile(
+            payload.profile_id,
+            user_id,
+            include_secret=True,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail='平台配置不存在')
+
+    profile = _normalize_provider_payload({
+        'name': existing['name'] if existing else '模型发现',
+        'preset': payload.preset or (existing['preset'] if existing else 'custom'),
+        'provider_type': payload.provider_type or (
+            existing['provider_type'] if existing else 'openai_compatible'
+        ),
+        'base_url': payload.base_url or (existing['base_url'] if existing else ''),
+        'default_model': existing['default_model'] if existing else '',
+        'api_key': payload.api_key or (existing.get('api_key', '') if existing else ''),
+    })
+    if not profile.get('api_key'):
+        raise HTTPException(status_code=400, detail='请先配置 API Key')
+    return profile
+
+
 @ai_router.get('/api/ai/providers')
 def list_ai_providers(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['user_id']
@@ -6770,6 +7122,29 @@ def list_ai_providers(current_user: Dict[str, Any] = Depends(get_current_user)):
         'providers': [_provider_public_payload(item) for item in db_manager.list_ai_provider_profiles(user_id)],
         'presets': PROVIDER_PRESETS,
     }
+
+
+@ai_router.post('/api/ai/providers/discover-models')
+def discover_ai_provider_models(
+    payload: AIProviderModelDiscoveryRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    profile = _provider_discovery_profile(payload, user_id)
+    try:
+        models = _run_bounded_ai_call(
+            user_id,
+            lambda: discover_provider_models(profile),
+        )
+        return {'models': normalize_provider_models(models)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(
+            f'平台模型发现失败 profile={payload.profile_id or "draft"}: '
+            f'{type(e).__name__}'
+        )
+        raise HTTPException(status_code=400, detail='模型列表读取失败，请检查平台、Key 和地址')
 
 
 @ai_router.post('/api/ai/providers')
@@ -6824,8 +7199,14 @@ def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = D
             user_id,
             lambda: discover_provider_models(profile),
         )
-        db_manager.update_ai_provider_models(profile_id, user_id, models)
-        return {'models': models, 'cached_at': time.time()}
+        models = normalize_provider_models(models)
+        if models:
+            db_manager.update_ai_provider_models(profile_id, user_id, models)
+            cached_at = time.time()
+        else:
+            models = normalize_provider_models(profile.get('models'))
+            cached_at = profile.get('models_cached_at')
+        return {'models': models, 'cached_at': cached_at}
     except HTTPException:
         raise
     except Exception as e:
@@ -7428,20 +7809,18 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
                                current_user: Dict[str, Any] = Depends(get_current_user)):
     item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
     overview = str(request.overview or '').strip()
-    seed = dict(request.profile) if isinstance(request.profile, dict) else {}
     if not overview:
-        seed_overview = seed.get('overview') if isinstance(seed.get('overview'), dict) else {}
+        profile = request.profile if isinstance(request.profile, dict) else {}
+        seed_overview = profile.get('overview') if isinstance(profile.get('overview'), dict) else {}
         overview = str(seed_overview.get('text') or '').strip()
     if not overview:
         raise HTTPException(status_code=400, detail='请先填写商品概览，再生成结构化草稿')
-    seed['overview'] = {
-        **(seed.get('overview') if isinstance(seed.get('overview'), dict) else {}),
+    seed = {'overview': {
         'text': overview,
         'source': 'user',
         'status': 'confirmed',
-    }
+    }}
     source_hash = _item_knowledge_source_hash(item)
-    db_manager.save_ai_item_knowledge_draft(cookie_id, item_id, seed, source_hash)
     try:
         generated = ai_reply_engine.generate_item_knowledge_draft({
             'title': item.get('item_title') or '',
@@ -7451,7 +7830,7 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
         draft = ai_reply_engine.merge_generated_knowledge_with_seed(seed, generated)
         db_manager.save_ai_item_knowledge_draft(cookie_id, item_id, draft, source_hash)
         return {
-            'message': '概览已保存，AI结构化草稿已生成',
+            'message': '旧草稿已替换，新的AI结构化草稿已生成',
             'draft': draft,
             'source_detail_hash': source_hash,
         }
@@ -7474,11 +7853,11 @@ def copy_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledg
         raise HTTPException(status_code=400, detail='请选择至少一个目标商品')
     try:
         result = db_manager.copy_ai_item_knowledge_draft(
-            cookie_id, item_id, request.target_item_ids, request.overwrite
+            cookie_id, item_id, request.target_item_ids
         )
         return {
             **result,
-            'message': f"已复制到 {len(result['copied_item_ids'])} 个商品草稿",
+            'message': f"已覆盖 {len(result['copied_item_ids'])} 个商品草稿",
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8003,7 +8382,11 @@ async def get_all_items_from_account(
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(
+            cookies_str,
+            cookie_id,
+            register_instance=False,
+        )
 
         # 调用获取所有商品信息的方法（自动分页）
         logger.info(
@@ -8094,7 +8477,11 @@ async def get_items_by_page(
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(
+            cookies_str,
+            cookie_id,
+            register_instance=False,
+        )
 
         # 调用获取指定页商品信息的方法
         logger.info(
@@ -8613,7 +9000,7 @@ def get_dashboard_summary(
     period = _dashboard_period(range_key, start_date, end_date)
     # 仪表盘一律只统计当前登录用户自己的数据，admin 也不例外（不再提供全局视图）
     scoped_user_id = current_user['user_id']
-    valid_statuses = list(VALID_ORDER_STATUSES)
+    valid_statuses = list(DASHBOARD_ANALYTICS_STATUSES)
     current = db_manager.get_order_analytics(
         start_date=period['start_date'],
         end_date=period['end_date'],
@@ -8631,10 +9018,22 @@ def get_dashboard_summary(
             status_code=500,
             detail=current.get('error') or previous.get('error') or '仪表盘统计失败',
         )
+    single_day = period['start_date'] == period['end_date']
+    if single_day:
+        hourly = db_manager.get_traffic_analytics(
+            start_date=period['start_date'],
+            end_date=period['end_date'],
+            user_id=scoped_user_id,
+            include_statuses=valid_statuses,
+        )
+        if 'error' in hourly:
+            raise HTTPException(status_code=500, detail=hourly.get('error') or '仪表盘时段统计失败')
+        current['hourly_stats'] = hourly.get('hourly', [])
     return {
         "success": True,
         "scope": "user",
         "range": period,
+        "trend_granularity": "hour" if single_day else "day",
         "stats": db_manager.get_dashboard_stats(scoped_user_id),
         "current": current,
         "previous": previous,
@@ -8709,7 +9108,7 @@ def get_valid_orders(
         user_id = current_user['user_id']
 
         # 定义有效订单状态
-        valid_statuses = list(VALID_ORDER_STATUSES)
+        valid_statuses = list(DASHBOARD_ANALYTICS_STATUSES)
 
         # 调用数据库函数获取有效订单
         orders = db_manager.get_orders_for_analytics(
@@ -8745,7 +9144,7 @@ def get_traffic_analytics(
     try:
         log_with_user('info', f"查询订单时段分析: {start_date} - {end_date}", current_user)
         user_id = current_user['user_id']
-        valid_statuses = list(VALID_ORDER_STATUSES)
+        valid_statuses = list(DASHBOARD_ANALYTICS_STATUSES)
         data = db_manager.get_traffic_analytics(
             start_date=start_date,
             end_date=end_date,
@@ -9337,8 +9736,76 @@ def update_item_multi_quantity_delivery(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ItemDeliveryModeUpdate(BaseModel):
+    mode: Literal['off', 'resource', 'invite']
+    card_id: Optional[int] = None
+
+
+class ItemDeliveryModeBatch(BaseModel):
+    cookie_id: str
+    item_ids: List[str] = Field(default_factory=list, max_length=500)
+    mode: Literal['off', 'resource', 'invite']
+    card_id: Optional[int] = None
+
+
+def _delivery_mode_error(result: Dict[str, Any]) -> HTTPException:
+    code = str(result.get('error') or 'update_failed')
+    if code in {'item_not_found', 'resource_not_found'}:
+        return HTTPException(status_code=404, detail=code)
+    if code in {'resource_disabled', 'api_resource_not_validated'}:
+        return HTTPException(status_code=409, detail=code)
+    return HTTPException(status_code=400, detail=code)
+
+
+@content_router.put("/items/{cookie_id}/{item_id}/delivery-mode")
+def update_item_delivery_mode(
+    cookie_id: str,
+    item_id: str,
+    payload: ItemDeliveryModeUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    if cookie_id not in db_manager.get_all_cookies(user_id):
+        raise HTTPException(status_code=403, detail="无权限操作该账号商品")
+    result = db_manager.set_item_delivery_mode(
+        cookie_id,
+        item_id,
+        payload.mode,
+        user_id,
+        card_id=payload.card_id,
+    )
+    if result.get('outcome') != 'updated':
+        raise _delivery_mode_error(result)
+    return {
+        "message": "发货方式已保存",
+        "item_id": item_id,
+        "mode": result.get('mode'),
+        "card_id": result.get('card_id'),
+    }
+
+
+@content_router.post("/items/delivery-modes/batch")
+def update_item_delivery_modes_batch(
+    payload: ItemDeliveryModeBatch,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = current_user['user_id']
+    if payload.cookie_id not in db_manager.get_all_cookies(user_id):
+        raise HTTPException(status_code=403, detail="无权限操作该账号商品")
+    item_ids = [str(value).strip() for value in payload.item_ids if str(value).strip()]
+    if not item_ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个商品")
+    return db_manager.set_item_delivery_modes_batch(
+        payload.cookie_id,
+        item_ids,
+        payload.mode,
+        user_id,
+        card_id=payload.card_id,
+    )
+
+
 class ItemDeliveryBindingUpdate(BaseModel):
-    """None 表示解除绑定（该商品回落到关键词兜底规则）。"""
+    """Compatibility shape; None now means explicit off, never keyword fallback."""
     card_id: Optional[int] = None
 
 
@@ -9545,19 +10012,37 @@ async def _sync_recent_orders(
             coverage["covered"] / coverage["total"], 4
         ) if coverage["total"] else 0.0
 
-    requires_login = [row["cookie_id"] for row in account_results if row.get("requires_login")]
-    successful = sum(1 for row in account_results if row.get("success"))
-    partial = any(row.get("partial") for row in account_results) or (successful > 0 and successful < len(account_results))
+    skipped_reauth = [
+        row["cookie_id"]
+        for row in account_results
+        if row.get("skipped") and row.get("skip_reason") == "skipped_reauth"
+    ]
+    active_results = [row for row in account_results if not row.get("skipped")]
+    requires_login = [
+        row["cookie_id"]
+        for row in active_results
+        if row.get("requires_login")
+    ]
+    successful = sum(1 for row in active_results if row.get("success"))
+    active_count = len(active_results)
+    all_active_successful = successful == active_count
+    partial = bool(skipped_reauth) or any(
+        row.get("partial") or not row.get("success") for row in active_results
+    )
     permission_denied = any(
         row.get("error_code") == "platform_permission_denied"
         for row in account_results
     )
     payload = {
-        "success": successful == len(account_results),
+        "success": all_active_successful,
         "partial": partial,
         "message": (
-            "订单同步完成"
-            if successful == len(account_results)
+            "登录状态待恢复的账号已跳过订单同步"
+            if not active_count and skipped_reauth
+            else "订单同步完成，登录状态待恢复的账号已跳过"
+            if all_active_successful and skipped_reauth
+            else "订单同步完成"
+            if all_active_successful
             else "登录状态已过期，请先在账号管理更新登录状态"
             if requires_login and successful == 0
             else "平台拒绝订单访问，请检查卖家订单权限"
@@ -9567,9 +10052,10 @@ async def _sync_recent_orders(
         "days": days,
         "summary": total_summary,
         "requires_login": requires_login,
+        "skipped_reauth": skipped_reauth,
         "accounts": account_results,
     }
-    status_code = 409 if requires_login and successful == 0 else 200
+    status_code = 409 if requires_login and active_count and successful == 0 else 200
     return JSONResponse(status_code=status_code, content=payload)
 
 

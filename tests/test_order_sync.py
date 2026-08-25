@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import time
@@ -15,12 +16,18 @@ from order_sync_service import (
     XianyuOrderListClient,
     choose_order_status,
     classify_platform_error,
+    classify_order_business_type,
     extract_order_list,
+    fetch_xianyu_pending_order_page,
     normalize_order_status,
     normalize_order_record,
+    normalize_pending_order_record,
     parse_amount_fen,
+    parse_order_detail_payload,
     parse_order_api_payload,
+    parse_pending_order_api_payload,
     fetch_xianyu_order_list_page,
+    session_refresh_blocks_order_requests,
 )
 from utils.browser_pool import cookie_fingerprint
 from order_status_handler import extract_order_event_identity
@@ -95,6 +102,67 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(unavailable["code"], "platform_unavailable")
         self.assertTrue(unavailable["retryable"])
 
+    def test_order_request_gate_matches_listener_human_action_states(self):
+        self.assertTrue(session_refresh_blocks_order_requests({
+            "state": "manual_reauth_required",
+        }))
+        self.assertTrue(session_refresh_blocks_order_requests({
+            "state": "verification_required",
+        }))
+        self.assertFalse(session_refresh_blocks_order_requests({
+            "state": "action_required",
+            "error_code": "connection_failures",
+        }))
+
+    def test_pending_order_payload_filters_status_and_requires_fulfillment_fields(self):
+        result = parse_pending_order_api_payload({
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "items": [
+                    {
+                        "bizOrderId": "order-pending",
+                        "auctionId": "item-pending",
+                        "buyerId": "buyer-pending",
+                        "auctionTitle": "测试商品",
+                        "totalFee": "12.50",
+                        "buyAmount": 2,
+                        "orderStatus": "2",
+                        "idleBizCode": "6",
+                    },
+                    {
+                        "bizOrderId": "order-shipped",
+                        "auctionId": "item-shipped",
+                        "orderStatus": "3",
+                    },
+                    {
+                        "bizOrderId": "order-invalid",
+                        "orderStatusMsg": "等待卖家发货",
+                    },
+                ],
+            },
+        }, "account-1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["invalid_records"], 1)
+        self.assertEqual(len(result["orders"]), 1)
+        order = result["orders"][0]
+        self.assertEqual(order["order_id"], "order-pending")
+        self.assertEqual(order["item_id"], "item-pending")
+        self.assertEqual(order["buyer_id"], "buyer-pending")
+        self.assertEqual(order["amount"], "12.50")
+        self.assertEqual(order["quantity"], "2")
+        self.assertEqual(order["order_status"], "pending_ship")
+        self.assertEqual(order["order_business_type"], "ordinary")
+
+    def test_pending_order_payload_rejects_an_all_invalid_pending_page(self):
+        result = parse_pending_order_api_payload({
+            "ret": ["SUCCESS::调用成功"],
+            "data": {"items": [{"orderStatus": "2"}]},
+        }, "account-1")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "invalid_response_schema")
+
     def test_recent_order_list_payload_is_extracted_and_normalized(self):
         payload = {
             "ret": ["SUCCESS::调用成功"],
@@ -135,6 +203,9 @@ class OrderStatusNormalizationTests(unittest.TestCase):
                         },
                         "buyerInfoVO": {"buyerId": "buyer-merchant"},
                         "priceVO": {"totalPrice": "¥35.00", "buyNum": "3"},
+                        "rightVO": {
+                            "btnList": [{"tradeAction": "LOGISTICS_SEND"}],
+                        },
                     }],
                 }
             },
@@ -148,6 +219,110 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(order["order_status"], "completed")
         self.assertEqual(order["amount"], "35.00")
         self.assertEqual(order["quantity"], "3")
+        self.assertEqual(order["order_business_type"], "ordinary")
+
+    def test_order_business_type_uses_positive_markers_and_fails_closed(self):
+        lead_detail = {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "orderId": "order-lead",
+                "itemId": "item-lead",
+                "peerUserId": "buyer-lead",
+                "status": "2",
+                "utArgs": {
+                    "xGlobalBizCode": "commer|leadReservation|onlineService",
+                    "globalBizCode": "autotrade",
+                    "idleBizCode": "7000",
+                    "orderStatusName": "买家已付款，请尽快发货",
+                },
+                "components": [{
+                    "render": "leadReservationPhoneInfoVO",
+                    "data": {
+                        "leadId": "lead-fixture",
+                        "orderStatusInfo": {"title": "买家已付款，请尽快发货"},
+                        "itemInfo": {"buyAmount": "1", "title": "Fixture"},
+                        "priceInfo": {"amount": {"value": "0.00"}},
+                    },
+                }],
+            },
+        }
+        ordinary_detail = {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "orderId": "order-ordinary",
+                "itemId": "item-ordinary",
+                "peerUserId": "buyer-ordinary",
+                "status": "2",
+                "utArgs": {
+                    "idleBizCode": "6",
+                    "orderStatusName": "买家已付款，请尽快发货",
+                },
+                "components": [{
+                    "data": {
+                        "orderStatusInfo": {"title": "买家已付款，请尽快发货"},
+                        "itemInfo": {"buyAmount": "1", "title": "Fixture"},
+                        "priceInfo": {"amount": {"value": "3.00"}},
+                    },
+                }],
+            },
+        }
+        unknown_detail = {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "orderId": "order-unknown",
+                "itemId": "item-unknown",
+                "peerUserId": "buyer-unknown",
+                "status": "2",
+                "utArgs": {"orderStatusName": "买家已付款，请尽快发货"},
+                "components": [{
+                    "data": {
+                        "orderStatusInfo": {"title": "买家已付款，请尽快发货"},
+                        "itemInfo": {"buyAmount": "1", "title": "Fixture"},
+                        "priceInfo": {"amount": {"value": "0.00"}},
+                    },
+                }],
+            },
+        }
+
+        for payload, expected in (
+            (lead_detail, "lead"),
+            (ordinary_detail, "ordinary"),
+            (unknown_detail, "unknown"),
+        ):
+            with self.subTest(expected=expected):
+                parsed = parse_order_detail_payload(payload, "account-1")
+                self.assertTrue(parsed["success"])
+                self.assertEqual(parsed["orders"][0]["order_business_type"], expected)
+
+        self.assertEqual(
+            classify_order_business_type({
+                "commonData": {"orderStatus": "待发货"},
+                "rightVO": {"btnList": [{
+                    "tradeAction": "CLOSE_ORDER",
+                    "name": "取消预约",
+                }]},
+            }),
+            "lead",
+        )
+        self.assertEqual(
+            classify_order_business_type({
+                "commonData": {"orderStatus": "待发货"},
+                "rightVO": {"btnList": [{"tradeAction": "LOGISTICS_SEND"}]},
+            }),
+            "ordinary",
+        )
+        self.assertEqual(
+            normalize_pending_order_record({
+                "bizOrderId": "order-lead-list",
+                "auctionId": "item-lead",
+                "buyerId": "buyer-lead",
+                "totalFee": "0.00",
+                "buyAmount": 1,
+                "orderStatus": "2",
+                "idleBizCode": "7000",
+            }, "account-1")["order_business_type"],
+            "lead",
+        )
 
     def test_order_list_does_not_infer_unverified_buyer_identity_fields(self):
         order = normalize_order_record({
@@ -403,9 +578,44 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             days=90,
         )
 
-        self.assertFalse(result["success"])
-        self.assertTrue(result["requires_login"])
+        self.assertTrue(result["success"])
+        self.assertTrue(result["skipped"])
+        self.assertFalse(result["requires_login"])
+        self.assertEqual(result["error_code"], "skipped_reauth")
         self.assertEqual(result["summary"]["status_updated"], 0)
+        self.assertEqual(self.db.get_order_by_id("order-1")["order_status"], "shipped")
+        self.assertEqual(
+            self.db.get_account_session_refresh("account-1")["state"],
+            "manual_reauth_required",
+        )
+
+    async def test_manual_reauth_state_skips_discovery_without_changing_orders(self):
+        self.db.insert_or_update_order(
+            order_id="order-1",
+            order_status="shipped",
+            cookie_id="account-1",
+        )
+        self.db.update_account_session_refresh(
+            "account-1",
+            state="manual_reauth_required",
+            trigger="test",
+            error_code="session_expired",
+        )
+        discoverer = AsyncMock()
+
+        result = await OrderSyncCoordinator(
+            self.db,
+            discoverer=discoverer,
+        ).sync_account(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; cookie2=value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["skip_reason"], "skipped_reauth")
+        self.assertEqual(result["coverage"], "none")
+        discoverer.assert_not_awaited()
         self.assertEqual(self.db.get_order_by_id("order-1")["order_status"], "shipped")
 
     async def test_discovery_inserts_missing_order_and_updates_existing_status(self):
@@ -618,6 +828,56 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["requires_login"])
         self.assertEqual(result["error_code"], "session_expired")
 
+    async def test_permission_denied_falls_back_to_pending_orders_only(self):
+        merchant_loader = AsyncMock(return_value={
+            "ret": ["PERMISSION_EXCEPTION::seller order permission denied"],
+        })
+        pending_loader = AsyncMock(return_value={
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "items": [{
+                    "bizOrderId": "order-pending",
+                    "auctionId": "item-pending",
+                    "buyerId": "buyer-pending",
+                    "auctionTitle": "测试商品",
+                    "totalFee": "9.90",
+                    "buyAmount": 1,
+                    "orderStatus": "2",
+                }],
+            },
+        })
+
+        result = await XianyuOrderListClient(
+            page_loader=merchant_loader,
+            pending_page_loader=pending_loader,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["coverage"], "pending_only")
+        self.assertEqual(result["orders"][0]["order_id"], "order-pending")
+        merchant_loader.assert_awaited_once()
+        pending_loader.assert_awaited_once()
+
+    async def test_non_permission_failures_never_use_pending_fallback(self):
+        pending_loader = AsyncMock()
+        result = await XianyuOrderListClient(
+            page_loader=AsyncMock(return_value={
+                "ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"],
+            }),
+            pending_page_loader=pending_loader,
+        ).discover(
+            cookie_id="account-1",
+            cookie_string="unb=account-1; _m_h5_tk=token_value",
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "session_expired")
+        pending_loader.assert_not_awaited()
+
     async def test_recent_order_client_merges_set_cookie_and_retries_once(self):
         cookie_values = []
 
@@ -794,6 +1054,64 @@ class OrderSyncCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"ret": ["NETWORK_ERROR::TimeoutError"]})
         self.assertEqual(captured["timeout"].total, 20)
+
+    async def test_pending_transport_uses_verified_api_shape(self):
+        captured = {}
+
+        class Response:
+            status = 200
+            headers = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def json(self, **_kwargs):
+                return {"ret": ["SUCCESS::调用成功"], "data": {"items": []}}
+
+        class Session:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            def post(self, url, **kwargs):
+                captured["url"] = url
+                captured.update(kwargs)
+                return Response()
+
+        with patch(
+            "order_sync_service.aiohttp.ClientSession",
+            Session,
+        ), patch("utils.xianyu_utils.generate_sign", return_value="test-sign"):
+            result = await fetch_xianyu_pending_order_page(
+                cookie_id="account-1",
+                cookie_string="unb=account-1; _m_h5_tk=token_suffix",
+                page_number=9,
+                page_size=99,
+                user_id="account-1",
+                user_agent="Synthetic-UA",
+            )
+
+        self.assertEqual(result["data"]["items"], [])
+        self.assertTrue(captured["url"].endswith(
+            "/mtop.taobao.idle.trade.sold.get/5.0/"
+        ))
+        self.assertEqual(captured["params"]["api"], "mtop.taobao.idle.trade.sold.get")
+        self.assertEqual(captured["params"]["v"], "5.0")
+        self.assertEqual(captured["params"]["type"], "originaljson")
+        self.assertEqual(captured["params"]["valueType"], "original")
+        self.assertEqual(
+            json.loads(captured["data"]["data"]),
+            {"pageNumber": 1, "orderStatus": "NOT_SHIP", "offsetRow": 0},
+        )
+        self.assertEqual(captured["headers"]["Origin"], "https://h5.m.goofish.com")
 
     async def test_recent_order_client_stops_when_target_order_is_found(self):
         requested_pages = []

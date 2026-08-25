@@ -24,6 +24,7 @@ from schema_migrations import MigrationRunner, get_schema_version
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
     PASSWORD_HASH_VERSION,
+    SYSTEM_SECRET_ENCRYPTION_VERSION,
     SYSTEM_SECRET_PREFIX,
     AccountCredentialCipher,
     SystemSecretCipher,
@@ -75,6 +76,9 @@ ITEM_METRIC_RECOMMENDATION_MIN_INTERVAL_SECONDS = 2 * 60 * 60
 ITEM_METRIC_RECOMMENDATION_MAX_INTERVAL_SECONDS = 6 * 60 * 60
 FULFILLMENT_ATTEMPT_LEASE_SECONDS = 6 * 60 * 60
 FULFILLMENT_MAX_QUANTITY = 100
+FULFILLMENT_API_PROTOCOL = "fulfillment_api_v1"
+CARD_STOCK_IMPORT_MAX_ITEMS = 10_000
+CARD_STOCK_ITEM_MAX_BYTES = 2_048
 BACKUP_MAX_SERIALIZED_BYTES = 128 * 1024 * 1024
 BACKUP_MAX_TOTAL_ROWS = 1_000_000
 BACKUP_MAX_TABLES = 32
@@ -124,6 +128,7 @@ USER_BACKUP_TABLES = (
     "ai_item_knowledge_versions",
     "item_metric_snapshots",
     "item_metric_collection_states",
+    "order_auto_ratings",
 )
 SYSTEM_BACKUP_TABLES = (
     "cookies",
@@ -146,7 +151,11 @@ SYSTEM_BACKUP_TABLES = (
     "item_metric_collection_states",
     "fulfillment_attempts",
     "fulfillment_card_reservations",
+    "fulfillment_api_operations",
+    "fulfillment_delivery_payloads",
+    "fulfillment_resend_events",
     "invite_bridge_operations",
+    "order_auto_ratings",
 )
 BACKUP_INSERT_ORDER = (
     "cookies",
@@ -167,7 +176,11 @@ BACKUP_INSERT_ORDER = (
     "item_metric_collection_states",
     "fulfillment_attempts",
     "fulfillment_card_reservations",
+    "fulfillment_api_operations",
+    "fulfillment_delivery_payloads",
+    "fulfillment_resend_events",
     "invite_bridge_operations",
+    "order_auto_ratings",
     "delivery_rules",
     "message_notifications",
 )
@@ -177,8 +190,12 @@ BACKUP_AUTO_ID_TABLES = {
     "ai_item_knowledge_versions",
     "item_info",
     "item_metric_snapshots",
+    "order_auto_ratings",
     "fulfillment_attempts",
     "fulfillment_card_reservations",
+    "fulfillment_api_operations",
+    "fulfillment_delivery_payloads",
+    "fulfillment_resend_events",
     "message_notifications",
 }
 BACKUP_IMAGE_REFERENCE_COLUMNS = {
@@ -2252,7 +2269,8 @@ class DBManager:
                     "show_browser, created_at, xianyu_unb, password_encrypted, "
                     "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent, "
                     "cookie_revision, login_method, last_login_at, last_validated_at, "
-                    "last_expired_at, avatar_url, xianyu_nick "
+                    "last_expired_at, avatar_url, xianyu_nick, "
+                    "auto_rate_enabled, auto_rate_enabled_at "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -2287,6 +2305,8 @@ class DBManager:
                         'last_expired_at': result[19],
                         'avatar_url': result[20] or '',
                         'xianyu_nick': result[21] or '',
+                        'auto_rate_enabled': bool(result[22]),
+                        'auto_rate_enabled_at': result[23],
                     }
                 return None
             except Exception as e:
@@ -2793,6 +2813,287 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新自动确认发货设置失败: {e}")
                 return False
+
+    def update_auto_rate(
+        self,
+        cookie_id: str,
+        user_id: int,
+        enabled: bool,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Owner-scoped opt-in; enabling starts a new-order-only boundary."""
+        enabled_at = float(time.time() if now is None else now)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                row = cursor.execute(
+                    "SELECT auto_rate_enabled FROM cookies WHERE id = ? AND user_id = ?",
+                    (str(cookie_id), int(user_id)),
+                ).fetchone()
+                if not row:
+                    return False
+                if bool(row[0]) == bool(enabled):
+                    return True
+                cursor.execute(
+                    "UPDATE cookies SET auto_rate_enabled = ?, auto_rate_enabled_at = ? "
+                    "WHERE id = ? AND user_id = ?",
+                    (
+                        int(bool(enabled)),
+                        enabled_at if enabled else None,
+                        str(cookie_id),
+                        int(user_id),
+                    ),
+                )
+                if not enabled:
+                    cursor.execute(
+                        "UPDATE order_auto_ratings SET state = 'cancelled', "
+                        "result_code = 'account_disabled', updated_at = ? "
+                        "WHERE cookie_id = ? AND user_id = ? AND state = 'scheduled'",
+                        (enabled_at, str(cookie_id), int(user_id)),
+                    )
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新自动好评设置失败: {type(exc).__name__}")
+                return False
+
+    def get_auto_rate_settings(
+        self,
+        cookie_id: str,
+        user_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            params: List[Any] = [str(cookie_id)]
+            owner_clause = ""
+            if user_id is not None:
+                owner_clause = " AND user_id = ?"
+                params.append(int(user_id))
+            row = self.conn.execute(
+                "SELECT auto_rate_enabled, auto_rate_enabled_at FROM cookies "
+                f"WHERE id = ?{owner_clause}",
+                tuple(params),
+            ).fetchone()
+            if not row:
+                return None
+            counts = {
+                str(state): int(count)
+                for state, count in self.conn.execute(
+                    "SELECT state, COUNT(*) FROM order_auto_ratings "
+                    f"WHERE cookie_id = ?{owner_clause} GROUP BY state",
+                    tuple(params),
+                ).fetchall()
+            }
+        return {
+            "enabled": bool(row[0]),
+            "enabled_at": row[1],
+            "pending_count": counts.get("scheduled", 0) + counts.get("submitting", 0),
+            "success_count": counts.get("succeeded", 0),
+            "failed_count": counts.get("failed", 0),
+            "needs_reconcile_count": counts.get("needs_reconcile", 0),
+        }
+
+    def get_auto_rate_enabled_accounts(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT id, value, user_id, xianyu_unb, browser_user_agent, "
+                "cookie_revision, auto_rate_enabled_at FROM cookies "
+                "WHERE auto_rate_enabled = 1 AND auto_rate_enabled_at IS NOT NULL "
+                "ORDER BY id"
+            ).fetchall()
+        return [
+            {
+                "cookie_id": str(row[0]),
+                "cookie_string": str(row[1] or ""),
+                "user_id": int(row[2]),
+                "xianyu_unb": str(row[3] or ""),
+                "browser_user_agent": str(row[4] or ""),
+                "cookie_revision": int(row[5] or 0),
+                "enabled_at": float(row[6]),
+            }
+            for row in rows
+        ]
+
+    def schedule_auto_rate_task(
+        self,
+        *,
+        user_id: int,
+        cookie_id: str,
+        order_id: str,
+        item_title: str,
+        order_created_at: float,
+        due_at: float,
+        now: Optional[float] = None,
+        allow_historical: bool = False,
+    ) -> bool:
+        """Insert once, while ownership and opt-in checks still hold.
+
+        Historical backfill is opt-in at the caller; normal scheduler callers
+        keep the enable-time boundary by default.
+        """
+        created_at = float(time.time() if now is None else now)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO order_auto_ratings ("
+                    "user_id, cookie_id, order_id, item_title, order_created_at, "
+                    "due_at, created_at, updated_at"
+                    ") SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM cookies "
+                    "WHERE id = ? AND user_id = ? AND auto_rate_enabled = 1 "
+                    "AND auto_rate_enabled_at IS NOT NULL "
+                    "AND (? = 1 OR ? >= auto_rate_enabled_at)",
+                    (
+                        int(user_id), str(cookie_id), str(order_id),
+                        str(item_title or "")[:200], float(order_created_at),
+                        float(due_at), created_at, created_at,
+                        str(cookie_id), int(user_id), int(bool(allow_historical)),
+                        float(order_created_at),
+                    ),
+                )
+                inserted = cursor.rowcount == 1
+                self.conn.commit()
+                return inserted
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"创建自动好评任务失败: {type(exc).__name__}")
+                return False
+
+    def claim_due_auto_rate_task(self, *, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        claimed_at = float(time.time() if now is None else now)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                row = cursor.execute(
+                    "SELECT r.id, r.user_id, r.cookie_id, r.order_id, r.item_title, "
+                    "r.feedback, r.attempt_count FROM order_auto_ratings AS r "
+                    "JOIN cookies AS c ON c.id = r.cookie_id AND c.user_id = r.user_id "
+                    "WHERE r.state = 'scheduled' AND r.due_at <= ? "
+                    "AND c.auto_rate_enabled = 1 ORDER BY r.due_at, r.id LIMIT 1",
+                    (claimed_at,),
+                ).fetchone()
+                if not row:
+                    return None
+                cursor.execute(
+                    "UPDATE order_auto_ratings SET state = 'submitting', "
+                    "attempt_count = attempt_count + 1, updated_at = ? "
+                    "WHERE id = ? AND state = 'scheduled'",
+                    (claimed_at, int(row[0])),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return None
+                self.conn.commit()
+                return {
+                    "id": int(row[0]),
+                    "user_id": int(row[1]),
+                    "cookie_id": str(row[2]),
+                    "order_id": str(row[3]),
+                    "item_title": str(row[4] or ""),
+                    "feedback": str(row[5] or ""),
+                    "attempt_count": int(row[6] or 0) + 1,
+                }
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"领取自动好评任务失败: {type(exc).__name__}")
+                return None
+
+    def set_auto_rate_feedback(self, task_id: int, feedback: str) -> bool:
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE order_auto_ratings SET feedback = ?, updated_at = ? "
+                    "WHERE id = ? AND state = 'submitting'",
+                    (str(feedback or "")[:200], time.time(), int(task_id)),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self.conn.rollback()
+                return False
+
+    def mark_auto_rate_submission_started(
+        self,
+        task_id: int,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        started_at = float(time.time() if now is None else now)
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE order_auto_ratings SET submitted_at = ?, updated_at = ? "
+                    "WHERE id = ? AND state = 'submitting' AND submitted_at IS NULL "
+                    "AND EXISTS (SELECT 1 FROM cookies AS c "
+                    "WHERE c.id = order_auto_ratings.cookie_id "
+                    "AND c.user_id = order_auto_ratings.user_id "
+                    "AND c.auto_rate_enabled = 1)",
+                    (started_at, started_at, int(task_id)),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self.conn.rollback()
+                return False
+
+    def finish_auto_rate_task(
+        self,
+        task_id: int,
+        *,
+        state: str,
+        result_code: str,
+        error: str = "",
+        response: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        if state not in {"succeeded", "failed", "needs_reconcile"}:
+            raise ValueError("invalid auto-rate terminal state")
+        finished_at = float(time.time() if now is None else now)
+        response_json = json.dumps(response or {}, ensure_ascii=False, separators=(",", ":"))[:4000]
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE order_auto_ratings SET state = ?, result_code = ?, "
+                    "last_error = ?, response_json = ?, updated_at = ? "
+                    "WHERE id = ? AND state = 'submitting'",
+                    (
+                        state, str(result_code or "")[:100], str(error or "")[:500],
+                        response_json, finished_at, int(task_id),
+                    ),
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"完成自动好评任务失败: {type(exc).__name__}")
+                return False
+
+    def reconcile_interrupted_auto_rate_tasks(self, *, now: Optional[float] = None) -> int:
+        """Replay only work that stopped before its durable pre-POST marker."""
+        updated_at = float(time.time() if now is None else now)
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE order_auto_ratings SET state = 'scheduled', "
+                "result_code = 'service_restarted_before_submit', "
+                "last_error = '', due_at = ?, updated_at = ? "
+                "WHERE state = 'submitting' AND submitted_at IS NULL",
+                (updated_at, updated_at),
+            )
+            cursor.execute(
+                "UPDATE order_auto_ratings SET state = 'needs_reconcile', "
+                "result_code = 'service_restarted', "
+                "last_error = '提交开始后服务重启，请人工核对平台评价状态', updated_at = ? "
+                "WHERE state = 'submitting' AND submitted_at IS NOT NULL",
+                (updated_at,),
+            )
+            count = cursor.rowcount
+            self.conn.commit()
+            return int(count)
 
     def update_cookie_remark(self, cookie_id: str, remark: str) -> bool:
         """更新Cookie的备注"""
@@ -4263,18 +4564,21 @@ class DBManager:
         return profile
 
     def create_ai_provider_profile(self, user_id: int, data: dict) -> int:
-        from ai_provider_service import encrypt_provider_key
+        from ai_provider_service import encrypt_provider_key, normalize_provider_models
 
         with self.lock:
             cursor = self.conn.cursor()
             try:
                 if data.get('is_default'):
                     cursor.execute("UPDATE ai_provider_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
+                has_models = 'models' in data
+                models = normalize_provider_models(data.get('models')) if has_models else []
                 cursor.execute('''
                 INSERT INTO ai_provider_profiles
                 (user_id, name, provider_type, preset, base_url, api_key_encrypted,
-                 default_model, verification_status, verification_message, last_verified_at, is_default)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 default_model, models_cache, models_cached_at, verification_status,
+                 verification_message, last_verified_at, is_default)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id,
                     str(data.get('name') or '').strip(),
@@ -4283,6 +4587,8 @@ class DBManager:
                     str(data.get('base_url') or '').rstrip('/'),
                     encrypt_provider_key(data.get('api_key', '')),
                     str(data.get('default_model') or '').strip(),
+                    json.dumps(models, ensure_ascii=False),
+                    time.time() if has_models else None,
                     data.get('verification_status', 'unverified'),
                     data.get('verification_message', ''),
                     data.get('last_verified_at'),
@@ -4325,7 +4631,7 @@ class DBManager:
             return int(row[0] if row else 0)
 
     def update_ai_provider_profile(self, profile_id: int, user_id: int, data: dict) -> dict:
-        from ai_provider_service import encrypt_provider_key
+        from ai_provider_service import encrypt_provider_key, normalize_provider_models
         from settings_service import apply_secret_action
 
         with self.lock:
@@ -4345,17 +4651,28 @@ class DBManager:
             ])
             if sensitive_changed and self.count_ai_provider_references(profile_id):
                 raise ValueError('该平台正在被账号使用，请先让账号切换到其他平台再修改连接信息')
+            has_models = 'models' in data
+            models = normalize_provider_models(data.get('models')) if has_models else current.get('models', [])
+            models_cached_at = time.time() if has_models else current.get('models_cached_at')
+            if has_models and not models and current.get('models') and not sensitive_changed:
+                models = current['models']
+                models_cached_at = current.get('models_cached_at')
+            if sensitive_changed and not has_models:
+                models = []
+                models_cached_at = None
             if data.get('is_default'):
                 self.conn.execute("UPDATE ai_provider_profiles SET is_default = 0 WHERE user_id = ?", (user_id,))
             self.conn.execute('''
                 UPDATE ai_provider_profiles SET
                     name = ?, provider_type = ?, preset = ?, base_url = ?, api_key_encrypted = ?,
-                    default_model = ?, verification_status = ?, verification_message = ?,
+                    default_model = ?, models_cache = ?, models_cached_at = ?,
+                    verification_status = ?, verification_message = ?,
                     last_verified_at = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND user_id = ?
             ''', (
                 str(data.get('name', current['name'])).strip(), provider_type, preset, base_url,
                 encrypt_provider_key(api_key), str(data.get('default_model', current['default_model'])).strip(),
+                json.dumps(models, ensure_ascii=False), models_cached_at,
                 'unverified' if sensitive_changed else current['verification_status'],
                 '' if sensitive_changed else current['verification_message'],
                 None if sensitive_changed else current['last_verified_at'],
@@ -4374,11 +4691,13 @@ class DBManager:
             self.conn.commit()
 
     def update_ai_provider_models(self, profile_id: int, user_id: int, models: List[str]) -> None:
+        from ai_provider_service import normalize_provider_models
+
         with self.lock:
             self.conn.execute('''
                 UPDATE ai_provider_profiles SET models_cache = ?, models_cached_at = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND user_id = ?
-            ''', (json.dumps(models, ensure_ascii=False), time.time(), profile_id, user_id))
+            ''', (json.dumps(normalize_provider_models(models), ensure_ascii=False), time.time(), profile_id, user_id))
             self.conn.commit()
 
     def delete_ai_provider_profile(self, profile_id: int, user_id: int) -> bool:
@@ -4451,6 +4770,218 @@ class DBManager:
                 migrated += 1
             self.conn.commit()
             return migrated
+
+    # -------------------- AI 对话订单作用域 --------------------
+    _AI_CONVERSATION_SOURCES = frozenset({
+        "buyer",
+        "seller_human",
+        "assistant_generated",
+        "keyword",
+        "system",
+        "legacy",
+    })
+    _AI_CONVERSATION_DELIVERY_STATES = frozenset({
+        "legacy",
+        "not_applicable",
+        "received",
+        "recorded",
+        "draft",
+        "pending",
+        "succeeded",
+        "failed",
+        "ambiguous",
+    })
+
+    @classmethod
+    def _normalize_ai_conversation_provenance(
+        cls,
+        role: str,
+        source: Optional[str],
+        delivery_state: Optional[str],
+    ) -> Tuple[str, str]:
+        normalized_role = str(role or "").strip().lower()
+        source_value = str(source or "").strip().lower()
+        if not source_value:
+            source_value = {
+                "user": "buyer",
+                "buyer": "buyer",
+                "assistant": "assistant_generated",
+                "seller": "seller_human",
+                "human": "seller_human",
+                "system": "system",
+                "keyword": "keyword",
+            }.get(normalized_role, "legacy")
+        if source_value not in cls._AI_CONVERSATION_SOURCES:
+            source_value = "legacy"
+
+        state_value = str(delivery_state or "").strip().lower()
+        if not state_value:
+            state_value = (
+                "draft" if source_value == "assistant_generated" else "not_applicable"
+            )
+        if state_value not in cls._AI_CONVERSATION_DELIVERY_STATES:
+            state_value = "ambiguous"
+        return source_value, state_value
+
+    def insert_ai_conversation(
+        self,
+        cookie_id: str,
+        chat_id: str,
+        user_id: str,
+        item_id: str,
+        role: str,
+        content: str,
+        intent: Optional[str] = None,
+        *,
+        order_id: Optional[str] = None,
+        source: Optional[str] = None,
+        delivery_state: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Insert one conversation row with explicit order/provenance fields.
+
+        ``assistant_generated`` rows default to ``draft``; callers must update
+        them to ``succeeded`` only after the platform confirms delivery.
+        """
+        source_value, state_value = self._normalize_ai_conversation_provenance(
+            role, source, delivery_state
+        )
+        normalized_order_id = str(order_id or "").strip() or None
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO ai_conversations (
+                        cookie_id, chat_id, user_id, item_id, order_id,
+                        role, content, intent, source, delivery_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(cookie_id),
+                        str(chat_id),
+                        str(user_id),
+                        str(item_id),
+                        normalized_order_id,
+                        str(role or ""),
+                        str(content or ""),
+                        intent,
+                        source_value,
+                        state_value,
+                    ),
+                )
+                conversation_id = int(cursor.lastrowid)
+                row = cursor.execute(
+                    """
+                    SELECT id, cookie_id, chat_id, user_id, item_id, order_id,
+                           role, content, intent, bargain_count, source,
+                           delivery_state, created_at
+                    FROM ai_conversations WHERE id = ?
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                self.conn.commit()
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"保存AI对话失败: {type(exc).__name__}")
+                return None
+        if not row:
+            return None
+        keys = (
+            "id", "cookie_id", "chat_id", "user_id", "item_id", "order_id",
+            "role", "content", "intent", "bargain_count", "source",
+            "delivery_state", "created_at",
+        )
+        return dict(zip(keys, row))
+
+    def get_ai_conversations(
+        self,
+        cookie_id: str,
+        chat_id: str,
+        item_id: str,
+        *,
+        order_id: Optional[str] = None,
+        limit: int = 20,
+        include_unscoped: bool = False,
+        trusted_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Read deterministically ordered, optionally order-scoped history."""
+        bounded_limit = max(1, min(int(limit), 200))
+        params: List[Any] = [str(cookie_id), str(chat_id), str(item_id)]
+        where = ["cookie_id = ?", "chat_id = ?", "item_id = ?"]
+        normalized_order_id = str(order_id or "").strip()
+        if normalized_order_id:
+            if include_unscoped:
+                where.append("(order_id = ? OR order_id IS NULL)")
+            else:
+                where.append("order_id = ?")
+            params.append(normalized_order_id)
+        if trusted_only:
+            # Buyer/human/system records are usable conversation evidence;
+            # generated assistant text is trusted only after delivery succeeds.
+            # Legacy rows stay continuity-only until a caller re-records them
+            # with an explicit provenance value.
+            where.append(
+                "(source IN ('buyer', 'seller_human', 'keyword', 'system') "
+                "OR (source = 'assistant_generated' AND delivery_state = 'succeeded'))"
+            )
+        sql = f"""
+            SELECT id, cookie_id, chat_id, user_id, item_id, order_id,
+                   role, content, intent, bargain_count, source,
+                   delivery_state, created_at
+            FROM (
+                SELECT id, cookie_id, chat_id, user_id, item_id, order_id,
+                       role, content, intent, bargain_count, source,
+                       delivery_state, created_at
+                FROM ai_conversations
+                WHERE {' AND '.join(where)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY created_at ASC, id ASC
+        """
+        params.append(bounded_limit)
+        with self.lock:
+            try:
+                rows = self.conn.execute(sql, tuple(params)).fetchall()
+            except Exception as exc:
+                logger.error(f"读取AI对话失败: {type(exc).__name__}")
+                return []
+        keys = (
+            "id", "cookie_id", "chat_id", "user_id", "item_id", "order_id",
+            "role", "content", "intent", "bargain_count", "source",
+            "delivery_state", "created_at",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def update_ai_conversation_delivery_state(
+        self,
+        conversation_id: int,
+        delivery_state: str,
+        *,
+        cookie_id: Optional[str] = None,
+    ) -> bool:
+        """Set the platform delivery outcome for an AI draft."""
+        state_value = str(delivery_state or "").strip().lower()
+        if state_value not in self._AI_CONVERSATION_DELIVERY_STATES:
+            raise ValueError("无效的AI对话送达状态")
+        params: List[Any] = [state_value, int(conversation_id)]
+        owner_clause = ""
+        if cookie_id is not None:
+            owner_clause = " AND cookie_id = ?"
+            params.append(str(cookie_id))
+        with self.lock:
+            try:
+                cursor = self.conn.execute(
+                    "UPDATE ai_conversations SET delivery_state = ? "
+                    f"WHERE id = ?{owner_clause}",
+                    tuple(params),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error(f"更新AI对话送达状态失败: {type(exc).__name__}")
+                return False
 
     def save_ai_training_rules(self, cookie_id: str, item_id: str, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """新增或恢复启用训练规则，商品规则严格绑定当前商品。"""
@@ -4638,8 +5169,8 @@ class DBManager:
         return self.get_ai_item_knowledge_profile(cookie_id, item_id)
 
     def copy_ai_item_knowledge_draft(self, cookie_id: str, source_item_id: str,
-                                     target_item_ids: List[str], overwrite: bool = False) -> Dict[str, Any]:
-        """复制源商品当前档案到目标草稿，不自动发布。"""
+                                     target_item_ids: List[str], overwrite: bool = True) -> Dict[str, Any]:
+        """复制源商品当前档案并覆盖目标草稿，不自动发布。"""
         normalized_targets = []
         for value in target_item_ids or []:
             target_id = str(value or '').strip()
@@ -4667,39 +5198,30 @@ class DBManager:
             skipped = []
             missing = []
             skipped_reasons = {}
-            for target_id in normalized_targets:
-                cursor.execute(
-                    'SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ?',
-                    (cookie_id, target_id),
-                )
-                if not cursor.fetchone():
-                    missing.append(target_id)
-                    skipped_reasons[target_id] = '目标商品不存在或不属于当前账号'
-                    continue
-                cursor.execute('''
-                SELECT draft_json, published_json
-                FROM ai_item_knowledge_profiles
-                WHERE cookie_id = ? AND item_id = ?
-                ''', (cookie_id, target_id))
-                target_row = cursor.fetchone()
-                if target_row and not overwrite:
-                    target_draft = json.loads(target_row[0] or '{}')
-                    target_published = json.loads(target_row[1] or '{}')
-                    if target_draft or target_published:
-                        skipped.append(target_id)
-                        skipped_reasons[target_id] = '目标已有草稿或已发布知识档案，未开启覆盖'
+            try:
+                for target_id in normalized_targets:
+                    cursor.execute(
+                        'SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ?',
+                        (cookie_id, target_id),
+                    )
+                    if not cursor.fetchone():
+                        missing.append(target_id)
+                        skipped_reasons[target_id] = '目标商品不存在或不属于当前账号'
                         continue
-                cursor.execute('''
-                INSERT INTO ai_item_knowledge_profiles
-                (cookie_id, item_id, draft_json, source_detail_hash, draft_updated_at)
-                VALUES (?, ?, ?, '', CURRENT_TIMESTAMP)
-                ON CONFLICT(cookie_id, item_id) DO UPDATE SET
-                    draft_json = excluded.draft_json,
-                    source_detail_hash = '',
-                    draft_updated_at = CURRENT_TIMESTAMP
-                ''', (cookie_id, target_id, profile_json))
-                copied.append(target_id)
-            self.conn.commit()
+                    cursor.execute('''
+                    INSERT INTO ai_item_knowledge_profiles
+                    (cookie_id, item_id, draft_json, source_detail_hash, draft_updated_at)
+                    VALUES (?, ?, ?, '', CURRENT_TIMESTAMP)
+                    ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                        draft_json = excluded.draft_json,
+                        source_detail_hash = '',
+                        draft_updated_at = CURRENT_TIMESTAMP
+                    ''', (cookie_id, target_id, profile_json))
+                    copied.append(target_id)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
             return {
                 'copied_item_ids': copied,
                 'skipped_item_ids': skipped,
@@ -4792,6 +5314,58 @@ class DBManager:
         profile = self.get_ai_item_knowledge_profile(cookie_id, item_id)
         profile['version'] = next_version
         return profile
+
+    @staticmethod
+    def _knowledge_payload_has_content(profile: Any) -> bool:
+        """判断知识档案 JSON 是否包含真实内容（与前端 hasKnowledgeContent 同语义）。"""
+        if not isinstance(profile, dict):
+            return False
+        overview = profile.get('overview')
+        if isinstance(overview, dict) and str(overview.get('text') or '').strip():
+            return True
+        for section in ('pricing', 'process', 'after_sales', 'forbidden', 'faqs', 'notes'):
+            value = profile.get(section)
+            if isinstance(value, list) and len(value) > 0:
+                return True
+        return False
+
+    def get_ai_item_knowledge_status_by_cookie(self, cookie_id: str) -> Dict[str, Dict[str, Any]]:
+        """按账号返回商品知识档案状态映射，用于商品列表标识与复制目标提示。
+
+        Returns:
+            Dict[item_id, {'has_draft': bool, 'published_version': int,
+                           'draft_updated_at': str|None, 'published_at': str|None}]
+            只包含存在草稿内容或已发布版本的商品。
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT item_id, draft_json, published_version, draft_updated_at, published_at
+                FROM ai_item_knowledge_profiles
+                WHERE cookie_id = ?
+                ''', (cookie_id,))
+                rows = cursor.fetchall()
+            status: Dict[str, Dict[str, Any]] = {}
+            for item_id, draft_json, published_version, draft_updated_at, published_at in rows:
+                try:
+                    draft = json.loads(draft_json or '{}')
+                except (TypeError, ValueError):
+                    draft = {}
+                has_draft = self._knowledge_payload_has_content(draft)
+                version = int(published_version or 0)
+                if not has_draft and version <= 0:
+                    continue
+                status[str(item_id)] = {
+                    'has_draft': has_draft,
+                    'published_version': version,
+                    'draft_updated_at': draft_updated_at,
+                    'published_at': published_at,
+                }
+            return status
+        except Exception as e:
+            logger.error(f"读取商品知识档案状态失败: {e}")
+            return {}
 
     # -------------------- 默认回复操作 --------------------
     def save_default_reply(self, cookie_id: str, enabled: bool, reply_content: str = None, reply_once: bool = False, reply_image_url: str = None):
@@ -6247,11 +6821,203 @@ class DBManager:
 
     # ==================== 卡券管理方法 ====================
 
+    @staticmethod
+    def _card_api_config_dict(api_config: Any) -> Optional[Dict[str, Any]]:
+        if api_config is None or api_config == "":
+            return None
+        if isinstance(api_config, str):
+            try:
+                api_config = json.loads(api_config)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("API 配置必须是 JSON 对象") from exc
+        if not isinstance(api_config, dict):
+            raise ValueError("API 配置必须是对象")
+        return dict(api_config)
+
+    def _prepare_card_api_storage(
+        self,
+        card_type: str,
+        api_config: Any,
+        api_token: Optional[str],
+    ) -> tuple[Optional[str], str, int, str]:
+        config = self._card_api_config_dict(api_config)
+        if str(card_type or "") != "api":
+            serialized = (
+                json.dumps(config, ensure_ascii=False, separators=(",", ":"))
+                if config is not None
+                else None
+            )
+            return serialized, "", 0, "unvalidated"
+
+        config = config or {}
+        protocol = str(config.get("protocol") or "").strip()
+        embedded_token = ""
+        if protocol == FULFILLMENT_API_PROTOCOL:
+            embedded_token = str(
+                config.pop("api_token", config.pop("token", "")) or ""
+            ).strip()
+            allowed = {"protocol", "url", "method", "timeout", "spec"}
+            if set(config) - allowed:
+                raise ValueError("幂等 API 只允许 protocol、url、method、timeout 和 spec")
+            url = str(config.get("url") or "").strip()
+            if not url.lower().startswith("https://"):
+                raise ValueError("幂等 API 地址必须使用 HTTPS")
+            method = str(config.get("method") or "POST").strip().upper()
+            if method != "POST":
+                raise ValueError("幂等 API 只支持 POST")
+            try:
+                timeout = int(config.get("timeout", 10))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("API 超时时间无效") from exc
+            if timeout < 1 or timeout > 30:
+                raise ValueError("API 超时时间必须在 1 到 30 秒之间")
+            spec = config.get("spec") or {}
+            if not isinstance(spec, dict):
+                raise ValueError("API spec 必须是对象")
+            config = {
+                "protocol": FULFILLMENT_API_PROTOCOL,
+                "url": url,
+                "method": "POST",
+                "timeout": timeout,
+                "spec": spec,
+            }
+            validation_status = "unvalidated"
+        else:
+            # Arbitrary legacy configs remain stored for manual inspection but
+            # never become bindable automatic resources.
+            validation_status = "manual_only"
+
+        token = str(api_token if api_token is not None else embedded_token).strip()
+        encrypted = SystemSecretCipher(self.db_path).encrypt(token) if token else ""
+        version = SYSTEM_SECRET_ENCRYPTION_VERSION if encrypted else 0
+        serialized = json.dumps(
+            config,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return serialized, encrypted, version, validation_status
+
+    @staticmethod
+    def _public_card_api_config(raw_config: Any) -> Optional[Dict[str, Any]]:
+        if raw_config is None or raw_config == "":
+            return None
+        try:
+            config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+        except (TypeError, ValueError):
+            return {"legacy": True}
+        if not isinstance(config, dict):
+            return {"legacy": True}
+        allowed = ("protocol", "url", "method", "timeout", "spec")
+        return {key: config[key] for key in allowed if key in config}
+
+    def _card_token_preview(self, encrypted: Any) -> str:
+        value = str(encrypted or "")
+        if not value:
+            return ""
+        try:
+            return mask_secret_preview(SystemSecretCipher(self.db_path).decrypt(value))
+        except ValueError:
+            return "***"
+
+    @staticmethod
+    def _card_stock_stats(
+        cursor: sqlite3.Cursor,
+        *,
+        card_id: int,
+        card_type: str,
+        data_content: Any,
+        low_stock_threshold: int,
+    ) -> Dict[str, Any]:
+        available = len(
+            [line for line in str(data_content or "").splitlines() if line.strip()]
+        ) if card_type == "data" else 0
+        counts = {
+            str(state): int(count)
+            for state, count in cursor.execute(
+                "SELECT state, COUNT(*) FROM fulfillment_card_reservations "
+                "WHERE card_id = ? GROUP BY state",
+                (int(card_id),),
+            ).fetchall()
+        }
+        bound = cursor.execute(
+            "SELECT COUNT(*) FROM item_info WHERE delivery_card_id = ?",
+            (int(card_id),),
+        ).fetchone()
+        threshold = max(0, int(low_stock_threshold or 0))
+        return {
+            "available": available,
+            "reserved": counts.get("reserved", 0),
+            "used": counts.get("committed", 0),
+            "review": counts.get("manual_review", 0),
+            "bound": int(bound[0] if bound else 0),
+            "low_stock": card_type == "data" and available <= threshold,
+        }
+
+    def _decode_card_row(
+        self,
+        cursor: sqlite3.Cursor,
+        row: Sequence[Any],
+    ) -> Dict[str, Any]:
+        (
+            card_id,
+            name,
+            card_type,
+            api_config,
+            text_content,
+            data_content,
+            image_url,
+            description,
+            enabled,
+            delay_seconds,
+            is_multi_spec,
+            spec_name,
+            spec_value,
+            created_at,
+            updated_at,
+            low_stock_threshold,
+            api_token_encrypted,
+            _api_token_encryption_version,
+            api_validation_status,
+            api_validated_at,
+        ) = row
+        stats = self._card_stock_stats(
+            cursor,
+            card_id=int(card_id),
+            card_type=str(card_type),
+            data_content=data_content,
+            low_stock_threshold=int(low_stock_threshold or 0),
+        )
+        return {
+            "id": int(card_id),
+            "name": name,
+            "type": card_type,
+            "api_config": self._public_card_api_config(api_config),
+            "text_content": text_content,
+            "data_content": data_content,
+            "image_url": image_url,
+            "description": description,
+            "enabled": bool(enabled),
+            "delay_seconds": int(delay_seconds or 0),
+            "is_multi_spec": bool(is_multi_spec),
+            "spec_name": spec_name,
+            "spec_value": spec_value,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "low_stock_threshold": int(low_stock_threshold or 0),
+            "api_token_configured": bool(api_token_encrypted),
+            "token_preview": self._card_token_preview(api_token_encrypted),
+            "api_validation_status": str(api_validation_status or "unvalidated"),
+            "api_validated_at": api_validated_at,
+            "stats": stats,
+        }
+
     def create_card(self, name: str, card_type: str, api_config=None,
                    text_content: str = None, data_content: str = None, image_url: str = None,
                    description: str = None, enabled: bool = True, delay_seconds: int = 0,
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
-                   user_id: int = None):
+                   user_id: int = None, api_token: Optional[str] = None,
+                   low_stock_threshold: int = 5):
         """创建新卡券（支持多规格）"""
         with self.lock:
             try:
@@ -6280,23 +7046,31 @@ class DBManager:
                     if cursor.fetchone()[0] > 0:
                         raise ValueError(f"卡券名称已存在：{name}")
 
-                # 处理api_config参数 - 如果是字典则转换为JSON字符串
-                api_config_str = None
-                if api_config is not None:
-                    if isinstance(api_config, dict):
-                        import json
-                        api_config_str = json.dumps(api_config)
-                    else:
-                        api_config_str = str(api_config)
+                try:
+                    low_stock_threshold = int(low_stock_threshold)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("低库存阈值必须是整数") from exc
+                if low_stock_threshold < 0:
+                    raise ValueError("低库存阈值不能小于 0")
+                (
+                    api_config_str,
+                    api_token_encrypted,
+                    api_token_encryption_version,
+                    api_validation_status,
+                ) = self._prepare_card_api_storage(card_type, api_config, api_token)
 
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
                                  description, enabled, delay_seconds, is_multi_spec,
-                                 spec_name, spec_value, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 spec_name, spec_value, user_id, low_stock_threshold,
+                                 api_token_encrypted, api_token_encryption_version,
+                                 api_validation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, card_type, api_config_str, text_content, data_content, image_url,
                       description, enabled, delay_seconds, is_multi_spec,
-                      spec_name, spec_value, user_id))
+                      spec_name, spec_value, user_id, low_stock_threshold,
+                      api_token_encrypted, api_token_encryption_version,
+                      api_validation_status))
                 self.conn.commit()
                 card_id = cursor.lastrowid
 
@@ -6314,55 +7088,25 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                columns = (
+                    "id, name, type, api_config, text_content, data_content, image_url, "
+                    "description, enabled, delay_seconds, is_multi_spec, spec_name, "
+                    "spec_value, created_at, updated_at, low_stock_threshold, "
+                    "api_token_encrypted, api_token_encryption_version, "
+                    "api_validation_status, api_validated_at"
+                )
                 if user_id is not None:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    ''', (user_id,))
+                    cursor.execute(
+                        f"SELECT {columns} FROM cards WHERE user_id = ? "
+                        "ORDER BY created_at DESC, id DESC",
+                        (int(user_id),),
+                    )
                 else:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards
-                    ORDER BY created_at DESC
-                    ''')
-
-                cards = []
-                for row in cursor.fetchall():
-                    # 解析api_config JSON字符串
-                    api_config = row[3]
-                    if api_config:
-                        try:
-                            import json
-                            api_config = json.loads(api_config)
-                        except (json.JSONDecodeError, TypeError):
-                            # 如果解析失败，保持原始字符串
-                            pass
-
-                    cards.append({
-                        'id': row[0],
-                        'name': row[1],
-                        'type': row[2],
-                        'api_config': api_config,
-                        'text_content': row[4],
-                        'data_content': row[5],
-                        'image_url': row[6],
-                        'description': row[7],
-                        'enabled': bool(row[8]),
-                        'delay_seconds': row[9] or 0,
-                        'is_multi_spec': bool(row[10]) if row[10] is not None else False,
-                        'spec_name': row[11],
-                        'spec_value': row[12],
-                        'created_at': row[13],
-                        'updated_at': row[14]
-                    })
-
-                return cards
+                    cursor.execute(
+                        f"SELECT {columns} FROM cards ORDER BY created_at DESC, id DESC"
+                    )
+                rows = cursor.fetchall()
+                return [self._decode_card_row(cursor, row) for row in rows]
             except Exception as e:
                 logger.error(f"获取卡券列表失败: {e}")
                 return []
@@ -6372,51 +7116,26 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                columns = (
+                    "id, name, type, api_config, text_content, data_content, image_url, "
+                    "description, enabled, delay_seconds, is_multi_spec, spec_name, "
+                    "spec_value, created_at, updated_at, low_stock_threshold, "
+                    "api_token_encrypted, api_token_encryption_version, "
+                    "api_validation_status, api_validated_at"
+                )
                 if user_id is not None:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards WHERE id = ? AND user_id = ?
-                    ''', (card_id, user_id))
+                    cursor.execute(
+                        f"SELECT {columns} FROM cards WHERE id = ? AND user_id = ?",
+                        (int(card_id), int(user_id)),
+                    )
                 else:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards WHERE id = ?
-                    ''', (card_id,))
+                    cursor.execute(
+                        f"SELECT {columns} FROM cards WHERE id = ?",
+                        (int(card_id),),
+                    )
 
                 row = cursor.fetchone()
-                if row:
-                    # 解析api_config JSON字符串
-                    api_config = row[3]
-                    if api_config:
-                        try:
-                            import json
-                            api_config = json.loads(api_config)
-                        except (json.JSONDecodeError, TypeError):
-                            # 如果解析失败，保持原始字符串
-                            pass
-
-                    return {
-                        'id': row[0],
-                        'name': row[1],
-                        'type': row[2],
-                        'api_config': api_config,
-                        'text_content': row[4],
-                        'data_content': row[5],
-                        'image_url': row[6],
-                        'description': row[7],
-                        'enabled': bool(row[8]),
-                        'delay_seconds': row[9] or 0,
-                        'is_multi_spec': bool(row[10]) if row[10] is not None else False,
-                        'spec_name': row[11],
-                        'spec_value': row[12],
-                        'created_at': row[13],
-                        'updated_at': row[14]
-                    }
-                return None
+                return self._decode_card_row(cursor, row) if row else None
             except Exception as e:
                 logger.error(f"获取卡券失败: {e}")
                 return None
@@ -6425,20 +7144,22 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None, user_id: int = None):
+                   spec_value: str = None, user_id: int = None,
+                   api_token: Optional[str] = None,
+                   low_stock_threshold: Optional[int] = None):
         """更新卡券（支持用户隔离：提供 user_id 时只能改自己的卡券）"""
         with self.lock:
             try:
-                # 处理api_config参数
-                api_config_str = None
-                if api_config is not None:
-                    if isinstance(api_config, dict):
-                        import json
-                        api_config_str = json.dumps(api_config)
-                    else:
-                        api_config_str = str(api_config)
-
                 cursor = self.conn.cursor()
+                owner_clause = " AND user_id = ?" if user_id is not None else ""
+                owner_params = [int(user_id)] if user_id is not None else []
+                current = cursor.execute(
+                    "SELECT type, api_config, api_token_encrypted FROM cards "
+                    f"WHERE id = ?{owner_clause}",
+                    [int(card_id), *owner_params],
+                ).fetchone()
+                if not current:
+                    return False
 
                 # 构建更新语句
                 update_fields = []
@@ -6450,9 +7171,42 @@ class DBManager:
                 if card_type is not None:
                     update_fields.append("type = ?")
                     params.append(card_type)
-                if api_config_str is not None:
-                    update_fields.append("api_config = ?")
-                    params.append(api_config_str)
+                if api_config is not None or api_token is not None or card_type is not None:
+                    effective_type = str(card_type or current[0])
+                    config_input = api_config if api_config is not None else current[1]
+                    if api_token is None and current[2]:
+                        existing_token = SystemSecretCipher(self.db_path).decrypt(
+                            str(current[2])
+                        )
+                    else:
+                        existing_token = api_token
+                    (
+                        api_config_str,
+                        encrypted_token,
+                        encryption_version,
+                        validation_status,
+                    ) = self._prepare_card_api_storage(
+                        effective_type,
+                        config_input,
+                        existing_token,
+                    )
+                    update_fields.extend(
+                        [
+                            "api_config = ?",
+                            "api_token_encrypted = ?",
+                            "api_token_encryption_version = ?",
+                            "api_validation_status = ?",
+                            "api_validated_at = NULL",
+                        ]
+                    )
+                    params.extend(
+                        [
+                            api_config_str,
+                            encrypted_token,
+                            encryption_version,
+                            validation_status,
+                        ]
+                    )
                 if text_content is not None:
                     update_fields.append("text_content = ?")
                     params.append(text_content)
@@ -6480,6 +7234,15 @@ class DBManager:
                 if spec_value is not None:
                     update_fields.append("spec_value = ?")
                     params.append(spec_value)
+                if low_stock_threshold is not None:
+                    try:
+                        normalized_threshold = int(low_stock_threshold)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("低库存阈值必须是整数") from exc
+                    if normalized_threshold < 0:
+                        raise ValueError("低库存阈值不能小于 0")
+                    update_fields.append("low_stock_threshold = ?")
+                    params.append(normalized_threshold)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -6532,6 +7295,246 @@ class DBManager:
                 logger.error(f"更新卡券图片URL失败: {e}")
                 self.conn.rollback()
                 return False
+
+    def get_card_api_runtime_config(
+        self,
+        card_id: int,
+        user_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the fixed v1 provider config only to the fulfillment runtime."""
+        with self.lock:
+            try:
+                row = self.conn.execute(
+                    "SELECT api_config, api_token_encrypted, enabled, "
+                    "api_validation_status FROM cards "
+                    "WHERE id = ? AND user_id = ? AND type = 'api'",
+                    (int(card_id), int(user_id)),
+                ).fetchone()
+                if not row:
+                    return None
+                config = self._card_api_config_dict(row[0]) or {}
+                token = SystemSecretCipher(self.db_path).decrypt(str(row[1] or ""))
+                canonical = json.dumps(
+                    {"config": config, "token": token},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                fingerprint = SystemSecretCipher(self.db_path).digest(
+                    canonical,
+                    purpose="fulfillment-api-config-v1",
+                )
+                return {
+                    **config,
+                    "api_token": token,
+                    "enabled": bool(row[2]),
+                    "validation_status": str(row[3] or "unvalidated"),
+                    "config_fingerprint": fingerprint,
+                }
+            except (TypeError, ValueError) as exc:
+                logger.warning("读取 API 运行配置失败 type={}", type(exc).__name__)
+                return None
+
+    def set_card_api_validation(
+        self,
+        card_id: int,
+        user_id: int,
+        status: str,
+        *,
+        api_token: Optional[str] = None,
+    ) -> bool:
+        normalized = str(status or "").strip()
+        if normalized not in {"validated", "unvalidated", "failed", "manual_only"}:
+            raise ValueError("API 校验状态无效")
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                row = cursor.execute(
+                    "SELECT api_token_encrypted FROM cards "
+                    "WHERE id = ? AND user_id = ? AND type = 'api'",
+                    (int(card_id), int(user_id)),
+                ).fetchone()
+                if not row:
+                    self.conn.rollback()
+                    return False
+                fields = [
+                    "api_validation_status = ?",
+                    "api_validated_at = ?",
+                    "updated_at = CURRENT_TIMESTAMP",
+                ]
+                params: List[Any] = [
+                    normalized,
+                    time.time() if normalized == "validated" else None,
+                ]
+                if api_token is not None:
+                    token = str(api_token).strip()
+                    encrypted = (
+                        SystemSecretCipher(self.db_path).encrypt(token) if token else ""
+                    )
+                    fields.extend(
+                        [
+                            "api_token_encrypted = ?",
+                            "api_token_encryption_version = ?",
+                        ]
+                    )
+                    params.extend(
+                        [
+                            encrypted,
+                            SYSTEM_SECRET_ENCRYPTION_VERSION if encrypted else 0,
+                        ]
+                    )
+                params.extend([int(card_id), int(user_id)])
+                cursor.execute(
+                    f"UPDATE cards SET {', '.join(fields)} "
+                    "WHERE id = ? AND user_id = ?",
+                    params,
+                )
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def import_card_stock(
+        self,
+        card_id: int,
+        user_id: int,
+        values: Sequence[Any],
+    ) -> Dict[str, Any]:
+        """Append unique one-time values without ever recycling historical values."""
+        if isinstance(values, (str, bytes)):
+            values = str(values).splitlines()
+        candidates = list(values)
+        if len(candidates) > CARD_STOCK_IMPORT_MAX_ITEMS:
+            raise ValueError("单批补货不能超过 10000 条")
+
+        normalized: List[str] = []
+        blank = 0
+        invalid = 0
+        for value in candidates:
+            item = str(value if value is not None else "").strip()
+            if not item:
+                blank += 1
+                continue
+            if len(item.encode("utf-8")) > CARD_STOCK_ITEM_MAX_BYTES:
+                invalid += 1
+                continue
+            normalized.append(item)
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                card = cursor.execute(
+                    "SELECT type, data_content, low_stock_threshold FROM cards "
+                    "WHERE id = ? AND user_id = ?",
+                    (int(card_id), int(user_id)),
+                ).fetchone()
+                if not card:
+                    self.conn.rollback()
+                    raise LookupError("资源不存在")
+                if str(card[0]) != "data":
+                    self.conn.rollback()
+                    raise ValueError("只有一次一密资源可以补货")
+
+                existing_values = [
+                    line.strip()
+                    for line in str(card[1] or "").splitlines()
+                    if line.strip()
+                ]
+                historical = {
+                    str(row[0])
+                    for row in cursor.execute(
+                        "SELECT value FROM fulfillment_card_reservations "
+                        "WHERE card_id = ?",
+                        (int(card_id),),
+                    ).fetchall()
+                }
+                seen = set(existing_values) | historical
+                added: List[str] = []
+                duplicates = 0
+                for value in normalized:
+                    if value in seen:
+                        duplicates += 1
+                        continue
+                    seen.add(value)
+                    added.append(value)
+                if added:
+                    cursor.execute(
+                        "UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND user_id = ?",
+                        (
+                            "\n".join([*existing_values, *added]),
+                            int(card_id),
+                            int(user_id),
+                        ),
+                    )
+                stats = self._card_stock_stats(
+                    cursor,
+                    card_id=int(card_id),
+                    card_type="data",
+                    data_content="\n".join([*existing_values, *added]),
+                    low_stock_threshold=int(card[2] or 0),
+                )
+                self.conn.commit()
+                return {
+                    "added": len(added),
+                    "duplicates": duplicates,
+                    "blank": blank,
+                    "invalid": invalid,
+                    "total": len(candidates),
+                    "stats": stats,
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_card_delete_blockers(
+        self,
+        card_id: int,
+        user_id: Optional[int] = None,
+    ) -> List[str]:
+        with self.lock:
+            cursor = self.conn.cursor()
+            owner_clause = " AND user_id = ?" if user_id is not None else ""
+            params: List[Any] = [int(card_id)]
+            if user_id is not None:
+                params.append(int(user_id))
+            if not cursor.execute(
+                f"SELECT 1 FROM cards WHERE id = ?{owner_clause}", params
+            ).fetchone():
+                return ["not_found"]
+            blockers: List[str] = []
+            if cursor.execute(
+                "SELECT 1 FROM item_info WHERE delivery_card_id = ? LIMIT 1",
+                (int(card_id),),
+            ).fetchone():
+                blockers.append("item_binding")
+            if cursor.execute(
+                "SELECT 1 FROM delivery_rules WHERE card_id = ? LIMIT 1",
+                (int(card_id),),
+            ).fetchone():
+                blockers.append("legacy_rule")
+            if cursor.execute(
+                "SELECT 1 FROM fulfillment_card_reservations "
+                "WHERE card_id = ? LIMIT 1",
+                (int(card_id),),
+            ).fetchone():
+                blockers.append("fulfillment_history")
+            if cursor.execute(
+                "SELECT 1 FROM fulfillment_api_operations "
+                "WHERE card_id = ? LIMIT 1",
+                (int(card_id),),
+            ).fetchone():
+                blockers.append("api_history")
+            if cursor.execute(
+                "SELECT 1 FROM fulfillment_delivery_payloads "
+                "WHERE source_card_id = ? LIMIT 1",
+                (int(card_id),),
+            ).fetchone():
+                blockers.append("payload_history")
+            return blockers
 
     # ==================== 自动发货规则方法 ====================
 
@@ -6938,13 +7941,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                active_reservation = cursor.execute(
-                    "SELECT 1 FROM fulfillment_card_reservations "
-                    "WHERE card_id = ? AND state IN ('reserved', 'manual_review') "
-                    "LIMIT 1",
-                    (card_id,),
-                ).fetchone()
-                if active_reservation:
+                if self.get_card_delete_blockers(card_id, user_id):
                     return False
                 if user_id is not None:
                     self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
@@ -7681,6 +8678,541 @@ class DBManager:
                 logger.error("读取履约状态失败 type={}", type(exc).__name__)
                 return None
 
+    _FULFILLMENT_API_OPERATION_COLUMNS = (
+        "id",
+        "attempt_id",
+        "user_id",
+        "cookie_id",
+        "card_id",
+        "idempotency_key",
+        "config_fingerprint",
+        "request_spec_json",
+        "state",
+        "attempt_count",
+        "http_status",
+        "external_operation_id",
+        "response_items_json",
+        "reason_code",
+        "created_at",
+        "updated_at",
+    )
+
+    @classmethod
+    def _decode_fulfillment_api_operation(
+        cls,
+        row: Optional[Sequence[Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        operation = dict(zip(cls._FULFILLMENT_API_OPERATION_COLUMNS, row))
+        for key in ("id", "attempt_id", "user_id", "attempt_count"):
+            operation[key] = int(operation[key])
+        operation["card_id"] = (
+            int(operation["card_id"]) if operation["card_id"] is not None else None
+        )
+        try:
+            operation["request_spec"] = json.loads(
+                str(operation.pop("request_spec_json") or "{}")
+            )
+        except (TypeError, ValueError):
+            operation["request_spec"] = {}
+        try:
+            operation["response_items"] = json.loads(
+                str(operation.pop("response_items_json") or "[]")
+            )
+        except (TypeError, ValueError):
+            operation["response_items"] = []
+        return operation
+
+    def _load_fulfillment_api_operation(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        operation_id: Optional[int] = None,
+        attempt_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if operation_id is not None:
+            where.append("id = ?")
+            params.append(int(operation_id))
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(int(attempt_id))
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(int(user_id))
+        if not where:
+            return None
+        columns = ", ".join(self._FULFILLMENT_API_OPERATION_COLUMNS)
+        row = cursor.execute(
+            f"SELECT {columns} FROM fulfillment_api_operations "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchone()
+        return self._decode_fulfillment_api_operation(row)
+
+    def create_fulfillment_api_operation(
+        self,
+        *,
+        attempt_id: int,
+        card_id: int,
+        idempotency_key: str,
+        config_fingerprint: str,
+        request_spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        key = str(idempotency_key or "").strip()
+        fingerprint = str(config_fingerprint or "").strip()
+        if not key or not fingerprint or not isinstance(request_spec, dict):
+            return {"outcome": "conflict", "operation": None}
+        spec_json = json.dumps(
+            request_spec,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if not attempt:
+                    self.conn.rollback()
+                    return {"outcome": "conflict", "operation": None}
+                existing = self._load_fulfillment_api_operation(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if existing:
+                    same = (
+                        existing.get("card_id") == int(card_id)
+                        and existing.get("idempotency_key") == key
+                        and existing.get("config_fingerprint") == fingerprint
+                        and json.dumps(
+                            existing.get("request_spec") or {},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        == spec_json
+                    )
+                    self.conn.commit()
+                    return {
+                        "outcome": "existing" if same else "conflict",
+                        "operation": existing,
+                    }
+                card = cursor.execute(
+                    "SELECT 1 FROM cards WHERE id = ? AND user_id = ? AND type = 'api'",
+                    (int(card_id), int(attempt["user_id"])),
+                ).fetchone()
+                if not card:
+                    self.conn.rollback()
+                    return {"outcome": "conflict", "operation": None}
+                now = time.time()
+                cursor.execute(
+                    "INSERT INTO fulfillment_api_operations "
+                    "(attempt_id, user_id, cookie_id, card_id, idempotency_key, "
+                    "config_fingerprint, request_spec_json, state, attempt_count, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', 0, ?, ?)",
+                    (
+                        int(attempt_id),
+                        int(attempt["user_id"]),
+                        str(attempt["cookie_id"]),
+                        int(card_id),
+                        key,
+                        fingerprint,
+                        spec_json,
+                        now,
+                        now,
+                    ),
+                )
+                operation = self._load_fulfillment_api_operation(
+                    cursor, operation_id=int(cursor.lastrowid)
+                )
+                self.conn.commit()
+                return {"outcome": "created", "operation": operation}
+            except sqlite3.IntegrityError:
+                self.conn.rollback()
+                with self.lock:
+                    existing = self._load_fulfillment_api_operation(
+                        self.conn.cursor(), attempt_id=int(attempt_id)
+                    )
+                return {"outcome": "existing", "operation": existing}
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("创建 API 履约操作失败 type={}", type(exc).__name__)
+                return {"outcome": "conflict", "operation": None}
+
+    def get_fulfillment_api_operation(
+        self,
+        operation_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        *,
+        attempt_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self._load_fulfillment_api_operation(
+                self.conn.cursor(),
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                user_id=user_id,
+            )
+
+    def record_fulfillment_api_attempt(
+        self,
+        operation_id: int,
+        *,
+        state: str,
+        http_status: Optional[int] = None,
+        external_operation_id: str = "",
+        response_items: Optional[Sequence[Any]] = None,
+        reason_code: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        normalized_state = str(state or "").strip()
+        if normalized_state not in {
+            "prepared", "pending", "succeeded", "failed", "manual_review"
+        }:
+            raise ValueError("API 履约状态无效")
+        items_json = None
+        if response_items is not None:
+            items = [str(item) for item in response_items]
+            items_json = json.dumps(
+                items,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                current = self._load_fulfillment_api_operation(
+                    cursor, operation_id=int(operation_id)
+                )
+                if not current or int(current["attempt_count"]) >= 4:
+                    self.conn.rollback()
+                    return current
+                fields = [
+                    "state = ?",
+                    "attempt_count = attempt_count + 1",
+                    "http_status = ?",
+                    "external_operation_id = ?",
+                    "reason_code = ?",
+                    "updated_at = ?",
+                ]
+                params: List[Any] = [
+                    normalized_state,
+                    int(http_status) if http_status is not None else None,
+                    str(external_operation_id or "")[:256],
+                    self._fulfillment_reason(reason_code) if reason_code else "",
+                    time.time(),
+                ]
+                if items_json is not None:
+                    fields.append("response_items_json = ?")
+                    params.append(items_json)
+                params.append(int(operation_id))
+                cursor.execute(
+                    f"UPDATE fulfillment_api_operations SET {', '.join(fields)} "
+                    "WHERE id = ? AND attempt_count < 4",
+                    params,
+                )
+                updated = self._load_fulfillment_api_operation(
+                    cursor, operation_id=int(operation_id)
+                )
+                self.conn.commit()
+                return updated
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    _FULFILLMENT_PAYLOAD_COLUMNS = (
+        "id",
+        "attempt_id",
+        "user_id",
+        "cookie_id",
+        "source_type",
+        "source_card_id",
+        "source_operation_id",
+        "payload_json",
+        "payload_hash",
+        "created_at",
+    )
+
+    @classmethod
+    def _decode_fulfillment_payload(
+        cls,
+        row: Optional[Sequence[Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        payload = dict(zip(cls._FULFILLMENT_PAYLOAD_COLUMNS, row))
+        for key in ("id", "attempt_id", "user_id"):
+            payload[key] = int(payload[key])
+        for key in ("source_card_id", "source_operation_id"):
+            payload[key] = int(payload[key]) if payload[key] is not None else None
+        try:
+            payload["payloads"] = json.loads(str(payload.pop("payload_json") or "[]"))
+        except (TypeError, ValueError):
+            payload["payloads"] = []
+        return payload
+
+    def _load_fulfillment_payload(
+        self,
+        cursor: sqlite3.Cursor,
+        *,
+        payload_id: Optional[int] = None,
+        attempt_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if payload_id is not None:
+            where.append("id = ?")
+            params.append(int(payload_id))
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(int(attempt_id))
+        if user_id is not None:
+            where.append("user_id = ?")
+            params.append(int(user_id))
+        if not where:
+            return None
+        columns = ", ".join(self._FULFILLMENT_PAYLOAD_COLUMNS)
+        row = cursor.execute(
+            f"SELECT {columns} FROM fulfillment_delivery_payloads "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).fetchone()
+        return self._decode_fulfillment_payload(row)
+
+    def commit_fulfillment_delivery_payload(
+        self,
+        attempt_id: int,
+        payloads: Sequence[Any],
+        *,
+        source_type: str,
+        source_operation_id: Optional[int] = None,
+        source_card_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if isinstance(payloads, (str, bytes)):
+            payload_values = [str(payloads)]
+        else:
+            payload_values = [str(value) for value in payloads]
+        if not payload_values or any(not value for value in payload_values):
+            return {"outcome": "conflict", "payload": None}
+        payload_json = json.dumps(
+            payload_values,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                attempt = self._load_fulfillment_attempt(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if not attempt or len(payload_values) != int(attempt["expected_quantity"]):
+                    self.conn.rollback()
+                    return {"outcome": "conflict", "payload": None}
+                existing = self._load_fulfillment_payload(
+                    cursor, attempt_id=int(attempt_id)
+                )
+                if existing:
+                    same = existing.get("payload_hash") == payload_hash
+                    self.conn.commit()
+                    return {
+                        "outcome": "existing" if same else "conflict",
+                        "payload": existing,
+                    }
+                now = time.time()
+                cursor.execute(
+                    "INSERT INTO fulfillment_delivery_payloads "
+                    "(attempt_id, user_id, cookie_id, source_type, source_card_id, "
+                    "source_operation_id, payload_json, payload_hash, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(attempt_id),
+                        int(attempt["user_id"]),
+                        str(attempt["cookie_id"]),
+                        str(source_type or "resource")[:32],
+                        int(source_card_id) if source_card_id is not None else None,
+                        int(source_operation_id)
+                        if source_operation_id is not None
+                        else None,
+                        payload_json,
+                        payload_hash,
+                        now,
+                    ),
+                )
+                payload = self._load_fulfillment_payload(
+                    cursor, payload_id=int(cursor.lastrowid)
+                )
+                self.conn.commit()
+                return {"outcome": "committed", "payload": payload}
+            except sqlite3.IntegrityError:
+                self.conn.rollback()
+                existing = self.get_fulfillment_delivery_payload(
+                    attempt_id=int(attempt_id)
+                )
+                return {
+                    "outcome": "existing"
+                    if existing and existing.get("payload_hash") == payload_hash
+                    else "conflict",
+                    "payload": existing,
+                }
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("提交履约载荷失败 type={}", type(exc).__name__)
+                return {"outcome": "conflict", "payload": None}
+
+    def get_fulfillment_delivery_payload(
+        self,
+        payload_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        *,
+        attempt_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            return self._load_fulfillment_payload(
+                self.conn.cursor(),
+                payload_id=payload_id,
+                attempt_id=attempt_id,
+                user_id=user_id,
+            )
+
+    def record_fulfillment_resend_event(
+        self,
+        *,
+        payload_id: int,
+        status: str,
+        user_id: Optional[int] = None,
+        attempt_id: Optional[int] = None,
+        cookie_id: Optional[str] = None,
+        request_mid: str = "",
+        reason_code: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        normalized_status = str(status or "").strip()
+        if normalized_status not in {"prepared", "succeeded", "failed", "ambiguous"}:
+            raise ValueError("重发状态无效")
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                payload = self._load_fulfillment_payload(
+                    cursor,
+                    payload_id=int(payload_id),
+                    user_id=user_id,
+                )
+                if not payload:
+                    self.conn.rollback()
+                    return None
+                resolved_attempt_id = int(attempt_id or payload["attempt_id"])
+                resolved_cookie_id = str(cookie_id or payload["cookie_id"])
+                now = time.time()
+                cursor.execute(
+                    "INSERT INTO fulfillment_resend_events "
+                    "(payload_id, attempt_id, user_id, cookie_id, status, "
+                    "request_mid, reason_code, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(payload_id),
+                        resolved_attempt_id,
+                        int(payload["user_id"]),
+                        resolved_cookie_id,
+                        normalized_status,
+                        str(request_mid or "")[:128],
+                        self._fulfillment_reason(reason_code) if reason_code else "",
+                        now,
+                    ),
+                )
+                event_id = int(cursor.lastrowid)
+                self.conn.commit()
+                return {
+                    "id": event_id,
+                    "payload_id": int(payload_id),
+                    "attempt_id": resolved_attempt_id,
+                    "status": normalized_status,
+                    "request_mid": str(request_mid or "")[:128],
+                    "reason_code": self._fulfillment_reason(reason_code)
+                    if reason_code
+                    else "",
+                    "created_at": now,
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def list_fulfillment_records(
+        self,
+        user_id: int,
+        *,
+        state: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        limit = min(max(int(limit), 1), 200)
+        offset = max(int(offset), 0)
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT p.id, p.attempt_id, p.cookie_id, p.source_type,
+                       p.source_card_id, p.created_at, a.state, a.reason_code,
+                       a.expected_quantity, a.order_id, a.updated_at,
+                       o.item_id, c.name,
+                       (SELECT r.status FROM fulfillment_resend_events AS r
+                        WHERE r.payload_id = p.id ORDER BY r.id DESC LIMIT 1)
+                FROM fulfillment_delivery_payloads AS p
+                JOIN fulfillment_attempts AS a
+                  ON a.id = p.attempt_id AND a.user_id = p.user_id
+                LEFT JOIN orders AS o
+                  ON o.order_id = a.order_id AND o.cookie_id = a.cookie_id
+                LEFT JOIN cards AS c ON c.id = p.source_card_id
+                WHERE p.user_id = ?
+                ORDER BY p.created_at DESC, p.id DESC
+                """,
+                (int(user_id),),
+            ).fetchall()
+        mapped: List[Dict[str, Any]] = []
+        for row in rows:
+            attempt_state = str(row[6] or "")
+            record_state = {
+                "committed": "succeeded",
+                "manual_review": "manual_review",
+                "released": "failed",
+                "prepared": "pending",
+                "sending": "pending",
+            }.get(attempt_state, "pending")
+            latest_resend = str(row[13] or "")
+            visible_state = "ambiguous" if latest_resend == "ambiguous" else record_state
+            if state and state != "all" and visible_state != state:
+                continue
+            mapped.append(
+                {
+                    "id": int(row[0]),
+                    "attempt_id": int(row[1]),
+                    "cookie_id": str(row[2]),
+                    "source_type": str(row[3]),
+                    "resource_id": int(row[4]) if row[4] is not None else None,
+                    "created_at": row[5],
+                    "status": visible_state,
+                    "reason_code": str(row[7] or ""),
+                    "quantity": int(row[8]),
+                    "order_id": str(row[9]),
+                    "updated_at": row[10],
+                    "item_id": str(row[11] or ""),
+                    "resource_name": str(row[12] or ""),
+                    "payload_preview": f"已保存 {int(row[8])} 条交付内容",
+                    "can_resend": attempt_state == "committed",
+                    "latest_resend_status": latest_resend or None,
+                }
+            )
+        total = len(mapped)
+        return {"items": mapped[offset:offset + limit], "total": total}
+
     def consume_batch_data(self, card_id: int):
         """消费批量数据的第一条记录（线程安全）"""
         with self.lock:
@@ -8057,39 +9589,276 @@ class DBManager:
             logger.error(f"获取商品多数量发货状态失败: {e}")
             return False
 
+    def set_item_delivery_mode(
+        self,
+        cookie_id: str,
+        item_id: str,
+        mode: str,
+        user_id: int,
+        *,
+        card_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically select off, one local resource, or invite fulfillment."""
+        normalized_mode = str(mode or "").strip().lower()
+        if normalized_mode not in {"off", "resource", "invite"}:
+            return {"outcome": "failed", "error": "invalid_mode"}
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                item = cursor.execute(
+                    "SELECT 1 FROM item_info AS i "
+                    "JOIN cookies AS c ON c.id = i.cookie_id "
+                    "WHERE i.cookie_id = ? AND i.item_id = ? AND c.user_id = ?",
+                    (str(cookie_id), str(item_id), int(user_id)),
+                ).fetchone()
+                if not item:
+                    self.conn.rollback()
+                    return {"outcome": "failed", "error": "item_not_found"}
+
+                selected_card_id: Optional[int] = None
+                invite_enabled = 0
+                if normalized_mode == "resource":
+                    try:
+                        selected_card_id = int(card_id) if card_id is not None else None
+                    except (TypeError, ValueError):
+                        selected_card_id = None
+                    if selected_card_id is None:
+                        self.conn.rollback()
+                        return {"outcome": "failed", "error": "resource_required"}
+                    card = cursor.execute(
+                        "SELECT type, api_config, api_token_encrypted, "
+                        "api_validation_status, enabled FROM cards "
+                        "WHERE id = ? AND user_id = ?",
+                        (selected_card_id, int(user_id)),
+                    ).fetchone()
+                    if not card:
+                        self.conn.rollback()
+                        return {"outcome": "failed", "error": "resource_not_found"}
+                    if not bool(card[4]):
+                        self.conn.rollback()
+                        return {"outcome": "failed", "error": "resource_disabled"}
+                    if str(card[0]) == "api":
+                        try:
+                            config = self._card_api_config_dict(card[1]) or {}
+                        except ValueError:
+                            config = {}
+                        if (
+                            config.get("protocol") != FULFILLMENT_API_PROTOCOL
+                            or not str(config.get("url") or "").lower().startswith("https://")
+                            or str(card[3] or "") != "validated"
+                            or not str(card[2] or "")
+                        ):
+                            self.conn.rollback()
+                            return {
+                                "outcome": "failed",
+                                "error": "api_resource_not_validated",
+                            }
+                elif normalized_mode == "invite":
+                    invite_enabled = 1
+
+                cursor.execute(
+                    "UPDATE item_info SET delivery_mode = ?, delivery_card_id = ?, "
+                    "invite_auto_fulfillment = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE cookie_id = ? AND item_id = ?",
+                    (
+                        normalized_mode,
+                        selected_card_id,
+                        invite_enabled,
+                        str(cookie_id),
+                        str(item_id),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return {"outcome": "failed", "error": "item_not_found"}
+                self.conn.commit()
+                return {
+                    "outcome": "updated",
+                    "mode": normalized_mode,
+                    "card_id": selected_card_id,
+                }
+            except Exception as exc:
+                self.conn.rollback()
+                logger.error("更新商品发货模式失败 type={}", type(exc).__name__)
+                return {"outcome": "failed", "error": "storage_error"}
+
+    def set_item_delivery_modes_batch(
+        self,
+        cookie_id: str,
+        item_ids: Sequence[Any],
+        mode: str,
+        user_id: int,
+        *,
+        card_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        updated: List[str] = []
+        failed: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for raw_item_id in list(item_ids)[:500]:
+            normalized_item_id = str(raw_item_id or "").strip()
+            if not normalized_item_id or normalized_item_id in seen:
+                continue
+            seen.add(normalized_item_id)
+            result = self.set_item_delivery_mode(
+                cookie_id,
+                normalized_item_id,
+                mode,
+                user_id,
+                card_id=card_id,
+            )
+            if result.get("outcome") == "updated":
+                updated.append(normalized_item_id)
+            else:
+                failed.append(
+                    {
+                        "item_id": normalized_item_id,
+                        "error": str(result.get("error") or "update_failed"),
+                    }
+                )
+        return {"updated": updated, "failed": failed}
+
+    def get_item_delivery_binding_status(
+        self,
+        cookie_id: str,
+        item_id: str,
+        user_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Describe an explicit selection without silently falling back."""
+        with self.lock:
+            try:
+                row = self.conn.execute(
+                    """
+                    SELECT i.delivery_mode, i.delivery_card_id,
+                           i.invite_auto_fulfillment,
+                           c.id, c.name, c.type, c.api_config, c.text_content,
+                           c.data_content, c.image_url, c.enabled, c.description,
+                           c.delay_seconds, c.is_multi_spec, c.spec_name, c.spec_value,
+                           c.api_token_encrypted, c.api_validation_status
+                    FROM item_info AS i
+                    JOIN cookies AS owner ON owner.id = i.cookie_id
+                    LEFT JOIN cards AS c
+                      ON c.id = i.delivery_card_id AND c.user_id = owner.user_id
+                    WHERE i.cookie_id = ? AND i.item_id = ? AND owner.user_id = ?
+                    """,
+                    (str(cookie_id), str(item_id), int(user_id)),
+                ).fetchone()
+                if not row:
+                    return None
+
+                mode = str(row[0] or "").strip()
+                if not mode:
+                    if bool(row[2]):
+                        mode = "invite"
+                    elif row[1] is not None:
+                        mode = "resource"
+                    else:
+                        return {
+                            "mode": "legacy",
+                            "status": "unbound",
+                            "resource_status": "unbound",
+                            "binding_explicit": False,
+                            "delivery_card_id": None,
+                            "rule": None,
+                        }
+                result: Dict[str, Any] = {
+                    "mode": mode,
+                    "status": "active",
+                    "resource_status": "active",
+                    "binding_explicit": True,
+                    "delivery_card_id": int(row[1]) if row[1] is not None else None,
+                    "rule": None,
+                }
+                if mode == "off":
+                    result.update(status="explicit_off", resource_status="explicit_off")
+                    return result
+                if mode == "invite":
+                    result.update(status="invite", resource_status="invite")
+                    return result
+                if mode != "resource" or row[1] is None or row[3] is None:
+                    result.update(status="missing", resource_status="missing")
+                    return result
+                if not bool(row[10]):
+                    result.update(status="disabled", resource_status="disabled")
+                    return result
+
+                card_type = str(row[5] or "")
+                api_config: Any = self._public_card_api_config(row[6])
+                if card_type == "data" and not any(
+                    line.strip() for line in str(row[8] or "").splitlines()
+                ):
+                    result.update(status="out_of_stock", resource_status="out_of_stock")
+                    return result
+                if card_type == "text" and not str(row[7] or "").strip():
+                    result.update(status="empty", resource_status="empty")
+                    return result
+                if card_type == "image" and not str(row[9] or "").strip():
+                    result.update(status="empty", resource_status="empty")
+                    return result
+                if card_type == "api":
+                    try:
+                        runtime_config = self.get_card_api_runtime_config(
+                            int(row[3]), int(user_id)
+                        ) or {}
+                    except ValueError:
+                        runtime_config = {}
+                    if (
+                        runtime_config.get("protocol") != FULFILLMENT_API_PROTOCOL
+                        or not str(runtime_config.get("url") or "").lower().startswith("https://")
+                        or runtime_config.get("validation_status") != "validated"
+                        or not runtime_config.get("api_token")
+                    ):
+                        result.update(
+                            status="protocol_invalid",
+                            resource_status="protocol_invalid",
+                        )
+                        return result
+                    api_config = runtime_config
+
+                result["rule"] = {
+                    "id": None,
+                    "keyword": "",
+                    "card_id": int(row[3]),
+                    "delivery_count": 1,
+                    "enabled": True,
+                    "description": row[11],
+                    "delivery_times": 0,
+                    "card_name": row[4],
+                    "card_type": card_type,
+                    "api_config": api_config,
+                    "text_content": row[7],
+                    "data_content": row[8],
+                    "image_url": row[9],
+                    "card_enabled": bool(row[10]),
+                    "card_description": row[11],
+                    "card_delay_seconds": int(row[12] or 0),
+                    "is_multi_spec": bool(row[13]),
+                    "spec_name": row[14],
+                    "spec_value": row[15],
+                    "source": "item_binding",
+                }
+                return result
+            except Exception as exc:
+                logger.error("读取商品发货模式失败 type={}", type(exc).__name__)
+                return None
+
     def update_item_invite_auto_fulfillment_status(
         self,
         cookie_id: str,
         item_id: str,
         enabled: bool,
     ) -> bool:
-        """Enable or disable the invite bridge for one account-owned item."""
-        try:
-            with self.lock:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    """
-                    UPDATE item_info
-                    SET invite_auto_fulfillment = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE cookie_id = ? AND item_id = ?
-                    """,
-                    (bool(enabled), cookie_id, item_id),
-                )
-                if cursor.rowcount <= 0:
-                    # 0 行也已隐式开启事务，必须显式结束，否则悬挂事务会击穿后续 BEGIN IMMEDIATE
-                    self.conn.rollback()
-                    return False
-                self.conn.commit()
-                logger.info(
-                    "更新邀请自动发货状态成功: item_id={} enabled={}",
-                    item_id,
-                    bool(enabled),
-                )
-                return True
-        except Exception as exc:
-            logger.error("更新邀请自动发货状态失败: {}", type(exc).__name__)
-            self.conn.rollback()
+        """Compatibility route into the same explicit three-mode transaction."""
+        user_id = self.get_cookie_user_id(cookie_id)
+        if user_id is None:
             return False
+        result = self.set_item_delivery_mode(
+            cookie_id,
+            item_id,
+            "invite" if enabled else "off",
+            int(user_id),
+        )
+        return result.get("outcome") == "updated"
 
     def is_invite_auto_fulfillment_enabled(
         self,
@@ -8119,53 +9888,15 @@ class DBManager:
         card_id: Optional[int],
         user_id: int,
     ) -> bool:
-        """Bind (or clear) the card delivered for one item.
-
-        商品级绑定取代"用商品标题去模糊匹配关键词规则"这一脆弱路径。卡密必须属于
-        同一用户；绑定卡密时同时关闭邀请发货，保证两条履约通道互斥、不会双扣库存。
-        """
-        with self.lock:
-            try:
-                cursor = self.conn.cursor()
-                if card_id is not None:
-                    owned = cursor.execute(
-                        'SELECT 1 FROM cards WHERE id = ? AND user_id = ?',
-                        (int(card_id), int(user_id)),
-                    ).fetchone()
-                    if not owned:
-                        self.conn.rollback()
-                        return False
-                cursor.execute(
-                    '''
-                    UPDATE item_info
-                    SET delivery_card_id = ?,
-                        invite_auto_fulfillment = CASE
-                            WHEN ? IS NULL THEN invite_auto_fulfillment ELSE FALSE
-                        END,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE cookie_id = ? AND item_id = ?
-                    ''',
-                    (
-                        int(card_id) if card_id is not None else None,
-                        int(card_id) if card_id is not None else None,
-                        str(cookie_id),
-                        str(item_id),
-                    ),
-                )
-                if cursor.rowcount <= 0:
-                    self.conn.rollback()
-                    return False
-                self.conn.commit()
-                logger.info(
-                    "更新商品发货绑定成功: item_id={} card_bound={}",
-                    item_id,
-                    card_id is not None,
-                )
-                return True
-            except Exception as exc:
-                logger.error("更新商品发货绑定失败: {}", type(exc).__name__)
-                self.conn.rollback()
-                return False
+        """Compatibility route into the same explicit three-mode transaction."""
+        result = self.set_item_delivery_mode(
+            cookie_id,
+            item_id,
+            "resource" if card_id is not None else "off",
+            user_id,
+            card_id=card_id,
+        )
+        return result.get("outcome") == "updated"
 
     def get_item_bound_delivery_rule(
         self,
@@ -8173,57 +9904,12 @@ class DBManager:
         item_id: str,
         user_id: int,
     ) -> Optional[Dict[str, Any]]:
-        """Return the item's bound card shaped like a delivery rule.
-
-        形状与 get_delivery_rules_by_keyword 的元素保持一致，让发货引擎无需分叉。
-        """
-        with self.lock:
-            try:
-                row = self.conn.execute(
-                    '''
-                    SELECT c.id, c.name, c.type, c.api_config, c.text_content,
-                           c.data_content, c.image_url, c.enabled, c.description,
-                           c.delay_seconds, c.is_multi_spec, c.spec_name, c.spec_value
-                    FROM item_info i
-                    JOIN cards c ON c.id = i.delivery_card_id
-                    WHERE i.cookie_id = ? AND i.item_id = ?
-                      AND c.user_id = ? AND c.enabled = 1
-                    ''',
-                    (str(cookie_id), str(item_id), int(user_id)),
-                ).fetchone()
-            except Exception as exc:
-                logger.error("读取商品发货绑定失败: {}", type(exc).__name__)
-                return None
-        if not row:
+        """Return only an active explicit resource shaped like a delivery rule."""
+        status = self.get_item_delivery_binding_status(cookie_id, item_id, user_id)
+        if not status or status.get("status") != "active":
             return None
-        api_config = row[3]
-        if api_config:
-            try:
-                api_config = json.loads(api_config)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return {
-            'id': None,
-            'keyword': '',
-            'card_id': row[0],
-            'delivery_count': 1,
-            'enabled': True,
-            'description': row[8],
-            'delivery_times': 0,
-            'card_name': row[1],
-            'card_type': row[2],
-            'api_config': api_config,
-            'text_content': row[4],
-            'data_content': row[5],
-            'image_url': row[6],
-            'card_enabled': bool(row[7]),
-            'card_description': row[8],
-            'card_delay_seconds': row[9] or 0,
-            'is_multi_spec': bool(row[10]) if row[10] is not None else False,
-            'spec_name': row[11],
-            'spec_value': row[12],
-            'source': 'item_binding',
-        }
+        rule = status.get("rule")
+        return dict(rule) if isinstance(rule, dict) else None
 
     def get_invite_auto_fulfillment_item_ids(
         self,
@@ -9731,8 +11417,7 @@ class DBManager:
                 ).fetchone()[0]
                 rows = cursor.execute(
                     f"{cte}SELECT {', '.join(self._ORDER_LIST_COLUMNS)} {base}"
-                    " ORDER BY o.cookie_id ASC, o.ordered_at_utc DESC,"
-                    " o.order_id DESC LIMIT ? OFFSET ?",
+                    " ORDER BY o.ordered_at_utc DESC, o.order_id DESC LIMIT ? OFFSET ?",
                     [*query_params, page_size, (page - 1) * page_size],
                 ).fetchall()
                 column_names = [

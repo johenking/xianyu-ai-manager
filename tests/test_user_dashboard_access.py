@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -452,6 +452,25 @@ class UserDashboardAccessTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403, response.text)
         live_class.assert_not_called()
+
+    def test_item_page_fetch_uses_non_listener_instance(self):
+        instance = MagicMock()
+        instance.get_item_list_info = AsyncMock(return_value={"current_count": 0})
+        instance.close_session = AsyncMock()
+        with patch("XianyuAutoAsync.XianyuLive", return_value=instance) as live_class:
+            response = self.client.post(
+                "/items/get-by-page",
+                headers=self.headers_for(self.user_one),
+                json={"cookie_id": "one-active", "page_number": 1, "page_size": 20},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        live_class.assert_called_once_with(
+            "unb=one-active; cookie2=session",
+            "one-active",
+            register_instance=False,
+        )
+        instance.get_item_list_info.assert_awaited_once_with(1, 20)
 
     def test_operational_cache_and_log_endpoints_require_admin(self):
         headers = self.headers_for(self.user_one)

@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 236)
+        self.assertEqual(len(signatures), 244)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -53,6 +53,12 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/internal/invite/mark-fulfilled"), signatures)
         self.assertIn(("GET", "/internal/invite/operations/{operation_key}"), signatures)
         self.assertIn(("PUT", "/items/{cookie_id}/{item_id}/invite-auto-fulfillment"), signatures)
+        self.assertIn(("PUT", "/items/{cookie_id}/{item_id}/delivery-mode"), signatures)
+        self.assertIn(("POST", "/items/delivery-modes/batch"), signatures)
+        self.assertIn(("POST", "/cards/{card_id}/stock/import"), signatures)
+        self.assertIn(("POST", "/cards/{card_id}/api/validate"), signatures)
+        self.assertIn(("GET", "/fulfillment-records"), signatures)
+        self.assertIn(("POST", "/fulfillment-records/{payload_id}/resend"), signatures)
         self.assertIn(("GET", "/api/auth/registration-config"), signatures)
         self.assertIn(("POST", "/api/auth/password-reset"), signatures)
         self.assertIn(("POST", "/api/auth/password-reset/verify-code"), signatures)
@@ -66,6 +72,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/api/accounts/{cookie_id}/session-refresh/show-browser"), signatures)
         self.assertIn(("POST", "/qr-login/cancel/{session_id}"), signatures)
         self.assertIn(("POST", "/api/accounts/{cid}/renewal-binding"), signatures)
+        self.assertIn(("PUT", "/cookies/{cid}/auto-rate"), signatures)
         self.assertIn(("POST", "/api/client-browser/devices"), signatures)
         self.assertIn(("GET", "/api/client-browser/devices"), signatures)
         self.assertIn(("DELETE", "/api/client-browser/devices/{device_id}"), signatures)

@@ -274,6 +274,7 @@ class HumanVerificationPolicyTests(unittest.TestCase):
                         "item_id": returned_item_id,
                         "buyer_id": returned_buyer_id,
                         "order_status": "pending_ship",
+                        "order_business_type": "ordinary",
                     }],
                 })
                 return await live._verify_paid_order_for_delivery(
@@ -323,6 +324,7 @@ class HumanVerificationPolicyTests(unittest.TestCase):
                     "item_id": "item-for-test",
                     "buyer_id": "buyer-for-test",
                     "order_status": "pending_ship",
+                    "order_business_type": "ordinary",
                 }],
             })
 
@@ -441,6 +443,54 @@ class HumanVerificationPolicyTests(unittest.TestCase):
         database.release_fulfillment_attempt.assert_not_called()
         live.mark_delivery_sent.assert_called_once_with("order-for-test")
 
+    def test_nonordinary_order_stops_before_every_fulfillment_side_effect(self):
+        live = self._make_fulfillment_live()
+        live._verify_paid_order_for_delivery.return_value = {
+            "allowed": False,
+            "status": "pending_ship",
+            "business_type": "lead",
+            "error_code": "lead_order_not_fulfillable",
+            "reason": "订单不是可自动发货的普通实物订单",
+        }
+        database = self._fulfillment_database()
+
+        self._run_fulfillment(live, database)
+
+        database.begin_fulfillment_attempt.assert_not_called()
+        database.apply_order_sync_update.assert_not_called()
+        live._auto_delivery.assert_not_awaited()
+        live.auto_confirm.assert_not_awaited()
+        live.auto_freeshipping.assert_not_awaited()
+        live.send_msg.assert_not_awaited()
+        live.send_image_msg.assert_not_awaited()
+
+    def test_paid_order_snapshot_is_written_before_fulfillment(self):
+        live = self._make_fulfillment_live()
+        live._verify_paid_order_for_delivery.return_value = {
+            "allowed": True,
+            "quantity": 2,
+            "amount": "12.34",
+            "created_at": "2026-07-10 14:30:00",
+        }
+        database = self._fulfillment_database()
+
+        self._run_fulfillment(live, database)
+
+        database.apply_order_sync_update.assert_called_once()
+        snapshot = database.apply_order_sync_update.call_args.kwargs
+        self.assertEqual(snapshot["order_id"], "order-for-test")
+        self.assertEqual(snapshot["incoming_status"], "pending_ship")
+        self.assertEqual(snapshot["status_source"], "realtime_message")
+        self.assertEqual(snapshot["paid_amount_fen"], 1234)
+        self.assertEqual(snapshot["quantity"], "2")
+        database.reconcile_order_status_events.assert_called_once_with(
+            cookie_id="account-for-test",
+            order_id="order-for-test",
+            item_id="item-for-test",
+            buyer_id="buyer-for-test",
+            chat_id="chat-for-test",
+        )
+
     def test_sending_transition_failure_releases_without_platform_or_message_side_effects(self):
         live = self._make_fulfillment_live()
         database = self._fulfillment_database()
@@ -533,12 +583,17 @@ class HumanVerificationPolicyTests(unittest.TestCase):
         database.commit_fulfillment_attempt.assert_not_called()
         self.assertEqual(live.send_msg.await_count, 2)
 
-    def test_batch_cards_require_persistent_reservation_and_api_cards_fail_closed(self):
+    def test_batch_cards_reserve_and_api_v1_persists_before_delivery(self):
         source = inspect.getsource(XianyuLive._auto_delivery)
+        api_source = inspect.getsource(XianyuLive._prepare_fulfillment_api_v1_payloads)
 
         self.assertIn("reserve_batch_card_data", source)
         self.assertNotIn("consume_batch_data", source)
-        self.assertIn("api_card_requires_manual_review", source)
+        self.assertIn("_prepare_fulfillment_api_v1_payloads", source)
+        self.assertIn("FULFILLMENT_API_PROTOCOL", api_source)
+        self.assertIn("create_fulfillment_api_operation", api_source)
+        self.assertIn("commit_fulfillment_delivery_payload", api_source)
+        self.assertIn("idempotency_key", api_source)
 
     def test_fulfillment_state_machine_has_no_platform_action_before_sending_transition(self):
         source = inspect.getsource(XianyuLive._execute_fulfillment_attempt)

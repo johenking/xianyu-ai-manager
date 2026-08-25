@@ -26,7 +26,7 @@ from config import config as cfg  # 导入config实例（不是模块），使�
 import sys
 import aiohttp
 from collections import defaultdict
-from db_manager import db_manager
+from db_manager import FULFILLMENT_API_PROTOCOL, db_manager
 from account_session_refresh import (
     RETRYABLE_SESSION_ERROR_CODES,
     is_retryable_session_error_code,
@@ -47,6 +47,12 @@ from utils.outbound_http import (
     request_public_http,
 )
 from utils.outbound_smtp import open_public_smtp
+from utils.xianyu_message import (
+    IMAGE_PLACEHOLDER,
+    extract_inbound_content,
+    message_has_content,
+    normalize_operation_message,
+)
 
 AUTO_DELIVERY_SOURCE_PAID_NOTICE = "paid_notice"
 AUTO_DELIVERY_SOURCE_BARGAIN_FREESHIPPING = "bargain_freeshipping"
@@ -61,6 +67,25 @@ WS_SEND_TIMEOUT = 10      # 单次业务帧发送上限，避免 await send 永�
 
 # 发货前付款核验的翻页上限。该核验持有账号订单同步锁，页数直接决定锁占用时长。
 DELIVERY_VERIFY_MAX_PAGES = 5
+FULFILLMENT_API_MAX_ATTEMPTS = 4
+
+# Shadow 默认开启，仍可通过环境变量立即关闭。
+AI_REPLY_SHADOW_ENABLED = os.getenv("AI_REPLY_SHADOW_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+AI_REPLY_SHADOW_TIMEOUT_SECONDS = 8
+_AI_REPLY_SHADOW_SEMAPHORE = None
+_AI_REPLY_SHADOW_LOOP = None
+
+
+def _get_ai_reply_shadow_semaphore():
+    """单 worker 事件循环内共享一个 Shadow 模型并发槽。"""
+    global _AI_REPLY_SHADOW_SEMAPHORE, _AI_REPLY_SHADOW_LOOP
+    loop = asyncio.get_running_loop()
+    if _AI_REPLY_SHADOW_SEMAPHORE is None or _AI_REPLY_SHADOW_LOOP is not loop:
+        _AI_REPLY_SHADOW_SEMAPHORE = asyncio.Semaphore(1)
+        _AI_REPLY_SHADOW_LOOP = loop
+    return _AI_REPLY_SHADOW_SEMAPHORE
 
 # 只能由人工完成认证才可离开的会话状态。任何自动路径把它们改写成 failed，
 # 都会让监听器闸门失灵：账号一边无限重连，一边不再对外显示"需人工重新登录"。
@@ -328,7 +353,7 @@ def extract_catalog_image_url(card_data: dict) -> str:
 class AutoReplyPauseManager:
     """自动回复暂停管理器"""
     def __init__(self):
-        # 存储每个chat_id的暂停信息 {chat_id: pause_until_timestamp}
+        # 暂停必须按账号和会话共同隔离，避免多个卖家账号使用同一 chat_id 时串台。
         self.paused_chats = {}
 
     def pause_chat(self, chat_id: str, cookie_id: str):
@@ -348,34 +373,36 @@ class AutoReplyPauseManager:
 
         pause_duration_seconds = pause_minutes * 60
         pause_until = time.time() + pause_duration_seconds
-        self.paused_chats[chat_id] = pause_until
+        self.paused_chats[(cookie_id, chat_id)] = pause_until
 
         # 计算暂停结束时间
         end_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pause_until))
         logger.info(f"【{cookie_id}】检测到手动发出消息，自动回复暂停{pause_minutes}分钟，恢复时间: {end_time}")
 
-    def is_chat_paused(self, chat_id: str) -> bool:
-        """检查指定chat_id是否处于暂停状态"""
-        if chat_id not in self.paused_chats:
+    def is_chat_paused(self, chat_id: str, cookie_id: str) -> bool:
+        """检查指定账号的chat_id是否处于暂停状态"""
+        pause_key = (cookie_id, chat_id)
+        if pause_key not in self.paused_chats:
             return False
 
         current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
+        pause_until = self.paused_chats[pause_key]
 
         if current_time >= pause_until:
             # 暂停时间已过，移除记录
-            del self.paused_chats[chat_id]
+            del self.paused_chats[pause_key]
             return False
 
         return True
 
-    def get_remaining_pause_time(self, chat_id: str) -> int:
-        """获取指定chat_id剩余暂停时间（秒）"""
-        if chat_id not in self.paused_chats:
+    def get_remaining_pause_time(self, chat_id: str, cookie_id: str) -> int:
+        """获取指定账号的chat_id剩余暂停时间（秒）"""
+        pause_key = (cookie_id, chat_id)
+        if pause_key not in self.paused_chats:
             return 0
 
         current_time = time.time()
-        pause_until = self.paused_chats[chat_id]
+        pause_until = self.paused_chats[pause_key]
         remaining = max(0, int(pause_until - current_time))
 
         return remaining
@@ -383,11 +410,11 @@ class AutoReplyPauseManager:
     def cleanup_expired_pauses(self):
         """清理已过期的暂停记录"""
         current_time = time.time()
-        expired_chats = [chat_id for chat_id, pause_until in self.paused_chats.items()
+        expired_keys = [pause_key for pause_key, pause_until in self.paused_chats.items()
                         if current_time >= pause_until]
 
-        for chat_id in expired_chats:
-            del self.paused_chats[chat_id]
+        for pause_key in expired_keys:
+            del self.paused_chats[pause_key]
 
 
 # 全局暂停管理器实例
@@ -983,6 +1010,7 @@ class XianyuLive:
         cookie_id: str = "default",
         user_id: int = None,
         runtime_state: dict = None,
+        register_instance: bool = True,
     ):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
@@ -1143,8 +1171,9 @@ class XianyuLive:
         # 初始化订单状态处理器
         self._init_order_status_handler()
 
-        # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        # 注册实例到类级别字典（用于API调用）；商品同步等临时实例不得覆盖在线监听器。
+        if register_instance:
+            self._register_instance()
 
     def _init_order_status_handler(self):
         """初始化订单状态处理器"""
@@ -1530,26 +1559,40 @@ class XianyuLive:
         """实时确认普通订单已付款；任何不确定状态都按未通过处理。"""
         from order_sync_service import (
             XianyuOrderListClient,
+            fetch_xianyu_order_detail,
             get_order_sync_lock,
             normalize_order_status,
+            ORDER_BUSINESS_ORDINARY,
+            parse_order_detail_payload,
             parse_trusted_order_quantity,
         )
 
         expected_item_id = str(item_id or "").strip()
         expected_buyer_id = str(buyer_id or "").strip()
-        # 这条路径在账号订单同步锁内运行，扫描越久，同步与其它发货就排队越久。
-        # 刚付款的订单必定排在列表最前，命中目标即早停；这里只为"订单查不到"的
-        # 最坏情况设上限，把锁占用从二十页压到五页（仍覆盖最近 100 笔）。
+        # 已知订单号优先查单订单详情，避免刚付款事件排在批量订单同步之后。
+        # 详情不可用时再回退到有页数上限的订单列表。
         client = XianyuOrderListClient(max_pages=DELIVERY_VERIFY_MAX_PAGES)
         try:
-            async with get_order_sync_lock(self.cookie_id):
-                discovery = await client.discover(
-                    cookie_id=self.cookie_id,
-                    cookie_string=self.cookies_str,
-                    days=365,
-                    user_agent=self.browser_user_agent,
-                    target_order_id=str(order_id),
+            discovery = {}
+            if str(order_id).isdigit():
+                discovery = parse_order_detail_payload(
+                    await fetch_xianyu_order_detail(
+                        cookie_id=self.cookie_id,
+                        cookie_string=self.cookies_str,
+                        order_id=str(order_id),
+                        user_agent=self.browser_user_agent,
+                    ),
+                    self.cookie_id,
                 )
+            if not discovery.get("success"):
+                async with get_order_sync_lock(self.cookie_id):
+                    discovery = await client.discover(
+                        cookie_id=self.cookie_id,
+                        cookie_string=self.cookies_str,
+                        days=365,
+                        user_agent=self.browser_user_agent,
+                        target_order_id=str(order_id),
+                    )
         except Exception as exc:
             reason = sanitize_runtime_error(
                 f"实时订单状态查询异常: {type(exc).__name__}"
@@ -1603,15 +1646,39 @@ class XianyuLive:
                 "attempts": 1,
             }
 
+        order_business_type = str(
+            result.get("order_business_type") or "unknown"
+        ).strip().lower()
         order_status = normalize_order_status(
             result.get("order_status"),
             str(result.get("platform_status_text") or ""),
         )
+        if order_business_type != ORDER_BUSINESS_ORDINARY:
+            error_code = (
+                "lead_order_not_fulfillable"
+                if order_business_type == "lead"
+                else "order_business_type_unconfirmed"
+            )
+            logger.warning(
+                "【{}】订单 {} 业务类型={}，跳过自动发货",
+                self.cookie_id,
+                order_id,
+                order_business_type,
+            )
+            return {
+                "allowed": False,
+                "status": order_status,
+                "business_type": order_business_type,
+                "error_code": error_code,
+                "reason": "订单不是可自动发货的普通实物订单",
+                "attempts": 1,
+            }
         if order_status == "pending_ship":
             logger.info(f"【{self.cookie_id}】订单 {order_id} 实时付款状态校验通过")
             return {
                 "allowed": True,
                 "status": order_status,
+                "business_type": order_business_type,
                 "reason": "买家已付款，等待卖家发货",
                 "attempts": 1,
                 "quantity": parse_trusted_order_quantity(result.get("quantity")),
@@ -1934,6 +2001,7 @@ class XianyuLive:
                     item_title=str(payment_check.get("item_title") or ""),
                     created_at=payment_check.get("created_at"),
                     chat_id=chat_id,
+                    order_business_type=payment_check.get("business_type"),
                     is_bargain=(
                         delivery_source == AUTO_DELIVERY_SOURCE_BARGAIN_FREESHIPPING
                         or bool(payment_check.get("is_bargain"))
@@ -1946,7 +2014,10 @@ class XianyuLive:
                     "邀请商品订单已保存并提交桥接扫描: delivery_source={}",
                     delivery_source,
                 )
-                await invite_bridge_poller.scan_once()
+                await invite_bridge_poller.scan_once(
+                    discover=False,
+                    trusted_order_ids={order_id},
+                )
                 return
 
             # 使用订单ID作为锁的键
@@ -2049,11 +2120,40 @@ class XianyuLive:
                         order_id=order_id,
                         item_id=item_id,
                         buyer_id=send_user_id,
+                        quantity=str(payment_check.get("quantity") or quantity_to_send),
+                        amount=payment_check.get("amount"),
+                        order_status="pending_ship",
                         cookie_id=self.cookie_id,
+                        created_at=payment_check.get("created_at"),
                         chat_id=chat_id,
                     ):
                         logger.error("自动发货订单上下文保存失败，已停止处理")
                         return
+
+                    # 付款核验已经拿到可信快照；写入现有订单同步字段，避免普通订单
+                    # 只能等后续批量同步才进入仪表盘金额与时段统计。
+                    from order_sync_service import parse_amount_fen, parse_order_time_utc
+
+                    snapshot_status = str(
+                        (existing_order or {}).get("order_status") or "pending_ship"
+                    )
+                    db_manager.apply_order_sync_update(
+                        order_id=order_id,
+                        cookie_id=self.cookie_id,
+                        incoming_status=snapshot_status,
+                        status_source="realtime_message",
+                        ordered_at=parse_order_time_utc(payment_check.get("created_at")),
+                        paid_amount_fen=parse_amount_fen(payment_check.get("amount")),
+                        quantity=str(payment_check.get("quantity") or quantity_to_send),
+                        chat_id=chat_id,
+                    )
+                    db_manager.reconcile_order_status_events(
+                        cookie_id=self.cookie_id,
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=send_user_id,
+                        chat_id=chat_id,
+                    )
 
                     fulfillment = await self._execute_fulfillment_attempt(
                         websocket=websocket,
@@ -2102,24 +2202,6 @@ class XianyuLive:
                         self._delayed_lock_release(lock_key, delay_minutes=10)
                     )
                     self._lock_hold_info[lock_key]['task'] = delay_task
-
-                    sent_count = int(fulfillment.get("sent_count") or 0)
-                    if sent_count > 1:
-                        await self.send_delivery_failure_notification(
-                            send_user_name,
-                            send_user_id,
-                            item_id,
-                            f"多数量发货成功，共发送 {sent_count} 个卡券",
-                            chat_id,
-                        )
-                    else:
-                        await self.send_delivery_failure_notification(
-                            send_user_name,
-                            send_user_id,
-                            item_id,
-                            "发货成功",
-                            chat_id,
-                        )
 
                 except Exception as e:
                     logger.error(f"自动发货处理异常: {self._safe_str(e)}")
@@ -4274,7 +4356,216 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新默认回复图片URL失败: {e}")
 
-    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str):
+    def _ai_item_info(self, item_info_raw):
+        if not item_info_raw:
+            return {
+                'title': '商品信息获取失败',
+                'price': 0,
+                'desc': '暂无商品描述',
+            }
+        return {
+            'title': item_info_raw.get('item_title', '未知商品'),
+            'price': self._parse_price(item_info_raw.get('item_price', '0')),
+            'desc': item_info_raw.get('item_detail', '暂无商品描述'),
+        }
+
+    async def _resolve_ai_order_context(self, ai_reply_engine, chat_id: str,
+                                        item_id: str, user_id: str = None,
+                                        order_id: str = None,
+                                        order_scope: str = None):
+        """用引擎的归属校验解析订单；旧引擎或旧 schema 下保持原调用形状。"""
+        resolver = getattr(ai_reply_engine, 'resolve_order_scope', None)
+        if not callable(resolver):
+            return None, None
+        result = await asyncio.to_thread(
+            resolver,
+            chat_id=chat_id,
+            cookie_id=self.cookie_id,
+            item_id=item_id,
+            order_id=order_id,
+            order_scope=order_scope,
+            user_id=user_id,
+        )
+        if not isinstance(result, dict):
+            return None, None
+        scope = str(result.get('scope') or '').strip().lower()
+        resolved_order_id = str(result.get('order_id') or '').strip() or None
+        if scope in {'exact', 'unique'} and resolved_order_id:
+            return resolved_order_id, scope
+        if scope in {'ambiguous', 'none'}:
+            return None, scope
+        return None, None
+
+    async def _record_seller_human_message(self, chat_id: str, item_id: str,
+                                           content: str):
+        """后台记录平台已观察到的人工卖家消息，不阻塞监听与暂停逻辑。"""
+        try:
+            from ai_reply_engine import ai_reply_engine
+
+            resolved_order_id, order_scope = await self._resolve_ai_order_context(
+                ai_reply_engine, chat_id, item_id,
+            )
+            if not resolved_order_id:
+                return
+            await asyncio.to_thread(
+                ai_reply_engine.save_conversation,
+                chat_id=chat_id,
+                cookie_id=self.cookie_id,
+                user_id=self.myid,
+                item_id=item_id,
+                role='seller_human',
+                content=content,
+                order_id=resolved_order_id,
+                order_scope=order_scope,
+                source='seller_human',
+                delivery_state='succeeded',
+            )
+        except Exception as exc:
+            logger.warning(
+                "【{}】记录人工回复失败: error_type={}",
+                self.cookie_id,
+                type(exc).__name__,
+            )
+
+    async def _mark_ai_reply_delivery(self, chat_id: str, item_id: str,
+                                      content: str, delivery_state: str):
+        try:
+            from ai_reply_engine import ai_reply_engine
+
+            marked = await asyncio.to_thread(
+                ai_reply_engine.mark_conversation_delivery,
+                chat_id=chat_id,
+                cookie_id=self.cookie_id,
+                item_id=item_id,
+                delivery_state=delivery_state,
+                content=content,
+            )
+            if not marked:
+                logger.warning(f"【{self.cookie_id}】未找到对应AI草稿记录")
+        except Exception as exc:
+            logger.warning(
+                "【{}】记录AI回复发送结果失败: error_type={}",
+                self.cookie_id,
+                type(exc).__name__,
+            )
+
+    def _schedule_ai_shadow_reply(self, send_user_id: str, send_message: str,
+                                  item_id: str, chat_id: str, image_refs=None,
+                                  order_id: str = None, order_scope: str = None,
+                                  sent_reply: str = None, reply_source: str = ''):
+        """在正式回复结束后启动旁路候选，永不参与发送。"""
+        if not AI_REPLY_SHADOW_ENABLED:
+            return
+
+        async def run_shadow():
+            resolved_order_id = None
+            resolved_scope = None
+            try:
+                from ai_reply_engine import ai_reply_engine
+
+                resolved_order_id, resolved_scope = await self._resolve_ai_order_context(
+                    ai_reply_engine, chat_id, item_id, send_user_id,
+                    order_id=order_id, order_scope=order_scope,
+                )
+                if resolved_order_id:
+                    await asyncio.to_thread(
+                        ai_reply_engine.save_conversation,
+                        chat_id=chat_id,
+                        cookie_id=self.cookie_id,
+                        user_id=send_user_id,
+                        item_id=item_id,
+                        role='buyer',
+                        content=send_message,
+                        order_id=resolved_order_id,
+                        order_scope=resolved_scope,
+                        source='buyer',
+                        delivery_state='received',
+                    )
+                    if sent_reply:
+                        source = {
+                            'AI': 'assistant_generated',
+                            '关键词': 'keyword',
+                            '默认': 'system',
+                        }.get(reply_source, 'system')
+                        await asyncio.to_thread(
+                            ai_reply_engine.save_conversation,
+                            chat_id=chat_id,
+                            cookie_id=self.cookie_id,
+                            user_id=self.myid,
+                            item_id=item_id,
+                            role='assistant',
+                            content=sent_reply,
+                            order_id=resolved_order_id,
+                            order_scope=resolved_scope,
+                            source=source,
+                            delivery_state='ambiguous',
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "【{}】记录AI订单作用域消息失败: error_type={}",
+                    self.cookie_id,
+                    type(exc).__name__,
+                )
+                return
+
+            semaphore = _get_ai_reply_shadow_semaphore()
+            self._ai_reply_shadow_semaphore = semaphore
+            if semaphore.locked():
+                logger.info(f"【{self.cookie_id}】AI Shadow 正忙，跳过本次候选")
+                return
+
+            await semaphore.acquire()
+            defer_release = False
+            model_task = None
+            try:
+                item_info = self._ai_item_info(
+                    await asyncio.to_thread(
+                        db_manager.get_item_info, self.cookie_id, item_id,
+                    )
+                )
+                model_task = self._create_tracked_task(
+                    ai_reply_engine.generate_shadow_reply_async(
+                        message=send_message,
+                        item_info=item_info,
+                        chat_id=chat_id,
+                        cookie_id=self.cookie_id,
+                        user_id=send_user_id,
+                        item_id=item_id,
+                        image_refs=image_refs,
+                        order_id=resolved_order_id,
+                        order_scope=resolved_scope,
+                    )
+                )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(model_task),
+                        timeout=AI_REPLY_SHADOW_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(f"【{self.cookie_id}】AI Shadow 候选超时")
+                    defer_release = True
+                    model_task.add_done_callback(lambda _task: semaphore.release())
+            except asyncio.CancelledError:
+                if model_task is not None and not model_task.done():
+                    defer_release = True
+                    model_task.add_done_callback(lambda _task: semaphore.release())
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "【{}】AI Shadow 候选失败: error_type={}",
+                    self.cookie_id,
+                    type(exc).__name__,
+                )
+            finally:
+                if not defer_release:
+                    semaphore.release()
+
+        self._create_tracked_task(run_shadow())
+
+    async def get_ai_reply(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str, chat_id: str,
+                           image_refs=None, order_id: str = None, order_scope: str = None):
         """获取AI回复"""
         self.last_ai_attempt_at = time.time()
         self.last_ai_result = "started"
@@ -4293,31 +4584,21 @@ class XianyuLive:
 
             if not item_info_raw:
                 logger.warning(f"数据库中无商品信息: {item_id}")
-                # 使用默认商品信息
-                item_info = {
-                    'title': '商品信息获取失败',
-                    'price': 0,
-                    'desc': '暂无商品描述'
-                }
-            else:
-                # 解析数据库中的商品信息
-                item_info = {
-                    'title': item_info_raw.get('item_title', '未知商品'),
-                    'price': self._parse_price(item_info_raw.get('item_price', '0')),
-                    'desc': item_info_raw.get('item_detail', '暂无商品描述')
-                }
+            item_info = self._ai_item_info(item_info_raw)
 
-            # 生成AI回复
-            # 由于外部已实现防抖机制，跳过内部等待（skip_wait=True）
-            reply = await ai_reply_engine.generate_reply_async(
-                message=send_message,
-                item_info=item_info,
-                chat_id=chat_id,
-                cookie_id=self.cookie_id,
-                user_id=send_user_id,
-                item_id=item_id,
-                skip_wait=True  # 跳过内部等待，因为外部已实现防抖
-            )
+            # 生成AI回复；文本消息继续使用原请求形状，图片消息才追加多模态字段。
+            ai_kwargs = {
+                "message": send_message,
+                "item_info": item_info,
+                "chat_id": chat_id,
+                "cookie_id": self.cookie_id,
+                "user_id": send_user_id,
+                "item_id": item_id,
+                "skip_wait": True,
+            }
+            if image_refs:
+                ai_kwargs["image_refs"] = image_refs
+            reply = await ai_reply_engine.generate_reply_async(**ai_kwargs)
 
             if reply:
                 self.last_ai_result = "generated"
@@ -4340,10 +4621,9 @@ class XianyuLive:
         try:
             if not price_str:
                 return 0.0
-            # 移除非数字字符，保留小数点
             price_clean = re.sub(r'[^\d.]', '', str(price_str))
             return float(price_clean) if price_clean else 0.0
-        except:
+        except Exception:
             return 0.0
 
     async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None):
@@ -5378,15 +5658,55 @@ class XianyuLive:
                 logger.warning(f"账号 {self.cookie_id} 未找到归属用户，跳过自动发货")
                 return None
 
-            # 商品级绑定优先：卖家在"自动发货"里为该商品明确指定了卡密时，直接用它。
-            # 关键词匹配只作为未绑定商品的兜底（改标题、多商品同词都会让匹配失灵）。
+            # 关键词只属于从未选择过发货模式的旧商品。任何显式选择一旦
+            # 失效都必须失败关闭，不能换成标题碰巧命中的另一个资源。
             delivery_rules = []
-            bound_rule = database.get_item_bound_delivery_rule(
+            binding_status = database.get_item_delivery_binding_status(
                 self.cookie_id,
                 item_id,
-                user_id=rule_owner_user_id,
+                rule_owner_user_id,
             )
-            if bound_rule:
+            if binding_status is None:
+                if fulfillment_attempt_id is not None:
+                    database.mark_fulfillment_manual_review(
+                        int(fulfillment_attempt_id),
+                        "delivery_binding_state_unavailable",
+                    )
+                logger.warning("商品发货模式状态不可用，已停止自动交付")
+                return None
+            binding_explicit = bool(binding_status.get("binding_explicit"))
+            if binding_explicit:
+                resource_status = str(
+                    binding_status.get("status")
+                    or binding_status.get("resource_status")
+                    or "missing"
+                )
+                if resource_status != "active":
+                    if resource_status not in {"explicit_off", "invite"} and fulfillment_attempt_id is not None:
+                        reason = {
+                            "missing": "bound_resource_missing",
+                            "disabled": "bound_resource_disabled",
+                            "out_of_stock": "bound_resource_out_of_stock",
+                            "protocol_invalid": "bound_resource_protocol_invalid",
+                            "empty": "bound_resource_empty",
+                        }.get(resource_status, "bound_resource_unavailable")
+                        database.mark_fulfillment_manual_review(
+                            int(fulfillment_attempt_id),
+                            reason,
+                        )
+                    logger.warning(
+                        "显式发货模式不可用，禁止关键词回落: status={}",
+                        resource_status,
+                    )
+                    return None
+                bound_rule = binding_status.get("rule")
+                if not isinstance(bound_rule, dict):
+                    if fulfillment_attempt_id is not None:
+                        database.mark_fulfillment_manual_review(
+                            int(fulfillment_attempt_id),
+                            "bound_resource_missing",
+                        )
+                    return None
                 spec_compatible = (
                     not is_multi_spec
                     or not bound_rule.get('is_multi_spec')
@@ -5402,11 +5722,15 @@ class XianyuLive:
                     )
                     delivery_rules = [bound_rule]
                 else:
-                    logger.warning(
-                        "商品绑定的多规格卡密与订单规格不匹配，回落关键词规则匹配"
-                    )
+                    if fulfillment_attempt_id is not None:
+                        database.mark_fulfillment_manual_review(
+                            int(fulfillment_attempt_id),
+                            "bound_resource_spec_mismatch",
+                        )
+                    logger.warning("商品绑定资源与订单规格不匹配，禁止关键词回落")
+                    return None
 
-            if not delivery_rules:
+            if not delivery_rules and not binding_explicit:
                 if is_multi_spec:
                     # 多规格商品：只匹配多规格发货规则
                     if spec_name and spec_value:
@@ -5551,20 +5875,31 @@ class XianyuLive:
                 logger.info(f"开始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
                 delivery_content = None
+                content_already_final = False
 
                 # 根据卡券类型处理发货内容
                 if rule['card_type'] == 'api':
-                    # API cards can allocate a one-time secret at the provider.
-                    # They need a provider-specific two-phase receipt before
-                    # automated fulfillment can be made restart-safe.
-                    if fulfillment_attempt_id is not None:
-                        database.mark_fulfillment_manual_review(
-                            int(fulfillment_attempt_id),
-                            "api_card_requires_manual_review",
-                        )
-                        logger.warning("API 卡券自动交付未启用，订单已转人工复核")
+                    if fulfillment_attempt_id is None:
+                        logger.warning("API 资源缺少持久化履约尝试，禁止自动调用")
                         return None
-                    delivery_content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
+                    api_payloads = await self._prepare_fulfillment_api_v1_payloads(
+                        rule=rule,
+                        order_id=order_id,
+                        item_id=item_id,
+                        expected_quantity=expected_quantity,
+                        fulfillment_attempt_id=int(fulfillment_attempt_id),
+                        spec_name=spec_name,
+                        spec_value=spec_value,
+                        database=database,
+                    )
+                    if (
+                        not api_payloads
+                        or delivery_index < 0
+                        or delivery_index >= len(api_payloads)
+                    ):
+                        return None
+                    delivery_content = api_payloads[delivery_index]
+                    content_already_final = True
 
                 elif rule['card_type'] == 'text':
                     # 固定文字类型：直接使用文字内容
@@ -5584,8 +5919,52 @@ class XianyuLive:
                         delivery_content = None
 
                 if delivery_content:
-                    # 处理备注信息和变量替换
-                    final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
+                    final_content = (
+                        delivery_content
+                        if content_already_final
+                        else self._process_delivery_content_with_description(
+                            delivery_content,
+                            rule.get('card_description', ''),
+                        )
+                    )
+                    if fulfillment_attempt_id is not None and rule['card_type'] != 'api':
+                        if rule['card_type'] == 'data':
+                            raw_payloads = list(reserved_batch_values or [])
+                        else:
+                            raw_payloads = [delivery_content] * int(expected_quantity)
+                        final_payloads = [
+                            self._process_delivery_content_with_description(
+                                value,
+                                rule.get('card_description', ''),
+                            )
+                            for value in raw_payloads
+                        ]
+                        committed = database.commit_fulfillment_delivery_payload(
+                            int(fulfillment_attempt_id),
+                            final_payloads,
+                            source_type=str(rule['card_type']),
+                            source_card_id=int(rule['card_id']),
+                        )
+                        if (committed or {}).get('outcome') not in {
+                            'committed', 'created', 'existing'
+                        }:
+                            database.mark_fulfillment_manual_review(
+                                int(fulfillment_attempt_id),
+                                'delivery_payload_conflict',
+                            )
+                            logger.warning("履约载荷持久化冲突，已停止自动交付")
+                            return None
+                        persisted_payloads = list(
+                            ((committed or {}).get('payload') or {}).get('payloads')
+                            or final_payloads
+                        )
+                        if persisted_payloads != final_payloads:
+                            database.mark_fulfillment_manual_review(
+                                int(fulfillment_attempt_id),
+                                'delivery_payload_conflict',
+                            )
+                            return None
+                        final_content = persisted_payloads[delivery_index]
 
                     # A durable attempt records delivery only after every
                     # outbound message is acknowledged by the WebSocket.
@@ -5633,6 +6012,421 @@ class XianyuLive:
             logger.error(f"处理备注信息失败: {e}")
             # 出错时返回原始发货内容
             return delivery_content
+
+    async def _prepare_fulfillment_api_v1_payloads(
+        self,
+        *,
+        rule,
+        order_id: str,
+        item_id: str,
+        expected_quantity: int,
+        fulfillment_attempt_id: int,
+        spec_name: str = None,
+        spec_value: str = None,
+        database=None,
+    ):
+        """Allocate exactly once with a durable same-key retry fence."""
+        if database is None:
+            from db_manager import db_manager as database
+
+        def manual_review(reason: str) -> None:
+            database.mark_fulfillment_manual_review(
+                int(fulfillment_attempt_id),
+                reason,
+            )
+
+        try:
+            expected_quantity = int(expected_quantity)
+        except (TypeError, ValueError):
+            expected_quantity = 0
+        if not fulfillment_attempt_id or expected_quantity < 1:
+            return None
+
+        config = rule.get("api_config") or {}
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except (TypeError, ValueError):
+                config = {}
+        if not isinstance(config, dict) or config.get("protocol") != FULFILLMENT_API_PROTOCOL:
+            manual_review("legacy_api_requires_manual_review")
+            return None
+
+        url = str(config.get("url") or "").strip()
+        token = str(config.get("api_token") or config.get("token") or "").strip()
+        if not url.lower().startswith("https://") or not token:
+            manual_review("api_v1_configuration_invalid")
+            return None
+        try:
+            timeout = int(config.get("timeout", 10))
+        except (TypeError, ValueError):
+            timeout = 0
+        if timeout < 1 or timeout > 30:
+            manual_review("api_v1_configuration_invalid")
+            return None
+        configured_spec = config.get("spec") or {}
+        if not isinstance(configured_spec, dict):
+            manual_review("api_v1_configuration_invalid")
+            return None
+        request_spec = dict(configured_spec)
+        if spec_name or spec_value:
+            request_spec["selected"] = {
+                "name": str(spec_name or ""),
+                "value": str(spec_value or ""),
+            }
+
+        persisted = database.get_fulfillment_delivery_payload(
+            attempt_id=int(fulfillment_attempt_id)
+        )
+        if persisted:
+            payloads = list(persisted.get("payloads") or [])
+            if (
+                persisted.get("source_type") == "api_v1"
+                and len(payloads) == expected_quantity
+                and all(isinstance(item, str) and item for item in payloads)
+            ):
+                return payloads
+            manual_review("api_v1_payload_conflict")
+            return None
+
+        canonical_config = json.dumps(
+            {
+                "url": url,
+                "timeout": timeout,
+                "spec": request_spec,
+                "token": token,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        config_fingerprint = str(config.get("config_fingerprint") or "").strip()
+        if not config_fingerprint:
+            config_fingerprint = hashlib.sha256(
+                canonical_config.encode("utf-8")
+            ).hexdigest()
+        idempotency_key = hashlib.sha256(
+            (
+                f"fulfillment-api-v1:{fulfillment_attempt_id}:{order_id}:"
+                f"{item_id}:{rule.get('card_id')}:{config_fingerprint}"
+            ).encode("utf-8")
+        ).hexdigest()
+        created = database.create_fulfillment_api_operation(
+            attempt_id=int(fulfillment_attempt_id),
+            card_id=int(rule.get("card_id")),
+            idempotency_key=idempotency_key,
+            config_fingerprint=config_fingerprint,
+            request_spec=request_spec,
+        )
+        operation = (created or {}).get("operation")
+        if (created or {}).get("outcome") == "conflict" or not operation:
+            manual_review("api_v1_operation_conflict")
+            return None
+
+        operation_id = int(operation["id"])
+
+        def commit_items(items) -> list[str] | None:
+            values = [str(item) for item in list(items or [])]
+            if (
+                len(values) != expected_quantity
+                or any(not value or len(value.encode("utf-8")) > 2048 for value in values)
+            ):
+                manual_review("api_v1_quantity_mismatch")
+                return None
+            final_values = [
+                self._process_delivery_content_with_description(
+                    value,
+                    str(rule.get("card_description") or ""),
+                )
+                for value in values
+            ]
+            committed = database.commit_fulfillment_delivery_payload(
+                attempt_id=int(fulfillment_attempt_id),
+                payloads=final_values,
+                source_type="api_v1",
+                source_operation_id=operation_id,
+                source_card_id=int(rule.get("card_id")),
+            )
+            if (committed or {}).get("outcome") not in {
+                "committed", "created", "existing"
+            }:
+                manual_review("api_v1_payload_conflict")
+                return None
+            payload = (committed or {}).get("payload") or {}
+            persisted_values = list(payload.get("payloads") or final_values)
+            if persisted_values != final_values:
+                manual_review("api_v1_payload_conflict")
+                return None
+            return final_values
+
+        if operation.get("state") == "succeeded":
+            return commit_items(operation.get("response_items") or [])
+        if operation.get("state") in {"failed", "manual_review"}:
+            if operation.get("state") == "manual_review":
+                manual_review("api_v1_operation_manual_review")
+            return None
+
+        request_body = {
+            "action": "allocate",
+            "idempotency_key": str(operation.get("idempotency_key") or idempotency_key),
+            "order_id": str(order_id),
+            "item_id": str(item_id),
+            "quantity": expected_quantity,
+            "spec": request_spec,
+        }
+        attempts_used = int(operation.get("attempt_count") or 0)
+        for attempt_number in range(attempts_used, FULFILLMENT_API_MAX_ATTEMPTS):
+            try:
+                response = await request_public_http(
+                    "POST",
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Idempotency-Key": request_body["idempotency_key"],
+                    },
+                    json_body=request_body,
+                    timeout_seconds=timeout,
+                    max_response_bytes=256 * 1024,
+                    allowed_methods=("POST",),
+                    require_https=True,
+                )
+            except OutboundRequestError as exc:
+                retryable = exc.code in {"network_error", "timeout", "http_408", "http_429"}
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="pending" if retryable else "manual_review",
+                    reason_code="api_v1_network_retry" if retryable else "api_v1_request_unknown",
+                )
+                if not retryable:
+                    manual_review("api_v1_request_unknown")
+                    return None
+                if attempt_number + 1 < FULFILLMENT_API_MAX_ATTEMPTS:
+                    await asyncio.sleep(attempt_number + 1)
+                continue
+            except Exception:
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="pending",
+                    reason_code="api_v1_network_retry",
+                )
+                if attempt_number + 1 < FULFILLMENT_API_MAX_ATTEMPTS:
+                    await asyncio.sleep(attempt_number + 1)
+                continue
+
+            http_status = int(getattr(response, "status", 0) or 0)
+            if http_status in {408, 429} or http_status >= 500:
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="pending",
+                    http_status=http_status,
+                    reason_code="api_v1_http_retry",
+                )
+                if attempt_number + 1 < FULFILLMENT_API_MAX_ATTEMPTS:
+                    await asyncio.sleep(attempt_number + 1)
+                continue
+            if http_status != 200:
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="manual_review",
+                    http_status=http_status,
+                    reason_code="api_v1_http_conflict",
+                )
+                manual_review("api_v1_http_conflict")
+                return None
+            try:
+                body = json.loads(str(getattr(response, "text", "") or ""))
+            except (TypeError, ValueError):
+                body = None
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"status", "operation_id", "items"}
+                or body.get("status") not in {"succeeded", "pending", "failed"}
+                or not isinstance(body.get("operation_id"), str)
+                or not body.get("operation_id")
+                or not isinstance(body.get("items"), list)
+            ):
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="manual_review",
+                    http_status=http_status,
+                    reason_code="api_v1_response_invalid",
+                )
+                manual_review("api_v1_response_invalid")
+                return None
+
+            state = str(body["status"])
+            if state == "pending":
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="pending",
+                    http_status=http_status,
+                    external_operation_id=body["operation_id"],
+                )
+                if attempt_number + 1 < FULFILLMENT_API_MAX_ATTEMPTS:
+                    await asyncio.sleep(attempt_number + 1)
+                continue
+            if state == "failed":
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="failed",
+                    http_status=http_status,
+                    external_operation_id=body["operation_id"],
+                    reason_code="api_v1_provider_failed",
+                )
+                return None
+
+            values = [str(item) for item in body["items"]]
+            if (
+                len(values) != expected_quantity
+                or any(not value or len(value.encode("utf-8")) > 2048 for value in values)
+            ):
+                database.record_fulfillment_api_attempt(
+                    operation_id,
+                    state="manual_review",
+                    http_status=http_status,
+                    external_operation_id=body["operation_id"],
+                    reason_code="api_v1_quantity_mismatch",
+                )
+                manual_review("api_v1_quantity_mismatch")
+                return None
+            database.record_fulfillment_api_attempt(
+                operation_id,
+                state="succeeded",
+                http_status=http_status,
+                external_operation_id=body["operation_id"],
+                response_items=values,
+            )
+            return commit_items(values)
+
+        manual_review("api_v1_retry_exhausted")
+        return None
+
+    async def resend_fulfillment_payload(
+        self,
+        *,
+        payload_id: int,
+        user_id: int,
+        database=None,
+    ):
+        """Resend only the immutable committed payload and wait for each message ACK."""
+        if database is None:
+            from db_manager import db_manager as database
+        payload = database.get_fulfillment_delivery_payload(
+            payload_id=int(payload_id),
+            user_id=int(user_id),
+        )
+        if not payload:
+            return None
+        attempt = database.get_fulfillment_attempt(int(payload["attempt_id"]))
+        if (
+            not attempt
+            or int(attempt.get("user_id") or 0) != int(user_id)
+            or str(attempt.get("state") or "") != "committed"
+            or str(attempt.get("cookie_id") or "") != str(self.cookie_id)
+        ):
+            return None
+        order = database.get_order_by_id(str(attempt.get("order_id") or "")) or {}
+        if str(order.get("cookie_id") or "") != str(self.cookie_id):
+            return None
+        buyer_id = str(order.get("buyer_id") or "").strip()
+        chat_id = str(order.get("chat_id") or "").strip()
+        item_id = str(order.get("item_id") or "").strip()
+        payloads = [str(value) for value in list(payload.get("payloads") or [])]
+        if not buyer_id or not payloads or not self.ws or getattr(self.ws, "closed", False):
+            return None
+
+        prepared = database.record_fulfillment_resend_event(
+            payload_id=int(payload_id),
+            attempt_id=int(attempt["attempt_id"]),
+            user_id=int(user_id),
+            cookie_id=str(self.cookie_id),
+            status="prepared",
+        )
+        if not prepared:
+            return None
+
+        sent_count = 0
+        last_mid = ""
+        final_status = "succeeded"
+        reason = ""
+        try:
+            for value in payloads:
+                if value.startswith("__IMAGE_SEND__"):
+                    image_data = value.replace("__IMAGE_SEND__", "", 1)
+                    card_id = None
+                    if "|" in image_data:
+                        card_id_raw, image_url = image_data.split("|", 1)
+                        try:
+                            card_id = int(card_id_raw)
+                        except ValueError:
+                            card_id = None
+                    else:
+                        image_url = image_data
+                    if not chat_id:
+                        final_status = "failed"
+                        reason = "resend_chat_unavailable"
+                        break
+                    response = await self.send_image_msg(
+                        self.ws,
+                        chat_id,
+                        buyer_id,
+                        image_url,
+                        card_id=card_id,
+                        wait_for_response=True,
+                    )
+                elif chat_id:
+                    response = await self.send_msg(
+                        self.ws,
+                        chat_id,
+                        buyer_id,
+                        value,
+                        wait_for_response=True,
+                    )
+                else:
+                    response = await self.send_msg_once(
+                        buyer_id,
+                        item_id,
+                        value,
+                        wait_for_response=True,
+                    )
+                if not isinstance(response, dict):
+                    final_status = "ambiguous"
+                    reason = "resend_ack_missing"
+                    break
+                headers = response.get("headers")
+                if isinstance(headers, dict):
+                    last_mid = str(headers.get("mid") or "")[:128]
+                summary = self._direct_frame_error_summary(response)
+                code = summary.get("code")
+                if code not in (None, "200"):
+                    final_status = "ambiguous" if sent_count else "failed"
+                    reason = "resend_rejected"
+                    break
+                sent_count += 1
+        except DirectMessageNotSubmitted:
+            final_status = "ambiguous" if sent_count else "failed"
+            reason = "resend_not_submitted"
+        except Exception:
+            final_status = "ambiguous"
+            reason = "resend_outcome_unknown"
+
+        if sent_count != len(payloads) and final_status == "succeeded":
+            final_status = "ambiguous"
+            reason = "resend_incomplete"
+        final = database.record_fulfillment_resend_event(
+            payload_id=int(payload_id),
+            attempt_id=int(attempt["attempt_id"]),
+            user_id=int(user_id),
+            cookie_id=str(self.cookie_id),
+            status=final_status,
+            request_mid=last_mid,
+            reason_code=reason,
+        )
+        return {
+            "status": final_status,
+            "event_id": (final or {}).get("id"),
+            "request_mid": last_mid,
+        }
 
     async def _get_api_card_content(self, rule, order_id=None, item_id=None, buyer_id=None, spec_name=None, spec_value=None, retry_count=0):
         """调用API获取卡券内容，支持动态参数替换和重试机制"""
@@ -6356,7 +7150,7 @@ class XianyuLive:
                 return {}
         return {}
 
-    async def send_msg(self, ws, cid, toid, text):
+    async def send_msg(self, ws, cid, toid, text, wait_for_response=False):
         text = {
             "contentType": 1,
             "text": {
@@ -6364,12 +7158,7 @@ class XianyuLive:
             }
         }
         text_base64 = str(base64.b64encode(json.dumps(text).encode('utf-8')), 'utf-8')
-        msg = {
-            "lwp": "/r/MessageSend/sendByReceiverScope",
-            "headers": {
-                "mid": generate_mid()
-            },
-            "body": [
+        body = [
                 {
                     "uuid": generate_uuid(),
                     "cid": f"{cid}@goofish",
@@ -6399,8 +7188,22 @@ class XianyuLive:
                     ]
                 }
             ]
+        if wait_for_response:
+            return await self._request_lwp_response(
+                ws,
+                "/r/MessageSend/sendByReceiverScope",
+                body=body,
+                timeout=10,
+            )
+        msg = {
+            "lwp": "/r/MessageSend/sendByReceiverScope",
+            "headers": {
+                "mid": generate_mid()
+            },
+            "body": body,
         }
         await self._ws_send_guarded(ws, msg)
+        return True
 
     async def init(self, ws):
         # 如果没有token或者token过期，获取新token
@@ -6929,7 +7732,7 @@ class XianyuLive:
         self.configure_cookie_refresh(enabled, interval_minutes)
 
 
-    async def send_msg_once(self, toid, item_id, text):
+    async def send_msg_once(self, toid, item_id, text, wait_for_response=False):
         async with self.direct_message_lock:
             websocket = self.ws
             if not websocket or getattr(websocket, "closed", False):
@@ -6983,10 +7786,20 @@ class XianyuLive:
                         "direct conversation response did not include a conversation id"
                         + (f": {json.dumps(summary, ensure_ascii=False)}" if summary else "")
                     )
-                await self.send_msg(websocket, cid, toid, text)
+                if wait_for_response:
+                    message_response = await self.send_msg(
+                        websocket,
+                        cid,
+                        toid,
+                        text,
+                        wait_for_response=True,
+                    )
+                else:
+                    await self.send_msg(websocket, cid, toid, text)
+                    message_response = True
                 self._remember_direct_conversation(toid, item_id, cid)
                 logger.info(f'【{self.cookie_id}】send message')
-                return True
+                return message_response
             except asyncio.TimeoutError as exc:
                 self.direct_send_init_error_count += 1
                 raise DirectMessageNotSubmitted("direct conversation response timed out") from exc
@@ -7052,7 +7865,7 @@ class XianyuLive:
                 and isinstance(message["1"], dict)
                 and "10" in message["1"]
                 and isinstance(message["1"]["10"], dict)
-                and "reminderContent" in message["1"]["10"]
+                and message_has_content(message)
             )
         except Exception:
             return False
@@ -7313,7 +8126,8 @@ class XianyuLive:
 
     async def _schedule_debounced_reply(self, chat_id: str, message_data: dict, websocket,
                                        send_user_name: str, send_user_id: str, send_message: str,
-                                       item_id: str, msg_time: str):
+                                       item_id: str, msg_time: str, image_refs=None,
+                                       order_id: str = None):
         """
         调度防抖回复：如果用户连续发送消息，等待用户停止发送后再回复最后一条消息
 
@@ -7407,7 +8221,9 @@ class XianyuLive:
                     'send_user_id': send_user_id,
                     'send_message': send_message,
                     'item_id': item_id,
-                    'msg_time': msg_time
+                    'msg_time': msg_time,
+                    'image_refs': image_refs or (),
+                    'order_id': order_id,
                 },
                 'timer': current_timer
             }
@@ -7449,7 +8265,9 @@ class XianyuLive:
                         last_msg['send_message'],
                         last_msg['item_id'],
                         chat_id,
-                        last_msg['msg_time']
+                        last_msg['msg_time'],
+                        last_msg.get('image_refs'),
+                        last_msg.get('order_id'),
                     )
 
                 except asyncio.CancelledError:
@@ -7467,7 +8285,8 @@ class XianyuLive:
 
     async def _process_chat_message_reply(self, message_data: dict, websocket, send_user_name: str,
                                          send_user_id: str, send_message: str, item_id: str,
-                                         chat_id: str, msg_time: str):
+                                         chat_id: str, msg_time: str, image_refs=None,
+                                         order_id: str = None):
         """
         处理聊天消息的回复逻辑（从handle_message中提取出来的核心回复逻辑）
 
@@ -7481,6 +8300,9 @@ class XianyuLive:
             chat_id: 聊天ID
             msg_time: 消息时间
         """
+        reply = None
+        reply_source = ''
+        shadow_scheduled = False
         try:
             # 自动回复消息
             if not AUTO_REPLY.get('enabled', True):
@@ -7488,21 +8310,20 @@ class XianyuLive:
                 return
 
             # 检查该chat_id是否处于暂停状态
-            if pause_manager.is_chat_paused(chat_id):
-                remaining_time = pause_manager.get_remaining_pause_time(chat_id)
+            if pause_manager.is_chat_paused(chat_id, self.cookie_id):
+                remaining_time = pause_manager.get_remaining_pause_time(chat_id, self.cookie_id)
                 remaining_minutes = remaining_time // 60
                 remaining_seconds = remaining_time % 60
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】自动回复已暂停，剩余时间: {remaining_minutes}分{remaining_seconds}秒")
                 return
 
-            reply = None
-            reply_source = ''
-
             # 按关键词、AI、默认回复的顺序处理；旧的未认证内部 API
             # 不再接收聊天、账号或商品标识。
             if not reply:
                 # 1. 首先尝试关键词匹配（传入商品ID）
-                reply = await self.get_keyword_reply(send_user_name, send_user_id, send_message, item_id)
+                reply = None if image_refs else await self.get_keyword_reply(
+                    send_user_name, send_user_id, send_message, item_id
+                )
                 if reply == "EMPTY_REPLY":
                     # 匹配到关键词但回复内容为空，不进行任何回复
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】匹配到空回复关键词，跳过自动回复")
@@ -7511,7 +8332,15 @@ class XianyuLive:
                     reply_source = '关键词'  # 标记为关键词回复
                 else:
                     # 2. 关键词匹配失败，如果AI开关打开，尝试AI回复
-                    reply = await self.get_ai_reply(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    if image_refs:
+                        reply = await self.get_ai_reply(
+                            send_user_name, send_user_id, send_message, item_id, chat_id,
+                            image_refs=image_refs,
+                        )
+                    else:
+                        reply = await self.get_ai_reply(
+                            send_user_name, send_user_id, send_message, item_id, chat_id,
+                        )
                     if reply:
                         reply_source = 'AI'  # 标记为AI回复
                     else:
@@ -7593,6 +8422,10 @@ class XianyuLive:
                             else:
                                 # 只有图片没有文字，已经发送完毕
                                 if default_image_url:
+                                    self._schedule_ai_shadow_reply(
+                                        send_user_id, send_message, item_id, chat_id,
+                                        image_refs=image_refs, order_id=order_id,
+                                    )
                                     return
                                 reply = None
                         else:
@@ -7600,8 +8433,6 @@ class XianyuLive:
 
             # 注意：这里只有商品ID，没有标题和详情，根据新的规则不保存到数据库
             # 商品信息会在其他有完整信息的地方保存（如发货规则匹配时）
-            # 消息通知已在收到消息时立即发送，此处不再重复发送
-
             # 如果有回复内容，发送消息
             if reply:
                 # 检查是否是图片发送标记
@@ -7611,11 +8442,19 @@ class XianyuLive:
                     # 发送图片消息
                     try:
                         await self.send_image_msg(websocket, chat_id, send_user_id, image_url)
+                        if reply_source == "AI":
+                            await self._mark_ai_reply_delivery(
+                                chat_id, item_id, reply, 'ambiguous',
+                            )
                         # 记录发出的图片消息
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                         logger.info(f"[{msg_time}] 【{reply_source}图片发出】发送成功")
                     except Exception as e:
                         # 图片发送失败，发送错误提示
+                        if reply_source == "AI":
+                            await self._mark_ai_reply_delivery(
+                                chat_id, item_id, reply, 'ambiguous',
+                            )
                         logger.error(f"图片发送失败: {self._safe_str(e)}")
                         await self.send_msg(websocket, chat_id, send_user_id, "抱歉，图片发送失败，请稍后重试。")
                         msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -7623,6 +8462,10 @@ class XianyuLive:
                 else:
                     # 普通文本消息
                     await self.send_msg(websocket, chat_id, send_user_id, reply)
+                    if reply_source == "AI":
+                        await self._mark_ai_reply_delivery(
+                            chat_id, item_id, reply, 'ambiguous',
+                        )
                     # 记录发出的消息
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                     logger.info(
@@ -7634,7 +8477,30 @@ class XianyuLive:
             else:
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】未找到匹配的回复规则，不回复")
+            shadow_scheduled = True
+            self._schedule_ai_shadow_reply(
+                send_user_id, send_message, item_id, chat_id,
+                image_refs=image_refs, order_id=order_id,
+                sent_reply=reply, reply_source=reply_source,
+            )
         except Exception as e:
+            if reply_source == "AI" and reply:
+                await self._mark_ai_reply_delivery(
+                    chat_id, item_id, reply, 'ambiguous',
+                )
+            if reply and not shadow_scheduled:
+                shadow_scheduled = True
+                try:
+                    self._schedule_ai_shadow_reply(
+                        send_user_id, send_message, item_id, chat_id,
+                        image_refs=image_refs, order_id=order_id,
+                        sent_reply=reply, reply_source=reply_source,
+                    )
+                except Exception as shadow_error:
+                    logger.warning(
+                        "Shadow 任务调度失败: error_type={}",
+                        type(shadow_error).__name__,
+                    )
             if self.last_ai_result == "generated":
                 self.last_ai_result = f"send_error:{type(e).__name__}"
             logger.error(f"处理聊天消息回复时发生错误: {self._safe_str(e)}")
@@ -7699,27 +8565,24 @@ class XianyuLive:
                     parsed_data = json.loads(data)
                     # 处理未加密的消息（如系统提示等）
                     msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                    if isinstance(parsed_data, dict) and 'chatType' in parsed_data:
-                        if 'operation' in parsed_data and 'content' in parsed_data['operation']:
-                            content = parsed_data['operation']['content']
-                            if 'sessionArouse' in content:
-                                # 处理系统引导消息
-                                logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】小闲鱼智能提示:")
-                                if 'arouseChatScriptInfo' in content['sessionArouse']:
-                                    for qa in content['sessionArouse']['arouseChatScriptInfo']:
-                                        logger.info(f"  - {qa['chatScrip']}")
-                            elif 'contentType' in content:
-                                # 其他类型的未加密消息
-                                content_keys = (
-                                    sorted(str(key) for key in content.keys())
-                                    if isinstance(content, dict)
-                                    else []
-                                )
-                                logger.warning(
-                                    f"[{msg_time}] 【{self.cookie_id}】【系统】"
-                                    f"其他类型消息: keys={content_keys}"
-                                )
-                        return
+                    operation = parsed_data.get('operation') if isinstance(parsed_data, dict) else None
+                    content = operation.get('content') if isinstance(operation, dict) else None
+                    if isinstance(content, dict):
+                        if 'sessionArouse' in content:
+                            # 处理系统引导消息
+                            logger.info(f"[{msg_time}] 【{self.cookie_id}】【系统】小闲鱼智能提示:")
+                            if 'arouseChatScriptInfo' in content['sessionArouse']:
+                                for qa in content['sessionArouse']['arouseChatScriptInfo']:
+                                    logger.info(f"  - {qa['chatScrip']}")
+                            return
+                        message = normalize_operation_message(parsed_data)
+                        if message is None:
+                            content_keys = sorted(str(key) for key in content.keys())
+                            logger.warning(
+                                f"[{msg_time}] 【{self.cookie_id}】【系统】"
+                                f"其他类型消息: keys={content_keys}"
+                            )
+                            return
                     else:
                         # 如果不是系统消息，将解析的数据作为message
                         message = parsed_data
@@ -7727,6 +8590,9 @@ class XianyuLive:
                     # 如果JSON解析失败，尝试解密
                     decrypted_data = decrypt(data)
                     message = json.loads(decrypted_data)
+                    normalized = normalize_operation_message(message) if isinstance(message, dict) else None
+                    if normalized:
+                        message = normalized
             except Exception as e:
                 logger.error(f"消息解密失败: {self._safe_str(e)}")
                 return
@@ -7739,6 +8605,30 @@ class XianyuLive:
             # 确保message是字典类型
             if not isinstance(message, dict):
                 logger.error(f"消息格式错误，期望字典但得到: {type(message)}")
+                return
+
+            early_message_1 = message.get("1")
+            early_message_10 = (
+                early_message_1.get("10")
+                if isinstance(early_message_1, dict)
+                else None
+            )
+            early_sender_id = (
+                str(early_message_10.get("senderUserId") or "").strip()
+                if isinstance(early_message_10, dict)
+                else ""
+            )
+            early_content = extract_inbound_content(message)
+            early_text = early_content.text or (
+                str(early_message_10.get("reminderContent") or "").strip()
+                if isinstance(early_message_10, dict)
+                else ""
+            )
+            if (
+                early_sender_id != str(self.myid or "").strip()
+                and "".join(early_text.split()) == "开通留资卡功能建联更安全"
+            ):
+                logger.info(f"【{self.cookie_id}】留资推广卡在消息入口丢弃")
                 return
 
             # 【消息接收标识】记录收到消息的时间，用于控制Cookie刷新
@@ -7853,7 +8743,11 @@ class XianyuLive:
                 message_10 = message_1["10"]
                 send_user_name = message_10.get("senderNick", message_10.get("reminderTitle", "未知用户"))
                 send_user_id = message_10.get("senderUserId", "unknown")
-                send_message = message_10.get("reminderContent", "")
+                inbound_content = extract_inbound_content(message)
+                image_refs = inbound_content.images
+                send_message = inbound_content.text or message_10.get("reminderContent", "")
+                if not send_message and image_refs:
+                    send_message = IMAGE_PLACEHOLDER
 
                 chat_id_raw = message_1.get("2", "")
                 chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
@@ -7876,6 +8770,13 @@ class XianyuLive:
                 # 暂停该chat_id的自动回复10分钟
                 pause_manager.pause_chat(chat_id, self.cookie_id)
 
+                if send_message:
+                    self._create_tracked_task(
+                        self._record_seller_human_message(
+                            chat_id, item_id, send_message,
+                        )
+                    )
+
                 return
             else:
                 observed_at = create_time / 1000 if create_time > 0 else time.time()
@@ -7893,21 +8794,6 @@ class XianyuLive:
                 )
                 self.last_inbound_at = time.time()
                 self.last_inbound_kind = "customer_chat"
-
-                # 🔔 立即发送消息通知（独立于自动回复功能）
-                # 检查是否为群组消息，如果是群组消息则跳过通知
-                try:
-                    session_type = message_10.get("sessionType", "1")  # 默认为个人消息类型
-                    if session_type == "30":
-                        logger.info(f"📱 检测到群组消息（sessionType=30），跳过消息通知")
-                    else:
-                        # 只对个人消息发送通知
-                        await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
-                except Exception as notify_error:
-                    logger.error(f"📱 发送消息通知失败: {self._safe_str(notify_error)}")
-
-
-
 
             # 【优先处理】使用订单状态处理器处理系统消息
             if self.order_status_handler:
@@ -8078,7 +8964,9 @@ class XianyuLive:
                 send_user_id=send_user_id,
                 send_message=send_message,
                 item_id=item_id,
-                msg_time=msg_time
+                msg_time=msg_time,
+                image_refs=image_refs,
+                order_id=order_id,
             )
 
         except Exception as e:
@@ -8755,7 +9643,17 @@ class XianyuLive:
             "sync_summary": sync_summary,
         }
 
-    async def send_image_msg(self, ws, cid, toid, image_url, width=800, height=600, card_id=None):
+    async def send_image_msg(
+        self,
+        ws,
+        cid,
+        toid,
+        image_url,
+        width=800,
+        height=600,
+        card_id=None,
+        wait_for_response=False,
+    ):
         """发送图片消息"""
         try:
             # 检查图片URL是否需要上传到CDN
@@ -8829,13 +9727,7 @@ class XianyuLive:
 
             logger.info(f"【{self.cookie_id}】Base64编码长度: {len(content_base64)}")
 
-            # 构造WebSocket消息（完全参考send_msg的格式）
-            msg = {
-                "lwp": "/r/MessageSend/sendByReceiverScope",
-                "headers": {
-                    "mid": generate_mid()
-                },
-                "body": [
+            body = [
                     {
                         "uuid": generate_uuid(),
                         "cid": f"{cid}@goofish",
@@ -8865,10 +9757,23 @@ class XianyuLive:
                         ]
                     }
                 ]
-            }
-
-            await self._ws_send_guarded(ws, msg)
+            if wait_for_response:
+                response = await self._request_lwp_response(
+                    ws,
+                    "/r/MessageSend/sendByReceiverScope",
+                    body=body,
+                    timeout=10,
+                )
+            else:
+                msg = {
+                    "lwp": "/r/MessageSend/sendByReceiverScope",
+                    "headers": {"mid": generate_mid()},
+                    "body": body,
+                }
+                await self._ws_send_guarded(ws, msg)
+                response = True
             logger.info(f"【{self.cookie_id}】图片消息发送成功")
+            return response
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送图片消息失败: {self._safe_str(e)}")

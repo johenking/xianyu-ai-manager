@@ -220,7 +220,7 @@ class FulfillmentPersistenceTests(unittest.TestCase):
         self.assertEqual(state["reservation_values"], ["code-a"])
         self.assertEqual(self._card_lines(), ["code-b", "code-c"])
 
-    def test_active_reservation_blocks_card_deletion_until_safe_release(self):
+    def test_any_fulfillment_history_keeps_resource_auditable_after_release(self):
         attempt_id = self._begin()["attempt_id"]
         self.assertEqual(
             self.db.reserve_batch_card_data(attempt_id, self.card_one, 1),
@@ -232,7 +232,7 @@ class FulfillmentPersistenceTests(unittest.TestCase):
         self.assertTrue(
             self.db.release_fulfillment_attempt(attempt_id, "pre_send_cancelled")
         )
-        self.assertTrue(
+        self.assertFalse(
             self.db.delete_card(self.card_one, user_id=self.user_one["id"])
         )
 

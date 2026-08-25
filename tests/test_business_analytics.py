@@ -299,6 +299,45 @@ class BusinessAnalyticsTests(unittest.TestCase):
         hourly = {row["hour"]: row["order_count"] for row in payload["hourly"]}
         self.assertEqual(hourly.get(14), 2)
 
+    def test_dashboard_summary_uses_hourly_buckets_and_net_refund_statuses(self):
+        with self.db.lock:
+            self.db.conn.executemany(
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, order_status, "
+                "cookie_id, created_at, ordered_at_utc, paid_amount_fen) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ("order-refunding", "item-refund", "buyer-refund", "7.00", "refunding",
+                     "one-active", "2026-07-10 09:30:00", _epoch_cst(2026, 7, 10, 17, 0), 700),
+                    ("order-refund-cancelled", "item-refund", "buyer-refund", "8.00", "refund_cancelled",
+                     "one-active", "2026-07-10 09:31:00", _epoch_cst(2026, 7, 10, 18, 0), 800),
+                    ("order-refunded", "item-refund", "buyer-refund", "9.00", "refunded",
+                     "one-active", "2026-07-10 09:32:00", _epoch_cst(2026, 7, 10, 19, 0), 900),
+                    ("order-cancelled", "item-refund", "buyer-refund", "10.00", "cancelled",
+                     "one-active", "2026-07-10 09:33:00", _epoch_cst(2026, 7, 10, 20, 0), 1000),
+                ),
+            )
+            self.db.conn.commit()
+
+        response = self.client.get(
+            "/api/dashboard/summary",
+            params={
+                "range": "custom",
+                "start_date": "2026-07-10",
+                "end_date": "2026-07-10",
+            },
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        current = response.json()["current"]
+        self.assertEqual(response.json()["trend_granularity"], "hour")
+        self.assertEqual(current["revenue_stats"]["total_orders"], 7)
+        self.assertEqual(current["revenue_stats"]["total_amount"], 60.5)
+        hourly = {row["hour"]: row for row in current["hourly_stats"]}
+        self.assertEqual(hourly[14]["order_count"], 2)
+        self.assertEqual(hourly[17]["amount"], 7.0)
+        self.assertEqual(hourly[18]["amount"], 8.0)
+        self.assertNotIn(19, hourly)
+
     def test_buyers_endpoint_returns_scoped_payload(self):
         response = self.client.get(
             "/analytics/buyers",

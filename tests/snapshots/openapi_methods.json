@@ -152,6 +152,9 @@
     "GET",
     "POST"
   ],
+  "/api/ai/providers/discover-models": [
+    "POST"
+  ],
   "/api/ai/providers/{profile_id}": [
     "DELETE",
     "PUT"
@@ -324,8 +327,14 @@
     "GET",
     "PUT"
   ],
+  "/cards/{card_id}/api/validate": [
+    "POST"
+  ],
   "/cards/{card_id}/image": [
     "PUT"
+  ],
+  "/cards/{card_id}/stock/import": [
+    "POST"
   ],
   "/change-admin-password": [
     "POST"
@@ -355,6 +364,9 @@
   ],
   "/cookies/{cid}/auto-confirm": [
     "GET",
+    "PUT"
+  ],
+  "/cookies/{cid}/auto-rate": [
     "PUT"
   ],
   "/cookies/{cid}/cookie-refresh-settings": [
@@ -400,6 +412,12 @@
   "/face-verification/screenshot/{account_id}": [
     "DELETE",
     "GET"
+  ],
+  "/fulfillment-records": [
+    "GET"
+  ],
+  "/fulfillment-records/{payload_id}/resend": [
+    "POST"
   ],
   "/geetest/register": [
     "GET"
@@ -457,6 +475,9 @@
   "/items/delivery-bindings/batch": [
     "POST"
   ],
+  "/items/delivery-modes/batch": [
+    "POST"
+  ],
   "/items/get-all-from-account": [
     "POST"
   ],
@@ -472,6 +493,9 @@
     "PUT"
   ],
   "/items/{cookie_id}/{item_id}/delivery-binding": [
+    "PUT"
+  ],
+  "/items/{cookie_id}/{item_id}/delivery-mode": [
     "PUT"
   ],
   "/items/{cookie_id}/{item_id}/invite-auto-fulfillment": [

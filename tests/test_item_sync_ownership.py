@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from db_manager import DBManager
+import XianyuAutoAsync
 import reply_server
 
 
@@ -83,7 +84,39 @@ class ItemSyncOwnershipTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(resp.json().get("success"))
-        live_cls.assert_called_once()
+        live_cls.assert_called_once_with(
+            "unb=111; c=1",
+            "acct-one",
+            register_instance=False,
+        )
+
+    def test_non_listener_instance_does_not_replace_registered_listener(self):
+        sentinel = object()
+        previous = XianyuAutoAsync.XianyuLive._instances.get("acct-temp")
+        XianyuAutoAsync.XianyuLive._instances["acct-temp"] = sentinel
+        fake_db = MagicMock()
+        fake_db.get_cookie_details.return_value = {}
+        fake_db.get_cookie_refresh_settings.return_value = {
+            "enabled": False,
+            "interval_minutes": 1440,
+        }
+        fake_db.get_account_session_refresh.return_value = {}
+        try:
+            with patch.object(XianyuAutoAsync, "db_manager", fake_db), patch.object(
+                XianyuAutoAsync.XianyuLive, "_register_instance"
+            ) as register:
+                XianyuAutoAsync.XianyuLive(
+                    "unb=111; c=1",
+                    "acct-temp",
+                    register_instance=False,
+                )
+            register.assert_not_called()
+            self.assertIs(XianyuAutoAsync.XianyuLive.get_instance("acct-temp"), sentinel)
+        finally:
+            if previous is None:
+                XianyuAutoAsync.XianyuLive._instances.pop("acct-temp", None)
+            else:
+                XianyuAutoAsync.XianyuLive._instances["acct-temp"] = previous
 
 
 if __name__ == "__main__":

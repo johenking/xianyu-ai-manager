@@ -99,11 +99,11 @@ class AutoDeliveryBindingPriorityTests(unittest.TestCase):
     def test_unbound_item_still_falls_back_to_keyword_rule(self):
         self.assertEqual(self._deliver(), "KEYWORD-CODE")
 
-    def test_disabled_bound_card_falls_back_instead_of_sending_nothing(self):
-        # 绑定卡密被停用时，绑定视为不可用，回落关键词兜底而不是整单跳过
+    def test_disabled_bound_card_never_falls_back_to_another_resource(self):
+        # 显式绑定失效时必须停住，避免按标题误发另一份资源。
         self.db.set_item_delivery_card("acct-one", "item-1", self.bound_card_id, self.user["id"])
         self.db.update_card(self.bound_card_id, enabled=False, user_id=self.user["id"])
-        self.assertEqual(self._deliver(), "KEYWORD-CODE")
+        self.assertIsNone(self._deliver())
 
     def test_binding_delivers_even_when_no_keyword_rule_matches(self):
         # 商品标题改成与任何关键词都不匹配：这正是旧模糊匹配失灵的场景

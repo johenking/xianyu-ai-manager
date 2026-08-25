@@ -51,6 +51,11 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _is_provisional_chat(chat_id: str) -> bool:
+    """Synthetic direct references are placeholders until a real IM cid exists."""
+    return str(chat_id or "").strip().startswith("direct:")
+
+
 def _signature_headers(body: Dict[str, Any], secret: str, operation_key: str = "") -> Dict[str, str]:
     timestamp = str(int(time.time()))
     nonce = secrets.token_hex(16)
@@ -273,10 +278,17 @@ async def send_invite_message(request: Request, body: SendMessageRequest):
     await _verify_request(request, payload)
     operation, created = _begin_operation(body.operation_key, "message", body.order_id, body.cookie_id, payload)
     if not created:
-        if (
+        retryable_prewrite_failure = (
             operation["status"] == "failed"
             and operation.get("last_error") == "direct_conversation_not_submitted"
-        ):
+        )
+        retryable_identity_transition = (
+            body.operation_key.startswith("fulfillment-message-")
+            and operation["status"] == "needs_review"
+            and operation.get("last_error") == "chat identity mismatch"
+            and _is_provisional_chat(body.chat_id)
+        )
+        if retryable_prewrite_failure or retryable_identity_transition:
             with db_manager.lock:
                 db_manager.conn.execute(
                     "UPDATE invite_bridge_operations SET status = 'pending', provider_ref = '', "
@@ -297,8 +309,11 @@ async def send_invite_message(request: Request, body: SendMessageRequest):
     expected_buyer = str(order.get("buyer_id") or "")
     if expected_buyer and expected_buyer != body.to_user_id:
         return _set_operation(body.operation_key, "needs_review", error="buyer identity mismatch")
-    expected_chat = str(order.get("chat_id") or "")
-    if expected_chat and expected_chat != body.chat_id:
+    expected_chat = str(order.get("chat_id") or "").strip()
+    effective_chat = body.chat_id
+    if _is_provisional_chat(body.chat_id) and expected_chat and not _is_provisional_chat(expected_chat):
+        effective_chat = expected_chat
+    if expected_chat and not _is_provisional_chat(expected_chat) and expected_chat != effective_chat:
         return _set_operation(body.operation_key, "needs_review", error="chat identity mismatch")
     try:
         from XianyuAutoAsync import XianyuLive
@@ -319,23 +334,54 @@ async def send_invite_message(request: Request, body: SendMessageRequest):
                     state,
                     error=str(payment_check.get("error_code") or "payment state is not pending_ship"),
                 )
-        if body.chat_id.startswith("direct:"):
-            await asyncio.wait_for(
-                live_instance.send_msg_once(body.to_user_id, str(order.get("item_id") or ""), body.text),
+        if _is_provisional_chat(effective_chat):
+            message_response = await asyncio.wait_for(
+                live_instance.send_msg_once(
+                    body.to_user_id,
+                    str(order.get("item_id") or ""),
+                    body.text,
+                    wait_for_response=True,
+                ),
                 timeout=20,
             )
             conversation_mode = "direct_create"
         else:
-            await asyncio.wait_for(
-                live_instance.send_msg(live_instance.ws, body.chat_id, body.to_user_id, body.text),
+            message_response = await asyncio.wait_for(
+                live_instance.send_msg(
+                    live_instance.ws,
+                    effective_chat,
+                    body.to_user_id,
+                    body.text,
+                    wait_for_response=True,
+                ),
                 timeout=20,
             )
             conversation_mode = "existing"
+        if not isinstance(message_response, dict):
+            return _set_operation(
+                body.operation_key,
+                "ambiguous",
+                provider_ref=body.operation_key,
+                error="platform message response missing",
+            )
+        response_summary = XianyuLive._direct_frame_error_summary(message_response)
+        response_code = response_summary.get("code")
+        if response_code not in (None, "200"):
+            return _set_operation(
+                body.operation_key,
+                "failed",
+                error=f"platform message rejected: code={response_code}",
+            )
         return _set_operation(
             body.operation_key,
-            "submitted",
+            "succeeded",
             provider_ref=body.operation_key,
-            response={"messageAccepted": True, "conversationMode": conversation_mode},
+            response={
+                "messageAccepted": True,
+                "platformAcknowledged": True,
+                "conversationMode": conversation_mode,
+                "chatCanonicalized": effective_chat != body.chat_id,
+            },
         )
     except Exception as exc:
         from XianyuAutoAsync import DirectMessageNotSubmitted

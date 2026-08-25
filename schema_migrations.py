@@ -13,6 +13,7 @@ import unicodedata
 
 from security_utils import (
     ACCOUNT_PASSWORD_ENCRYPTION_VERSION,
+    SYSTEM_SECRET_ENCRYPTION_VERSION,
     AccountCredentialCipher,
     SystemSecretCipher,
     token_digest,
@@ -1609,6 +1610,367 @@ def _item_delivery_binding_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     )
 
 
+def _seller_auto_rate_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Opt-in seller reviews with one durable state row per order."""
+    if not cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cookies'"
+    ).fetchone():
+        return
+    _add_column(
+        cursor,
+        "cookies",
+        "auto_rate_enabled INTEGER NOT NULL DEFAULT 0 CHECK (auto_rate_enabled IN (0, 1))",
+    )
+    _add_column(cursor, "cookies", "auto_rate_enabled_at REAL")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_id_user ON cookies(id, user_id)"
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_auto_ratings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            item_title TEXT NOT NULL DEFAULT '',
+            order_created_at REAL NOT NULL,
+            due_at REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'scheduled'
+                CHECK (state IN (
+                    'scheduled', 'submitting', 'succeeded', 'failed',
+                    'needs_reconcile', 'cancelled'
+                )),
+            feedback TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            result_code TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            response_json TEXT NOT NULL DEFAULT '{}',
+            submitted_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(user_id, cookie_id, order_id),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_order_auto_ratings_due "
+        "ON order_auto_ratings(state, due_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_order_auto_ratings_account "
+        "ON order_auto_ratings(user_id, cookie_id, state)"
+    )
+
+
+def _ai_order_scoped_conversations_v1(
+    cursor: sqlite3.Cursor,
+    _db_path: str,
+) -> None:
+    """Add order scope and delivery provenance to AI conversation rows.
+
+    Existing rows stay in place and are deliberately marked ``legacy`` so a
+    caller can use them for conversational continuity without treating them as
+    verified order facts or delivered assistant messages.
+    """
+    table_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'ai_conversations'"
+    ).fetchone()
+    if not table_exists:
+        # DBManager normally creates this table before MigrationRunner runs;
+        # keeping the migration self-contained also makes isolated migrations
+        # safe on a minimal database used by tests or recovery tooling.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                order_id TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                intent TEXT,
+                bargain_count INTEGER DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'legacy',
+                delivery_state TEXT NOT NULL DEFAULT 'legacy',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id) REFERENCES cookies (id) ON DELETE CASCADE
+            )
+            """
+        )
+    else:
+        _add_column(cursor, "ai_conversations", "order_id TEXT")
+        _add_column(
+            cursor,
+            "ai_conversations",
+            "source TEXT NOT NULL DEFAULT 'legacy'",
+        )
+        _add_column(
+            cursor,
+            "ai_conversations",
+            "delivery_state TEXT NOT NULL DEFAULT 'legacy'",
+        )
+
+    # Be explicit for databases whose older columns were nullable or blank.
+    cursor.execute(
+        "UPDATE ai_conversations SET source = 'legacy' "
+        "WHERE source IS NULL OR TRIM(source) = ''"
+    )
+    cursor.execute(
+        "UPDATE ai_conversations SET delivery_state = 'legacy' "
+        "WHERE delivery_state IS NULL OR TRIM(delivery_state) = ''"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_conversations_order_scope "
+        "ON ai_conversations(cookie_id, order_id, created_at DESC, id DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_conversations_chat_scope "
+        "ON ai_conversations(cookie_id, chat_id, item_id, created_at DESC, id DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_conversations_order_lookup "
+        "ON ai_conversations(cookie_id, order_id, created_at, id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ai_conversations_delivery "
+        "ON ai_conversations(cookie_id, chat_id, item_id, delivery_state, created_at, id)"
+    )
+
+
+def _delivery_center_v1(cursor: sqlite3.Cursor, db_path: str) -> None:
+    """Reliable resources, explicit delivery modes, and immutable payload history."""
+    tables = {
+        str(row[0])
+        for row in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required = {"users", "cookies", "cards", "item_info", "fulfillment_attempts"}
+    if not required <= tables:
+        return
+
+    _add_column(
+        cursor,
+        "cards",
+        "low_stock_threshold INTEGER NOT NULL DEFAULT 5 CHECK (low_stock_threshold >= 0)",
+    )
+    _add_column(cursor, "cards", "api_token_encrypted TEXT NOT NULL DEFAULT ''")
+    _add_column(
+        cursor,
+        "cards",
+        "api_token_encryption_version INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column(
+        cursor,
+        "cards",
+        "api_validation_status TEXT NOT NULL DEFAULT 'unvalidated'",
+    )
+    _add_column(cursor, "cards", "api_validated_at REAL")
+    _add_column(cursor, "item_info", "delivery_mode TEXT")
+
+    # Existing explicit card/invite selections stay explicit. Rows that have
+    # never selected a mode remain NULL and are the only rows allowed to use
+    # the legacy keyword fallback.
+    cursor.execute(
+        "UPDATE item_info SET delivery_mode = 'resource' "
+        "WHERE delivery_mode IS NULL AND delivery_card_id IS NOT NULL"
+    )
+    cursor.execute(
+        "UPDATE item_info SET delivery_mode = 'invite' "
+        "WHERE delivery_mode IS NULL AND invite_auto_fulfillment = 1"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_info_delivery_mode "
+        "ON item_info(cookie_id, delivery_mode, delivery_card_id)"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cards_id_user ON cards(id, user_id)"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_attempt_id_user "
+        "ON fulfillment_attempts(id, user_id)"
+    )
+
+    # Migrate only the fixed v1 top-level token shape. Arbitrary legacy
+    # headers/params remain byte-for-byte in place and are marked manual-only.
+    cipher = SystemSecretCipher(db_path)
+    for card_id, raw_config in cursor.execute(
+        "SELECT id, api_config FROM cards WHERE type = 'api'"
+    ).fetchall():
+        status = "manual_only"
+        try:
+            import json
+
+            config = json.loads(str(raw_config or "{}"))
+        except (TypeError, ValueError):
+            config = None
+        if isinstance(config, dict) and config.get("protocol") == "fulfillment_api_v1":
+            token = str(config.pop("api_token", config.pop("token", "")) or "")
+            if token:
+                cursor.execute(
+                    "UPDATE cards SET api_config = ?, api_token_encrypted = ?, "
+                    "api_token_encryption_version = ? WHERE id = ?",
+                    (
+                        json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+                        cipher.encrypt(token),
+                        SYSTEM_SECRET_ENCRYPTION_VERSION,
+                        int(card_id),
+                    ),
+                )
+            status = "unvalidated"
+        cursor.execute(
+            "UPDATE cards SET api_validation_status = ? WHERE id = ?",
+            (status, int(card_id)),
+        )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fulfillment_api_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            card_id INTEGER,
+            idempotency_key TEXT NOT NULL,
+            config_fingerprint TEXT NOT NULL,
+            request_spec_json TEXT NOT NULL DEFAULT '{}',
+            state TEXT NOT NULL DEFAULT 'prepared'
+                CHECK (state IN ('prepared', 'pending', 'succeeded', 'failed', 'manual_review')),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 4),
+            http_status INTEGER,
+            external_operation_id TEXT NOT NULL DEFAULT '',
+            response_items_json TEXT NOT NULL DEFAULT '[]',
+            reason_code TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(attempt_id),
+            UNIQUE(idempotency_key),
+            FOREIGN KEY(attempt_id, user_id)
+                REFERENCES fulfillment_attempts(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_api_operation_id_user "
+        "ON fulfillment_api_operations(id, user_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fulfillment_api_operation_state "
+        "ON fulfillment_api_operations(user_id, state, updated_at DESC)"
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_fulfillment_api_card_owner_insert
+        BEFORE INSERT ON fulfillment_api_operations
+        WHEN NEW.card_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM cards
+            WHERE id = NEW.card_id AND user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'fulfillment api card owner mismatch');
+        END
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fulfillment_delivery_payloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_card_id INTEGER,
+            source_operation_id INTEGER,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(attempt_id),
+            FOREIGN KEY(attempt_id, user_id)
+                REFERENCES fulfillment_attempts(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(source_card_id) REFERENCES cards(id) ON DELETE SET NULL,
+            FOREIGN KEY(source_operation_id)
+                REFERENCES fulfillment_api_operations(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_fulfillment_payload_card_owner_insert
+        BEFORE INSERT ON fulfillment_delivery_payloads
+        WHEN NEW.source_card_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM cards
+            WHERE id = NEW.source_card_id AND user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'fulfillment payload card owner mismatch');
+        END
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_fulfillment_payload_operation_owner_insert
+        BEFORE INSERT ON fulfillment_delivery_payloads
+        WHEN NEW.source_operation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM fulfillment_api_operations
+            WHERE id = NEW.source_operation_id AND user_id = NEW.user_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'fulfillment operation owner mismatch');
+        END
+        """
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fulfillment_payload_id_user "
+        "ON fulfillment_delivery_payloads(id, user_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fulfillment_payload_owner_time "
+        "ON fulfillment_delivery_payloads(user_id, created_at DESC, id DESC)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fulfillment_resend_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload_id INTEGER NOT NULL,
+            attempt_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            cookie_id TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK (status IN ('prepared', 'succeeded', 'failed', 'ambiguous')),
+            request_mid TEXT NOT NULL DEFAULT '',
+            reason_code TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            FOREIGN KEY(payload_id, user_id)
+                REFERENCES fulfillment_delivery_payloads(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(attempt_id, user_id)
+                REFERENCES fulfillment_attempts(id, user_id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(cookie_id, user_id)
+                REFERENCES cookies(id, user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_fulfillment_resend_payload_time "
+        "ON fulfillment_resend_events(payload_id, created_at DESC, id DESC)"
+    )
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -1730,6 +2092,21 @@ MIGRATIONS: Sequence[Migration] = (
         "2026081302",
         "item_delivery_binding_v1",
         _item_delivery_binding_v1,
+    ),
+    Migration(
+        "2026081601",
+        "seller_auto_rate_v1",
+        _seller_auto_rate_v1,
+    ),
+    Migration(
+        "2026081801",
+        "ai_order_scoped_conversations_v1",
+        _ai_order_scoped_conversations_v1,
+    ),
+    Migration(
+        "2026082401",
+        "delivery_center_v1",
+        _delivery_center_v1,
     ),
 )
 
