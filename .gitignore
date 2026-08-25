@@ -7,6 +7,9 @@
 *.private.yml
 secrets/
 credentials/
+.account_credential_key
+.ai_provider_key
+.system_secret_key
 *.key
 *.pem
 *.p12
@@ -17,6 +20,7 @@ data/
 backups/
 logs/
 output/
+outputs/
 realtime.log
 realtime*.log
 browser_data/
@@ -62,6 +66,7 @@ npm-debug.log*
 
 # Browser and test artifacts
 .playwright/
+.playwright-cli/
 .playwright-mcp/
 playwright-report/
 test-results/
