@@ -26,6 +26,8 @@ export interface OrderListQuery {
   pageSize?: number;
 }
 
+const ORDER_READ_TIMEOUT_MS = 15_000;
+
 export const getOrders = async (
   query: OrderListQuery = {},
   signal?: AbortSignal,
@@ -42,7 +44,7 @@ export const getOrders = async (
     end_date: query.endDate || undefined,
   };
 
-  const res = await get<any>('/api/orders', params, signal);
+  const res = await get<any>('/api/orders', params, signal, ORDER_READ_TIMEOUT_MS);
 
   // Handle backend response variations
   const orders = res.orders || res.data || [];
@@ -64,6 +66,7 @@ export const getOrderDetail = async (
     `/api/orders/${orderId}`,
     undefined,
     signal,
+    ORDER_READ_TIMEOUT_MS,
   );
   return {
     success: true,

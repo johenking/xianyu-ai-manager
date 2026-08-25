@@ -73,6 +73,7 @@ const request = async <T>(
   body?: unknown,
   params?: QueryParams,
   signal?: AbortSignal,
+  timeoutMs?: number,
 ): Promise<T> => {
   const token = localStorage.getItem('auth_token');
   const isFormData = body instanceof FormData;
@@ -88,32 +89,65 @@ const request = async <T>(
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const response = await fetch(buildUrl(path, params), {
-    method,
-    headers,
-    body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
-    signal,
-  });
-
-  const contentType = response.headers.get('content-type') || '';
-  const data = contentType.includes('application/json')
-    ? await response.json()
-    : await response.text();
-
-  if (!response.ok) {
-    if (response.status === 401) {
-      localStorage.removeItem('auth_token');
-      window.dispatchEvent(new Event('auth:logout'));
-    }
-
-    throw parseRequestError(data, response.status);
+  const hasTimeout = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0;
+  const controller = hasTimeout ? new AbortController() : null;
+  let timedOut = false;
+  let timeoutHandle: ReturnType<typeof globalThis.setTimeout> | undefined;
+  const forwardAbort = () => controller?.abort(signal?.reason);
+  if (controller && signal) {
+    if (signal.aborted) forwardAbort();
+    else signal.addEventListener('abort', forwardAbort, { once: true });
+  }
+  if (controller) {
+    timeoutHandle = globalThis.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
   }
 
-  return data as T;
+  try {
+    const response = await fetch(buildUrl(path, params), {
+      method,
+      headers,
+      body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
+      signal: controller?.signal ?? signal,
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    const data = contentType.includes('application/json')
+      ? await response.json()
+      : await response.text();
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        localStorage.removeItem('auth_token');
+        window.dispatchEvent(new Event('auth:logout'));
+      }
+
+      throw parseRequestError(data, response.status);
+    }
+
+    return data as T;
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiRequestError('请求超时，请重试', {
+        code: 'CLIENT_TIMEOUT',
+        status: 408,
+      });
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle !== undefined) globalThis.clearTimeout(timeoutHandle);
+    signal?.removeEventListener('abort', forwardAbort);
+  }
 };
 
-export const get = <T>(path: string, params?: QueryParams, signal?: AbortSignal) =>
-  request<T>('GET', path, undefined, params, signal);
+export const get = <T>(
+  path: string,
+  params?: QueryParams,
+  signal?: AbortSignal,
+  timeoutMs?: number,
+) => request<T>('GET', path, undefined, params, signal, timeoutMs);
 
 export const post = <T>(path: string, body?: unknown) =>
   request<T>('POST', path, body);
