@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiRequestError, post } from './request';
+import { ApiRequestError, get, post } from './request';
 
 describe('request error handling', () => {
   beforeEach(() => {
@@ -14,6 +14,7 @@ describe('request error handling', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -58,5 +59,35 @@ describe('request error handling', () => {
       code: 'INVITE_INVALID',
       status: 400,
     });
+  });
+
+  it('aborts a bounded GET and reports a stable client-timeout error', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => (
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'));
+        });
+      })
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const boundedGet = get as unknown as (
+      path: string,
+      params?: undefined,
+      signal?: AbortSignal,
+      timeoutMs?: number,
+    ) => Promise<unknown>;
+    const pending = boundedGet('/api/orders', undefined, undefined, 5_000);
+    const requestSignal = fetchMock.mock.calls[0]?.[1]?.signal;
+    expect(requestSignal).toBeInstanceOf(AbortSignal);
+
+    const rejection = expect(pending).rejects.toMatchObject({
+      message: '请求超时，请重试',
+      code: 'CLIENT_TIMEOUT',
+      status: 408,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await rejection;
   });
 });

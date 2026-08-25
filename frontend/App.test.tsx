@@ -36,7 +36,10 @@ describe('App identity hydration', () => {
     window.history.replaceState({}, '', '/');
   });
 
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
 
   it('keeps a valid token after a transient verify failure and offers retry', async () => {
     localStorage.setItem('auth_token', 'valid-token');
@@ -81,5 +84,22 @@ describe('App identity hydration', () => {
 
     await screen.findByText('仪表盘内容');
     expect(screen.getByRole('button', { name: '打开导航' })).toHaveClass('h-11', 'w-11');
+  });
+
+  it('does not preload every application page after authentication', async () => {
+    const idleCallback = vi.fn();
+    vi.stubGlobal('requestIdleCallback', idleCallback);
+    localStorage.setItem('auth_token', 'valid-token');
+    vi.mocked(verifyToken).mockResolvedValue({
+      authenticated: true,
+      user_id: 2,
+      username: 'user',
+      is_admin: false,
+    });
+
+    render(<App />);
+
+    await screen.findByText('仪表盘内容');
+    expect(idleCallback).not.toHaveBeenCalled();
   });
 });

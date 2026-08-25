@@ -40,6 +40,7 @@ def _fake_aiohttp_session(
     headers: dict = None,
     calls: list = None,
     session_kwargs: list = None,
+    delay: float = 0,
 ):
     """替身 aiohttp.ClientSession：让媒体端点在测试里不发真实网络请求。"""
 
@@ -50,6 +51,8 @@ def _fake_aiohttp_session(
             self.headers = headers or {"Content-Type": "image/png"}
 
         async def __aenter__(self):
+            if delay:
+                await asyncio.sleep(delay)
             if error is not None:
                 raise error
             return self
@@ -161,10 +164,14 @@ class OrderApiContractTests(unittest.TestCase):
             reply_server, "ORDER_ITEM_IMAGE_CACHE_DIR", self.media_dir
         )
         self._media_patch.start()
+        getattr(reply_server, "_ORDER_ITEM_IMAGE_FAILURE_CACHE", {}).clear()
+        getattr(reply_server, "_ORDER_ITEM_IMAGE_INFLIGHT", {}).clear()
         self.client = TestClient(reply_server.app, raise_server_exceptions=False)
 
     def tearDown(self):
         self.client.close()
+        getattr(reply_server, "_ORDER_ITEM_IMAGE_FAILURE_CACHE", {}).clear()
+        getattr(reply_server, "_ORDER_ITEM_IMAGE_INFLIGHT", {}).clear()
         self._media_patch.stop()
         reply_server.SESSION_TOKENS.clear()
         reply_server.db_manager = self.original_db
@@ -476,6 +483,64 @@ class OrderApiContractTests(unittest.TestCase):
         with _public_image_network(error=AssertionError("网络层不应被调用")):
             second = self.client.get("/api/orders/order-1/item-image", headers=headers)
         self.assertEqual(second.status_code, 200)
+
+    def test_item_image_failure_cache_prevents_repeated_source_requests(self):
+        self._attach_snapshot_image()
+        calls = []
+        headers = self.headers_for(self.user_one)
+
+        with _public_image_network(status=404, calls=calls):
+            first = self.client.get("/api/orders/order-1/item-image", headers=headers)
+            second = self.client.get("/api/orders/order-1/item-image", headers=headers)
+
+        self.assertEqual(first.status_code, 404)
+        self.assertEqual(second.status_code, 404)
+        self.assertEqual(first.json()["detail"]["reason"], "source_expired")
+        self.assertEqual(second.json()["detail"]["reason"], "source_expired")
+        self.assertEqual(calls, ["https://img.alicdn.com/item-1.png"])
+
+    def test_item_image_concurrent_misses_share_one_download(self):
+        self._attach_snapshot_image()
+        calls = []
+        current_user = {"user_id": self.user_one["id"]}
+
+        async def exercise():
+            return await asyncio.gather(
+                reply_server.get_order_item_image(
+                    "order-1", current_user=current_user, orders_db=self.db,
+                ),
+                reply_server.get_order_item_image(
+                    "order-1", current_user=current_user, orders_db=self.db,
+                ),
+            )
+
+        with _public_image_network(
+            status=200,
+            body=_png_bytes(),
+            calls=calls,
+            delay=0.05,
+        ):
+            responses = asyncio.run(exercise())
+
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(calls, ["https://img.alicdn.com/item-1.png"])
+
+    def test_item_image_transcoding_runs_off_the_event_loop(self):
+        self._attach_snapshot_image()
+
+        async def run_inline(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        to_thread = AsyncMock(side_effect=run_inline)
+        with patch.object(reply_server.asyncio, "to_thread", new=to_thread):
+            with _public_image_network(status=200, body=_png_bytes()):
+                response = self.client.get(
+                    "/api/orders/order-1/item-image",
+                    headers=self.headers_for(self.user_one),
+                )
+
+        self.assertEqual(response.status_code, 200)
+        to_thread.assert_awaited_once()
 
     def test_item_image_rejects_non_https_and_untrusted_hosts_before_network(self):
         headers = self.headers_for(self.user_one)

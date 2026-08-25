@@ -1344,4 +1344,69 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(within(secondDialog).getByRole('button', { name: '放弃修改' }));
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'AI助手设置' })).not.toBeInTheDocument());
   });
+
+  it('does not poll account session status while the document is hidden', async () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+
+    render(<AccountList />);
+    await screen.findByRole('heading', { name: '验证账号' });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getAccountSessionStatus).not.toHaveBeenCalled();
+
+    visibility.mockReturnValue('visible');
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
+    await waitFor(() => expect(getAccountSessionStatus).toHaveBeenCalledTimes(2));
+  });
+
+  it('uses a fifteen-second stable-state interval instead of polling every three seconds', async () => {
+    vi.useFakeTimers();
+    render(<AccountList />);
+    await act(async () => {
+      for (let index = 0; index < 6; index += 1) await Promise.resolve();
+    });
+
+    expect(getAccountSessionStatus).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(getAccountSessionStatus).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+    expect(getAccountSessionStatus).toHaveBeenCalledTimes(4);
+  });
+
+  it('never starts another status poll while the previous poll is in flight', async () => {
+    vi.useFakeTimers();
+    const resolvers: Array<(status: any) => void> = [];
+    vi.mocked(getAccountSessionStatus).mockImplementation(() => new Promise((resolve) => {
+      resolvers.push(resolve);
+    }));
+
+    render(<AccountList />);
+    await act(async () => {
+      for (let index = 0; index < 6; index += 1) await Promise.resolve();
+    });
+
+    expect(getAccountSessionStatus).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(getAccountSessionStatus).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolvers.forEach((resolve) => resolve({
+        state: 'idle',
+        trigger: '',
+        message: '',
+        error_code: '',
+        verification_image_url: '',
+      }));
+      await Promise.resolve();
+    });
+  });
 });
