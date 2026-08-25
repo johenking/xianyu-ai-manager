@@ -7210,7 +7210,10 @@ def refresh_ai_provider_models(profile_id: int, current_user: Dict[str, Any] = D
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning(f'平台模型列表刷新失败 profile={profile_id}: {type(e).__name__}')
+        error_code = e.code if isinstance(e, OutboundRequestError) else type(e).__name__
+        logger.warning(
+            f'平台模型列表刷新失败 profile={profile_id}: error_code={error_code}'
+        )
         raise HTTPException(status_code=400, detail='模型列表读取失败，可手动填写模型 ID 后测试')
 
 
@@ -7241,7 +7244,11 @@ def test_ai_provider(profile_id: int, payload: AIProviderTestRequest,
         raise
     except Exception as e:
         db_manager.update_ai_provider_verification(profile_id, user_id, 'failed', '测试回复生成失败')
-        logger.warning(f'AI平台测试失败 profile={profile_id} model={model_name}: {type(e).__name__}')
+        error_code = e.code if isinstance(e, OutboundRequestError) else type(e).__name__
+        logger.warning(
+            f'AI平台测试失败 profile={profile_id} model={model_name}: '
+            f'error_code={error_code}'
+        )
         raise HTTPException(status_code=400, detail='测试回复生成失败，请检查平台、Key、地址和模型 ID')
 
 
@@ -9064,7 +9071,7 @@ def get_order_analytics(
         user_id = current_user['user_id']
 
         # 定义有效订单状态（只统计这几种状态）
-        valid_statuses = list(VALID_ORDER_STATUSES)
+        valid_statuses = list(DASHBOARD_ANALYTICS_STATUSES)
 
         # 调用数据库分析函数，传入包含状态
         analytics_data = db_manager.get_order_analytics(

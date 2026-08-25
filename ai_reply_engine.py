@@ -25,7 +25,7 @@ from urllib.parse import quote, urlsplit
 from loguru import logger
 from openai import OpenAI
 from db_manager import db_manager
-from utils.outbound_http import request_public_http_sync
+from utils.outbound_http import OutboundRequestError, request_public_http_sync
 
 
 class _ModelCallBudgetExceeded(RuntimeError):
@@ -1290,7 +1290,12 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 return ''
             return content
         except Exception as e:
-            logger.error(f"AI兼容API调用失败: error_type={type(e).__name__}")
+            error_code = (
+                e.code
+                if isinstance(e, OutboundRequestError)
+                else type(e).__name__
+            )
+            logger.error(f"AI兼容API调用失败: error_code={error_code}")
             raise
 
     @classmethod
