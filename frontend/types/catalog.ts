@@ -187,6 +187,13 @@ export interface OrderAnalytics {
   status_stats?: Array<{ status: string; count: number; amount: number }>;
   // 按收货城市聚合的地区分布（后端按订单量降序 Top 50，仅运营地理统计）
   city_stats?: Array<{ city: string; order_count: number; total_amount: number }>;
+  // 按闲鱼账号聚合的贡献榜（显示名备注优先，金额降序 Top 20）
+  account_stats?: Array<{
+    cookie_id: string;
+    account_name: string;
+    order_count: number;
+    total_amount: number;
+  }>;
 }
 
 export interface DashboardSummary {

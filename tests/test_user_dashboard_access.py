@@ -221,6 +221,37 @@ class UserDashboardAccessTests(unittest.TestCase):
         self.assertNotIn("item-one", response.text)
         self.assertNotIn("item-two", response.text)
 
+    def test_dashboard_summary_account_stats_scoped_and_prefer_remark(self):
+        # 账号贡献：按账号聚合、金额降序；显示名备注优先、无备注回退账号 ID；跨租户不可见
+        with self.db.lock:
+            cursor = self.db.conn.cursor()
+            cursor.execute(
+                "UPDATE cookies SET remark = ? WHERE id = ?",
+                ("主力号", "one-active"),
+            )
+            cursor.execute(
+                "INSERT INTO orders (order_id, item_id, buyer_id, amount, paid_amount_fen, "
+                "order_status, cookie_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("order-three", "item-one", "buyer-three", "20.00", 2000, "completed", "one-paused", "2026-07-10 12:30:00"),
+            )
+            self.db.conn.commit()
+
+        response = self.client.get(
+            "/api/dashboard/summary",
+            params={"range": "7days", "end_date": "2026-07-11"},
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        account_stats = response.json()["current"]["account_stats"]
+        self.assertEqual(
+            account_stats,
+            [
+                {"cookie_id": "one-paused", "account_name": "one-paused", "order_count": 1, "total_amount": 20.0},
+                {"cookie_id": "one-active", "account_name": "主力号", "order_count": 1, "total_amount": 12.5},
+            ],
+        )
+        self.assertNotIn("two-active", response.text)
+
     def test_admin_dashboard_only_counts_own_data(self):
         # 给 admin 也造一份业务数据，确认仪表盘只统计到 admin 自己名下的那份
         admin = self.db.get_user_by_username("admin")

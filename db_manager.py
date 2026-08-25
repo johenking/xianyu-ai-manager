@@ -12523,12 +12523,36 @@ class DBManager:
                         'avg_amount': round(row[3] or 0, 2)
                     })
 
+                # 6. 账号贡献（按闲鱼账号聚合；显示名备注优先，无备注回退账号 ID）
+                cursor.execute(f"""
+                    SELECT
+                        o.cookie_id,
+                        MAX(COALESCE(NULLIF(c.remark, ''), o.cookie_id)) as account_name,
+                        COUNT(DISTINCT o.order_id) as order_count,
+                        SUM(o.paid_amount_fen) / 100.0 as total_amount
+                    FROM {from_clause}
+                    {where_clause}
+                    GROUP BY o.cookie_id
+                    ORDER BY total_amount DESC, order_count DESC
+                    LIMIT 20
+                """, params)
+
+                account_stats = []
+                for row in cursor.fetchall():
+                    account_stats.append({
+                        'cookie_id': row[0],
+                        'account_name': row[1],
+                        'order_count': row[2],
+                        'total_amount': round(row[3] or 0, 2),
+                    })
+
                 return {
                     'revenue_stats': revenue_stats,
                     'daily_stats': daily_stats,
                     'status_stats': status_stats,
                     'city_stats': city_stats,
                     'item_stats': item_stats,
+                    'account_stats': account_stats,
                     'amount_coverage': amount_coverage,
                     'time_coverage': time_coverage,
                     'metric_source': 'order_transactions',
