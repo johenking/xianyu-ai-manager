@@ -1,5 +1,83 @@
 # Handoff
 
+## 2026-08-24 自动发货成熟标准版发布
+
+本轮把自动发货收敛为商品配置、资源库、发货记录三页工作台。资源类型是固定资料、一次一密、图片和固定 HTTPS POST 的幂等 API v1；空资源不可创建，商品的 `off/resource/invite` 选择原子互斥，显式资源失效时失败关闭而不回落关键词或其他资源。一次一密沿用 `cards.data_content` 与既有预留，TXT/CSV/逐行补货会对当前库存和全部历史预留去重；API Token 由 `SystemSecretCipher` 加密，公开读取与记录只返回遮罩。
+
+履约载荷先持久化再发送，API 同键最多四次且只重放同一键；未知/冲突结果进入 `manual_review`。发货记录可查看遮罩历史，原样重发复用 committed 原载荷，不扣库存、不调用供应方，并要求确认。绑定或履约历史存在时资源只能停用，不能硬删。迁移为 `2026082401`，新增 API 操作、不可变载荷和重发账本表。
+
+本轮未改 `/Users/mac/Projects/wo-f`、邀请桥合同、付款核验、mid ACK、真实绑定、库存或订单。候选使用生产数据库副本且 8 个账号全部关闭；生产发布只替换四个后端文件和维护源生成的静态资源，静态资源先行、`index.html` 最后，随后一次受控 LaunchAgent reload。
+
+生产证据：PID `13548 → 88845`；本地/公网 `/health/ready` 均为 `ready`、迁移 `2026082401`；`8091` 单 listener；SQLite `integrity_check=ok`、外键违规为零、新表结构完整；启动 listener 数与 reload 前一致，无新 Traceback/CRITICAL/HTTP 5xx，关键表指纹在切换前后保持。具体运行数据只保留在本地发布证据中。随后静态-only 触控命中区修正未 reload 后端；最终公网入口为 `assets/index-DgjfWuPd.js` 与 `assets/index-CrHg7Yfi.css`，与本地 SHA-256 一致。
+
+完整命令、红→绿、候选/公网截图、最终原件冷备、patch、验证记录和回滚演练位于 `/Users/mac/Documents/咸鱼监控台/outputs/delivery-center-20260824T192237+0800/release-candidate-v4/`；可执行回滚为该目录的 `rollback.sh`。工作树既有未提交资产保持原样，未 commit/push/reset/clean。
+
+## 2026-08-23 商品同步 listener 注册隔离发布
+
+根因是 `XianyuLive.__init__` 曾无条件写入 `_instances[cookie_id]`：全量和分页商品同步创建的临时 HTTP 实例会覆盖 `cookie_manager.py` 创建的长期 WebSocket listener，随后邀请桥可能得到一个没有在线 WebSocket 的实例。构造器现保留 `register_instance=True` 默认值供长期 listener 使用；`POST /items/get-all-from-account` 与 `POST /items/get-by-page` 都显式传 `register_instance=False`，临时实例关闭自己的 HTTP session 而不改变注册表。
+
+回归覆盖两个同步入口和“临时实例不能替换既有 listener”，定向结果为 `84 passed / 4 subtests`，当时完整后端为 `969 passed / 197 subtests`。生产候选从生产原件制作，只原子替换 `XianyuAutoAsync.py` 与 `reply_server.py` 并受控 reload 一次；本地/公网 readiness、单 `8091` listener、SQLite integrity、日志窗口和隔离回滚均通过。
+
+后续 2026-08-24 Delivery Center 发布继续保留这一护栏。2026-08-25 的只读复核确认当前 PID `88845` 运行的生产源码仍有条件注册和两处 `False`，两份后端与最终 Delivery Center 候选逐字节一致；本地/公网均为 `ready`、迁移 `2026082401`、SQLite `integrity_check=ok`，启动后日志窗口没有 `listener_unavailable` 或 `Traceback`。原始证据位于 `outputs/listener-registry-fix-20260823T210631+0800/`，回滚单元位于 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/listener-registry-fix-20260823T210631+0800/`。
+
+## 2026-08-22 商品知识档案覆盖语义发布
+
+AI 结构化草稿生成现在以本次概览、商品标题、价格和详情重建完整草稿；成功后整体替换旧 `draft_json`，失败时保留原草稿。档案复制固定覆盖目标草稿，不自动发布，也不改变目标 `published_json`、历史版本或独立训练规则。
+
+生产候选定向回归 `25 passed`，后端全量 `967 passed / 197 subtests`，前端定向 `3 passed`；生产发布经后端先换位、受控 reload/readiness、再切换静态入口完成。最终证据为本地/公网 `ready`、迁移 `2026081601`、单 `8091` listener、18/18 稳定探针和新旧入口资源哈希一致；回滚脚本在隔离 fixture 中实跑恢复五个入口文件。
+
+证据、补丁和回滚分别位于 `/Users/mac/Documents/咸鱼监控台/outputs/item-knowledge-overwrite-20260822T110235/deploy-live-20260822T121906+0800/verification.md`、`/Users/mac/Documents/咸鱼监控台/outputs/item-knowledge-overwrite-20260822T110235/patch.diff` 和 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/item-knowledge-overwrite-20260822T121906+0800/rollback.sh`。后续 2026-08-24 交付中心发布已重载相关后端，但当前生产源码仍保留上述生成/复制语义。
+
+## 2026-08-19 普通账号待发货回退与过期会话隔离发布
+
+普通账号订单列表明确返回 `platform_permission_denied` 时，订单同步会进入受约束的 `pending_only` 回退，并逐项校验订单、商品、买家、金额、数量和待发货状态；`lead`、`unknown` 或任一关键字段不一致仍失败关闭。会话已进入人工重登状态时，订单同步和邀请轮询返回或记录 `skipped_reauth`，不继续触发平台请求。
+
+该两文件候选已原子部署；生产 `order_sync_service.py` 与 `invite_bridge_poller.py` 的落盘时间早于当前 PID `88845` 的启动时间，当前进程已经加载。验证记录位于 `outputs/autodelivery-fallback-atomic-20260818T123246+0800/evidence/verification-record.md`。代码发布不替代逐账号线上观察和一笔低金额真实订单金丝雀，这两项继续列为外部门禁。
+
+## Historical Seller Auto-Rate Backfill On 2026-08-18 (Read-Only Gate)
+
+The production candidate added only `db_manager.py`'s opt-in `allow_historical=False` guard and the standalone `backfill_auto_rates.py` operator tool. The default command opens SQLite with `mode=ro`, scans each enabled account through the existing order-list client for 365 days (up to 100 pages/2000 orders), counts exact `RATE` actions, and never imports the rating submitter or writes a task. Normal scheduler callers retain the enable-time boundary.
+
+The latest production read-only scan completed full, non-truncated coverage for two enabled accounts while one returned `session_expired`, so the aggregate remained `incomplete=true`, `applied=0`, and `apply_allowed=false`. No historical task was created and no platform review request was sent; the already-running scheduler's later ordinary work is independent of this read-only scan. Exact account and task counts remain only in the local evidence.
+
+Deployment used atomic per-file replacement without LaunchAgent reload. PID `42728`, one `8091` listener, local/public readiness `ready`, migration `2026081601`, and public entry `assets/index-BPyBD1ot.js` were unchanged by this rollout. The observed later PID/static/order-file drift was external to the two-file change and was preserved. Full commands, literal output, hashes, and rollback are in `/Users/mac/Documents/咸鱼监控台/outputs/auto-rate-history-20260818T000412+0800/`; production originals are in `/Users/mac/Library/Application Support/XianyuManager Rollbacks/auto-rate-history-20260818T000412+0800/`.
+
+The apply phase remains blocked until the expired account is restored and a fresh default scan reports complete coverage for all three accounts. After an explicit confirmation based on that report, `--apply` may schedule only currently rateable, untracked orders with the existing 5-15 minute delay; it never submits reviews directly. Buyer-to-seller rating and any successful or ambiguous platform review reversal remain outside this rollout.
+
+## Invite Confirmation Latency Repair On 2026-08-17
+
+The installed production now handles a verified paid invitation order without waiting behind account-wide order synchronization or the invitation poller's global discovery scan. Numeric platform order IDs try the single-order detail endpoint first and fall back to at most five order-list pages. After that payment check succeeds, the event invokes a target-only `scan_once(discover=False, trusted_order_ids={order_id})`; the internal send-message route still performs its independent payment verification and keeps the existing idempotency and message-ACK gate.
+
+The pre-deploy same-account observation took `55.094s` from the payment-status event to confirmation-message ACK. After the controlled reload, the same boundary took `2.926s`. One complete production ledger recorded a single-attempt `send_confirmation` in `0.859s`, buyer confirmation, a distinct single-attempt `send_fulfillment_message` in `2.571s`, and single-attempt `mark_fulfilled` in `3.467s`, ending in local `fulfilled`. No target confirmation/fulfillment operation created after the deployment remained pending, ambiguous, failed, or in review at closeout.
+
+Only `/Users/mac/Library/Application Support/XianyuManager/XianyuAutoAsync.py` and `invite_bridge_poller.py` were replaced, followed by one controlled LaunchAgent reload. Local and public readiness stayed `ready`, migration remained `2026081601`, and one process listened on `8091`; database content, static assets, configuration, keys, browser profiles, uploads, and the separate invitation-service deployment were preserved. The exact commands and literal outputs are in `outputs/invite-confirm-latency-20260817T203138+0800/verification-record.md`; the runnable rollback is `/Users/mac/Library/Application Support/XianyuManager Rollbacks/invite-confirm-latency-20260817T203138+0800/rollback.sh`.
+
+## 2026-08-18 仪表盘实时发布
+
+生产仪表盘现在区分单日时段视图和多日日视图。`GET /api/dashboard/summary` 对单日返回 `trend_granularity=hour` 与保存的东八区下单时间桶，对多日返回 `day` 与日桶。界面补齐缺失小时，在可见且在线时每 15 秒刷新；后台请求失败保留最后一次成功状态；数字用 `NumberFlow` 动画并遵守 reduced-motion 偏好。
+
+付款事件会在普通履约路径继续前持久化可信金额、数量和下单时间。仪表盘净销售额保留 `refunding`，排除 `refunded`/`cancelled`，重新计入 `refund_cancelled`；订单明细在计数、金额或状态分布变化时刷新。生产候选从维护源前端和三个限定后端副本按文件发布；数据库、迁移、配置、密钥、浏览器 Profile、上传和无关脏改动均保留。
+
+新鲜证据记录本地/公网 readiness 为 `ready`、迁移 `2026081601`、单个 `8091` listener、`today -> hour`、`7days -> day`、后端仪表盘回归 `147 passed + 25 subtests`、前端 `29` 个文件 `183` 个测试。验证记录、候选哈希、桌面/移动截图、补丁和可执行回滚均位于 `/Users/mac/Documents/咸鱼监控台/outputs/dashboard-realtime-20260818T000823+0800/`。
+
+## 2026-08-18 今日经营脉搏 UI 重排
+
+仪表盘默认范围改为“今天”，范围控件统一为今天、昨天、近 3 天、近 7 天、近 30 天和自定义，并提供 `aria-pressed` 与 44px 触控高度。今日图只展示东八区已发生到当前小时的数据，峰谷和涨跌排除未结束小时；跨日范围结束于今天时也排除未结束日期，数据不足显示 `--`。桌面保持 KPI/趋势左右结构，移动端重排后在 390x844 首屏露出浅色分析区。
+
+动效沿用已有 NumberFlow 与 Recharts 650ms 过渡，数据指纹不变时不重播；`prefers-reduced-motion` 下关闭页面淡入、旋转、脉冲和图表过渡。前端全量为 `29` 个测试文件、`188 passed`，TypeScript、构建、静态代际、扩展校验和四个视口的 ego-browser 验收通过。
+
+本次只把维护源生成的静态候选按资源优先、`index.html` 最后顺序发布，没有重载后端。生产 PID `51419`、单个 `8091` listener、readiness `ready`、迁移 `2026081601` 保持；本地和公网 HTML 均引用 `assets/index-D8NYx3ge.js` 与 `assets/index-DlLMEdhT.css`。候选、前端补丁、四视口截图、验证记录和可执行回滚位于 `/Users/mac/Documents/咸鱼监控台/outputs/dashboard-ui-20260818T132445+0800/`。
+
+## Seller Auto-Rate And Frontend Source Correction On 2026-08-16
+
+The installed production now exposes product-bound Auto Delivery and an account-level, default-off seller auto-rate switch. Auto-rating covers seller-to-buyer reviews only: it discovers orders created after enablement with the exact platform `RATE` action, delays each task by 5-15 minutes, generates one fact-conservative Chinese sentence with a fixed fallback, and submits serially. The merchant request uses `tradeIdList`; only `data.module.success` plus the target order in `successOrderIds` is accepted as success. Explicit rejection is `failed`; an inconclusive result or restart after the durable pre-POST marker is `needs_reconcile` and is not automatically replayed. Buyer-to-seller rating remains outside the active contract pending a real write-and-readback canary.
+
+The frontend release identity is Auto Delivery present, Skill Center absent, and native-helper code plus user-facing “本机助手” wording absent. The maintained frontend under `/Users/mac/Documents/咸鱼监控台/frontend` is the only build source. The installed production checkout may contain task-specific changes and must not replace the maintained source or be copied wholesale back into it.
+
+Final production evidence recorded `ready`, migration `2026081601`, three of three runtime sessions, one `8091` listener, and the same `index-DN0GYD_l.js` entry from local and public HTML. All account auto-rate switches and task counts were zero, so the deployment submitted no real review. The four invitation/fulfillment path files stayed byte-identical to the pre-deploy snapshot; the combined auto-rate and invitation/fulfillment regression passed 79 tests, and the production auto-rate module passed seven focused tests. One controlled backend reload loaded the corrected merchant schema; static publication itself stayed online.
+
+The verified deployment diff, exact commands, literal outputs, manifest, reverse frontend patch, and runnable rollback are in `/Users/mac/Documents/咸鱼监控台/outputs/auto-rate-deploy-20260816/`. The full pre-deploy rollback snapshot remains at `/Users/mac/Library/Application Support/XianyuManager Rollbacks/auto-rate-20260816-165736-pre-deploy`.
+
 ## v1.10.1 Login Verification Hotfix Release On 2026-07-29
 
 This hotfix keeps QR, SMS and password login in the same server-Chrome session
@@ -46,10 +124,11 @@ Production release evidence:
   `secrets` in 9 seconds and the complete `test` job in 4 minutes 15 seconds.
 - The mode-`0700` rollback unit
   `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.1-pre-deploy-20260729-192456`
-  retains the previous `v1.10.0` source, SQLite backup, local keys, browser
+  retained the previous `v1.10.0` source, SQLite backup, local keys, browser
   Profile, static assets, uploads, extension, LaunchAgent and Git bundle. Its
   SQLite integrity check and all 2,338 SHA-256 entries passed after the service
-  stopped.
+  stopped. The path no longer existed during the 2026-08-25 audit, so those
+  retained contents are not currently re-verifiable.
 - Production fast-forwarded to the exact application commit and restarted as
   one worker with PID `40759`. Local and public readiness passed, migration
   `2026072703` remained unchanged, SQLite integrity was `ok`, and the runtime
@@ -122,7 +201,8 @@ Local release gates completed on 2026-07-29:
   used an integrity-checked production database copy and copied all three
   local keys into a mode-`0700` directory. After migration, every candidate
   account was explicitly disabled before the acceptance start; no production
-  account state was modified.
+  account state was modified. The candidate path no longer existed during the
+  2026-08-25 audit, so it remains historical evidence only.
 - The acceptance start used one Uvicorn process on `127.0.0.1:8092`, migration
   `2026072703`, zero account listener tasks and zero runtime sessions. Local
   live/readiness, SQLite integrity, version `1.10.0`, root HTML, authenticated
@@ -145,12 +225,13 @@ Production release evidence:
 - PR run `30427347536` passed both `secrets` and `test` on the final branch
   head. The exact squash commit then passed both jobs again on main in run
   `30427623552` before deployment.
-- The stopped-service, mode-`0700` rollback unit is
+- The stopped-service, mode-`0700` rollback unit was
   `/Users/mac/Library/Application Support/XianyuManager Rollbacks/v1.10.0-pre-deploy-20260729-142216`.
   Its 2,323-entry SHA-256 manifest, Git bundle, SQLite integrity check, three
   local keys, prior tracked source, static and upload files, browser profiles,
   browser extension and LaunchAgent all verified before the production
-  checkout moved.
+  checkout moved. The path no longer existed during the 2026-08-25 audit, so
+  its contents are not currently re-verifiable.
 - The clean production checkout fast-forwarded from `8e9f056` to `7a4f472`.
   The production frontend build reported version `1.10.0`, retained 36 and 35
   assets across two generations with zero orphans, and npm reported zero known
@@ -597,13 +678,15 @@ return HTTP 200 with migration `2026073101`. The deployed frontend entry and CSS
 match local/public responses byte-for-byte, and both versioned extension ZIPs
 return HTTP 200 with matching hashes.
 
-The complete rollback unit is outside the repository at
+The complete rollback unit was recorded outside the repository at
 `/Users/mac/Library/Application Support/XianyuManager Rollbacks/client-browser-login-20260801-011335`.
-It contains the pre-deploy source archive, SQLite and runtime data snapshots,
+It was recorded as containing the pre-deploy source archive, SQLite and runtime data snapshots,
 browser profiles, prior static assets, patch/diff files, `verification.md`, and
 `rollback.sh`. The rollback script passed syntax and `--check`; no live account
 login was performed during deployment, so the remaining real-platform gate is a
-manual user canary after the one-time extension installation.
+manual user canary after the one-time extension installation. The path no
+longer existed during the 2026-08-25 audit, so those contents are not currently
+re-verifiable.
 
 After deployment, the existing HTTP/2 Cloudflare tunnel briefly returned 502/530
 while its edge connections cycled. A reversible LaunchAgent `kickstart` restored
@@ -663,8 +746,10 @@ commit `a8caed4` only to preserve the pre-existing production candidate history;
 its source tree has zero file differences from `origin/main@012db74`. Local and
 public readiness, OpenAPI `1.10.4`, HTML entry `assets/index-B3_Qlwcs.js`, all
 three public package hashes, SQLite integrity, one listener, repeated public
-HTTP/2 samples, and both rollback checks passed. The complete record is
-`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146/verification.md`.
+HTTP/2 samples, and both rollback checks passed. The complete record was
+`/Users/mac/Library/Application Support/XianyuManager Rollbacks/native-helper-login-20260802-105146/verification.md`;
+that path no longer existed during the 2026-08-25 audit, so the historical
+record is not currently re-verifiable.
 
 The remaining live-provider gate is a real ordinary-user login from that user's
 computer: start the downloaded helper, let it open that user's Chrome, complete
@@ -737,3 +822,27 @@ kickstarts `com.sub2api.cloudflared`, waits for a ready connection, and applies 
 180-second cooldown. It never restarts the application worker or edits the local
 proxy/DNS process. Production installation and its rollback are recorded in the
 dated rollback unit for this incident after the live stability window completes.
+
+## Lead-order guard on 2026-08-19
+
+The production order guard now classifies platform records from positive markers:
+`leadReservation`/`idleBizCode=7000` and lead components identify a lead order;
+`idleBizCode=6` or the explicit `LOGISTICS_SEND` action identifies an ordinary
+order. Automatic delivery and invitation staging accept only the ordinary class;
+lead and unconfirmed records fail closed before card reservation, platform
+confirmation, or buyer messaging.
+
+The release was assembled from a production checkout snapshot and deployed only
+the three task files (`XianyuAutoAsync.py`, `order_sync_service.py`, and
+`invite_bridge_poller.py`) by same-directory atomic replacement. A single
+controlled LaunchAgent reload loaded the new modules in PID `43286`; readiness
+returned in two seconds, the local and public endpoints remained `ready`, and
+the service stayed on one `8091` listener with migration `2026081601`.
+
+The candidate isolation suite passed `150` tests with `46` subtests; the current
+backend suite passed `963` tests with `197` subtests. The target lead order was
+read-only checked before and after the cutover: it remained `pending_ship` and
+`system_shipped=0`, with no fulfillment attempt or card reservation added. Full
+hashes, patch replay, failure-recovery rehearsal, production backup, and the
+executable rollback are recorded in
+`outputs/lead-order-guard-20260819T204757+0800/evidence/verification-record.md`.

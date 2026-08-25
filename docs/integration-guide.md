@@ -29,14 +29,16 @@ Backend sessions are persisted in `auth_sessions` and expire after 30 days. Neve
 | Public registration and recovery | `GET /api/auth/registration-config`, `POST /api/auth/captcha`, `POST /api/auth/email-code`, `POST /register`, `POST /api/auth/password-reset/verify-code`, `POST /api/auth/password-reset` |
 | Registration administration | `/api/admin/registration/status`, `/limit`, `/users`, `/enabled`; legacy `/invites` returns 410 |
 | Settings | User-owned `GET /api/settings/user-summary`, `PUT /api/settings/user-basic`; administrator-only `/api/settings/summary`, `/sections/{section}`, `/verify/{section}`, `/verify/smtp/confirm` |
-| AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST .../models/refresh`, `POST .../test` |
+| AI providers | `GET/POST /api/ai/providers`, `PUT/DELETE /api/ai/providers/{id}`, `POST /api/ai/providers/discover-models`, `POST .../models/refresh`, `POST .../test` |
 | AI training | `POST /ai-reply-lab/reply/{cookie_id}`, `POST /ai-reply-lab/save/{cookie_id}`, `/ai-training-rules/{cookie_id}*` |
 | Product knowledge | `/ai-item-knowledge/{cookie_id}/{item_id}*` |
 | Official account login | Web QR through `/qr-login/*`; headed Chrome QR/SMS/password through `POST /api/official-login/sessions`, `GET .../{session_id}`, owner-scoped `POST .../interact`, administrator-loopback `POST .../show-browser`, and `POST .../cancel`; compatibility `/password-login*` and `/official-window-login*` |
 | Account session | `GET /api/accounts/{cookie_id}/session-status`, `POST .../session-refresh`, `POST .../session-refresh/cancel`, `POST .../session-refresh/show-browser`, `PUT /cookies/{cid}/cookie-refresh-settings` |
 | Auto-reply diagnostics | `GET /api/diagnostics/auto-reply/{cookie_id}` |
 | Dashboard, orders and analytics | `GET /api/dashboard/summary`, `POST /api/orders/sync`, `GET /api/orders`, `POST /api/orders/{order_id}/refresh`, `GET /analytics/items/performance`, `GET /analytics/items/traffic`, `GET /analytics/items/metrics/status`, `POST /analytics/items/metrics/sync` |
-| Skill Center | `/api/skills/monitor/*`, `/api/skills/agent/*`, `/api/skills/ops/*` |
+| Invitation fulfillment bridge | HMAC-only internal `POST /internal/invite/order-events`, `POST /internal/invite/send-message`, `POST /internal/invite/mark-fulfilled`, `GET /internal/invite/operations/{operation_key}` |
+| Product delivery center | `/cards*`, `POST /cards/{id}/stock/import`, `POST /cards/{id}/api/validate`, `PUT /items/{cookie_id}/{item_id}/delivery-mode`, `POST /items/delivery-modes/batch`, `GET /fulfillment-records`, `POST /fulfillment-records/{id}/resend` |
+| Seller auto-rating | Account-owned `PUT /cookies/{cid}/auto-rate` |
 
 Routes below require `Authorization: Bearer $TOKEN` unless they are explicitly described as public.
 
@@ -188,7 +190,7 @@ curl -sS "$BASE_URL/api/dashboard/summary?range=7days" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Ranges are `today`, `yesterday`, `3days`, `7days`, `30days`, or `custom`; custom requests also send `start_date` and `end_date` as `YYYY-MM-DD`. The response declares `scope: user` for ordinary users and `scope: system` for administrators, then returns `stats`, `current`, `previous`, `item_names`, and resolved date boundaries. Frontends should render the summary first and request `/analytics/orders/valid` afterward for detail rows.
+时间范围支持 `today`、`yesterday`、`3days`、`7days`、`30days` 和 `custom`；自定义请求还要用 `YYYY-MM-DD` 传入 `start_date` 与 `end_date`。响应始终声明 `scope: user`，管理员也不例外，并返回 `stats`、`current`、`previous`、`item_names` 和解析后的日期边界。单日范围的 `trend_granularity` 为 `hour`，多日范围为 `day`。单日 `current.hourly_stats` 使用东八区保存的平台注册下单时间；服务端桶可能稀疏，仪表盘会补齐 24 小时。多日趋势继续使用 `current.daily_stats`。仪表盘营收使用 `paid_amount_fen`：`refunding` 保留，`refunded` 和 `cancelled` 排除，`refund_cancelled` 重新计入。前端应先渲染汇总，再请求 `/analytics/orders/valid` 获取明细行。
 
 ## AI Provider Profiles
 
@@ -215,11 +217,17 @@ Refresh a provider's model list with `POST /api/ai/providers/{id}/models/refresh
 {"model_name":"model-id"}
 ```
 
+Use `POST /api/ai/providers/discover-models` to fill the model selector before saving. A new profile sends `provider_type`, `preset`, `base_url`, and `api_key`; an existing profile sends `profile_id` and may leave `api_key` empty to reuse its saved key. The response contains only normalized model IDs. Pass the selected IDs as `models` when creating or updating a profile; an empty discovery response keeps the existing cache.
+
 Provider responses never return the cleartext key. Accounts may only apply a new provider/model after a successful generated-reply test; a failed test leaves the active configuration unchanged.
+
+### Inbound Images
+
+Platform image messages are accepted from both legacy payloads and the newer `operation.content` shape. The service keeps the original CDN reference out of the model request: it only accepts HTTPS image hosts on the platform allowlist, checks the response type and size limits, decodes the image, and embeds it as an OpenAI-compatible `image_url` data part. This path requires a vision-capable model behind the selected OpenAI-compatible endpoint, including a compatible relay URL. A text-only DeepSeek model or an unverified Gemini/DashScope multimodal profile keeps the existing text/fallback behavior.
 
 ## Product Knowledge
 
-For product management screens, load a single account by default with `GET /items/cookie/{cookie_id}`. Use `GET /items` only for an explicit all-account view. Manual product sync remains account-scoped through `POST /items/get-all-from-account`.
+For product management screens, load a single account by default with `GET /items/cookie/{cookie_id}`. Use `GET /items` only for an explicit all-account view. Manual product sync remains account-scoped through `POST /items/get-all-from-account`; paginated sync uses `POST /items/get-by-page`. Both routes use short-lived clients with `register_instance=False`, so neither route replaces the account's long-lived WebSocket listener.
 
 Read the current draft, published snapshot, source product, and version state:
 
@@ -235,12 +243,11 @@ curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/generate" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "overview":"这是卖家确认的商品用途、规格、限制和交付方式。",
-    "profile":{}
+    "overview":"这是卖家确认的商品用途、规格、限制和交付方式。"
   }'
 ```
 
-The generation call saves the overview first, then combines it with the synchronized title, price, and detail text. Save edits with `PUT .../draft`. Publishing is a separate `POST .../publish` action and fails while generated fields remain unconfirmed.
+The generation call uses the submitted overview with the synchronized title, price, and detail text to build a fresh draft. A successful generation replaces the whole current draft; a failed generation leaves the previous draft intact. Save edits with `PUT .../draft`. Publishing is a separate `POST .../publish` action and fails while generated fields remain unconfirmed.
 
 Copy the source profile to other products:
 
@@ -248,12 +255,12 @@ Copy the source profile to other products:
 curl -sS -X POST "$BASE_URL/ai-item-knowledge/$COOKIE_ID/$ITEM_ID/copy" \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"target_item_ids":["target-item-id"],"overwrite":false}'
+  -d '{"target_item_ids":["target-item-id"]}'
 ```
 
-Copy writes target drafts only, never publishes, and skips targets that already contain draft or published knowledge unless `overwrite` is explicitly true. Use `GET .../versions` and `POST .../rollback/{version}` for history.
+Copy writes target drafts only, always replaces the selected target draft, and keeps the target published snapshot and history unchanged. It never publishes a target. Use `GET .../versions` and `POST .../rollback/{version}` for history.
 
-The copy response keeps `copied_item_ids`, `skipped_item_ids`, and `missing_item_ids`, and may also include `source_kind`, `copied_count`, `skipped_count`, `missing_count`, and `skipped_reasons` so clients can explain whether the source came from the draft or published snapshot and why a target was skipped.
+The response keeps `copied_item_ids`, `missing_item_ids`, and the legacy skip fields for client compatibility. Valid selected targets are reported as copied; missing or unowned targets remain in `missing_item_ids`.
 
 ## Training Rules And Lab
 
@@ -288,14 +295,14 @@ Price, plan, package, and warranty-price rules are hard guarded. If the model st
 
 ## Account Binding And Refresh
 
-Supported binding paths:
+Supported binding paths, in current UI order:
 
-- Server-side local Chrome (primary, loopback only): `POST /api/official-login/sessions` with `{"mode":"qr","show_browser":true}` opens a headed Chromium window on the service host and the user completes every official verification there. Any loopback console user may call it; non-loopback requests receive 403/409 and must use the extension or web QR. Token validation, `unb` identity, persistence, and frontend confirmation are all required before success.
-- Web QR: `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; `mobile_scan` keeps a scannable image while slider, face, SMS, interactive, and unknown verification hand off to a current-device session.
-- Browser extension import: register an `extension` client-browser device for the signed session flow, or create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings` for manual import. Extension detection is isolated from the user-machine helper path.
+- Web QR (recommended): `POST /qr-login/generate`, then poll `GET /qr-login/check/{session_id}`. The first QR image is rendered locally from official `codeContent`; `mobile_scan` keeps a scannable image while slider, face, SMS, interactive, and unknown verification hand off to the server browser or extension according to the current UI surface.
+- Server-side Chrome (fallback): `POST /api/official-login/sessions` with `{"mode":"qr","show_browser":true}` opens a headed Chromium window on the service host. The backend requires an authenticated console session and records unfamiliar source/Host values as warnings; the UI exposes this path only on loopback and the formal production hostname. Token validation, `unb` identity, persistence, and frontend confirmation are required before success.
+- Browser extension import: register an `extension` client-browser device for the signed session flow, or create a five-minute, owner-bound, single-use protocol-v2 pairing through `/api/browser-extension/pairings` for manual import. Extension detection is isolated to this entry.
 - Manual Cookie: `POST /cookies` for a new account or `PUT /cookies/{cid}` to update an existing account.
 
-Start a server-maintenance Chrome QR session from an administrator loopback console:
+Start a server-side Chrome QR session from an authenticated console where the UI exposes that path:
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
@@ -304,7 +311,7 @@ curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
   -d '{"mode":"qr","show_browser":true}'
 ```
 
-Poll `GET /api/official-login/sessions/{session_id}` only for this maintenance flow. The endpoint and all physical-window controls require administrator loopback access. Ordinary users use `/api/client-browser/sessions` and never create a server-side browser.
+Poll `GET /api/official-login/sessions/{session_id}` for this flow. Session ownership remains user-scoped, and a successful status still requires real platform Token validation and persistence; network-source warnings are observation only, not a substitute for authentication.
 
 Start the web QR session:
 
@@ -313,11 +320,9 @@ curl -sS -X POST "$BASE_URL/qr-login/generate" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Poll `GET /qr-login/check/{session_id}`. Generation and scanning never start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification return `continue_in_client_browser`; end the web QR with the compatibility reason `switched_to_extension`, then start either the user-machine helper or extension path. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
+Poll `GET /qr-login/check/{session_id}`. Generation and scanning never start a browser. A `mobile_scan` verification remains a scannable image. Slider, face, SMS, `interactive`, and unknown verification return `continue_in_client_browser`; end the web QR session, then start either the server-browser fallback or extension path. Hide/reopen keeps polling alive. Explicit cancellation uses `POST /qr-login/cancel/{session_id}` with `ended_by`; an expired QR remains queryable for at least five minutes before becoming `not_found`.
 
-The old remote SMS example below is server-maintenance-only. Ordinary SMS login
-is started by the console through the user-machine helper and the code is entered
-only in the user's Chrome/Edge.
+The SMS example below starts the same authenticated server-browser flow; remote devices use the extension entry instead.
 
 ```bash
 curl -sS -X POST "$BASE_URL/api/official-login/sessions" \
@@ -379,7 +384,15 @@ A `verification_required` state means the platform requires human verification i
 
 An active refresh is account-scoped and single-flight. Repeated `POST .../session-refresh` requests return the current persisted status and do not queue another browser session. Listener restarts restore the latest attempt or success as the scheduled-refresh anchor and set a fresh item-sync anchor, so a successful manual refresh cannot immediately trigger scheduled renewal or item-detail browser work.
 
-The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. The user-machine helper, web QR, Chrome extension, and manual Cookie binding remain human recovery options. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes have been removed and are intentionally absent from OpenAPI.
+The password flow follows the current official Goofish page and remains sensitive to page and risk-control changes. Web QR, server-side Chrome, the extension, and manual Cookie binding remain human recovery options. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes have been removed and are intentionally absent from OpenAPI.
+
+## Invitation Fulfillment Bridge
+
+The invitation bridge is opt-in through `XIANYU_INVITE_BRIDGE_ENABLED` and uses the shared HMAC secret for internal service calls; it is separate from administrator bearer-token routes. Product scope comes only from `item_info.invite_auto_fulfillment`, and new synced products stay off until an operator enables the switch. Order entry still requires a positively classified `ordinary` order with a current direct-API `pending_ship` result; `lead` and `unknown` fail closed.
+
+`POST /internal/invite/send-message` is idempotent by `operationKey`. Both existing and newly created conversations wait for the matching `/r/MessageSend/sendByReceiverScope` response by message `mid`: a matching platform success returns `succeeded` with `platformAcknowledged=true`, an explicit rejection returns `failed`, and a missing or unknown post-write result returns `ambiguous`. Only `succeeded` may release the invitation service to `mark-fulfilled`; `submitted`, `ambiguous`, and `needs_review` stay closed and are not blindly resent.
+
+The maintained source is `/Users/mac/Documents/咸鱼监控台`; the installed runtime on this Mac is `/Users/mac/Library/Application Support/XianyuManager`. They are separate trees. Inspect the process listening on `8091` before a deployment, preserve runtime data, and compare the task-specific source/runtime diff instead of copying either tree wholesale. The counterpart invitation service currently runs from `/Users/mac/Projects/wo-f`.
 
 ## Recent Order Sync
 
@@ -392,34 +405,50 @@ curl -sS -X POST "$BASE_URL/api/orders/sync" \
   -d '{"days":90,"cookie_id":null}'
 ```
 
-The response reports `discovered`, `status_updated`, `details_updated`, `unchanged`, and `failed` counts. It also returns account IDs in `requires_login`. If every selected account has an expired session, the API returns HTTP 409 and does not overwrite order data. Statuses include `unknown`, `processing`, `pending_ship`, `shipped`, `completed`, `refunding`, `refunded`, `refund_cancelled`, and `cancelled`.
+The response reports `discovered`, `status_updated`, `details_updated`, `unchanged`, and `failed` counts. It also returns account IDs in `requires_login`. If every selected account has an expired session, the API returns HTTP 409 and does not overwrite order data. Statuses include `unknown`, `processing`, `pending_ship`, `shipped`, `completed`, `refunding`, `refunded`, `refund_cancelled`, and `cancelled`; `order_business_type` is independently classified as `ordinary`, `lead`, or `unknown` and remains a required fulfillment gate.
 
-## Skill Center
+## Product Delivery And Seller Auto-Rating
 
-Create and list monitor tasks at `/api/skills/monitor/tasks`, update one with `PUT /api/skills/monitor/tasks/{task_id}`, run one immediately with `POST /api/skills/monitor/tasks/{task_id}/run`, and read results from `/api/skills/monitor/results`. A scheduled task uses these additional fields:
+The current delivery center has four resource types: `text` (fixed资料), `data` (一次一密), `image`, and `api`. Create or update a resource through `/cards`; the API type requires `api_config.protocol: "fulfillment_api_v1"`, an HTTPS URL, and `POST`. Public card reads never return the API Token.
 
-```json
-{
-  "schedule_enabled": true,
-  "schedule_interval_minutes": 60,
-  "ai_filter": "只保留价格明显低于市场价的商品",
-  "notify_enabled": true,
-  "account_id": "<owned-cookie-id>"
-}
-```
-
-Schedules default off and the interval must be at least 15 minutes. Task responses include `next_run_at`, `last_status`, `last_error`, and `last_run_at`. Manual and scheduled calls share one task lock; an overlapping manual run returns HTTP 409. Failed scheduled runs record the error and still compute their next attempt.
-
-AI filtering requires an owned account with an enabled provider, API key, base URL, and model. Missing configuration fails the run explicitly. Results are deduplicated across runs by task and `item_url`, falling back to platform item ID. Existing matches are not inserted or notified again.
-
-When notifications are enabled, the backend uses enabled Webhook, WeChat, DingTalk, Feishu, Bark, and Telegram channels. It attempts all supported channels and stores `sent`, `partial`, or `failed`; `skipped_no_channel` means no supported enabled channel was available. QQ and email channel records are not used by Skill Center monitoring.
-
-Expert prompts live at `/api/skills/agent/prompts`; test them against a real account and product with `/api/skills/agent/test-reply`. Runtime diagnostics are available at:
+Replenish one-time secrets with TXT/line input or a CSV containing a `secret` column:
 
 ```bash
-curl -sS "$BASE_URL/api/skills/ops/health" -H "Authorization: Bearer $TOKEN"
-curl -sS "$BASE_URL/api/skills/ops/browser-status" -H "Authorization: Bearer $TOKEN"
-curl -sS "$BASE_URL/api/skills/ops/delivery-diagnostics" -H "Authorization: Bearer $TOKEN"
+curl -sS -X POST "$BASE_URL/cards/$CARD_ID/stock/import" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"format":"csv","content":"secret,note\nCODE-001,first\nCODE-002,second\n"}'
 ```
 
-`GET /api/skills/capabilities` reports whether account AI configuration and at least one supported notification channel are currently available. Capability state reflects configuration readiness; it does not claim that a future run or external notification endpoint will succeed.
+Validate an API resource with a fixed HTTPS POST. Only an exact `{"status":"validated"}` response is accepted:
+
+```bash
+curl -sS -X POST "$BASE_URL/cards/$CARD_ID/api/validate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+Set one product's atomic delivery mode, or update up to 500 products in the batch route:
+
+```bash
+curl -sS -X PUT "$BASE_URL/items/$COOKIE_ID/$ITEM_ID/delivery-mode" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"resource","card_id":123}'
+```
+
+`mode` is exactly `off`, `resource`, or `invite`. A partial batch response reports `updated` and `failed` item IDs. Once an explicit mode is selected, a missing, disabled, empty, out-of-stock, or invalid resource fails closed; keyword rules are a compatibility fallback only for products with no explicit mode. The legacy `/items/{cookie_id}/{item_id}/delivery-binding` routes remain for older clients, but `card_id: null` now means explicit `off`, not keyword fallback. Resource and invitation delivery stay mutually exclusive.
+
+`GET /fulfillment-records?state=succeeded` returns owner-scoped masked history. `POST /fulfillment-records/{id}/resend` is available only for a committed record after UI confirmation; it reuses the immutable committed payload, does not consume inventory or call the provider, and records the platform message ACK state.
+
+Seller auto-rating is an account-owned, default-off switch:
+
+```bash
+curl -sS -X PUT "$BASE_URL/cookies/$COOKIE_ID/auto-rate" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"auto_rate_enabled":true}'
+```
+
+Enabling requires an owned account whose identity is ready. Only orders created after enablement and carrying the exact platform `RATE` action are scheduled, each with a 5-15 minute delay. AI generates one bounded positive sentence; a fixed positive sentence is used when AI is unavailable. The merchant write uses `tradeIdList`; only `data.module.success` plus membership in `successOrderIds` is accepted as success. Explicit rejection is `failed`; an ambiguous result is `needs_reconcile` and is not automatically retried. This contract is seller-to-buyer only. Buyer-to-seller automation remains pending a real write-and-readback canary.

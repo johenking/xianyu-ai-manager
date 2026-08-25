@@ -12,9 +12,17 @@ Set `ADMIN_PASSWORD` before public deployment, or change the password immediatel
 
 This project is a long-running FastAPI application with SQLite data, WebSocket/background work, and Playwright/Chromium browser automation. Netlify is best for static sites and serverless/edge functions. Its functions run in ephemeral runtimes and have execution limits, so it is not a good fit for keeping this app alive as a normal backend service.
 
-The account listeners and Skill Center scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
+Account listeners, the item-metric scheduler, invitation poller, and seller auto-rate scheduler share the application event loop. Run exactly one Uvicorn worker and persist SQLite storage; horizontal multi-worker deployment is unsupported.
 
-The official-login stability change adds migration `2026071701`, which persists the official browser User-Agent on each account. Before calling any build deployed, verify the listening process path, local and public health, the migration version, HTML entry bundle and every referenced asset, account listeners, disabled-by-default Cookie and Skill schedules, and the official-login status endpoints. Source or build completion alone is not deployment or CI evidence; dated Mac deployment evidence and external-account release gates live in `docs/handoff.md`.
+The current production schema includes product delivery binding (`2026081302`), seller auto-rating (`2026081601`), and the delivery center (`2026082401`). Before calling any build deployed, verify the listening process path, local and public health, the migration version returned by `/health/ready`, HTML entry bundle and every referenced asset, account listeners, default-off external-write switches, and the affected status endpoints. Source or build completion alone is not deployment or CI evidence; dated Mac deployment evidence and external-account release gates live in `docs/handoff.md`.
+
+## Production Source Boundary
+
+- Maintained source: `/Users/mac/Documents/咸鱼监控台`.
+- Installed production: `/Users/mac/Library/Application Support/XianyuManager`.
+- Build frontend assets only from the maintained `frontend/`. Reject a candidate unless Auto Delivery is present and Skill Center, native-helper code, and user-facing “本机助手” wording are absent.
+- Deploy task-related backend files and the verified `static/` generation only. Preserve production database, configuration, keys, browser profiles, uploads, dirty checkout changes, and rollback evidence; never copy either tree wholesale over the other.
+- Static publication stays online. Do not unload the LaunchAgent for backup or static work. When backend code must be loaded, use one controlled reload and immediately verify one `8091` listener plus local and public readiness.
 
 ## Recommended Platforms
 
@@ -106,7 +114,7 @@ docker run --rm -p 8091:8080 \
 
 Then open `http://localhost:8091`.
 
-The primary login path opens a server-side headed Chromium on the host. It targets the single-machine deployment where the service runs on the user's own Mac and the console is reached over loopback; the packaged native helper has been removed, and remote users rely on the browser extension and web-QR entries.
+Web QR is the recommended login path and does not start a browser. Server-side headed Chromium is the local/formal-domain fallback for the single-machine deployment where the service runs on the user's own Mac; the packaged native helper has been removed, and remote users rely on web QR or the browser extension.
 
 Server-side browser login launches Playwright's bundled Chromium by default (set `XIANYU_BROWSER_CHANNEL` to use an installed system browser) and needs a real display; the current container command does not start a virtual display. Treat server-browser paths as unsupported in Docker or cloud environments until a display/Xvfb setup and the human-verification path have been tested there. Persist `browser_data/` when those paths are enabled. Extension-bound automatic renewal runs on the user's extension device.
 

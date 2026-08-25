@@ -28,7 +28,9 @@ curl -sS https://xianyu.cxywjx.top/ | rg 'static/assets/index-'
 
 Inspect the command line of the process listening on port `8091` to identify the live runtime directory; do not infer it from the current shell. Preserve `data/`, `logs/`, `browser_data/`, `.venv/`, and `static/uploads/` during local deployments. Cloudflare can keep old hashed assets alive with `cf-cache-status: HIT`; if the public HTML points at the new entry bundle and local `/static/assets/<old>.js` is 404, the stale asset response is cache, not the running server.
 
-The official-login stability change adds migration `2026071701` for `cookies.browser_user_agent`. The migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, official-login status endpoints, account listeners, Cookie schedules, and Skill scheduler. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
+The maintained source and installed runtime are separate trees. Build frontend assets only from `/Users/mac/Documents/咸鱼监控台/frontend`; reject candidates unless Auto Delivery is present and Skill Center, native-helper code, and user-facing “本机助手” wording are absent. Deploy only task-related backend files and verified static assets. Preserve production dirty changes and runtime data, keep static publication online, and reload the backend once only when new Python code must be loaded.
+
+The current production schema includes product delivery binding (`2026081302`), seller auto-rating (`2026081601`), and the delivery center (`2026082401`). Migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, account listeners, and default-off external-write switches. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
 
 ### Tunnel 1033 / Zero Connections
 
@@ -73,12 +75,34 @@ shasum -a 256 "data/backups/xianyu_data_${STAMP}.db"
 
 Back up `data/.ai_provider_key`, `data/.account_credential_key`, and `data/.system_secret_key` with the database when their environment keys are not supplied. The system-secret key protects SMTP authorization codes and derives authentication HMAC digests; losing it prevents existing encrypted SMTP settings and one-time authentication records from being reused. Before replacing authentication code or profiles, stop the service and copy all of `browser_data/`; a live Chromium profile is not a reliable filesystem backup. The login service may best-effort remove only `.login_*`, `.window_*`, and `user_*.backup-*` directories older than six hours. Do not delete canonical or unmatched `user_*` profiles, unknown legacy directories, or fresh temporary directories because their identity or rollback value may not yet be reconciled.
 
+## Auto Delivery Delivery Center
+
+Use the maintained frontend at `/Users/mac/Documents/咸鱼监控台/frontend` and the single-worker runtime. The workbench is deliberately three pages: 商品配置, 资源库, and 发货记录. Resource types are fixed资料 (paste a link, extraction code, and instructions), 一次一密 (one value per line or CSV `secret` column), 图片, and 幂等 API. Empty resources cannot be created; an item mode is an atomic `off/resource/invite` choice, and an explicitly unavailable resource fails closed rather than falling back to a keyword or another resource.
+
+For a one-time-secret replenishment, open 资源库 → resource detail, choose 逐行粘贴 or CSV, inspect the precheck count and duplicate count, then confirm. The server trims blanks and deduplicates against both current stock and historical reservations. Check `available/reserved/used/review/bound` after import. A partial batch response changes only successful rows; failed rows remain selected for correction.
+
+API resources use only the fixed v1 contract: HTTPS POST, an encrypted Token, a strict `{status, operation_id, items[]}` response for allocation, and a stable `Idempotency-Key`. The UI stores Token with `SystemSecretCipher`, shows only a short mask, and disables 验证连接 until unsaved URL/spec/Token changes are saved. Do not paste a provider secret into logs, screenshots, curl output, or a fulfillment record.
+
+When investigating delivery, check the item mode, resource health, `fulfillment_attempts`, `fulfillment_api_operations`, and `fulfillment_delivery_payloads` in that order. `prepared` may release only before any possible side effect; `sending`, `pending`, or an unknown provider result stays in manual review. 发货记录 displays masked payload history. 原样重发 requires the confirmation prompt, reuses the committed payload, never calls the provider again, and records the platform `mid` ACK as `succeeded`, `failed`, or `ambiguous`; an ambiguous result is never retried automatically.
+
+The migration is `2026082401`. Before a production release, make an online SQLite backup and verify it independently:
+
+```bash
+sqlite3 data/xianyu_data.db ".backup 'data/backups/xianyu_data_delivery-center.db'"
+sqlite3 data/backups/xianyu_data_delivery-center.db "PRAGMA integrity_check;"
+curl -fsS http://127.0.0.1:8091/health/ready
+curl -fsS https://xianyu.cxywjx.top/health/ready
+lsof -nP -iTCP:8091 -sTCP:LISTEN
+```
+
+Deploy only the four task backend files and the maintained `static/` generation. Copy hashed assets first and switch `static/index.html` last; atomically replace the four Python files in the runtime directory, then perform one controlled LaunchAgent reload. Immediately verify the migration, SQLite integrity, one `8091` listener, both readiness endpoints, account listener log state, stable delivery/order counts, and absence of new traceback/5xx output. Keep the dated candidate, patch, verification record, and rollback unit together.
+
 ## Verification
 
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.lock
-python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py cloudflared_watchdog.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py auto_rate_service.py account_session_refresh.py cloudflared_watchdog.py item_metric_service.py item_metric_scheduler.py invite_bridge.py invite_bridge_poller.py backfill_order_snapshots.py browser_extension_pairing.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 python -m unittest discover -s tests -v
 ruff check .
 
@@ -95,11 +119,32 @@ The frontend build writes to `static/`. It keeps the current and previous succes
 
 The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
 
-Migration `2026072703` is the current production schema. It enforces account ownership for metric rows and collection state and adds durable fulfillment attempts and card reservations. A `sending` attempt found after restart, or any partial/uncertain send, must remain `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
+Read the current schema from `/health/ready`; the latest production verification is migration `2026082401`. Existing fulfillment attempts and card reservations remain durable: a `sending` attempt found after restart, or any partial/uncertain send, stays `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
 
 The item-metric scheduler must remain stopped unless at least one account has independently completed three fresh real canaries and a verified adapter is registered. A duplicate or non-increasing `observed_at`, a counter reset, or an out-of-order snapshot does not advance the canary. `metric_adapter_unavailable` is the expected fail-closed response before that external acceptance; it is not evidence that traffic collection ran. Scheduled collection is approximately every four hours, so traffic deltas are observation-window totals between consecutive snapshots. Do not interpret the compatibility `hourly` field as one-hour traffic; use `observation_windows` and its duration metadata.
 
-Order synchronization uses the direct seller-order MTOP feed. A partial response, `sync_limit_reached`, `status_unconfirmed`, `platform_permission_denied`, or `requires_login` must not be reported as a completed refresh. Automatic delivery requires a current direct API `pending_ship` result and must not fall back to DOM text.
+Order synchronization uses the direct seller-order MTOP feed. A partial response, `sync_limit_reached`, `status_unconfirmed`, `platform_permission_denied`, or `requires_login` must not be reported as a completed refresh. Automatic delivery and invitation fulfillment require both a positively classified `ordinary` order and a current direct API `pending_ship` result; `lead` or `unknown` orders fail closed and the system must not fall back to DOM text.
+
+### 邀请桥发布与核验
+
+邀请桥代码随唯一的 `com.cxywjx.xianyu-manager` LaunchAgent 进程加载。修改 `invite_bridge.py`、`invite_bridge_poller.py` 或 `XianyuAutoAsync.py` 后，先运行受影响测试和 `py_compile`，再重启现有 LaunchAgent；不要另外启动第二个 `Start.py`。重启后至少验证：
+
+```bash
+curl -fsS http://127.0.0.1:8091/health/ready
+lsof -nP -iTCP:8091 -sTCP:LISTEN
+python -c "import json,urllib.request; data=json.load(urllib.request.urlopen('http://127.0.0.1:8091/openapi.json')); print('/internal/invite/send-message' in data['paths'])"
+```
+
+消息账本语义固定如下：
+
+- `succeeded`：已收到该消息 `mid` 对应的明确成功响应，可以由邀请服务继续平台发货；
+- `failed`：平台明确拒绝或消息写入前确定失败，可以安全失败；
+- `ambiguous/needs_review`：写入后超时、断线或结果未知，不重发消息，也不执行平台发货；
+- `submitted`：仅表示旧路径曾写入，不是当前送达证据。
+
+确认链接延迟应分段核对：付款状态事件到首次实时核验、订单落库到邀请服务接收、`send_confirmation` 开始到平台 ACK。买家点击确认后的 `send_fulfillment_message` 是另一条幂等消息，不要误判为确认链接重复发送。若前两段重新出现十秒级等待，先检查数字订单详情是否回退、账号同步锁和批量扫描是否占用；不要通过删除付款复核、幂等或 ACK 门禁换取表面速度。
+
+真实验收前先确认所有启用邀请商品对应的卖家账号 listener 在线，且订单轮询已恢复；`manual_reauth_required` 必须由用户完成人工认证，不能靠重启绕过。随后只允许一笔受控订单，依次核对确认链接、兑换码和地址消息可见、消息操作 `succeeded`、平台发货操作 `succeeded`、闲鱼订单已发货，以及邀请服务本地订单 `fulfilled`。任一步未知时停止继续下单并保留两个项目的操作账本现场。
 
 Basic smoke tests:
 
@@ -119,10 +164,20 @@ curl -sS http://127.0.0.1:8091/api/settings/summary \
 
 curl -sS 'http://127.0.0.1:8091/api/dashboard/summary?range=7days' \
   -H "Authorization: Bearer $TOKEN"
-
-curl -sS http://127.0.0.1:8091/api/skills/ops/health \
-  -H "Authorization: Bearer $TOKEN"
 ```
+
+### 仪表盘实时刷新验收
+
+仪表盘发布后，用已登录汇总接口检查图表契约：
+
+```bash
+curl -fsS 'http://127.0.0.1:8091/api/dashboard/summary?range=today' \
+  -H "Authorization: Bearer $TOKEN" | jq '{trend_granularity, hourly_count: (.current.hourly_stats | length)}'
+curl -fsS 'http://127.0.0.1:8091/api/dashboard/summary?range=7days' \
+  -H "Authorization: Bearer $TOKEN" | jq '{trend_granularity, daily_count: (.current.daily_stats | length)}'
+```
+
+期望结果是：单日为 `hour`，服务端 `hourly_stats` 允许稀疏；多日为 `day` 并返回 `daily_stats`。界面默认选择“今天”，补零后只画到东八区当前小时，未来小时不展示，未结束小时/日期不参与峰谷和涨跌；历史单日仍保留完整 24 小时。数据不足时洞察显示 `--`。做 15 秒刷新探针时保持一个浏览器页签可见且在线。新付款快照会更新金额、数量、下单时间和明细；`refunding` 保留金额，`refunded` 扣除金额，`refund_cancelled` 恢复金额。后台请求失败时保留最后一次成功汇总，页头显示刷新延迟，不清空生产数据。
 
 ## Environment Variables
 
@@ -181,7 +236,7 @@ app_port: 8080
 
 Persist and protect the database, logs, uploads, all three local encryption keys, and `browser_data/`. Exclude `.venv/`, `frontend/node_modules/`, `data/`, `browser_data/`, `logs/`, `backups/`, `.env`, and database files from source uploads.
 
-The account QR panel offers two explicit choices and opening it starts neither. “Server Chrome QR” creates a unified official-login session; only an administrator on the service Mac loopback console may set `show_browser:true` and display the physical window. “Web QR” keeps the `/qr-login/*` path for remote access, and ordinary generation/scanning does not launch a browser. SMS login, explicit password login, server Chrome QR, web-QR secondary verification, and password renewal use installed system Chrome in headed mode because Goofish rejects headless Chromium. Remote users complete SMS or interactive risk control through the owner-scoped live console surface while the physical window stays off-screen. Switching modes or explicitly cancelling ends the matching session; hiding the panel does not stop polling. Automatic renewal is available only to password accounts with valid stored credentials. The current container entrypoint does not provide system Chrome or a virtual display, so do not claim Docker or cloud login renewal works until the browser, display/Xvfb, and human-verification workflow have been tested on that deployment.
+The account QR panel recommends “Web QR” and offers “Server Chrome” as a fallback; opening the panel starts neither. Web QR keeps `/qr-login/*` independent and ordinary generation/scanning does not launch a browser. The server-browser fallback requires an authenticated console session and is exposed by the UI only on loopback and the formal production hostname; unfamiliar source/Host values are warning-only observations. The extension is the remote-device path. Switching modes or explicitly cancelling ends the matching session; hiding the panel does not stop polling. Automatic renewal is available only to password accounts with valid stored credentials. The current container entrypoint does not provide a real display, so do not claim Docker or cloud server-browser login works until the display/Xvfb and human-verification workflow have been tested there.
 
 ## AI And Knowledge Diagnostics
 
@@ -205,38 +260,58 @@ Recommended order:
 1. Read `/api/accounts/{cookie_id}/session-status` and `/api/diagnostics/auto-reply/{cookie_id}`.
 2. Confirm `cookies.xianyu_unb` and `cookies.login_method` are present. Only `password` plus a valid username and encrypted password supports automatic renewal; that path tries `browser_data/user_<unb>` first.
 3. Keep the account listener running. In `action_required`, trigger `/session-refresh` exactly once; repeated Token or connection failures must not create a browser. In `manual_reauth_required`, the listener must remain in passive wait without WebSocket or Token-probe retries; use the returned `reauth_action` and do not keep calling refresh.
-4. For an ordinary user, first use “本机 Chrome 登录”. The console must reach that user's loopback helper, open Chrome/Edge on that computer, and keep polling through real Token validation, identity matching, persistence, frontend confirmation, and helper-owned tab closure. A missing helper shows its installer; it does not trigger extension detection or server Chrome.
-5. For remote web QR, keep mobile-scan verification as a scannable image. Slider, face, SMS, `interactive`, or unknown verification must move to the user-machine helper or the separate extension path. Hiding the modal must not turn an unfinished login into success. Server-browser interaction is reserved for the administrator loopback maintenance entry.
+4. Use “网页二维码（推荐）” first. It creates no browser process. If the platform requests interactive verification, switch to the authenticated server-browser fallback where the UI exposes it, or to the extension on a remote device.
+5. Keep `mobile_scan` verification as a scannable image. Slider, face, SMS, `interactive`, or unknown verification must move to the chosen browser path. Hiding the modal must not turn an unfinished login into success.
 6. Check the account edit modal before enabling scheduled preventive refresh; it defaults to off, is disabled for non-password sources, and should use conservative intervals such as 24 hours or longer.
-7. Use the user-machine helper, the separate Chrome extension, web QR, a matching manual Cookie, or administrator-visible server Chrome from the service Mac loopback maintenance entry. Never update an existing record with a different Cookie `unb`; the API must return HTTP 409 `account_identity_mismatch`.
+7. Use web QR, authenticated server-side Chrome, the separate extension, or a matching manual Cookie. Never update an existing record with a different Cookie `unb`; the API must return HTTP 409 `account_identity_mismatch`.
 
 For a password-account manual-refresh acceptance check, keep the account's scheduled refresh disabled, click start once, and observe the same window through the full human step. It must remain open until the real message Token succeeds, the Cookie and actual browser User-Agent are saved, and one listener replacement finishes. Then observe processes and status for at least 15 minutes: there must be no later browser, validation popup, scheduled refresh, or immediate item-detail Playwright session. Active duplicate requests return the current status instead of queuing work.
 8. Do not delete the account to re-login, because deletion removes account-linked configuration and knowledge.
 
 Cloud, overseas, or datacenter IPs can trigger Xianyu/Alibaba risk control. Local binding or a trusted domestic host is generally more reliable than a free ephemeral runtime.
 
-Do not switch the server-maintenance or legacy renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. The user-machine helper also opens a normal user-visible Chrome/Edge page. Do not override its User-Agent or add web-security/anti-detection flags. Invalid/missing credentials, identity mismatch, verification/login timeout, or official-page structure mismatch must persist `manual_reauth_required`; `profile_in_use`, temporary browser/probe failures, and cancellation remain retryable. Password login still depends on the current official page structure; when that flow breaks, use the user-machine helper, web QR, extension, or matching Cookie recovery without deleting the account.
+Do not switch the server-browser or legacy renewal browser to `headless=True`: Goofish currently returns an illegal-access page to headless Chromium. Do not override its User-Agent or add web-security/anti-detection flags. Invalid/missing credentials, identity mismatch, verification/login timeout, or official-page structure mismatch must persist `manual_reauth_required`; `profile_in_use`, temporary browser/probe failures, and cancellation remain retryable. Password login still depends on the current official page structure; when that flow breaks, use web QR, the extension, or matching Cookie recovery without deleting the account.
 
 API QR expiry is an explicit terminal result. After the first `expired` response, repeated polling must return `status='expired'` and “二维码已过期，请重新扫码” for at least five minutes before the session becomes `not_found`; associated verification screenshots must be removed on schedule. The old `/qr-login/refresh-cookies`, `/qr-login/reset-cooldown/{cookie_id}`, and `/qr-login/cooldown-status/{cookie_id}` routes are intentionally removed.
 
-## Skill Monitor Troubleshooting
+### Listener Registry Isolation
 
-The scheduler runs inside the one Uvicorn worker and polls every 30 seconds. Keep `WEB_CONCURRENCY=1`; multiple processes can race on the same SQLite task state.
-
-1. Read `/api/skills/monitor/tasks` and check `schedule_enabled`, `next_run_at`, `last_status`, and `last_error`.
-2. Confirm the interval is at least 15 minutes and the task is enabled.
-3. For AI filtering, verify the bound account has an enabled provider, key, base URL, and model that passed a generated-reply test.
-4. For notifications, enable at least one supported Webhook, WeChat, DingTalk, Feishu, Bark, or Telegram channel. QQ and email are not Skill Center senders.
-5. Interpret `partial` as at least one successful and at least one failed channel; inspect `raw_data.notify_error` for per-channel errors.
-6. A repeated item is intentionally skipped when the same task already stored its URL or platform item ID.
-7. After a service restart, a task left in `running` becomes `failed` with an interruption error and can run again on its next schedule.
-
-Smoke-test a task manually before enabling its schedule:
+`XianyuLive._instances` must contain the long-lived instance created by `cookie_manager.py`. Full and paginated product sync use temporary HTTP clients with `register_instance=False`; clicking sync or changing pages must not replace the account's WebSocket listener. Lock this contract with:
 
 ```bash
-curl -sS -X POST "$BASE_URL/api/skills/monitor/tasks/$TASK_ID/run" \
-  -H "Authorization: Bearer $TOKEN"
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+  tests/test_item_sync_ownership.py tests/test_user_dashboard_access.py
 ```
+
+When investigating `listener_unavailable`, do not use `runtime_sessions.total`: that registry counts expiring login, training, and refresh operations, not account listeners. Confirm one Uvicorn process on `8091`, inspect the affected account's listener task/state, record the current log byte offset, perform only the intended full or paginated sync, and require no new `listener_unavailable` or `Traceback` in the appended window. A backend release must also retain local/public readiness and a single `8091` listener.
+
+## Notification Policy (Maintained Source, Not Deployed)
+
+维护源候选将普通客户聊天和自动发货成功（含多数量成功）保持静默；付款拦截、发货失败、处理异常和人工复核继续告警。Cookie/会话失效、人工重登和明确运行故障沿用现有一次性去重告警；重复检测不重复发送。当前生产 `XianyuAutoAsync.py` 仍保留客户消息通知调用，因此不得把本节描述成线上现状；发布时只应用该单文件差异、受控 reload 一次，并重新核验 readiness、单 listener 和新增日志窗口。SMTP、QQ 邮箱配置、数据库结构和通知 API 不因该候选策略改变。
+
+## Seller Auto-Rate Troubleshooting
+
+The scheduler runs inside the one Uvicorn worker, scans every 60 seconds, and submits at most one task per pass. Keep `WEB_CONCURRENCY=1`; multiple processes can race on the same SQLite task state.
+
+1. Read the account details returned by `/cookies/details`; confirm the owner-scoped `auto_rate_enabled` value and pending/success/failed/needs-reconcile counters.
+2. The switch defaults off. Enabling requires a ready account identity and schedules only orders created afterward with the exact platform `RATE` action.
+3. Normal due time is 5-15 minutes after discovery. AI configuration is optional; unavailable or rejected output uses a fixed positive sentence.
+4. `failed` means the platform explicitly rejected the order. `needs_reconcile` means the write may have happened or the response was inconclusive; inspect the platform order once and never replay it automatically.
+5. A restart before the durable pre-POST marker can reschedule the task; a restart after that marker moves it to `needs_reconcile`.
+6. The active contract is seller-to-buyer only. Keep buyer-to-seller automation out of production until a real write-and-readback canary proves the platform flow.
+
+### Historical Backfill (Read-Only First)
+
+`backfill_auto_rates.py` is an operator tool, not part of the scheduler. Run it from the installed runtime directory with the production virtualenv:
+
+```bash
+cd "/Users/mac/Library/Application Support/XianyuManager"
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python backfill_auto_rates.py
+```
+
+The default run opens SQLite with `mode=ro`, scans 365 days with a 100-page/2000-order cap, reports only account slots and aggregate counts, and never imports the review submitter. Any session expiry, partial coverage, truncation, or unparseable order time sets `incomplete=true` and blocks the entire apply phase. Do not treat a candidate count as a completed review.
+
+Only after every enabled account reports `complete=true` and the operator has an explicit submission confirmation may the same command be rerun with `--apply`. That mode re-scans first, inserts only untracked rateable orders through the unique key, assigns a 5-15 minute delay, and still does not submit a review directly. Repeating `--apply` should add zero rows. Keep the generated manifest and use the dated rollback script for code rollback; never reverse an already successful or ambiguous platform review automatically.
 
 ## Order Sync Troubleshooting
 
@@ -246,7 +321,7 @@ Use `POST /api/orders/sync` with `{"days":90}` to discover missing recent orders
 
 ```bash
 tmux capture-pane -t xianyu-butler -p -S -500
-rg -n "session-refresh|scheduled_cookie_refresh|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
+rg -n "session-refresh|scheduled_cookie_refresh|auto.?rate|needs_reconcile|verification_required|qr-login|password-login|风控|验证码|captcha|登录失败|error|ERROR" realtime.log logs -S
 ```
 
 Protected log APIs include `/logs`, `/logs/stats`, `/risk-control-logs`, and `/admin/logs`. Logs must not contain full Cookies, tokens, provider keys, verification URLs, stable account identities, the default administrator password, email OTPs, password-reset grant IDs or tokens, full email addresses, or any password. API request records use request IDs and matched route templates such as `/api/accounts/{cookie_id}/session-status`; raw Uvicorn access logging stays disabled so dynamic path values are not emitted a second time. Expected WebSocket disconnects are warning-level retry events without tracebacks, while unexpected failures retain only the exception class and sanitized summary.

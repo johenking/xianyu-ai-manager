@@ -1,6 +1,6 @@
 # Xianyu AI Manager
 
-闲鱼多账号商品管理、自动回复、自动发货与商品级 AI 知识管理平台。
+闲鱼多账号商品管理、自动回复、自动发货、卖家自动好评与商品级 AI 知识管理平台。
 
 [![CI](https://github.com/johenking/xianyu-ai-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/johenking/xianyu-ai-manager/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -9,29 +9,31 @@
 
 ## 功能
 
-- 多账号管理：本机 Chrome 零安装直登（服务端 bundled Chromium，仅限回环访问）、浏览器扩展导入、网页二维码和手动 Cookie 入口，按真实 `unb` 保留账号数据；自动续期只在扩展密码登录后由用户明确授权并绑定当前设备时启用。
+- 多账号管理：网页二维码推荐登录、服务端本机 Chrome 备选、浏览器扩展导入和手动 Cookie 入口，按真实 `unb` 保留账号数据；自动续期只在扩展密码登录后由用户明确授权并绑定当前设备时启用。
 - 商品管理：按账号筛选和同步真实商品，只有选择“全部账号”时才展示全量商品；每件商品可维护独立知识档案和训练规则，相同商品可复刻知识草稿。
 - AI 客服：商品事实优先，按议价、技术、默认三类专家策略回复；不同账号可选择不同平台和模型。
 - AI 训练：在独立对话框中模拟买家咨询，显示实际加载、排除和停用的规则；修正确认后才写入线上配置。
 - 关键词回复：账号级关键词回复、默认回复与关键词发货规则。
-- 订单与卡密：发现并同步近 90 天订单，区分签收、退款中、已退款和关闭状态，并管理卡密库存与自动发货规则。
+- 自动发货工作台：商品配置、资源库、发货记录三页；资源支持固定资料、一次一密、图片和幂等 API v1，商品以 `off`/`resource`/`invite` 原子互斥选择，显式资源失效时失败关闭。一次一密支持 TXT、CSV `secret` 列和逐行补货，发货记录提供遮罩查看与确认后的原样重发。
+- 订单与卡密：发现并同步近 90 天订单，区分签收、退款中、已退款和关闭状态；历史关键词规则仅对未选择显式商品发货方式的商品作为兼容兜底。
+- 邀请履约桥：对商品级开关启用的订单接收邀请服务的 HMAC 操作；消息按 `mid` 等待闲鱼 WebSocket 对应响应，只有明确成功才写 `succeeded` 并允许后续发货，超时或未知结果失败关闭且不自动重发。
 - 权限化设置：普通用户维护自己的商品同步节奏和 AI 平台；管理员额外管理全局基础、SMTP、注册开关和运行状态。
-- 经营仪表盘：首屏一次读取当前用户的账号、订单、库存和营收汇总，独立加载订单时段、成交爆品、客户行为和商品表现；含管理员在内的所有角色都只看自己 `user_id` 归属的数据，不存在系统范围仪表盘，管理员权限只用于注册、用户和系统管理。真实商品流量只有在卖家后台指标适配器完成账号级三次金丝雀后才展示，默认关闭。
-- 技能中心：手动与定时真实商品监控、AI 商品筛选、结果通知、专家提示词和运行诊断。
+- 经营仪表盘：默认打开“今天”，首屏一次读取当前用户的账号、订单、库存和营收汇总，独立加载订单时段、成交爆品、客户行为和商品表现；今日趋势只画到东八区当前小时，峰谷和涨跌只使用已完成时段，历史单日保留 24 个小时桶，多日按日展示。页面在线且可见时每 15 秒后台刷新，营收、订单数和账号数使用自然滚动；付款核验后的新订单、退款完成和退款撤销会更新金额与订单明细。含管理员在内的所有角色都只看自己 `user_id` 归属的数据，不存在系统范围仪表盘，管理员权限只用于注册、用户和系统管理。真实商品流量只有在卖家后台指标适配器完成账号级三次金丝雀后才展示，默认关闭。
+- 卖家自动好评：账号级默认关闭，只处理开关开启后新增且平台明确显示可评价的卖出订单；AI 生成事实克制的一句好评，失败时使用固定正向文案。
 - 直接注册：管理员开关、图形验证码、邮箱验证码和普通用户容量共同控制注册；支持用户名或邮箱登录、两阶段密码找回、协议页面和普通用户启停。
 - 统一公共入口：登录、注册、找回密码、服务条款和隐私说明复用主应用的品牌组件与视觉体系，页面版本由 `frontend/package.json` 在 Vite 构建时注入。
 
-当前技能中心能力边界：
+当前卖家自动好评边界：
 
 | 能力 | 状态 |
 | --- | --- |
-| 手动执行一次真实商品搜索 | 可用 |
-| 专家策略用于测试与正式回复 | 可用 |
-| 定时监控调度 | 可用，默认关闭，最短 15 分钟 |
-| AI 商品过滤 | 可用，需要至少一个账号完成 AI 配置 |
-| 监控结果通知发送 | 可用，支持 Webhook、微信、钉钉、飞书、Bark、Telegram |
+| 账号级开关 | 可用，默认关闭 |
+| 卖家评价买家 | 可用，只处理开关开启后的可评价订单 |
+| AI 好评文案 | 可用，8-60 字；生成失败使用固定正向文案 |
+| 提交节奏 | 严格串行，随机延迟 5-15 分钟 |
+| 买家评价卖家 | 等待真实写入与回读闭环验证 |
 
-调度器运行在单进程事件循环中，每 30 秒检查到期任务。结果按任务和商品链接去重，缺少链接时使用商品 ID；通知会尝试全部已启用的受支持渠道，并记录 `sent`、`partial` 或 `failed`，不会把未发送结果伪装成成功。
+调度器运行在单进程事件循环中，每 60 秒发现并串行处理任务。提交使用商家评价接口的 `tradeIdList`；只有 `data.module.success` 为真且 `successOrderIds` 包含目标订单时才记成功。明确拒绝记失败，结果不明确记 `needs_reconcile`，不会自动重发可能已经提交的评价。
 
 ## AI 上下文优先级
 
@@ -50,11 +52,11 @@
 ## 商品知识工作流
 
 1. 选择真实账号和商品，先用卖家自己的话填写“商品概览”。
-2. 点击 AI 生成结构化草稿；AI 会结合概览、商品标题、价格和详情补全字段。
+2. 点击 AI 生成结构化草稿；AI 会结合概览、商品标题、价格和详情重建完整草稿，旧草稿内容会被整体替换。生成失败时保留原草稿。
 3. 人工确认或修正 AI 内容，保存草稿并发布版本。
 4. 只有已发布版本会进入真实买家自动回复；草稿可继续用于训练测试。
 
-知识档案可复制到同一账号的其他商品。复制操作只写入目标商品草稿，默认跳过已有知识的目标，也不会自动发布；发布前应核对价格、规格和交付差异。
+知识档案可复制到同一账号的其他商品。复制操作会整体覆盖目标商品草稿，保留目标已发布版本和历史版本，且不自动发布；发布前应核对价格、规格和交付差异。
 
 ## 账号重登与会话
 
@@ -62,11 +64,11 @@
 
 新增账号流程把三条用户路径分开，打开面板本身不会发起登录请求：
 
-- **本机 Chrome 登录（主路径，免安装）**：从本机（`127.0.0.1`）访问控制台时，服务端直接用 Playwright 自带的 Chromium 在这台 Mac 上打开闲鱼官方登录页；扫码、手机号、账号密码以及滑块、人脸、短信或未知交互验证都在该真实浏览器窗口中完成，无需安装任何插件或助手。安全边界是回环访问：公网或局域网请求不能驱动服务端浏览器。
+- **网页二维码（推荐）**：调用官方接口取得 `codeContent` 并在本地渲染，适合手机扫码，普通扫码不会启动浏览器。若平台要求继续交互风控，可切换到本机 Chrome 或浏览器扩展。
+- **本机 Chrome 登录（备选，免安装）**：服务端用 Playwright Chromium 在这台 Mac 上打开闲鱼官方登录页；前端仅在回环与正式域名展示该入口，后端要求有效控制台登录态并把陌生来源记为观测 warning。
 - **浏览器扩展导入**：独立使用当前 Chrome/Edge Profile，适合远程访问或需要扩展续期的设备；扩展检测只发生在这一入口。
-- **网页二维码**：调用官方接口取得 `codeContent` 并在本地渲染，适合手机扫码。若平台要求继续风控，可切换到本机 Chrome 登录窗口完成验证。
 
-扩展只通过一次性设备证明提交登录态；Cookie、Token、密码和验证码不经过前端页面。服务端仍会真实验证平台 Token、`unb` 身份和账号落库。只有前端再次确认账号出现在账号列表后，本机 Chrome 窗口或扩展标签页才会关闭。原“本机助手”客户端已彻底移除：本机访问由服务端 Chrome 直登覆盖，远程访问使用扩展或网页二维码；历史上以助手登录的账号数据仍按原样保留和展示。
+扩展只通过一次性设备证明提交登录态；Cookie、Token、密码和验证码不经过前端页面。服务端仍会真实验证平台 Token、`unb` 身份和账号落库。只有前端再次确认账号出现在账号列表后，本机 Chrome 窗口或扩展标签页才会关闭。原“本机助手”客户端已彻底移除；历史上以助手登录的账号数据仍按原样保留和展示。
 
 手动 Cookie 和手动扩展配对仍作为高级人工导入方式保留。
 
@@ -92,6 +94,7 @@
 - 模型列表无法读取时可以手填模型 ID。
 - 平台或模型切换必须先生成测试回复，成功后才会写入账号线上配置。
 - 测试失败不会修改账号当前使用的平台和模型，也不会静默切换到其他收费平台。
+- 入站图片消息会从闲鱼 CDN 校验后转为 OpenAI 兼容视觉请求；中转 URL 需要指向支持视觉输入的模型，纯文本模型仍按原文本路径处理。
 - Anthropic 原生 Messages API 暂未接入；Claude 模型可通过 OpenRouter 等兼容网关使用。
 
 ## 技术栈
@@ -159,7 +162,7 @@ docker compose up --build -d
 
 ```bash
 .venv/bin/pip install -r requirements-dev.lock
-.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py backfill_order_snapshots.py browser_extension_pairing.py skill_monitor_scheduler.py skill_monitor_delivery_dispatcher.py skill_monitor_retention_janitor.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
+.venv/bin/python -m py_compile Start.py app_factory.py application_runtime.py api_routers.py auth_email_service.py auth_registration_service.py settings_service.py db_manager.py schema_migrations.py security_utils.py session_registry.py official_login_sessions.py repositories/auth_repository.py repositories/runtime_session_repository.py services/auth_service.py ai_provider_service.py ai_reply_engine.py auto_rate_service.py account_session_refresh.py order_sync_service.py item_metric_service.py item_metric_scheduler.py invite_bridge.py invite_bridge_poller.py backfill_order_snapshots.py browser_extension_pairing.py reply_server.py XianyuAutoAsync.py utils/browser_interaction.py utils/xianyu_official_login.py utils/xianyu_session_probe.py utils/qr_login.py utils/qr_verification_browser.py utils/outbound_http.py utils/outbound_smtp.py utils/verification_images.py
 .venv/bin/python -m unittest discover -s tests -v
 ruff check .
 
@@ -176,13 +179,7 @@ npm run verify:build
 
 本项目以 [zhinianboke/xianyu-auto-reply](https://github.com/zhinianboke/xianyu-auto-reply) 为主要上游进行修改，上游使用 AGPL-3.0。本项目同样使用 [AGPL-3.0](LICENSE)。
 
-技能中心是独立安全重写，设计参考：
-
-- [Usagi-org/ai-goofish-monitor](https://github.com/Usagi-org/ai-goofish-monitor)：监控流程
-- [shaxiu/XianyuAutoAgent](https://github.com/shaxiu/XianyuAutoAgent)：专家策略
-- [GuDong2003/xianyu-auto-reply-fix](https://github.com/GuDong2003/xianyu-auto-reply-fix)：诊断思路
-
-完整归属和修改说明见 [NOTICE](NOTICE)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请阅读 [SECURITY.md](SECURITY.md)。
+历史来源、已退役能力和修改说明见 [NOTICE](NOTICE)。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请阅读 [SECURITY.md](SECURITY.md)。
 
 ## 免责声明
 
