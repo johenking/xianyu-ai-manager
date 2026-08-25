@@ -7,12 +7,11 @@
 
 # 当前生产状态
 
-- 最终复核时间：2026-08-26 00:49（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `69388`；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`。
-- 当前生产已包含 Bundle A、滑块隐身账密自愈、扫码免密续签、Toast、UI 一致性、仪表盘图表重组与运营概览精修。公网前端入口为 `assets/index-DoyWuvdx.js` / `assets/index-CzklVxLW.css`，与生产 `static/index.html` 一致。
-- 前端关键路径性能优化已在维护源 `main@2f375c9` 完成并推送，但尚未部署：维护源构建入口为 `assets/index-COZcVS0D.js` / `assets/index-Dmdj5dMP.css`，生产 `reply_server.py` 也尚无订单图片单飞、负缓存与四并发背压代码。
-- 当前进程保持 20:55:58 启动的生产版本，本次收尾只做只读核验与知识同步，没有替换生产文件、重载服务或写入数据库。
+- 最终复核时间：2026-08-26 01:52（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `6309`（00:59:02 随性能优化发布的受控重载启动）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`。
+- 当前生产已包含 Bundle A、滑块隐身账密自愈、扫码免密续签、Toast、UI 一致性、仪表盘图表重组、运营概览精修、前端关键路径性能优化（00:57 发布，含 `reply_server.py` 订单图片单飞/负缓存/四并发背压），以及营收趋势图恢复早上版本（01:43 纯静态发布）。公网前端入口为 `assets/index-B3QLJzmi.js` / `assets/index-Dt1bU_Op.css`，与生产 `static/index.html` 一致。
+- 维护源 `main@b329c44` 已推送 origin/main 并与生产对齐：生产静态构建自 `b329c44` 对应工作树，生产后端与 `fcd1182` 一致（本次恢复为纯前端）。
 - listener 注册隔离仍有效；`runtime_sessions` 只记录带 TTL 的临时操作，不代表 listener 数量。
-- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。工作树中的既有文档改动与 `.cursor/` 用户资产继续保留，不清理、不覆盖。
+- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。工作树中的 `.cursor/` 用户资产继续保留，不清理、不覆盖。
 
 ## 部署后观察（替代真人 canary）
 
@@ -22,6 +21,10 @@
 
 ## 证据路由
 
+- 营收趋势图恢复早上版本发布（08-26 01:43）：`outputs/trend-restore-20260826T014313+0800/`（verification-record.md、post-deploy-verify.txt；回滚在生产 `_rollback/trend-restore-20260826T014313+0800/`）。
+- 前端关键路径性能优化发布（08-26 00:57）：`outputs/frontend-critical-20260826T005740+0800/`（verification-record.md、source-head.txt；回滚在生产 `_rollback/` 同名目录）。
+- 运营概览精修发布（22:28，含过载事故记录）：`outputs/hero-refine-20260825T222457+0800/`（evidence/verification-record.md、original/、rollback/rollback.sh + static-original）。
+- 仪表盘图表区重组发布（20:59）：`outputs/dashboard-refine-20260825T205258+0800/`。
 - L3 发布：`outputs/l3-login-deploy-20260825T183702+0800/`（evidence/verification-record.md、original/、candidate/、rollback/rollback.sh + db-backup + static-original）。
 - Toast 静态发布：`outputs/knowledge-toast-20260825T190639+0800/`（并行会话，纯前端）。
 - 上一发布：`outputs/bundle-a-20260825T133612+0800/`（evidence/verification-record.md、patch、rollback）。

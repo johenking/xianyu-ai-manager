@@ -1,10 +1,18 @@
 # Handoff
 
+## 2026-08-26 运营概览营收趋势图恢复早上版本发布
+
+依据用户反馈（早上版本观感优于晚间改版）把营收趋势图恢复到 2026-08-25 早上基线 `91bf92a`，其余晚间改版全部保留（hero 左列 flex 布局与 4 指标含客单价、商品成交榜合并、客单价分布、买家构成、账号贡献、BusinessInsights 静默跟刷不动）。恢复内容与 `91bf92a` 字节级一致：折线 linear→monotone（线宽 2.5、去 activeDot）、撤销 `ReferenceDot` 峰谷图上标注（连带 TrendMarkerLabel/anchorFor）、渐变 0.32、网格恢复虚线、柱 fillOpacity 0.28 圆角 [3,3]、图高 192→174px（Dashboard 的 Suspense 占位同步）；`getTrendHighlights` 移除 `peakAmount/lowAmount` 扩展，两个测试文件同步回退（峰谷标注用例删除、ResponsiveContainer mock 恢复简单版）。维护源提交 `b329c44` 已推送 `origin/main`。
+
+纯前端静态发布、零停机、后端零动作零重启（PID `6309` 不变）：候选=生产基线 `fcd1182`（前端关键路径性能优化已在线）+ 仅本次恢复，代际链条核验维护源上一代==生产当前代；32 新资产 `rsync --ignore-existing` 增量落盘（assets 226→258、逐一 SHA-256 一致），`index.html` 与 `.asset-generations.json` cp+mv 原子替换（入口 `index-COZcVS0D.js`→`index-B3QLJzmi.js`）。门禁：tsc 零错误、定向 3 测试文件 33 passed（单 worker）、vite build + verify:build orphaned=0；全量 vitest 按共机重活禁令未跑。发布后本地/公网 readiness `ready`、迁移 `2026082502` 不变、单 `8091` listener、本地与公网 HTML 及入口 JS 哈希一致、`DashboardCharts-BDQ3GYMP.js` 公网 200、`rollback.sh --check=PASS`。证据位于 `outputs/trend-restore-20260826T014313+0800/`，回滚单元位于生产 `_rollback/trend-restore-20260826T014313+0800/`（纯静态回切、无需重启）。
+
 ## 2026-08-25 仪表盘图表区重组与账号贡献聚合发布
 
 本轮把仪表盘优化发布到生产（20:52-20:59，晚于当日 L3 与 Toast 发布）：后端 `db_manager.py` 的 `get_order_analytics` 新增 account_stats 聚合（`6b2edbc`，按 `cookie_id` 分组、`COALESCE(NULLIF(c.remark,''), o.cookie_id)` 备注优先命名、金额降序 Top 20，沿用既有 from/where 子句继承用户隔离与净销售口径）；前端静态整代切换到维护源 HEAD `61437f7` 构建产物（入口 `index-CqWHdiEA.js` / `index-D3VyG5-z.css`）。仪表盘重组内容：商品销量排行与下单占比合并为「商品成交榜」（销售额/订单量切换）、新增客单价分布直方图（前端按订单实付分五档）、买家构成环形（复购/单次）、账号贡献 Top 6；地区分布下线（生产 30 天 7236 笔订单 `receiver_city` 全空）；HeroTrend 与 BusinessInsights 视觉中性化（图标统一灰、频次分布统一 ShareBars），BusinessInsights 在仪表盘摘要指纹变化时静默跟刷（15s 轮询数据不变则不发请求、失败保留旧内容）。整代构建同时带上并行会话当日完成的 UI 一致性批次 A（`08abe07`）与批次 B（`4117f14`，全站 ConfirmDialog 替代原生 confirm），均已过各自门禁。
 
 部署为在线原子（未预卸载 LaunchAgent）：部署前归因确认生产 `db_manager.py` 与维护源 diff 精确等于 account_stats 单一 hunk、无生产热修被覆盖；新资产 `rsync --ignore-existing` 增量落盘（旧代资产保留），`index.html` 与 `db_manager.py` cp+mv 原子替换后一次受控 kickstart。门禁：后端 `1017 passed / 201 subtests`（≥ 基线，skipped=0）、Ruff 全绿、前端 tsc 零错误、vite build 通过、仪表盘相关 37 用例全过。生产核验：新 PID `69388`（20:55:58）、单 `8091` listener、本地/公网 readiness `ready`、迁移 `2026082502` 不变（本次无迁移无 DB 写入）、公网入口 SHA256 与本地一致、4 个账号 listener 心跳正常、日志无新增 ERROR（「缺少 cardList」为部署前既有的平台侧周期现象，频次未恶化）；account_stats 同构 SQL 在冷备副本返回多账号真实聚合行。证据与可执行回滚位于 `outputs/dashboard-refine-20260825T205258+0800/`（`rollback/rollback.sh --check=PASS`）。
+
+同日 22:28 依据用户预览反馈完成运营概览跟进发布（`64c373b`，纯前端静态、零停机不重启）：hero 网格 `items-end`→`items-stretch`、左列 flex 上下撑满（营收数字顶对齐、指标行钉底消除左上空白），指标 3→4 列新增「客单价」，列宽 5:7→4.5:7.5；趋势折线 monotone→linear 去平滑波浪假象，`ReferenceDot` 图上直接标注营收最高点（黄）/最低点（灰）+ ¥金额（口径与峰谷条一致仅已结束时段，金额全 0 不标、全相等只标峰值，近边缘自动换锚点），图表高 174→192px；`getTrendHighlights` 扩展 `peakAmount/lowAmount`，测试 mock 改为透传宽高使 SVG 标注可断言（新增 5 用例）。部署=32 新资产增量落盘（assets 131→163）+ `index.html` 原子替换（入口 `index-CqWHdiEA.js`→`index-DoyWuvdx.js`），后端零动作、PID `69388` 不变；公网入口哈希与本地一致、新入口 JS 公网 200、`rollback.sh --check=PASS`。证据位于 `outputs/hero-refine-20260825T222457+0800/`。发布前 22:05 曾发生整机过载事故（多会话并行重活叠加本会话后台全量 vitest，load 峰值 199、swap 10.1G/11.2G 近耗尽，cloudflared 被饿死致公网站点全部超时）：杀测试进程 + 用户关闭虚拟机后 22:21 恢复（load 22、公网 200），后端全程未崩（PID/心跳不变）。经验固化：生产与开发共机，全量前端测试等高并发重活不得在本机后台运行，改动门禁以定向用例 + 构建为准。
 
 ## 2026-08-25 扫码免密自动续签（L3 登录五阶段）发布
 
@@ -871,8 +879,8 @@ hashes, patch replay, failure-recovery rehearsal, production backup, and the
 executable rollback are recorded in
 `outputs/lead-order-guard-20260819T204757+0800/evidence/verification-record.md`.
 
-## 2026-08-26 前端关键路径性能优化（仅维护源）
+## 2026-08-26 前端关键路径性能优化发布
 
 本轮完成订单与账号读取超时止损、订单图片直链优先与代理回退背压、页面按意图加载，以及账号状态自适应轮询。订单图片代理前后端均限制为 4 并发，并具备同订单 single-flight、失败负缓存和显式重试绕过；账号稳定态每 15 秒检查，刷新或验证活跃态保持 3 秒，页面隐藏时暂停并取消在途请求，任何批次未结束前不会叠加下一轮。
 
-维护源提交为 `508b91a`、`f7afdbc`、`2f07bf1`、`946ba80`、`8a7dc8a`、`8e693dc`，均已推送 `origin/main`。低优先级单 worker 定向门禁为前端关键路径 5 文件 `80 passed`、TypeScript 零错误、Vite build 通过、构建校验 `orphaned=0`。本轮未替换生产文件、未重载服务、未运行数据库写入或迁移；生产状态保持不变。
+维护源提交为 `508b91a`、`f7afdbc`、`2f07bf1`、`946ba80`、`8a7dc8a`、`8e693dc`。低优先级单 worker 门禁为前端关键路径 5 文件 `80 passed`，后端图片契约 `15 passed / 3 subtests`，TypeScript、Vite build、构建产物校验、`py_compile` 与 Ruff 均通过。生产发布只增量写入新静态资产，原子替换 `static/index.html`、资产代际清单和 `reply_server.py`，随后执行一次受控服务重载；没有数据库写入或迁移。发布后本地与公网 readiness 均为 `ready`，迁移保持 `2026082502`，单个 `8091` listener，公网 HTML 与入口 JS 分别和生产本地文件哈希一致，OpenAPI 已暴露图片端点的 `retry` 参数，五个账号 listener 均恢复心跳，启动切片未出现 ERROR、Traceback 或 CRITICAL。回滚原件、候选、校验脚本及验证记录位于 `outputs/frontend-critical-20260826T005740+0800/` 与生产 `_rollback` 同名目录，`rollback.sh --check` 为 `PASS`。
