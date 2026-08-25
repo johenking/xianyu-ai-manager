@@ -2846,7 +2846,9 @@ class XianyuLive:
         except Exception as exc:
             logger.error(f"【{self.cookie_id}】CDP 接管异常: {type(exc).__name__}")
             return ""
-        if not getattr(result, "succeeded", False):
+        # CDP 的目标是拿到有效登录态；L3 建档只是附带产物，可能因为档案被占用
+        # 等原因失败。按 status 判定成功，has_l3_memory 如实回写，不虚标记忆。
+        if getattr(result, "status", "") != "success" or not getattr(result, "cookies", None):
             logger.warning(
                 f"【{self.cookie_id}】CDP 接管未成功: "
                 f"{getattr(result, 'error_code', '') or 'unknown'}"
@@ -2855,7 +2857,11 @@ class XianyuLive:
         from db_manager import db_manager
         from utils.xianyu_l3_memory import cookies_to_string as l3_cookies_to_string
 
-        await asyncio.to_thread(db_manager.mark_l3_memory, self.cookie_id, ready=True)
+        await asyncio.to_thread(
+            db_manager.mark_l3_memory,
+            self.cookie_id,
+            ready=bool(getattr(result, "has_l3_memory", False)),
+        )
         return l3_cookies_to_string(result.cookies)
 
     async def _try_password_login_refresh(

@@ -62,6 +62,7 @@ OFFICIAL_LOGIN_ERROR_MESSAGES = {
     "login_submit_missing": "闲鱼官方登录页面已变化，请重新登录",
     "login_state_unknown": "闲鱼官方登录未能确认成功，请重新登录",
     "fast_entry_unavailable": "浏览器免密记忆已失效，请重新扫码",
+    "session_not_renewed": "免密续签未取得新会话（可能是网络异常），将稍后重试",
     "human_verification_required": "需要在闲鱼官方页面完成人工验证",
     "illegal_access": "平台判定当前访问非法，请重新登录",
     "cdp_identity_mismatch": "本机 Chrome 登录账号与当前账号不一致，请重新登录",
@@ -89,6 +90,7 @@ RETRYABLE_SESSION_ERROR_CODES = {
     "profile_in_use",
     "browser_error",
     "fast_entry_timeout",
+    "session_not_renewed",
     "cdp_connect_failed",
     "cdp_endpoint_missing",
 }

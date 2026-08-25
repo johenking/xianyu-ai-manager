@@ -24,18 +24,29 @@ from utils.xianyu_session_probe import (
 
 
 class _FakeLocator:
-    def __init__(self, owner):
+    def __init__(self, owner, *, present=True):
         self.owner = owner
+        self.present = present
         self.first = self
+
+    def wait_for(self, state="visible", timeout=5000):
+        del state, timeout
+        if not self.present:
+            raise RuntimeError("Timeout 5000ms exceeded waiting for locator")
 
     def click(self, timeout=5000):
         del timeout
+        if not self.present:
+            raise RuntimeError("Timeout 5000ms exceeded during click")
         self.owner.clicked = True
 
 
 class _FakeFrame:
-    def __init__(self, *, clickable=True):
+    def __init__(self, *, clickable=True, button_present=None):
         self.clickable = clickable
+        # button_present=False 模拟真实 Playwright：get_by_text 正常返回 locator，
+        # 但按钮不在 DOM 里，wait_for/click 都会超时。
+        self.button_present = clickable if button_present is None else button_present
         self.clicked = False
 
     def wait_for_load_state(self, *_args, **_kwargs):
@@ -45,7 +56,7 @@ class _FakeFrame:
         del exact
         if text != "快速进入" or not self.clickable:
             raise RuntimeError("locator not found")
-        return _FakeLocator(self)
+        return _FakeLocator(self, present=self.button_present)
 
 
 class _FakeIframe:
@@ -83,9 +94,13 @@ class _FakePage:
 
 
 class _FakeContext:
-    def __init__(self, page, cookies):
+    def __init__(self, page, cookies, *, baseline=None):
         self.pages = [page]
         self.fresh = dict(cookies)
+        # 进入浏览器时（goto 之前）收集到的基线 Cookie；默认与 fresh 相同，
+        # 模拟「浏览器没有换发任何新会话」的场景。
+        self.baseline = dict(baseline) if baseline is not None else dict(cookies)
+        self.collect_count = 0
         self.seeded = ""
         self.closed = False
 
@@ -108,13 +123,23 @@ class _FakeContext:
 
 
 class _FakeChromium:
-    def __init__(self, context, *, fail_connect=False, connect_cookies=None):
+    def __init__(
+        self,
+        context,
+        *,
+        fail_connect=False,
+        connect_cookies=None,
+        fail_launch_message="",
+    ):
         self.context = context
         self.fail_connect = fail_connect
         self.connect_cookies = connect_cookies or {}
+        self.fail_launch_message = fail_launch_message
         self.connected_endpoint = None
 
     def launch_persistent_context(self, profile_path, **_kwargs):
+        if self.fail_launch_message:
+            raise RuntimeError(self.fail_launch_message)
         Path(profile_path).mkdir(parents=True, exist_ok=True)
         (Path(profile_path) / "Default").mkdir(exist_ok=True)
         return self.context
@@ -151,6 +176,9 @@ class _FakeOfficial:
         context.seeded = cookie_string
 
     def _collect_relevant_cookies(self, context):
+        context.collect_count += 1
+        if context.collect_count == 1:
+            return dict(context.baseline)
         return dict(context.fresh)
 
     def _browser_user_agent(self, page):
@@ -162,6 +190,11 @@ FRESH_COOKIES = {
     "cookie2": "session",
     "_m_h5_tk": "token",
     "_m_h5_tk_enc": "enc",
+}
+STALE_COOKIES = {
+    "unb": "9988",
+    "cookie2": "stale-session",
+    "_m_h5_tk": "stale-token",
 }
 
 
@@ -200,15 +233,44 @@ class L3MemoryServiceTests(unittest.TestCase):
     def test_passwordless_refresh_clicks_quick_enter_and_requires_cookie2(self):
         frame = _FakeFrame(clickable=True)
         page = _FakePage(iframe=_FakeIframe(frame))
-        context = _FakeContext(page, FRESH_COOKIES)
+        context = _FakeContext(page, FRESH_COOKIES, baseline=STALE_COOKIES)
         (self.root / "user_9988" / "Default").mkdir(parents=True)
         service = self._service(context)
 
-        result = service.passwordless_refresh("9988", FRESH_COOKIES, settle_seconds=0)
+        result = service.passwordless_refresh("9988", STALE_COOKIES, settle_seconds=0)
 
         self.assertTrue(result.succeeded)
         self.assertTrue(frame.clicked)
         self.assertEqual(result.cookies["cookie2"], "session")
+
+    def test_passwordless_refresh_unchanged_session_is_retryable(self):
+        """断网等场景旧 Cookie 原样收回时，必须判可重试而不是假成功。"""
+        page = _FakePage()
+        context = _FakeContext(page, STALE_COOKIES, baseline=STALE_COOKIES)
+        (self.root / "user_9988" / "Default").mkdir(parents=True)
+        service = self._service(context)
+
+        result = service.passwordless_refresh("9988", STALE_COOKIES, settle_seconds=0)
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.error_code, "session_not_renewed")
+        self.assertIn(result.error_code, PASSWORDLESS_RETRYABLE_ERROR_CODES)
+        self.assertFalse(result.requires_manual_reauth)
+
+    def test_quick_enter_button_missing_is_manual(self):
+        """iframe 已加载但没有「快速进入」按钮 = 记忆真失效，判单向人工重登。"""
+        frame = _FakeFrame(clickable=True, button_present=False)
+        page = _FakePage(iframe=_FakeIframe(frame))
+        context = _FakeContext(page, FRESH_COOKIES, baseline=STALE_COOKIES)
+        (self.root / "user_9988" / "Default").mkdir(parents=True)
+        service = self._service(context)
+
+        result = service.passwordless_refresh("9988", STALE_COOKIES, settle_seconds=0)
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.error_code, "fast_entry_unavailable")
+        self.assertTrue(result.requires_manual_reauth)
+        self.assertFalse(frame.clicked)
 
     def test_passwordless_refresh_without_quick_enter_is_manual(self):
         frame = _FakeFrame(clickable=False)
@@ -276,6 +338,70 @@ class L3MemoryServiceTests(unittest.TestCase):
 
         self.assertEqual(result.error_code, "cdp_connect_failed")
         self.assertIn(result.error_code, PASSWORDLESS_RETRYABLE_ERROR_CODES)
+
+    def test_cdp_success_without_profile_does_not_claim_l3(self):
+        """persist_profile=False 时 Cookie 有效但不得虚标 L3 记忆。"""
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context, connect_cookies=dict(FRESH_COOKIES))
+        service = self._service(context, chromium=chromium)
+
+        result = service.import_from_cdp(
+            endpoint="http://127.0.0.1:9222",
+            expected_unb="9988",
+            persist_profile=False,
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(result.has_l3_memory)
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.cookies["cookie2"], "session")
+        self.assertFalse((self.root / "user_9988").exists())
+
+    def test_cdp_seed_failure_keeps_cookies_but_not_l3(self):
+        """CDP 会话有效而建档失败时，登录态可用、has_l3_memory 必须为 False。"""
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(
+            context,
+            connect_cookies=dict(FRESH_COOKIES),
+            fail_launch_message="ProcessSingleton lock is held by another process",
+        )
+        service = self._service(context, chromium=chromium)
+
+        result = service.import_from_cdp(
+            endpoint="http://127.0.0.1:9222",
+            expected_unb="9988",
+            persist_profile=True,
+        )
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(result.has_l3_memory)
+        self.assertEqual(result.cookies["unb"], "9988")
+        profile = self.root / "user_9988"
+        marker = profile / ".l3_ready"
+        self.assertFalse(marker.exists())
+
+    def test_launch_failure_classification_is_narrow(self):
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        service = self._service(context)
+
+        in_use = service._launch_failure(RuntimeError("ProcessSingleton lock held"))
+        singleton = service._launch_failure(RuntimeError("SingletonLock exists"))
+        corrupt = service._launch_failure(
+            RuntimeError("Failed to create a ProfileDirectory: data corrupt")
+        )
+        generic = service._launch_failure(RuntimeError("Target page crashed"))
+        profile_word = service._launch_failure(
+            RuntimeError("browser profile version too new")
+        )
+
+        self.assertEqual(in_use.error_code, "profile_in_use")
+        self.assertEqual(singleton.error_code, "profile_in_use")
+        self.assertEqual(corrupt.error_code, "profile_corrupt")
+        self.assertEqual(generic.error_code, "browser_error")
+        self.assertEqual(profile_word.error_code, "browser_error")
 
 
 class QRLoginL3SeedTests(unittest.IsolatedAsyncioTestCase):

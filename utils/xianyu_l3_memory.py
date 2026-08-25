@@ -39,9 +39,13 @@ PASSWORDLESS_RETRYABLE_ERROR_CODES = {
     "profile_in_use",
     "browser_error",
     "fast_entry_timeout",
+    "session_not_renewed",
     "session_probe_retryable",
     "cdp_connect_failed",
 }
+# 未换新判定只看这两个字段：cookie2 是 L2 会话身份，_m_h5_tk 随访问刷新；
+# 二者同时与进入浏览器前的基线完全一致，说明本次会话没有发生任何真实续签。
+SESSION_RENEWAL_COOKIE_NAMES = ("cookie2", "_m_h5_tk")
 PASSWORDLESS_MANUAL_REAUTH_ERROR_CODES = {
     "fast_entry_unavailable",
     "account_mismatch",
@@ -194,7 +198,7 @@ class L3MemoryService:
         profile_path = self.profile_path(expected_unb)
         with XianyuOfficialLoginService._lock_for(f"profile:{expected_unb}"):
             try:
-                collected, user_agent = self._run_browser_session(
+                _baseline, collected, user_agent = self._run_browser_session(
                     profile_path=profile_path,
                     cookies=cookie_map,
                     expected_unb=expected_unb,
@@ -237,7 +241,7 @@ class L3MemoryService:
         cookie_map = normalize_cookie_map(current_cookie)
         with XianyuOfficialLoginService._lock_for(f"profile:{expected_unb}"):
             try:
-                collected, user_agent = self._run_browser_session(
+                baseline, collected, user_agent = self._run_browser_session(
                     profile_path=profile_path,
                     cookies=cookie_map,
                     expected_unb=expected_unb,
@@ -257,6 +261,13 @@ class L3MemoryService:
                 )
             except Exception as exc:
                 return self._launch_failure(exc)
+
+        if self._session_not_renewed(baseline, collected):
+            logger.warning("免密续签收集到的会话与进入前完全一致，判定未续签")
+            return self._failed(
+                "session_not_renewed",
+                "免密续签未取得新会话（可能是网络异常），将稍后重试",
+            )
 
         return self._validated_fresh_cookies(
             collected,
@@ -329,14 +340,19 @@ class L3MemoryService:
             )
             if seeded.succeeded:
                 return seeded
+            logger.warning(
+                "CDP 会话有效，但写入浏览器记忆失败: {}",
+                seeded.error_code or "seed_failed",
+            )
 
-        self.mark_profile_ready(cookie_unb)
+        # CDP 读到的登录态本身有效，但没有真实建档时不得虚标 L3 记忆：
+        # marker-only 空档案会让后续免密续签打开一个没有登录记忆的浏览器。
         return L3MemoryResult(
             status="success",
             cookies=cookies,
             unb=cookie_unb,
             browser_user_agent=user_agent or detect_default_browser_user_agent(),
-            has_l3_memory=True,
+            has_l3_memory=False,
         )
 
     def _run_browser_session(
@@ -347,7 +363,7 @@ class L3MemoryService:
         expected_unb: str,
         require_quick_enter: bool,
         settle_seconds: Optional[float],
-    ) -> tuple[dict[str, str], str]:
+    ) -> tuple[dict[str, str], dict[str, str], str]:
         profile_path.mkdir(parents=True, exist_ok=True)
         wait_seconds = l3_settle_seconds(
             settle_seconds if settle_seconds is not None else self.settle_seconds
@@ -377,6 +393,7 @@ class L3MemoryService:
                     context,
                     cookies_to_string(cookies),
                 )
+            baseline = dict(self.official._collect_relevant_cookies(context) or {})
             page = context.pages[0] if getattr(context, "pages", None) else context.new_page()
             self._safe_goto(page, GOOFISH_HOME_URL)
             self._wait(page, min(1.5, wait_seconds if wait_seconds else 0.2))
@@ -387,10 +404,33 @@ class L3MemoryService:
             self._wait(page, wait_seconds)
             collected = self.official._collect_relevant_cookies(context)
             user_agent = self.official._browser_user_agent(page)
-            return collected, user_agent or detect_default_browser_user_agent()
+            return baseline, collected, user_agent or detect_default_browser_user_agent()
         finally:
             self._close_quietly(context)
             self._stop_quietly(playwright)
+
+    @staticmethod
+    def _session_not_renewed(
+        baseline: Mapping[str, str],
+        collected: Mapping[str, str],
+    ) -> bool:
+        """True when every renewal-sensitive cookie is unchanged from the baseline.
+
+        进入浏览器前收集到的 Cookie（注入的旧值 + 档案持久层）与离开时完全一致，
+        说明本次没有发生任何真实续签——典型场景是断网时页面根本没加载，
+        `about:blank` 无登录 iframe 又会被解读为「已在登录态」。此时旧 Cookie
+        原样收回，不能当成续签结果交给监听。基线缺字段时不做该判定，交由
+        完整性校验兜底。
+        """
+        if not baseline or not collected:
+            return False
+        for name in SESSION_RENEWAL_COOKIE_NAMES:
+            old_value = str(baseline.get(name) or "")
+            if not old_value:
+                return False
+            if str(collected.get(name) or "") != old_value:
+                return False
+        return True
 
     def try_quick_enter(self, page: Any) -> Optional[bool]:
         """Click passport 快速进入. True=ok/already in; False=unavailable; None=no iframe."""
@@ -432,6 +472,15 @@ class L3MemoryService:
         if callable(get_by_text):
             locator = get_by_text("快速进入", exact=True)
             first = locator.first if hasattr(locator, "first") else locator
+            # 先确认按钮真的存在：iframe 已加载但没有「快速进入」正是记忆失效
+            # 的形态，必须返回 False 走 fast_entry_unavailable（引导重新扫码），
+            # 而不能让 click 的 TimeoutError 被外层误判成可重试的等待超时。
+            wait_for = getattr(first, "wait_for", None)
+            if callable(wait_for):
+                try:
+                    wait_for(state="visible", timeout=5000)
+                except Exception:
+                    return False
             first.click(timeout=5000)
             return True
         query_selector = getattr(frame, "query_selector", None)
@@ -477,7 +526,7 @@ class L3MemoryService:
         text = str(exc)
         error_code = (
             "profile_in_use"
-            if "ProcessSingleton" in text or "profile" in text.lower()
+            if "ProcessSingleton" in text or "SingletonLock" in text
             else "profile_corrupt"
             if "corrupt" in text.lower() or "failed to create" in text.lower()
             else "browser_error"
@@ -658,6 +707,7 @@ __all__ = [
     "L3MemoryService",
     "PASSWORDLESS_MANUAL_REAUTH_ERROR_CODES",
     "PASSWORDLESS_RETRYABLE_ERROR_CODES",
+    "SESSION_RENEWAL_COOKIE_NAMES",
     "cookies_to_string",
     "default_cdp_endpoint",
     "import_from_cdp",
