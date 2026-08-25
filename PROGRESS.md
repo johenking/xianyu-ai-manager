@@ -7,12 +7,12 @@
 
 # 当前生产状态
 
-- 最终复核时间：2026-08-25 19:19（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `17178`（18:41 kickstart）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`（`cookies.has_l3_memory/l3_memory_at` 加列），SQLite 迁移演练与部署均 integrity ok。
-- 当前生产 = Bundle A + 滑块隐身账密自愈（`10fe06a`）+ 扫码免密续签五阶段（`7055de7`）+ 审查优化（`330ab1c`）+ 知识档案/商品 Toast 静态发布（`874a29a`）：后端与源码 `330ab1c` 对齐（替换 8 个后端文件、新增 `utils/xianyu_l3_memory.py` 与 `utils/xianyu_slider_stealth.py`、`global_config.yml` 的 `TOKEN_REFRESH_INTERVAL` 3600→1800），前端与源码 `874a29a` 对齐。
-- 前端公网入口现为 `assets/index-DX2cSsFw.js` / `assets/index-BsM2xUcO.css`：L3 发布（18:42，worktree 检出 `330ab1c` 干净构建，入口 `index-B2WW7m1I.js`，AccountList 增加 L3 记忆标识与免密续签开关）之后，同日 19:09 并行会话以纯静态方式发布 Toast 反馈（零停机、PID 不变、L3 UI 保留）。
-- 重启后两账号 listener 心跳与消息接收正常；重启窗口 8 处瞬时 WS 连接 ERROR 已自愈，无 Traceback。
+- 最终复核时间：2026-08-26 00:49（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `69388`；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`。
+- 当前生产已包含 Bundle A、滑块隐身账密自愈、扫码免密续签、Toast、UI 一致性、仪表盘图表重组与运营概览精修。公网前端入口为 `assets/index-DoyWuvdx.js` / `assets/index-CzklVxLW.css`，与生产 `static/index.html` 一致。
+- 前端关键路径性能优化已在维护源 `main@2f375c9` 完成并推送，但尚未部署：维护源构建入口为 `assets/index-COZcVS0D.js` / `assets/index-Dmdj5dMP.css`，生产 `reply_server.py` 也尚无订单图片单飞、负缓存与四并发背压代码。
+- 当前进程保持 20:55:58 启动的生产版本，本次收尾只做只读核验与知识同步，没有替换生产文件、重载服务或写入数据库。
 - listener 注册隔离仍有效；`runtime_sessions` 只记录带 TTL 的临时操作，不代表 listener 数量。
-- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。并行会话的 Toast/ItemList 前端改动已随 `874a29a` 提交并发布，工作树现仅剩未跟踪的 `.cursor/`（用户配置资产，禁止清理或提交）。
+- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。工作树中的既有文档改动与 `.cursor/` 用户资产继续保留，不清理、不覆盖。
 
 ## 部署后观察（替代真人 canary）
 

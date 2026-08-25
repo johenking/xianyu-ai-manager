@@ -30,7 +30,7 @@ Inspect the command line of the process listening on port `8091` to identify the
 
 The maintained source and installed runtime are separate trees. Build frontend assets only from `/Users/mac/Documents/咸鱼监控台/frontend`; reject candidates unless Auto Delivery is present and Skill Center, native-helper code, and user-facing “本机助手” wording are absent. Deploy only task-related backend files and verified static assets. Preserve production dirty changes and runtime data, keep static publication online, and reload the backend once only when new Python code must be loaded.
 
-The current production schema includes product delivery binding (`2026081302`), seller auto-rating (`2026081601`), and the delivery center (`2026082401`). Migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, account listeners, and default-off external-write switches. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
+The current production schema includes product delivery binding (`2026081302`), seller auto-rating (`2026081601`), the delivery center (`2026082401`), and account L3 browser-memory flags (`2026082502`). Migration version alone does not prove the service or public bundle was upgraded. Before calling any revision deployed, verify the listening process path, health response, HTML entry bundle and every referenced asset, public page version, account listeners, and default-off external-write switches. Keep dated rollout evidence in `docs/handoff.md` rather than treating this checklist as proof.
 
 ### Tunnel 1033 / Zero Connections
 
@@ -119,7 +119,7 @@ The frontend build writes to `static/`. It keeps the current and previous succes
 
 The displayed frontend version comes from `frontend/package.json` through the Vite `__APP_VERSION__` define. Check the package version before building, then verify the built login, registration, password-recovery, terms, and privacy views all show the expected shared brand and version; a source edit without a matching public entry bundle is not a deployment.
 
-Read the current schema from `/health/ready`; the latest production verification is migration `2026082401`. Existing fulfillment attempts and card reservations remain durable: a `sending` attempt found after restart, or any partial/uncertain send, stays `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
+Read the current schema from `/health/ready`; the latest production verification is migration `2026082502`. Existing fulfillment attempts and card reservations remain durable: a `sending` attempt found after restart, or any partial/uncertain send, stays `manual_review`; do not return its reservations to available inventory or mark the order shipped. Only a `prepared` attempt with no possible external side effect can be released.
 
 The item-metric scheduler must remain stopped unless at least one account has independently completed three fresh real canaries and a verified adapter is registered. A duplicate or non-increasing `observed_at`, a counter reset, or an out-of-order snapshot does not advance the canary. `metric_adapter_unavailable` is the expected fail-closed response before that external acceptance; it is not evidence that traffic collection ran. Scheduled collection is approximately every four hours, so traffic deltas are observation-window totals between consecutive snapshots. Do not interpret the compatibility `hourly` field as one-hour traffic; use `observation_windows` and its duration metadata.
 
@@ -285,9 +285,9 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
 
 When investigating `listener_unavailable`, do not use `runtime_sessions.total`: that registry counts expiring login, training, and refresh operations, not account listeners. Confirm one Uvicorn process on `8091`, inspect the affected account's listener task/state, record the current log byte offset, perform only the intended full or paginated sync, and require no new `listener_unavailable` or `Traceback` in the appended window. A backend release must also retain local/public readiness and a single `8091` listener.
 
-## Notification Policy (Maintained Source, Not Deployed)
+## Notification Policy
 
-维护源候选将普通客户聊天和自动发货成功（含多数量成功）保持静默；付款拦截、发货失败、处理异常和人工复核继续告警。Cookie/会话失效、人工重登和明确运行故障沿用现有一次性去重告警；重复检测不重复发送。当前生产 `XianyuAutoAsync.py` 仍保留客户消息通知调用，因此不得把本节描述成线上现状；发布时只应用该单文件差异、受控 reload 一次，并重新核验 readiness、单 listener 和新增日志窗口。SMTP、QQ 邮箱配置、数据库结构和通知 API 不因该候选策略改变。
+普通客户聊天和自动发货成功（含多数量成功）保持静默；付款拦截、发货失败、处理异常和人工复核继续告警。Cookie/会话失效、人工重登和明确运行故障沿用现有一次性去重告警；重复检测不重复发送。该策略已随 2026-08-25 Bundle A 部署，当前生产 `XianyuAutoAsync.py` 只保留兼容方法定义，没有普通聊天或成功发货调用点。SMTP、QQ 邮箱配置、数据库结构和通知 API 不因该策略改变。
 
 ## Seller Auto-Rate Troubleshooting
 
