@@ -24,6 +24,7 @@ import {
   knowledgeStateOf, newKnowledgeEntry, normalizeItemKnowledge,
 } from '../utils/itemKnowledge';
 import { pushToast } from './ui/Toast';
+import { confirmDialog } from './ui/ConfirmDialog';
 
 type ListSection = 'pricing' | 'process' | 'after_sales' | 'forbidden' | 'faqs' | 'notes';
 
@@ -329,7 +330,12 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   };
 
   const rollback = async (version: number) => {
-    if (!window.confirm(`确认回滚到第 ${version} 版并重新发布吗？`)) return;
+    const confirmed = await confirmDialog({
+      title: '回滚版本',
+      message: `确认回滚到第 ${version} 版并重新发布吗？`,
+      confirmText: '回滚并发布',
+    });
+    if (!confirmed) return;
     setPublishing(true);
     try {
       const result = await rollbackAIItemKnowledge(item.cookie_id, item.item_id, version);

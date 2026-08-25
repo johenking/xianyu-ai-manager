@@ -33,6 +33,7 @@ import {
 } from '../services/api';
 import CardList from './CardList';
 import RemoteImage from './ui/RemoteImage';
+import { confirmDialog } from './ui/ConfirmDialog';
 import {
   DeliveryMode,
   DeliveryModeBadge,
@@ -292,7 +293,12 @@ const AutoDelivery: React.FC = () => {
 
   const handleResend = async (record: FulfillmentRecord) => {
     if (!record.can_resend) return;
-    if (!window.confirm('确认按原始已保存内容重发？本操作不会换卡、扣库存或再次调用供应方。')) return;
+    const confirmed = await confirmDialog({
+      title: '重发原始内容',
+      message: '确认按原始已保存内容重发？本操作不会换卡、扣库存或再次调用供应方。',
+      confirmText: '重发',
+    });
+    if (!confirmed) return;
     setResendingId(record.id);
     setNotice(null);
     try {

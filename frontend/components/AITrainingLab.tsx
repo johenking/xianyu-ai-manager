@@ -20,6 +20,7 @@ import {
   Loader2, MessageSquare, Package, RefreshCw, Save, Send, Trash2, X,
 } from 'lucide-react';
 import { newKnowledgeEntry, normalizeItemKnowledge } from '../utils/itemKnowledge';
+import { confirmDialog } from './ui/ConfirmDialog';
 
 const PRESET_MESSAGES = [
   '这个商品怎么操作？',
@@ -146,9 +147,14 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
     void loadRules(selectedItemId);
   }, [selectedItemId]);
 
-  const changeItem = (nextItemId: string) => {
-    if (pendingRules.length > 0 && !window.confirm('有未保存的修正规则，切换商品会丢失这些修改。继续吗？')) {
-      return;
+  const changeItem = async (nextItemId: string) => {
+    if (pendingRules.length > 0) {
+      const confirmed = await confirmDialog({
+        title: '有未保存的修正规则',
+        message: '切换商品会丢失这些未保存的修改，确定继续吗？',
+        confirmText: '继续切换',
+      });
+      if (!confirmed) return;
     }
     setSelectedItemId(nextItemId);
   };
@@ -327,7 +333,7 @@ const AITrainingLab: React.FC<AITrainingLabProps> = ({ account, initialItemId, o
                 <select
                   id="ai-training-item"
                   value={selectedItemId}
-                  onChange={(event) => changeItem(event.target.value)}
+                  onChange={(event) => void changeItem(event.target.value)}
                   className="w-full ios-input px-3 py-3 rounded-lg text-sm font-semibold"
                   disabled={loadingItems}
                 >

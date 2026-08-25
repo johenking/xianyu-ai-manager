@@ -2,10 +2,11 @@
 import '@testing-library/jest-dom/vitest';
 
 import React from 'react';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import AutoDelivery from './AutoDelivery';
+import ConfirmDialogHost, { clearConfirmDialogs } from './ui/ConfirmDialog';
 import {
   getAccountDetails,
   getCards,
@@ -75,6 +76,7 @@ describe('AutoDelivery delivery workbench', () => {
   });
 
   afterEach(() => {
+    clearConfirmDialogs();
     cleanup();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
@@ -163,8 +165,7 @@ describe('AutoDelivery delivery workbench', () => {
       }],
       total: 1,
     });
-    vi.stubGlobal('confirm', vi.fn(() => true));
-    render(<AutoDelivery />);
+    render(<><AutoDelivery /><ConfirmDialogHost /></>);
     await screen.findByText('未配置商品');
 
     fireEvent.click(screen.getByRole('button', { name: '发货记录' }));
@@ -173,7 +174,11 @@ describe('AutoDelivery delivery workbench', () => {
     expect(document.body.textContent).not.toContain('ORIGINAL-CODE');
     fireEvent.click(screen.getByRole('button', { name: /原样重发/ }));
 
+    // 重发前必须经过统一确认弹窗，确认文案强调不会产生副作用
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent('不会换卡、扣库存或再次调用供应方');
+    fireEvent.click(within(dialog).getByRole('button', { name: '重发' }));
+
     await waitFor(() => expect(resendFulfillmentRecord).toHaveBeenCalledWith(77));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('不会换卡、扣库存或再次调用供应方'));
   });
 });

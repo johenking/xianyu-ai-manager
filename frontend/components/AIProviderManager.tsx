@@ -12,6 +12,7 @@ import {
 import { AIProviderPreset, AIProviderProfile } from '../types';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import { IconAction } from './ui/ProtectedPage';
+import { confirmDialog } from './ui/ConfirmDialog';
 import ModelSelector from './ModelSelector';
 
 type ProviderForm = {
@@ -195,7 +196,13 @@ const AIProviderManager: React.FC = () => {
   };
 
   const remove = async (provider: AIProviderProfile) => {
-    if (!window.confirm(`删除平台“${provider.name}”？`)) return;
+    const confirmed = await confirmDialog({
+      title: '删除平台',
+      message: `删除平台「${provider.name}」？账号上引用该平台的模型配置将失效。`,
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     setBusy(`delete-${provider.id}`);
     setNotice(null);
     try {

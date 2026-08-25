@@ -31,6 +31,7 @@ import {
   validateCardApi,
 } from '../services/api';
 import { resourceHealthOf } from './ui/DeliveryMode';
+import { confirmDialog } from './ui/ConfirmDialog';
 
 type ResourceType = Card['type'];
 type StockFormat = 'lines' | 'txt' | 'csv';
@@ -339,7 +340,13 @@ const CardList: React.FC<CardListProps> = ({ onChanged }) => {
 
   const removeResource = async () => {
     if (!selectedCard) return;
-    if (!window.confirm('确认永久删除这个从未绑定、也没有履约历史的资源？')) return;
+    const confirmed = await confirmDialog({
+      title: '删除资源',
+      message: '确认永久删除这个从未绑定、也没有履约历史的资源？',
+      confirmText: '永久删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     setSaving(true);
     try {
       await deleteCard(selectedCard.id);

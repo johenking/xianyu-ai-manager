@@ -4,6 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import AccountList from './AccountList';
+import ConfirmDialogHost, { clearConfirmDialogs } from './ui/ConfirmDialog';
 import { ApiRequestError } from '../services/request';
 import {
   getAccountDetails,
@@ -303,6 +304,7 @@ describe('AccountList session verification UI', () => {
 
   afterEach(() => {
     window.removeEventListener('message', clientBridgeListener);
+    clearConfirmDialogs();
     cleanup();
     vi.clearAllMocks();
     vi.restoreAllMocks();
@@ -882,9 +884,8 @@ describe('AccountList session verification UI', () => {
   });
 
   it('lets a loopback user start, show, and explicitly cancel server Chrome without any confirm', async () => {
-    // 启动服务端 Chrome 不再需要任何 confirm：即使 confirm 一律返回 false 也应正常启动
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<AccountList />);
+    // 启动服务端 Chrome 不再需要任何确认弹窗
+    render(<><AccountList /><ConfirmDialogHost /></>);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
@@ -896,7 +897,7 @@ describe('AccountList session verification UI', () => {
         show_browser: true,
       });
     });
-    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
     expect(generateQRLogin).not.toHaveBeenCalled();
     expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
     expect(screen.getByText('本机 Chrome 登录窗口')).toBeInTheDocument();
@@ -958,27 +959,29 @@ describe('AccountList session verification UI', () => {
   });
 
   it('requires confirmation before ending server Chrome to switch methods', async () => {
-    // 启动不再弹 confirm；只有“切换方式会结束本次会话”的 confirm 仍然保留
-    const confirmSpy = vi.spyOn(window, 'confirm')
-      .mockReturnValueOnce(false)
-      .mockReturnValueOnce(true);
-    render(<AccountList />);
+    // 启动不弹确认；只有「切换方式会结束本次会话」的确认弹窗仍然保留
+    render(<><AccountList /><ConfirmDialogHost /></>);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
     fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
     expect(await screen.findByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
-    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
 
+    // 第一次切换：在确认弹窗里点「取消」，会话保持不动
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent('当前登录仍在进行，切换方式会结束本次会话。是否继续？');
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
     expect(cancelOfficialLoginSession).not.toHaveBeenCalled();
     expect(screen.getByText('请使用闲鱼 App 扫码')).toBeInTheDocument();
 
+    // 第二次切换：确认后结束原会话并进入账号密码方式
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
+    const secondDialog = await screen.findByRole('alertdialog');
+    fireEvent.click(within(secondDialog).getByRole('button', { name: '继续切换' }));
     await waitFor(() => expect(cancelOfficialLoginSession).toHaveBeenCalledWith('official-session'));
     expect(await screen.findByText(/账号、密码、滑块和人脸验证只在该窗口输入/)).toBeInTheDocument();
-    expect(confirmSpy).toHaveBeenCalledTimes(2);
-    expect(confirmSpy).toHaveBeenCalledWith('当前登录仍在进行，切换方式会结束本次会话。是否继续？');
   });
 
   it('stops Chrome QR polling and refreshes accounts after success', async () => {
@@ -1012,14 +1015,16 @@ describe('AccountList session verification UI', () => {
   });
 
   it('does not create or cancel an official browser session for ordinary QR', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const view = render(<AccountList />);
+    const view = render(<><AccountList /><ConfirmDialogHost /></>);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
     fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
     await screen.findByAltText('闲鱼登录二维码');
     fireEvent.click(screen.getByRole('button', { name: '账号密码' }));
+    const dialog = await screen.findByRole('alertdialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: '继续切换' }));
+    await waitFor(() => expect(cancelQRLogin).toHaveBeenCalledWith('qr-session', 'switched_method'));
 
     view.unmount();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
@@ -1314,8 +1319,7 @@ describe('AccountList session verification UI', () => {
   });
 
   it('uses the unsaved-strategy confirmation from the AI modal close control', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<AccountList />);
+    render(<><AccountList /><ConfirmDialogHost /></>);
     const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
     fireEvent.click(within(accountCard as HTMLElement).getByTitle('AI设置'));
 
@@ -1327,7 +1331,17 @@ describe('AccountList session verification UI', () => {
     expect(closeButton).toHaveClass('min-h-11', 'min-w-11');
     fireEvent.click(closeButton);
 
-    expect(confirmSpy).toHaveBeenCalledWith('高级回复策略有未保存修改，确定放弃并关闭吗？');
+    // 未保存修改 → 弹出统一确认弹窗；点「取消」后弹窗关闭、AI 设置保持打开
+    const dialog = await screen.findByRole('alertdialog');
+    expect(dialog).toHaveTextContent('高级回复策略有未保存修改，确定放弃并关闭吗？');
+    fireEvent.click(within(dialog).getByRole('button', { name: '取消' }));
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
     expect(screen.getByRole('heading', { name: 'AI助手设置' })).toBeInTheDocument();
+
+    // 再次关闭并确认「放弃修改」→ AI 设置弹窗关闭
+    fireEvent.click(screen.getByRole('button', { name: '关闭 AI 设置' }));
+    const secondDialog = await screen.findByRole('alertdialog');
+    fireEvent.click(within(secondDialog).getByRole('button', { name: '放弃修改' }));
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'AI助手设置' })).not.toBeInTheDocument());
   });
 });

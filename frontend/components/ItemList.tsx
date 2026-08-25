@@ -24,6 +24,7 @@ import {
 } from './ui/DeliveryMode';
 import { knowledgeStateOf } from '../utils/itemKnowledge';
 import { pushToast } from './ui/Toast';
+import { confirmDialog } from './ui/ConfirmDialog';
 
 const toBool = (value: unknown) => value === true || value === 1 || value === '1';
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
@@ -128,7 +129,13 @@ const ItemList: React.FC = () => {
   };
 
   const handleDelete = async (item: Item) => {
-    if (confirm(`确认删除商品"${item.item_title}"吗？`)) {
+    const confirmed = await confirmDialog({
+      title: '删除商品',
+      message: `确认删除商品「${item.item_title || item.item_id}」吗？`,
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (confirmed) {
       const key = `delete-${itemKey(item)}`;
       setActionKey(key);
       try {

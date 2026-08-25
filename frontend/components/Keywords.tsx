@@ -4,6 +4,7 @@ import { AccountDetail, ShippingRule, ReplyRule, DefaultReply } from '../types';
 import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot, AlertCircle } from 'lucide-react';
 import { InlineNotice, ToggleControl } from './ui/StatusControls';
+import { confirmDialog } from './ui/ConfirmDialog';
 import { PANEL_CLASS } from './ui/dashboardParts';
 
 type TabType = 'reply' | 'delivery' | 'default';
@@ -372,7 +373,14 @@ const Keywords: React.FC = () => {
   };
 
   const handleDelete = async (id: string) => {
-    if (!selectedAccount || !confirm('确认删除该关键词吗？')) return;
+    if (!selectedAccount) return;
+    const confirmed = await confirmDialog({
+      title: '删除关键词',
+      message: '确认删除该关键词回复吗？',
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     try {
       await deleteReplyRule(id, selectedAccount);
       await loadKeywords();
@@ -383,7 +391,13 @@ const Keywords: React.FC = () => {
   };
 
   const handleDeleteDelivery = async (id: string) => {
-    if (!confirm('确认删除该发货规则吗？')) return;
+    const confirmed = await confirmDialog({
+      title: '删除发货规则',
+      message: '确认删除该关键词发货规则吗？',
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     try {
       await deleteShippingRule(id);
       await loadShippingRules();
@@ -432,7 +446,13 @@ const Keywords: React.FC = () => {
   };
 
   const handleDeleteDefault = async (cookieId: string) => {
-    if (!confirm('确认删除该默认回复吗？')) return;
+    const confirmed = await confirmDialog({
+      title: '删除默认回复',
+      message: '确认删除该账号的默认回复吗？',
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     try {
       await deleteDefaultReply(cookieId);
       await loadDefaultReplies();
@@ -443,7 +463,13 @@ const Keywords: React.FC = () => {
   };
 
   const handleClearRecords = async (cookieId: string) => {
-    if (!confirm('确认清空该账号的回复记录吗？清空后可以重新对所有对话使用默认回复。')) return;
+    const confirmed = await confirmDialog({
+      title: '清空回复记录',
+      message: '确认清空该账号的回复记录吗？清空后可以重新对所有对话使用默认回复。',
+      confirmText: '清空',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     try {
       await clearDefaultReplyRecords(cookieId);
       setPageNotice({ tone: 'success', text: '默认回复记录已清空' });

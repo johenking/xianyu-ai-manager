@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import ToastViewport from './components/ui/Toast';
+import ConfirmDialogHost from './components/ui/ConfirmDialog';
 import './index.css';
 
 const rootElement = document.getElementById('root');
@@ -14,5 +15,6 @@ root.render(
   <React.StrictMode>
     <App />
     <ToastViewport />
+    <ConfirmDialogHost />
   </React.StrictMode>
 );

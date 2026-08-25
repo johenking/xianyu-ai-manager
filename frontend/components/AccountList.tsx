@@ -4,6 +4,7 @@ import { AccountDetail, AccountSessionRefreshStatus, AIProviderProfile, AIReplyS
 import AITrainingLab from './AITrainingLab';
 import ModelSelector from './ModelSelector';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
+import { confirmDialog } from './ui/ConfirmDialog';
 import { AccountAvatar, CookieEditor } from './ui/AccountVisuals';
 import AuthenticatedImage from './ui/AuthenticatedImage';
 import BrowserInteractionSurface from './ui/BrowserInteractionSurface';
@@ -960,7 +961,13 @@ const AccountList: React.FC<AccountListProps> = () => {
   };
 
   const handleDelete = async (id: string) => {
-    if (confirm('确认删除该账号吗？')) {
+    const confirmed = await confirmDialog({
+      title: '删除账号',
+      message: '确认删除该闲鱼账号吗？删除后将停止其消息监听。',
+      confirmText: '删除',
+      tone: 'danger',
+    });
+    if (confirmed) {
       await deleteAccount(id);
       loadAccounts();
     }
@@ -1248,8 +1255,15 @@ const AccountList: React.FC<AccountListProps> = () => {
     replyStrategies.map(({ prompt_type, content, enabled }) => ({ prompt_type, content, enabled })),
   ) !== replyStrategiesBaselineRef.current;
 
-  const closeAIModal = () => {
-    if (replyStrategiesDirty && !window.confirm('高级回复策略有未保存修改，确定放弃并关闭吗？')) return;
+  const closeAIModal = async () => {
+    if (replyStrategiesDirty) {
+      const confirmed = await confirmDialog({
+        title: '放弃未保存修改',
+        message: '高级回复策略有未保存修改，确定放弃并关闭吗？',
+        confirmText: '放弃修改',
+      });
+      if (!confirmed) return;
+    }
     setActiveModal(null);
   };
 
@@ -1603,11 +1617,13 @@ const AccountList: React.FC<AccountListProps> = () => {
       && extensionPairing
       && ACTIVE_EXTENSION_PAIRING_STATES.has(extensionPairing.status),
     );
-    if (
-      (activeApiQRSessionId || hasActiveOfficialSession || hasActiveExtensionPairing)
-      && !window.confirm('当前登录仍在进行，切换方式会结束本次会话。是否继续？')
-    ) {
-      return;
+    if (activeApiQRSessionId || hasActiveOfficialSession || hasActiveExtensionPairing) {
+      const confirmed = await confirmDialog({
+        title: '结束当前登录会话',
+        message: '当前登录仍在进行，切换方式会结束本次会话。是否继续？',
+        confirmText: '继续切换',
+      });
+      if (!confirmed) return;
     }
 
     loginFlowGenerationRef.current += 1;
@@ -1836,10 +1852,14 @@ const AccountList: React.FC<AccountListProps> = () => {
       ? qrSessionId
       : '';
     const activeClientSessionId = qrEntryMode === 'client' ? activeClientBrowserSessionRef.current : '';
-    if (
-      (activeApiQRSessionId || activeOfficialSessionRef.current || activeClientSessionId)
-      && !window.confirm('返回扫码方式会结束本次登录会话。是否继续？')
-    ) return;
+    if (activeApiQRSessionId || activeOfficialSessionRef.current || activeClientSessionId) {
+      const confirmed = await confirmDialog({
+        title: '结束当前登录会话',
+        message: '返回扫码方式会结束本次登录会话。是否继续？',
+        confirmText: '继续返回',
+      });
+      if (!confirmed) return;
+    }
     loginFlowGenerationRef.current += 1;
     const flowGeneration = loginFlowGenerationRef.current;
     clearQRPolling();
