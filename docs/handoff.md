@@ -1,5 +1,15 @@
 # Handoff
 
+## 2026-08-25 Bundle A：AI 订单作用域回复、订单业务分类与告警收窄发布
+
+本轮把维护源积压的后端能力按 7 文件候选（`XianyuAutoAsync.py`、`ai_reply_engine.py`、`db_manager.py`、`reply_server.py`、`schema_migrations.py`、`order_sync_service.py`、`invite_bridge_poller.py`）发布到生产：AI 回复引擎新增订单作用域对话（迁移 `2026081801` 为 `ai_conversations` 补插 `order_id/source/delivery_state` 三列、3 个索引并把存量行标记 `legacy`）、shadow 双跑指标与模型调用预算；订单同步新增 `classify_order_business_type`，自动发货与邀请轮询对非 `ordinary` 订单失败关闭；2026-08-19 的告警策略收窄正式上线（普通客户聊天静默，失败/拦截/人工复核与会话终态告警保留）。
+
+候选从生产原件派生并保留当日上午的生产热修：消息 Token 探测透传 listener `device_id`（根治 `device_id_or_appkey_is_not_equal` 401，热修后零复发）、AI 出站失败日志记录 `OutboundRequestError.code`、仪表盘状态校验统一 `DASHBOARD_ANALYTICS_STATUSES`。滑块隐身账密自愈重登按失败关闭原则显式排除：候选移除 `_recover_via_slider_password_login` 及调用点，`account_session_refresh.py` 保持生产旧语义，`utils/xianyu_slider_stealth.py` 不部署；该特性继续留在维护源等待真机金丝雀。热修已回写维护源（含 `utils/xianyu_session_probe.py` 显式 `device_id` 支持）并补 2 个回归测试。
+
+门禁：维护源全量 `996 passed / 201 subtests`、Ruff 全绿；候选 `py_compile` 通过；隔离树（生产代码 + 候选 7 文件 + 维护源 tests）`985 passed / 11 failed`，11 个失败全部映射到有意排除的滑块特性，零意外失败。生产核验：新 PID `79093`（14:16:27）、单 `8091` listener、本地/公网 readiness `ready`、迁移 `2026081801` 已应用且 health 仍报 MAX 版本 `2026082401`、SQLite `integrity_check=ok`、外键违规 0、存量 37302 行 legacy 回填、新语义对话行已实时写入、4 个账号 listener 重连、`AI_SHADOW_METRIC` 指标流正常、日志无 Traceback。
+
+证据、patch、候选/原件哈希与可执行回滚位于 `/Users/mac/Documents/咸鱼监控台/outputs/bundle-a-20260825T133612+0800/`（`rollback/rollback.sh --check=PASS expected=candidate`；数据库无需回滚，迁移为纯加列，灾备冷备 `data/backups/pre-schema-20260825-141628-815287`）。
+
 ## 2026-08-24 自动发货成熟标准版发布
 
 本轮把自动发货收敛为商品配置、资源库、发货记录三页工作台。资源类型是固定资料、一次一密、图片和固定 HTTPS POST 的幂等 API v1；空资源不可创建，商品的 `off/resource/invite` 选择原子互斥，显式资源失效时失败关闭而不回落关键词或其他资源。一次一密沿用 `cards.data_content` 与既有预留，TXT/CSV/逐行补货会对当前库存和全部历史预留去重；API Token 由 `SystemSecretCipher` 加密，公开读取与记录只返回遮罩。
