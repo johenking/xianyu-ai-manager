@@ -1,5 +1,11 @@
 # Handoff
 
+## 2026-08-25 仪表盘图表区重组与账号贡献聚合发布
+
+本轮把仪表盘优化发布到生产（20:52-20:59，晚于当日 L3 与 Toast 发布）：后端 `db_manager.py` 的 `get_order_analytics` 新增 account_stats 聚合（`6b2edbc`，按 `cookie_id` 分组、`COALESCE(NULLIF(c.remark,''), o.cookie_id)` 备注优先命名、金额降序 Top 20，沿用既有 from/where 子句继承用户隔离与净销售口径）；前端静态整代切换到维护源 HEAD `61437f7` 构建产物（入口 `index-CqWHdiEA.js` / `index-D3VyG5-z.css`）。仪表盘重组内容：商品销量排行与下单占比合并为「商品成交榜」（销售额/订单量切换）、新增客单价分布直方图（前端按订单实付分五档）、买家构成环形（复购/单次）、账号贡献 Top 6；地区分布下线（生产 30 天 7236 笔订单 `receiver_city` 全空）；HeroTrend 与 BusinessInsights 视觉中性化（图标统一灰、频次分布统一 ShareBars），BusinessInsights 在仪表盘摘要指纹变化时静默跟刷（15s 轮询数据不变则不发请求、失败保留旧内容）。整代构建同时带上并行会话当日完成的 UI 一致性批次 A（`08abe07`）与批次 B（`4117f14`，全站 ConfirmDialog 替代原生 confirm），均已过各自门禁。
+
+部署为在线原子（未预卸载 LaunchAgent）：部署前归因确认生产 `db_manager.py` 与维护源 diff 精确等于 account_stats 单一 hunk、无生产热修被覆盖；新资产 `rsync --ignore-existing` 增量落盘（旧代资产保留），`index.html` 与 `db_manager.py` cp+mv 原子替换后一次受控 kickstart。门禁：后端 `1017 passed / 201 subtests`（≥ 基线，skipped=0）、Ruff 全绿、前端 tsc 零错误、vite build 通过、仪表盘相关 37 用例全过。生产核验：新 PID `69388`（20:55:58）、单 `8091` listener、本地/公网 readiness `ready`、迁移 `2026082502` 不变（本次无迁移无 DB 写入）、公网入口 SHA256 与本地一致、4 个账号 listener 心跳正常、日志无新增 ERROR（「缺少 cardList」为部署前既有的平台侧周期现象，频次未恶化）；account_stats 同构 SQL 在冷备副本返回多账号真实聚合行。证据与可执行回滚位于 `outputs/dashboard-refine-20260825T205258+0800/`（`rollback/rollback.sh --check=PASS`）。
+
 ## 2026-08-25 扫码免密自动续签（L3 登录五阶段）发布
 
 本轮把扫码免密自动续签五阶段（`7055de7`）连同审查优化（`330ab1c`）发布到生产：扫码成功落持久浏览器档案 `browser_data/user_<unb>` 并在 DB 标记 L3 记忆（迁移 `2026082502` 为 `cookies` 加 `has_l3_memory/l3_memory_at` 两列）；续签失效时免密快速进入优先于账密路径；`supports_automatic_refresh` 与 `auto_refresh_supported` 接受 L3 记忆为合法条件；失败纳入既有分层错误；CDP 接管仅在配置 `XIANYU_CHROME_CDP_ENDPOINT` 时启用，连不上或身份不符一律失败关闭。审查优化堵住四个缺口：免密续签以进浏览器前 Cookie 为基线，`cookie2` 与 `_m_h5_tk` 均未换新判 `session_not_renewed`（可重试），杜绝断网时旧 Cookie 被当成续签成功；「快速进入」按钮先探测存在性，iframe 加载而按钮缺失判 `fast_entry_unavailable`（单向 manual + 一次性告警），点击超时才可重试；CDP 建档失败不再 `mark_profile_ready` 虚标 L3，`has_l3_memory` 如实回写；浏览器启动失败的 `profile_in_use` 分类收窄到 ProcessSingleton/SingletonLock。
