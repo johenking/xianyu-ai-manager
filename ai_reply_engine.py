@@ -63,6 +63,73 @@ class AIReplyEngine:
         'warranty': ('有质保',),
     }
 
+    # 订单感知路径转正开关：环境变量优先，其次系统设置，默认关闭（保持 legacy 行为）。
+    ORDER_AWARE_ENV = 'AI_REPLY_ORDER_AWARE'
+    ORDER_AWARE_SETTING_KEY = 'ai_reply_order_aware'
+    _TRUTHY_FLAGS = {'1', 'true', 'yes', 'on'}
+    _FALSY_FLAGS = {'0', 'false', 'no', 'off'}
+
+    # 交易阶段：由已校验订单摘要的规范状态映射，供分阶段剧本使用。
+    TRADE_STAGE_LABELS = {
+        'presale': '售前咨询（未查到本商品订单）',
+        'ordered_unpaid': '已拍下待付款',
+        'paid_pending_ship': '已付款待发货',
+        'shipped_in_use': '已发货/使用中',
+        'completed': '交易完成',
+        'aftersale': '售后/退款处理中',
+        'closed': '订单已关闭',
+        'multiple_orders': '存在多笔订单待确认',
+        'unknown': '订单状态未知',
+    }
+
+    STAGE_STATUS_MAP = {
+        'processing': 'ordered_unpaid',
+        'pending_ship': 'paid_pending_ship',
+        'shipped': 'shipped_in_use',
+        'completed': 'completed',
+        'refunding': 'aftersale',
+        'refunded': 'aftersale',
+        # 退款撤销后订单回到正常履约轨道。
+        'refund_cancelled': 'shipped_in_use',
+        'cancelled': 'closed',
+    }
+
+    STAGE_PLAYBOOKS = {
+        'presale': (
+            '- 现在是售前阶段：介绍商品、解答疑问、按议价规则报价。\n'
+            '- 不得虚构订单、付款或发货信息；买家问订单进度时如实说明尚未查到订单，引导先拍下。'
+        ),
+        'ordered_unpaid': (
+            '- 买家已拍下但尚未付款：不要催促付款，可自然询问买家是否遇到问题、是否需要帮助。\n'
+            '- 可说明付款后系统会自动发货；不要重复推销，也不要擅自改价。'
+        ),
+        'paid_pending_ship': (
+            '- 买家已付款、系统待自动发货：先安抚，明确告知已收到付款、系统会自动发货。\n'
+            '- 不要承诺精确到分钟的时间；买家着急时告知稍等片刻即可收到。'
+        ),
+        'shipped_in_use': (
+            '- 已发货：优先解答如何查收和使用（兑换、激活、操作流程），指引买家按已发内容操作。\n'
+            '- 买家说没收到时，先引导查看聊天记录里的发货消息，不要重复承诺再次发货。'
+        ),
+        'completed': (
+            '- 交易已完成：致谢并欢迎回购；如买家反馈使用问题，按售后边界处理。'
+        ),
+        'aftersale': (
+            '- 订单处于退款或售后流程：语气安抚，按售后规则回应，不与买家争执。\n'
+            '- 不做超出商品规则的赔付或退款承诺；规则未覆盖时请买家稍等人工处理。'
+        ),
+        'closed': (
+            '- 订单已关闭：如买家仍有需求，引导重新拍下；不要把已关闭订单说成仍在进行。'
+        ),
+        'multiple_orders': (
+            '- 买家名下有多笔订单且无法确定是哪一笔：先请买家提供订单编号或说明是哪次购买，再回答订单相关问题。\n'
+            '- 与订单无关的通用问题可以直接回答。'
+        ),
+        'unknown': (
+            '- 已查到订单但状态未知：不要臆断付款或发货状态，可请买家描述当前进度，或说明稍后核实。'
+        ),
+    }
+
     """AI回复引擎"""
 
     def __init__(self):
@@ -170,6 +237,7 @@ class AIReplyEngine:
             'ts': time.time(),
             'request_id': str(values.get('request_id') or uuid.uuid4().hex[:12]),
             'scope': str(values.get('scope') or 'legacy'),
+            'stage': str(values.get('stage') or ''),
             'shadow': bool(values.get('shadow', False)),
             'elapsed_ms': round(float(values.get('elapsed_ms') or 0), 1),
             'model_calls': int(values.get('model_calls') or 0),
@@ -182,7 +250,7 @@ class AIReplyEngine:
             del self._shadow_metrics[:-500]
         logger.info(
             'AI_SHADOW_METRIC '
-            f"scope={metric['scope']} shadow={int(metric['shadow'])} "
+            f"scope={metric['scope']} stage={metric['stage'] or '-'} shadow={int(metric['shadow'])} "
             f"elapsed_ms={metric['elapsed_ms']} model_calls={metric['model_calls']} "
             f"context_count={metric['context_count']} ambiguous={int(metric['ambiguous'])} "
             f"result={metric['result']}"
@@ -296,6 +364,53 @@ class AIReplyEngine:
 
     # 兼容调用方可能采用的命名。
     get_order_scope = resolve_order_scope
+
+    def order_aware_enabled(self) -> bool:
+        """订单感知路径是否转正；环境变量显式设置时优先于系统设置。"""
+        env_value = str(os.getenv(self.ORDER_AWARE_ENV) or '').strip().lower()
+        if env_value in self._TRUTHY_FLAGS:
+            return True
+        if env_value in self._FALSY_FLAGS:
+            return False
+        try:
+            setting = str(
+                db_manager.get_system_setting(self.ORDER_AWARE_SETTING_KEY) or ''
+            ).strip().lower()
+        except Exception as exc:
+            logger.debug(f"读取订单感知开关失败: error_type={type(exc).__name__}")
+            return False
+        return setting in self._TRUTHY_FLAGS
+
+    def resolve_trade_stage(self, order_scope: Optional[str],
+                            order_summary_json: str = '') -> Optional[str]:
+        """把订单作用域与已校验订单摘要映射为交易阶段；legacy 下不注入阶段。"""
+        scope = str(order_scope or '').strip().lower()
+        if scope == 'legacy':
+            return None
+        if scope == 'ambiguous':
+            return 'multiple_orders'
+        if scope in {'exact', 'unique'}:
+            try:
+                summary = json.loads(order_summary_json) if order_summary_json else {}
+            except Exception:
+                summary = {}
+            if not isinstance(summary, dict):
+                summary = {}
+            status = str(summary.get('order_status') or '').strip().lower()
+            stage = self.STAGE_STATUS_MAP.get(status)
+            if stage:
+                return stage
+            if summary.get('system_shipped'):
+                return 'shipped_in_use'
+            return 'unknown'
+        return 'presale'
+
+    def _stage_directive(self, stage: Optional[str]) -> str:
+        if not stage:
+            return ''
+        label = self.TRADE_STAGE_LABELS.get(stage, self.TRADE_STAGE_LABELS['unknown'])
+        playbook = self.STAGE_PLAYBOOKS.get(stage, self.STAGE_PLAYBOOKS['unknown'])
+        return f"当前交易阶段：{label}\n阶段应对要求（优先于通用话术，不得虚构阶段外事实）：\n{playbook}"
 
     @staticmethod
     def _same_message(left: Any, right: Any) -> bool:
@@ -411,6 +526,21 @@ class AIReplyEngine:
 语言要求：简短专业，每句≤10字，总字数≤40字。
 回答重点：产品功能、使用方法、注意事项。
 注意：基于商品信息回答，避免过度承诺。''',
+
+            'payment': '''你是一位资深电商客服，解答拍单与付款环节问题。
+语言要求：简短友好，每句≤10字，总字数≤40字。
+回答重点：如何拍下、付款流程、付款后自动发货说明。
+注意：不催促买家，不擅自修改价格承诺。''',
+
+            'shipping': '''你是一位资深电商客服，解答发货与订单进度问题。
+语言要求：简短友好，每句≤10字，总字数≤40字。
+回答重点：自动发货流程、发货时间、如何查收已发内容。
+注意：以订单摘要为准，不虚构物流或发货状态。''',
+
+            'aftersale': '''你是一位资深电商客服，处理售后与退款咨询。
+语言要求：简短温和，每句≤10字，总字数≤40字。
+回答重点：售后边界、退款流程、安抚买家情绪。
+注意：不做商品规则之外的赔付或退款承诺。''',
 
             'default': '''你是一位资深电商卖家，提供优质客服。
 语言要求：简短友好，每句≤10字，总字数≤40字。
@@ -957,10 +1087,67 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             )
             return self.parse_rule_audit('', rules)
 
+    @staticmethod
+    def _explicit_amounts(text: str) -> List[str]:
+        """提取带货币标记的明确金额（¥100 / 100元 / 100块 / 100rmb）。"""
+        values = []
+        for match in re.finditer(
+            r'[¥￥]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元|块|rmb)', str(text or ''), re.IGNORECASE
+        ):
+            value = match.group(1) or match.group(2)
+            if value.endswith('.0'):
+                value = value[:-2]
+            if value not in values:
+                values.append(value)
+        return values
+
+    def _local_rule_audit(self, reply: str, rules: List[Dict],
+                          price_rules: List[Dict]) -> Optional[Dict]:
+        """低风险意图的本地规则守护；返回 None 表示可疑，需升级 LLM 审计。
+
+        本地只校验价格金额：回复中出现价格规则之外的明确金额，或带价格措辞的
+        规则外数字，视为可疑。非价格规则不在本地判定，标记 unknown（不触发重答）。
+        """
+        if price_rules:
+            allowed = set()
+            for rule in price_rules:
+                allowed.update(self._price_rule_amounts(str(rule.get('text') or '')))
+            explicit = self._explicit_amounts(reply)
+            if any(value not in allowed for value in explicit):
+                return None
+            price_wording = any(
+                keyword in str(reply or '') for keyword in ('元', '价', '优惠', '便宜', '¥', '￥')
+            )
+            if price_wording:
+                loose = self._price_rule_amounts(reply)
+                if any(value not in allowed for value in loose):
+                    return None
+
+        price_ids = {str(rule.get('id')) for rule in price_rules}
+        results = []
+        for rule in rules or []:
+            is_price = str(rule.get('id')) in price_ids
+            results.append({
+                'rule_id': rule.get('id'),
+                'text': str(rule.get('text') or ''),
+                'status': 'followed' if is_price else 'unknown',
+                'reason': '本地金额校验通过' if is_price else '低风险意图未做模型审计',
+            })
+        return {
+            'results': results,
+            'violation_count': 0,
+            'unknown_count': sum(1 for value in results if value['status'] == 'unknown'),
+            'conflicts': [],
+        }
+
     def generate_rule_checked_reply(self, settings: Dict, cookie_id: str, messages: List[Dict],
                                     buyer_message: str, rules: List[Dict], knowledge_text: str,
-                                    max_tokens: int, temperature: float) -> Dict:
-        """生成回复并审计适用规则；发现违反时最多重答一次。"""
+                                    max_tokens: int, temperature: float,
+                                    audit_mode: str = 'full') -> Dict:
+        """生成回复并审计适用规则；发现违反时最多重答一次。
+
+        audit_mode='local' 时低风险意图先走本地价格守护，仅可疑才升级 LLM 审计。
+        """
         price_rules = [dict(rule) for rule in rules or [] if self._is_price_rule(rule)]
         price_rule_ids = {str(rule.get('id')) for rule in price_rules}
         price_conflicts = self._detect_price_rule_conflicts(price_rules)
@@ -981,9 +1168,15 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
         reply = self._call_configured_model(
             cookie_id, settings, guarded_messages, max_tokens=max_tokens, temperature=temperature
         )
-        audit = self._audit_reply_against_rules(
-            settings, cookie_id, buyer_message, reply, rules, knowledge_text
-        )
+        audit = None
+        if audit_mode == 'local' and rules:
+            audit = self._local_rule_audit(reply, rules, price_rules)
+            if audit is None:
+                logger.info("本地价格守护发现可疑金额，升级为模型审计")
+        if audit is None:
+            audit = self._audit_reply_against_rules(
+                settings, cookie_id, buyer_message, reply, rules, knowledge_text
+            )
         regenerated = False
         remaining_budget = self._model_call_budget_remaining()
         can_regenerate = remaining_budget is None or remaining_budget > 0
@@ -1431,6 +1624,33 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
 
             msg_lower = message.lower()
 
+            # 售后/退款相关关键词（业务上最敏感，优先级最高）
+            aftersale_keywords = [
+                '退款', '退货', '退钱', '售后', '投诉', '举报', '换货', '不想要',
+                '申请退', '退了', '维权', '不好用想退',
+            ]
+            if any(kw in msg_lower for kw in aftersale_keywords):
+                logger.debug("本地意图检测: aftersale")
+                return 'aftersale'
+
+            # 发货/订单进度相关关键词
+            shipping_keywords = [
+                '发货', '发了吗', '什么时候发', '多久发', '没收到', '还没发', '没发',
+                '发我', '到哪了', '怎么还没', '进度', '几时发', '啥时候发', '什么时候到',
+            ]
+            if any(kw in msg_lower for kw in shipping_keywords):
+                logger.debug("本地意图检测: shipping")
+                return 'shipping'
+
+            # 拍单/付款环节关键词
+            payment_keywords = [
+                '付款', '付了', '已付', '支付', '拍下', '拍了', '怎么拍', '怎么买',
+                '下单', '付不了', '支付失败', '怎么付', '付完',
+            ]
+            if any(kw in msg_lower for kw in payment_keywords):
+                logger.debug("本地意图检测: payment")
+                return 'payment'
+
             # 价格相关关键词
             price_keywords = [
                 '便宜', '优惠', '刀', '降价', '包邮', '价格', '多少钱', '能少', '还能', '最低', '底价',
@@ -1443,8 +1663,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 logger.debug("本地意图检测: price")
                 return 'price'
 
-            # 技术相关关键词
-            tech_keywords = ['怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动']
+            # 技术/使用教程相关关键词
+            tech_keywords = [
+                '怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动',
+                '怎么兑换', '兑换', '激活', '怎么操作', '打不开', '用不了', '失效', '无效', '链接怎么',
+            ]
             if any(kw in msg_lower for kw in tech_keywords):
                 logger.debug("本地意图检测: tech")
                 return 'tech'
@@ -1603,7 +1826,8 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                       source: Optional[str] = None, delivery_state: Optional[str] = None,
                       shadow: bool = False) -> Optional[str]:
         """生成AI回复；订单作用域和Shadow参数均为向后兼容的可选项。"""
-        if not shadow:
+        if not shadow and not self.order_aware_enabled():
+            # 订单感知开关未打开时保持 legacy 生产行为不变。
             return self._generate_reply_legacy(
                 message=message,
                 item_info=item_info,
@@ -1617,6 +1841,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
 
         started_at = time.perf_counter()
         metric_scope = 'legacy'
+        metric_stage = ''
         metric_context_count = 0
         metric_result = 'unknown'
         metric_request_id = uuid.uuid4().hex[:12]
@@ -1748,6 +1973,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 order_summary = self._get_verified_order_summary(
                     effective_scope, effective_order_id, cookie_id, item_id, user_id
                 )
+                trade_stage = self.resolve_trade_stage(effective_scope, order_summary)
+                metric_stage = trade_stage or ''
+                stage_directive = self._stage_directive(trade_stage)
+                if stage_directive:
+                    system_prompt = f"{system_prompt}\n\n{stage_directive}"
 
                 # 当前问题由“用户消息”字段唯一注入；历史尾部重复项不再重复拼接。
                 prompt_context = self._drop_current_message_from_context(context, message)
@@ -1796,6 +2026,8 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 ]
 
                 self._reset_model_call_count()
+                # 价格与售后意图保留模型级规则审计；其余低风险意图走本地守护，可疑才升级。
+                audit_mode = 'full' if intent in {'price', 'aftersale'} else 'local'
                 checked = self.generate_rule_checked_reply(
                     settings=settings,
                     cookie_id=cookie_id,
@@ -1805,6 +2037,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                     knowledge_text=reply_context['knowledge_text'],
                     max_tokens=100,
                     temperature=0.7,
+                    audit_mode=audit_mode,
                 )
                 reply = checked['reply']
                 if checked['regenerated']:
@@ -1833,6 +2066,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             try:
                 self._record_shadow_metric(
                     scope=metric_scope,
+                    stage=metric_stage,
                     shadow=shadow,
                     elapsed_ms=(time.perf_counter() - started_at) * 1000,
                     model_calls=self._model_call_count(),
@@ -1881,6 +2115,9 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                               image_refs=None, order_id: Optional[str] = None,
                               order_scope: Optional[str] = None) -> Optional[str]:
         """生成旁路候选，不写正式会话、不等待防抖，调用方应丢弃其发送结果。"""
+        if self.order_aware_enabled():
+            logger.info("订单感知路径已转正，跳过Shadow旁路候选")
+            return None
         return self.generate_reply(
             message=message,
             item_info=item_info,
@@ -1899,6 +2136,9 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                                           cookie_id: str, user_id: str, item_id: str,
                                           image_refs=None, order_id: Optional[str] = None,
                                           order_scope: Optional[str] = None) -> Optional[str]:
+        if self.order_aware_enabled():
+            logger.info("订单感知路径已转正，跳过Shadow旁路候选")
+            return None
         return await self.generate_reply_async(
             message=message,
             item_info=item_info,
@@ -1961,9 +2201,11 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 chat_id, cookie_id, item_id, order_id, order_scope, columns
             )
             if trusted_only and {'source', 'delivery_state'} <= columns:
+                # ambiguous = 已发出但无平台 ACK；纳入上下文避免模型忘记自己已发过的话，
+                # 渲染时仍会标注为未确认（assistant_draft），不会被当作已确认事实。
                 where = (
                     f"({where}) AND (source IN ('buyer', 'seller_human', 'keyword', 'system') "
-                    "OR (source = 'assistant_generated' AND delivery_state = 'succeeded'))"
+                    "OR (source = 'assistant_generated' AND delivery_state IN ('succeeded', 'ambiguous')))"
                 )
             scoped = bool(order_id or str(order_scope or '').strip().lower() in {'exact', 'unique'})
             fetch_limit = max(limit, 100) if scoped and query else limit
@@ -1996,7 +2238,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                     if value.get('source') in {'buyer', 'seller_human', 'seller_observed', 'keyword', 'system'}
                     or (
                         value.get('role') in {'assistant', 'assistant_generated'}
-                        and value.get('delivery_state') == 'succeeded'
+                        and value.get('delivery_state') in {'succeeded', 'ambiguous'}
                     )
                 ]
 
