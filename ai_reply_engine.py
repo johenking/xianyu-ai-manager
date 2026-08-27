@@ -1637,6 +1637,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             shipping_keywords = [
                 '发货', '发了吗', '什么时候发', '多久发', '没收到', '还没发', '没发',
                 '发我', '到哪了', '怎么还没', '进度', '几时发', '啥时候发', '什么时候到',
+                '怎么发', '排队',
             ]
             if any(kw in msg_lower for kw in shipping_keywords):
                 logger.debug("本地意图检测: shipping")
@@ -1667,6 +1668,7 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
             tech_keywords = [
                 '怎么用', '参数', '坏了', '故障', '设置', '说明书', '功能', '用法', '教程', '驱动',
                 '怎么兑换', '兑换', '激活', '怎么操作', '打不开', '用不了', '失效', '无效', '链接怎么',
+                '怎么使用', '如何使用', '怎么弄', '怎么整',
             ]
             if any(kw in msg_lower for kw in tech_keywords):
                 logger.debug("本地意图检测: tech")
