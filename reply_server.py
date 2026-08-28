@@ -839,6 +839,21 @@ assets_dir = os.path.join(static_dir, 'assets')
 os.makedirs(assets_dir, exist_ok=True)
 app.mount('/assets', StaticFiles(directory=assets_dir), name='assets')
 
+
+_STATIC_NO_STORE_PREFIXES = ('/static/', '/assets/')
+
+
+@app.middleware("http")
+async def static_error_responses_no_store(request: Request, call_next):
+    # 静态资源的 4xx/5xx 必须禁止一切缓存：部署窗口内的资产 404 一旦被 CDN 按默认
+    # 规则缓存（Cloudflare 对 .js 等扩展名默认 Browser Cache TTL 4h），会把错误响应
+    # 投毒到用户浏览器，服务端修复后用户普通刷新仍白屏（2026-08-28 生产事故加固）。
+    response = await call_next(request)
+    if response.status_code >= 400 and request.url.path.startswith(_STATIC_NO_STORE_PREFIXES):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        response.headers['CDN-Cache-Control'] = 'no-store'
+    return response
+
 # 确保图片上传目录存在
 uploads_dir = os.path.join(static_dir, 'uploads', 'images')
 if not os.path.exists(uploads_dir):
