@@ -223,6 +223,82 @@ class LocalRuleAuditTests(StagePlaybookTestBase):
 
 
 class TrustedContextTests(StagePlaybookTestBase):
+    def test_non_text_placeholder_returns_fixed_guidance(self):
+        for message in ("[卡片消息]", "[图片]", "[语音]", "[视频]", "[图片][卡片消息]"):
+            self.assertEqual(
+                self.engine._non_text_guidance_reply(message, has_image_parts=False),
+                AIReplyEngine.NON_TEXT_GUIDANCE_REPLY,
+                message,
+            )
+
+    def test_pure_image_with_vision_goes_to_model(self):
+        self.assertIsNone(
+            self.engine._non_text_guidance_reply("[图片]", has_image_parts=True)
+        )
+        # 图片外还混有不可见内容时仍走固定引导。
+        self.assertEqual(
+            self.engine._non_text_guidance_reply("[图片][卡片消息]", has_image_parts=True),
+            AIReplyEngine.NON_TEXT_GUIDANCE_REPLY,
+        )
+
+    def test_normal_text_never_intercepted(self):
+        for message in ("发货了吗", "[图片]发货了吗", "我发了图片你看下", "[我发起了退款申请]"):
+            self.assertIsNone(
+                self.engine._non_text_guidance_reply(message, has_image_parts=False),
+                message,
+            )
+
+    def test_generate_reply_guides_card_message_without_model_call(self):
+        self._insert_order("order-a", "pending_ship")
+        with patch.object(self.engine, "order_aware_enabled", return_value=True), \
+                patch.object(self.engine, "_call_configured_model") as model:
+            reply = self.engine.generate_reply(
+                "[卡片消息]", {"title": "t", "price": "99", "desc": "d"},
+                "chat-1", "account-1", "buyer-1", "item-1", skip_wait=True,
+            )
+        model.assert_not_called()
+        self.assertEqual(reply, AIReplyEngine.NON_TEXT_GUIDANCE_REPLY)
+
+    def test_ambiguous_clarifies_twice_then_escalates(self):
+        self._insert_order("order-a", "pending_ship")
+        self._insert_order("order-b", "shipped")
+        replies = []
+        with patch.object(self.engine, "order_aware_enabled", return_value=True), \
+                patch.object(self.engine, "_call_configured_model") as model:
+            for _ in range(3):
+                replies.append(
+                    self.engine.generate_reply(
+                        "发货了吗", {"title": "t", "price": "99", "desc": "d"},
+                        "chat-1", "account-1", "buyer-1", "item-1", skip_wait=True,
+                    )
+                )
+        model.assert_not_called()
+        self.assertEqual(
+            replies,
+            [
+                AIReplyEngine.AMBIGUOUS_CLARIFY_REPLY,
+                AIReplyEngine.AMBIGUOUS_CLARIFY_REPLY,
+                AIReplyEngine.AMBIGUOUS_ESCALATE_REPLY,
+            ],
+        )
+
+    def test_ambiguous_clarify_count_ignores_old_records(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                """
+                INSERT INTO ai_conversations (
+                    cookie_id, chat_id, user_id, item_id, role, content,
+                    created_at
+                ) VALUES ('account-1', 'chat-1', 'seller', 'item-1', 'assistant', ?,
+                          datetime('now', '-3 days'))
+                """,
+                (AIReplyEngine.AMBIGUOUS_CLARIFY_REPLY,),
+            )
+            self.db.conn.commit()
+        self.assertEqual(
+            self.engine._ambiguous_clarify_count("chat-1", "account-1", "item-1"), 0
+        )
+
     def test_ambiguous_assistant_replies_stay_in_trusted_context(self):
         self.engine.save_conversation(
             "chat-1", "account-1", "buyer-1", "item-1", "user", "发货了吗",

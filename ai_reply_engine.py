@@ -130,6 +130,18 @@ class AIReplyEngine:
         ),
     }
 
+    # 非文本占位输入（订单感知路径）：内容对模型完全不可见，走固定引导话术而不是自由生成。
+    # [图片] 单独列出：多模态可用时仍交给模型看图回答。
+    NON_TEXT_PLACEHOLDERS = ('[卡片消息]', '[语音]', '[视频]')
+    IMAGE_PLACEHOLDER = '[图片]'
+    NON_TEXT_GUIDANCE_REPLY = '这边暂时查看不了您发的内容哈，麻烦打字说一下需求，马上帮您处理'
+
+    # 多订单澄清追问上限（订单感知路径）：窗口期内追问达到上限后改为提示转人工，不再重复追问。
+    AMBIGUOUS_CLARIFY_REPLY = '你这边有多个订单，请提供订单编号，我帮你核对。'
+    AMBIGUOUS_ESCALATE_REPLY = '已经帮您转人工跟进啦，老板看到会尽快回复您，请稍等哈'
+    AMBIGUOUS_CLARIFY_LIMIT = 2
+    AMBIGUOUS_CLARIFY_WINDOW_HOURS = 24
+
     """AI回复引擎"""
 
     def __init__(self):
@@ -411,6 +423,42 @@ class AIReplyEngine:
         label = self.TRADE_STAGE_LABELS.get(stage, self.TRADE_STAGE_LABELS['unknown'])
         playbook = self.STAGE_PLAYBOOKS.get(stage, self.STAGE_PLAYBOOKS['unknown'])
         return f"当前交易阶段：{label}\n阶段应对要求（优先于通用话术，不得虚构阶段外事实）：\n{playbook}"
+
+    def _non_text_guidance_reply(self, message: str, has_image_parts: bool) -> Optional[str]:
+        """整条消息由非文本占位符组成时返回固定引导话术；可看图的纯图片消息除外。"""
+        stripped = re.sub(r'\s+', '', str(message or ''))
+        if not stripped:
+            return None
+        placeholders = (*self.NON_TEXT_PLACEHOLDERS, self.IMAGE_PLACEHOLDER)
+        pattern = '|'.join(re.escape(value) for value in placeholders)
+        if not re.fullmatch(f'(?:{pattern})+', stripped):
+            return None
+        contains_opaque = bool(
+            re.sub(f'(?:{re.escape(self.IMAGE_PLACEHOLDER)})+', '', stripped)
+        )
+        if not contains_opaque and has_image_parts:
+            # 纯图片且多模态已启用：模型能看到图，不拦截。
+            return None
+        return self.NON_TEXT_GUIDANCE_REPLY
+
+    def _ambiguous_clarify_count(self, chat_id: str, cookie_id: str, item_id: str) -> int:
+        """统计窗口期内已保存的多订单澄清追问条数（按固定话术匹配，零迁移）。"""
+        try:
+            with db_manager.lock:
+                row = db_manager.conn.execute(
+                    "SELECT COUNT(*) FROM ai_conversations "
+                    "WHERE cookie_id = ? AND chat_id = ? AND item_id = ? "
+                    "AND role = 'assistant' AND content = ? "
+                    "AND created_at >= datetime('now', ?)",
+                    (
+                        cookie_id, chat_id, item_id, self.AMBIGUOUS_CLARIFY_REPLY,
+                        f'-{int(self.AMBIGUOUS_CLARIFY_WINDOW_HOURS)} hours',
+                    ),
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception as exc:
+            logger.debug(f"统计澄清追问次数失败: error_type={type(exc).__name__}")
+            return 0
 
     @staticmethod
     def _same_message(left: Any, right: Any) -> bool:
@@ -1921,6 +1969,18 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                 settings = db_manager.get_ai_reply_settings(cookie_id)
                 image_parts = self._prepare_image_parts(settings, image_refs)
 
+                # 非文本占位输入（卡片/语音/视频/无视觉图片）不走生成，直接固定引导。
+                guidance_reply = self._non_text_guidance_reply(message, bool(image_parts))
+                if guidance_reply:
+                    if not shadow:
+                        self._save_conversation_record(
+                            chat_id, cookie_id, user_id, item_id, "assistant", guidance_reply, intent,
+                            order_id=effective_order_id, order_scope=effective_scope,
+                            source='assistant_generated', delivery_state='draft',
+                        )
+                    metric_result = 'guided'
+                    return guidance_reply
+
                 context = self.get_conversation_context(
                     chat_id, cookie_id, item_id, order_id=effective_order_id,
                     order_scope=effective_scope, include_metadata=True, query=message,
@@ -1932,16 +1992,22 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                     order_id=effective_order_id, order_scope=effective_scope,
                 )
 
-                # 无法确定订单时不注入任意订单事实，直接走澄清回复。
+                # 无法确定订单时不注入任意订单事实，直接走澄清回复；
+                # 窗口期内追问达到上限后改为提示转人工，不再重复追问。
                 if effective_scope == 'ambiguous':
-                    reply = '你这边有多个订单，请提供订单编号，我帮你核对。'
+                    clarify_count = self._ambiguous_clarify_count(chat_id, cookie_id, item_id)
+                    if clarify_count >= self.AMBIGUOUS_CLARIFY_LIMIT:
+                        reply = self.AMBIGUOUS_ESCALATE_REPLY
+                        metric_result = 'escalated'
+                    else:
+                        reply = self.AMBIGUOUS_CLARIFY_REPLY
+                        metric_result = 'clarification'
                     if not shadow:
                         self._save_conversation_record(
                             chat_id, cookie_id, user_id, item_id, "assistant", reply, intent,
                             order_id=None, order_scope='ambiguous',
                             source='assistant_generated', delivery_state='draft',
                         )
-                    metric_result = 'clarification'
                     return reply
                 if effective_scope == 'none' and (order_id or str(order_scope or '').lower() == 'none'):
                     reply = '请提供有效的订单编号，我帮你核对。'
