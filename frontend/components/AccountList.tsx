@@ -83,9 +83,9 @@ interface BrowserInteractionDescriptor {
 }
 
 const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
-const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.2';
+const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.3';
 const CLIENT_BROWSER_PROTOCOL_VERSION = 1;
-const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.2.zip';
+const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.3.zip';
 
 type ClientBrowserConnectionState = {
   state:

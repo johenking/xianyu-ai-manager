@@ -89,4 +89,54 @@ describe('AuthenticatedImage', () => {
     );
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it('keeps the previous frame visible while the next revision loads', async () => {
+    let loadNext: ((value: Response) => void) | undefined;
+    const firstBlob = new Blob(['frame-one'], { type: 'image/png' });
+    const secondBlob = new Blob(['frame-two'], { type: 'image/png' });
+    vi.mocked(fetch).mockImplementationOnce(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'Content-Type': 'image/png' }),
+      blob: async () => firstBlob,
+    } as unknown as Response));
+    vi.mocked(URL.createObjectURL)
+      .mockImplementationOnce(() => 'blob:frame-one')
+      .mockImplementationOnce(() => 'blob:frame-two');
+
+    const view = render(
+      <AuthenticatedImage
+        src="/api/official-login/sessions/session-1/image?revision=1"
+        alt="cloud-chrome"
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'cloud-chrome' })).toHaveAttribute('src', 'blob:frame-one');
+    });
+
+    vi.mocked(fetch).mockImplementationOnce(
+      () => new Promise<Response>((resolve) => {
+        loadNext = resolve;
+      }),
+    );
+    view.rerender(
+      <AuthenticatedImage
+        src="/api/official-login/sessions/session-1/image?revision=2"
+        alt="cloud-chrome"
+      />,
+    );
+    expect(screen.getByRole('img', { name: 'cloud-chrome' })).toHaveAttribute('src', 'blob:frame-one');
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+
+    loadNext?.({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'Content-Type': 'image/png' }),
+      blob: async () => secondBlob,
+    } as unknown as Response);
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'cloud-chrome' })).toHaveAttribute('src', 'blob:frame-two');
+    });
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:frame-one');
+  });
 });

@@ -864,7 +864,18 @@ class XianyuOfficialLoginService:
                     )
                 worker.drain_interactions(page)
                 now = time.monotonic()
-                if now - last_frame_at >= 1.0:
+                security_verification_active = self._has_security_verification(page)
+                qr_waiting = (
+                    not security_verification_active
+                    and self._find_visible(page, (
+                        ".qrcode-img",
+                        ".qrcode img",
+                        "[class*='qrcode'] img",
+                        "img[alt*='二维码']",
+                    )) is not None
+                )
+                frame_interval = 5.0 if qr_waiting else 1.0
+                if now - last_frame_at >= frame_interval:
                     worker.capture_frame(page)
                     last_frame_at = now
                 # 可见窗口也响应"重新显示"：窗口被其他窗口挡住时可一键拉回前台。

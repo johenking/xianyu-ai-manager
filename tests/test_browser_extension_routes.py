@@ -108,6 +108,60 @@ class BrowserExtensionRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(other_owner.exception.status_code, 404)
 
+    async def test_retryable_probe_keeps_pairing_and_returns_error_code(self):
+        with patch.object(reply_server, "browser_extension_pairings", self.manager):
+            created = reply_server.create_browser_extension_pairing(
+                current_user=self.owner,
+            )["data"]
+
+        payload = reply_server.BrowserExtensionImportIn(
+            protocol_version=2,
+            pairing_id=created["pairing_id"],
+            pairing_token=created["pairing_token"],
+            cookies=_cookies(),
+            user_agent="Chrome Route Test",
+        )
+        retryable = SessionProbeResult(
+            status="retryable_error",
+            error_code="token_probe_exception",
+            message="probe timeout",
+        )
+        success = SessionProbeResult(
+            status="success",
+            cookies={"unb": "account-1", "cookie2": "session-cookie"},
+            access_token="validated-access-token",
+        )
+        persist = AsyncMock(return_value={
+            "account_id": "owned-row",
+            "is_new_account": True,
+        })
+
+        with (
+            patch.object(reply_server, "browser_extension_pairings", self.manager),
+            patch.object(
+                reply_server,
+                "probe_message_session_async",
+                AsyncMock(side_effect=[retryable, success]),
+            ),
+            patch.object(reply_server, "_persist_validated_account_login", persist),
+        ):
+            with self.assertRaises(HTTPException) as first:
+                await reply_server.import_browser_extension_cookies(
+                    payload,
+                    _request(client_host="203.0.113.20"),
+                )
+            imported = await reply_server.import_browser_extension_cookies(
+                payload,
+                _request(client_host="203.0.113.20"),
+            )
+
+        self.assertEqual(first.exception.status_code, 503)
+        self.assertEqual(first.exception.detail["code"], "session_probe_retryable")
+        self.assertIn("token_probe_exception", first.exception.detail["message"])
+        self.assertTrue(imported["success"])
+        self.assertEqual(imported["data"]["account_id"], "owned-row")
+        persist.assert_awaited_once()
+
     async def test_v1_compatibility_remains_loopback_only(self):
         with patch.object(reply_server, "browser_extension_pairings", self.manager):
             created = reply_server.create_browser_extension_pairing(

@@ -70,6 +70,26 @@ class BrowserExtensionPairingTests(unittest.TestCase):
         self.assertNotIn("pairing_token", completed)
         self.assertNotIn(pairing_token, str(completed))
 
+    def test_retryable_validation_restores_waiting_pairing(self):
+        status, pairing_token = self.manager.create(7)
+        locked = self.manager.begin_validation(
+            status["pairing_id"],
+            pairing_token,
+            protocol_version=2,
+            remote_host="203.0.113.20",
+        )
+        self.assertEqual(locked.status, "validating")
+        restored = self.manager.restore_waiting(status["pairing_id"])
+        self.assertEqual(restored["status"], "waiting")
+        again = self.manager.begin_validation(
+            status["pairing_id"],
+            pairing_token,
+            protocol_version=2,
+            remote_host="203.0.113.20",
+        )
+        self.assertEqual(again.owner_user_id, 7)
+        self.assertEqual(again.status, "validating")
+
 
 if __name__ == "__main__":
     unittest.main()

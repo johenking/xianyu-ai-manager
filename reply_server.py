@@ -2629,7 +2629,7 @@ async def import_browser_extension_cookies(
         raise HTTPException(status_code=413, detail="Cookie 数量超过限制")
 
     remote_host = request.client.host if request.client else ""
-    consumed = False
+    locked = False
     try:
         protocol_version = int(payload.protocol_version or 1)
         if protocol_version == 1 and not _is_strict_loopback_request(request):
@@ -2649,19 +2649,18 @@ async def import_browser_extension_cookies(
                 error_code="pairing_credential_missing",
                 http_status=400,
             )
-        record = browser_extension_pairings.consume(
+        record = browser_extension_pairings.begin_validation(
             payload.pairing_id,
             pairing_secret,
             protocol_version=protocol_version,
             remote_host=remote_host,
         )
-        consumed = True
+        locked = True
         raw_records = [
             cookie.model_dump() if hasattr(cookie, "model_dump") else cookie.dict()
             for cookie in payload.cookies
         ]
         imported_cookies = normalize_structured_cookies(raw_records)
-        browser_extension_pairings.mark_validating(payload.pairing_id)
         imported_unb = str(imported_cookies.get("unb") or "").strip()
         probe_result = await probe_message_session_async(
             session_cookies_to_string(imported_cookies),
@@ -2670,17 +2669,23 @@ async def import_browser_extension_cookies(
         platform_unb = str((probe_result.cookies or {}).get("unb") or "").strip()
 
         if not probe_result.succeeded:
-            error_code = (
-                "session_probe_retryable"
-                if probe_result.status == PROBE_RETRYABLE_ERROR
-                else probe_result.error_code or "session_validation_failed"
+            retryable = probe_result.status == PROBE_RETRYABLE_ERROR
+            probe_code = probe_result.error_code or (
+                "session_probe_retryable" if retryable else "session_validation_failed"
             )
-            message = (
-                "平台状态检查出现临时异常，未导入 Cookie"
-                if probe_result.status == PROBE_RETRYABLE_ERROR
-                else probe_result.message or "平台未确认有效登录状态"
+            error_code = "session_probe_retryable" if retryable else probe_code
+            if retryable:
+                browser_extension_pairings.restore_waiting(payload.pairing_id)
+                locked = False
+                raise PairingError(
+                    f"平台状态检查出现临时异常（{probe_code}），未导入 Cookie，可重试",
+                    error_code=error_code,
+                    http_status=503,
+                )
+            raise PairingError(
+                probe_result.message or f"平台未确认有效登录状态（{probe_code}）",
+                error_code=error_code,
             )
-            raise PairingError(message, error_code=error_code)
         if not platform_unb or platform_unb != imported_unb:
             raise PairingError(
                 "平台验证身份与导入 Cookie 不一致",
@@ -2706,6 +2711,7 @@ async def import_browser_extension_cookies(
             payload.pairing_id,
             account_id=account_info['account_id'],
         )
+        locked = False
         return {
             "success": True,
             "status": safe_status['status'],
@@ -2713,22 +2719,28 @@ async def import_browser_extension_cookies(
             "data": safe_status,
         }
     except PairingError as exc:
-        if consumed:
+        if locked and exc.error_code != "session_probe_retryable":
             browser_extension_pairings.fail(
                 payload.pairing_id,
                 message=str(exc),
                 error_code=exc.error_code,
             )
-        raise HTTPException(status_code=exc.http_status, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.error_code, "message": str(exc)},
+        ) from exc
     except Exception as exc:
-        if consumed:
+        if locked:
             browser_extension_pairings.fail(
                 payload.pairing_id,
                 message="导入处理失败",
                 error_code="import_failed",
             )
         logger.error(f"Chrome 扩展导入失败: {type(exc).__name__}")
-        raise HTTPException(status_code=400, detail="导入处理失败") from exc
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "import_failed", "message": "导入处理失败"},
+        ) from exc
 
 
 # ============ 带子路径的 /cookies/{cid}/xxx 路由必须在 /cookies/{cid} 之前定义 ============

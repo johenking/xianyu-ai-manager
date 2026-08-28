@@ -40,12 +40,21 @@ async function importCookies() {
       throw new Error('未检测到闲鱼登录态。请先在 Chrome 登录闲鱼，然后再导入；不必保持闲鱼为当前标签页。');
     }
 
-    const response = await fetch(pairing.importUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const result = await response.json().catch(() => ({}));
+    let response;
+    let result = {};
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      response = await fetch(pairing.importUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      result = await response.json().catch(() => ({}));
+      const retryable = response.status === 503
+        || result?.detail?.code === 'session_probe_retryable';
+      if (!retryable) break;
+      setStatus(`平台检查暂时失败，正在重试（${attempt + 1}/3）…`);
+      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+    }
     if (!response.ok || !result.success) {
       throw new Error(formatConsoleError(result, response.status));
     }

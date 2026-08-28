@@ -180,7 +180,7 @@ test('manifest provides a strict MV3 current-device bridge', async () => {
   assert.deepEqual(manifest.background, { service_worker: 'background.js', type: 'module' });
   assert.deepEqual(manifest.content_scripts[0].matches, ['https://xianyu.cxywjx.top/*']);
   assert.deepEqual(manifest.content_scripts[0].js, ['content.js']);
-  assert.equal(manifest.version, '1.2.2');
+  assert.equal(manifest.version, '1.2.3');
   assert.equal(manifest.host_permissions.length, 5);
   for (const suffix of ALLOWED_SUFFIXES) {
     assert.equal(
@@ -202,6 +202,7 @@ test('popup code never writes sensitive values to extension storage', async () =
   assert.equal(isAllowedCookie({ domain: '.example.com' }), false);
   assert.match(popup, /collectAllowedCookies/);
   assert.match(popup, /formatConsoleError/);
+  assert.match(popup, /session_probe_retryable/);
   assert.equal(popup.includes('当前标签页不是闲鱼或淘宝官方页面'), false);
   assert.equal(/getAll\(\{ storeId:/.test(popup), false);
 });

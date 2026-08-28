@@ -223,6 +223,68 @@ class BrowserExtensionPairingManager:
             record.code_digest = ""
             return record
 
+    def begin_validation(
+        self,
+        pairing_id: str,
+        pairing_code: str,
+        *,
+        protocol_version: int = 1,
+        remote_host: str,
+    ) -> PairingRecord:
+        """Lock a pairing for import without burning it until probe succeeds."""
+        requested_version = int(protocol_version or 1)
+        if requested_version not in {1, PAIRING_PROTOCOL_VERSION}:
+            raise PairingError(
+                "配对协议版本不受支持",
+                error_code="pairing_protocol_unsupported",
+                http_status=400,
+            )
+        if requested_version == 1 and not is_loopback_host(remote_host):
+            raise PairingError(
+                "旧版扩展导入仅接受本机回环请求",
+                error_code="non_loopback_request",
+                http_status=403,
+            )
+        with self._lock:
+            record = self._get_locked(pairing_id)
+            self._expire_locked(record)
+            if record.status == "expired":
+                raise PairingError("配对已过期", error_code="pairing_expired", http_status=410)
+            if record.status == "validating":
+                raise PairingError(
+                    "配对正在验证，请稍后重试",
+                    error_code="pairing_in_progress",
+                    http_status=409,
+                )
+            if record.consumed_at is not None or record.status not in {"waiting"}:
+                raise PairingError("配对已使用", error_code="pairing_already_used", http_status=409)
+
+            supplied_digest = _digest_code(pairing_code)
+            if not secrets.compare_digest(record.code_digest, supplied_digest):
+                record.attempts += 1
+                if record.attempts >= self.max_attempts:
+                    record.status = "failed"
+                    record.error_code = "pairing_attempts_exceeded"
+                    record.message = "配对尝试次数过多"
+                raise PairingError("配对码错误", error_code="pairing_code_invalid", http_status=403)
+
+            record.status = "validating"
+            record.message = "正在验证闲鱼登录状态"
+            return record
+
+    def restore_waiting(self, pairing_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self._get_locked(pairing_id)
+            self._expire_locked(record)
+            if record.status == "expired":
+                raise PairingError("配对已过期", error_code="pairing_expired", http_status=410)
+            if record.status != "validating" or record.consumed_at is not None:
+                raise PairingError("配对状态无效", error_code="pairing_state_invalid", http_status=409)
+            record.status = "waiting"
+            record.message = "等待 Chrome 扩展导入"
+            record.error_code = ""
+            return self._safe_status(record)
+
     def mark_validating(self, pairing_id: str) -> dict[str, Any]:
         with self._lock:
             record = self._get_locked(pairing_id)
@@ -240,6 +302,8 @@ class BrowserExtensionPairingManager:
             record.error_code = ""
             record.account_id = str(account_id or "")
             record.ended_by = "validated_and_persisted"
+            record.consumed_at = record.consumed_at or time.time()
+            record.code_digest = ""
             return self._safe_status(record)
 
     def fail(self, pairing_id: str, *, message: str, error_code: str) -> dict[str, Any]:
@@ -249,6 +313,8 @@ class BrowserExtensionPairingManager:
             record.message = str(message or "导入失败")[:200]
             record.error_code = str(error_code or "import_failed")[:80]
             record.ended_by = "validation_failed"
+            record.consumed_at = record.consumed_at or time.time()
+            record.code_digest = ""
             return self._safe_status(record)
 
     def clear(self) -> None:
@@ -263,7 +329,7 @@ class BrowserExtensionPairingManager:
         return record
 
     def _expire_locked(self, record: PairingRecord) -> None:
-        if record.status in {"waiting", "received"} and record.expires_at <= time.time():
+        if record.status in {"waiting", "received", "validating"} and record.expires_at <= time.time():
             record.status = "expired"
             record.message = "配对已过期"
             record.error_code = "pairing_expired"
