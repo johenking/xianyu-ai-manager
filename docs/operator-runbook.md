@@ -1,5 +1,7 @@
 # Operator Runbook
 
+> **⚠️ 生产位置已变更（2026-08-27）**：唯一活跃生产不再是本机 Mac 的 8091 LaunchAgent，而是云 HOST `app-suite-candidate` 上的 Docker 容器 `app-a-cloud-app-a-1`（回环 18091→容器 8080，release `/opt/app-suite-cloud/releases/cutover-20260827`，公网 `xianyu.cxywjx.top` / `xianyu-cloud.cxywjx.top` 走 VM 上的 cloudflared 隧道 `app-suite-cloud`）。当前发布方式：以运行中镜像为基底构建派生镜像（仅 COPY 任务文件）→ 更新 `manifest.env` → `docker compose -p app-a-cloud up -d --wait app-a` → 核验容器 healthy、18091 与公网双域名 readiness、迁移号、账号 listener 心跳；回滚脚本放同一 release 目录。拓扑与 ssh 入口见 `自动化/cloud-deploy/PROGRESS.md` 顶部「当前生产」。本手册以下 Mac 8091/LaunchAgent 章节仅适用于已冻结的本机回滚副本。
+
 ## Local Start
 
 ```bash
