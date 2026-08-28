@@ -145,6 +145,65 @@ class CatalogPersistenceTests(unittest.TestCase):
         )
 
 
+class _FakeItemListResponse:
+    def __init__(self, payload):
+        self._payload = payload
+        self.headers = {}
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeItemListPost:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def __aenter__(self):
+        return _FakeItemListResponse(self._payload)
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class ItemListEmptyInventoryTests(unittest.IsolatedAsyncioTestCase):
+    """实测（2026-08-28）：在售列表为空时闲鱼 SUCCESS 响应不含 cardList 字段。"""
+
+    def _build_live(self, payload):
+        live = object.__new__(XianyuLive)
+        live.cookie_id = "account-1"
+        live.myid = "account-1"
+        live.cookies_str = "unb=account-1; _m_h5_tk=token123_1700000000000"
+        live.session = SimpleNamespace(
+            post=lambda *args, **kwargs: _FakeItemListPost(payload)
+        )
+        return live
+
+    async def test_success_without_cardlist_but_with_page_markers_is_empty_inventory(self):
+        live = self._build_live({
+            "ret": ["SUCCESS::调用成功"],
+            "data": {"totalCount": 0, "nextPage": False},
+        })
+
+        with patch("XianyuAutoAsync._resolve_h5_api_url", side_effect=lambda url: url):
+            result = await live.get_item_list_info(save_to_db=False)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["current_count"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertFalse(result["has_next_page"])
+
+    async def test_success_without_cardlist_and_without_markers_stays_invalid(self):
+        live = self._build_live({
+            "ret": ["SUCCESS::调用成功"],
+            "data": {},
+        })
+
+        with patch("XianyuAutoAsync._resolve_h5_api_url", side_effect=lambda url: url):
+            result = await live.get_item_list_info(save_to_db=False)
+
+        self.assertEqual(result.get("error_code"), "invalid_response")
+
+
 class CatalogPaginationTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_failure_does_not_reconcile_or_hide_existing_items(self):
         live = object.__new__(XianyuLive)

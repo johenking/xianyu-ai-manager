@@ -9589,11 +9589,15 @@ class XianyuLive:
                 # 检查响应是否成功
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
                     items_data = res_json.get('data', {})
-                    if 'cardList' not in items_data or not isinstance(items_data.get('cardList'), list):
+                    card_list = items_data.get('cardList')
+                    if card_list is None and 'nextPage' in items_data:
+                        # 在售列表为空时闲鱼不返回 cardList 字段（实测 2026-08-28：
+                        # SUCCESS + totalCount/nextPage 存在但无 cardList），按 0 件商品处理。
+                        logger.info("商品列表为空（无在售商品）: page={}", page_number)
+                        card_list = []
+                    if not isinstance(card_list, list):
                         logger.error("商品列表响应缺少 cardList: page={}", page_number)
                         return {"error": "商品列表响应结构异常", "error_code": "invalid_response"}
-                    # 从cardList中提取商品信息
-                    card_list = items_data.get('cardList', [])
 
                     # 解析cardList中的商品信息
                     items_list = []
