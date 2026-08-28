@@ -1869,6 +1869,61 @@ def test_poller_recovers_platform_order_missing_from_local_database(monkeypatch)
     assert database.orders["order-recovered"]["ordered_at_source"] == "cst_string"
 
 
+def test_poller_discovers_accounts_in_bounded_parallel_and_times_from_completion(
+    monkeypatch,
+):
+    import invite_bridge_poller as poller_module
+
+    class _Database:
+        def get_all_cookies(self):
+            return {f"account-{index}": "fixture-cookie" for index in range(5)}
+
+        def get_cookie_details(self, _cookie_id):
+            return {}
+
+    class _Lock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _OrderClient:
+        active = 0
+        max_active = 0
+        calls = []
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def discover(self, **kwargs):
+            type(self).active += 1
+            type(self).max_active = max(type(self).max_active, type(self).active)
+            type(self).calls.append(kwargs["cookie_id"])
+            await asyncio.sleep(0.03)
+            type(self).active -= 1
+            return {"success": True, "orders": []}
+
+    poller = poller_module.InviteBridgePoller()
+    monkeypatch.setattr(poller_module, "db_manager", _Database())
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _id: {"item-1"})
+    monkeypatch.setattr(poller_module, "XianyuOrderListClient", _OrderClient)
+    monkeypatch.setattr(poller_module, "get_order_sync_lock", lambda _id: _Lock())
+
+    started_at = time.time()
+    asyncio.run(poller._discover_platform_orders())
+
+    assert _OrderClient.max_active == 3
+    assert len(_OrderClient.calls) == 5
+    assert set(poller._last_discovery_at) == {
+        f"account-{index}" for index in range(5)
+    }
+    assert min(poller._last_discovery_at.values()) >= started_at + 0.02
+
+    asyncio.run(poller._discover_platform_orders())
+    assert len(_OrderClient.calls) == 5
+
+
 def test_poller_lead_discovery_never_stages_or_emits_event(monkeypatch):
     import XianyuAutoAsync
     import invite_bridge_poller as poller_module
@@ -2213,6 +2268,240 @@ def test_poller_trusted_direct_scan_skips_discovery_and_payment_recheck(monkeypa
     assert "xianyu:" + hashlib.sha256(
         b"account-1:order-trusted:paid"
     ).hexdigest() not in poller._seen
+
+
+def test_poller_verified_order_path_reads_only_target_order(monkeypatch):
+    import XianyuAutoAsync
+    import invite_bridge_poller as poller_module
+
+    class _Database:
+        def __init__(self):
+            self.order = {
+                "order_id": "order-target",
+                "cookie_id": "account-1",
+                "item_id": "item-1",
+                "buyer_id": "buyer-1",
+                "chat_id": "chat-1",
+                "order_status": "pending_ship",
+                "amount": "3.88",
+                "quantity": "1",
+                "system_shipped": 0,
+            }
+            self.detail_calls = 0
+
+        def get_order_by_id(self, order_id):
+            self.detail_calls += 1
+            assert order_id == "order-target"
+            return dict(self.order)
+
+        def get_all_cookies(self):
+            raise AssertionError("verified order path scanned all accounts")
+
+        def get_orders_by_cookie(self, *_args, **_kwargs):
+            raise AssertionError("verified order path scanned the order list")
+
+        def find_chat_id_by_buyer(self, _cookie_id, _buyer_id):
+            return None
+
+    class _Socket:
+        closed = False
+
+    class _Live:
+        ws = _Socket()
+
+    database = _Database()
+    poller = poller_module.InviteBridgePoller()
+    sent = []
+
+    async def send_event(payload):
+        sent.append(payload)
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _id: {"item-1"})
+    monkeypatch.setattr(poller_module, "_message_operation_exists", lambda *_args: False)
+    monkeypatch.setattr(poller_module, "_send_order_event_to_invite", send_event)
+    monkeypatch.setattr(
+        XianyuAutoAsync.XianyuLive,
+        "get_instance",
+        staticmethod(lambda _cookie_id: _Live()),
+    )
+
+    sent_count = asyncio.run(
+        poller.scan_trusted_order(
+            cookie_id="account-1",
+            order_id="order-target",
+            item_id="item-1",
+            buyer_id="buyer-1",
+            chat_id="chat-1",
+            payment_check={
+                "allowed": True,
+                "status": "pending_ship",
+                "business_type": "ordinary",
+            },
+        )
+    )
+
+    assert sent_count == 1
+    assert database.detail_calls == 1
+    assert [payload["orderId"] for payload in sent] == ["order-target"]
+
+
+def test_paid_invite_notice_calls_only_the_verified_order_path(monkeypatch):
+    import XianyuAutoAsync
+    import db_manager as db_module
+    import invite_bridge_poller as poller_module
+
+    class _Database:
+        def get_item_info(self, cookie_id, item_id):
+            assert (cookie_id, item_id) == ("account-1", "item-1")
+            return {"item_id": item_id}
+
+    class _Poller:
+        def __init__(self):
+            self.staged = []
+            self.direct = []
+
+        def stage_order(self, **kwargs):
+            self.staged.append(kwargs)
+            return True
+
+        async def scan_trusted_order(self, **kwargs):
+            self.direct.append(kwargs)
+            return 1
+
+        async def scan_once(self, **_kwargs):
+            raise AssertionError("paid invite notice entered the batch scanner")
+
+    class _Live:
+        cookie_id = "account-1"
+        _extract_order_id = staticmethod(lambda _message: "order-1")
+
+        async def _verify_paid_order_for_delivery(self, **_kwargs):
+            return {
+                "allowed": True,
+                "status": "pending_ship",
+                "business_type": "ordinary",
+                "amount": "3.88",
+                "quantity": 1,
+            }
+
+    poller = _Poller()
+    monkeypatch.setattr(db_module, "db_manager", _Database())
+    monkeypatch.setattr(XianyuAutoAsync, "_invite_bridge_owns_item", lambda *_args: True)
+    monkeypatch.setattr(poller_module, "invite_bridge_poller", poller)
+
+    asyncio.run(
+        XianyuAutoAsync.XianyuLive._handle_auto_delivery(
+            _Live(),
+            websocket=object(),
+            message={},
+            send_user_name="buyer",
+            send_user_id="buyer-1",
+            item_id="item-1",
+            chat_id="chat-1",
+            msg_time="now",
+        )
+    )
+
+    assert len(poller.staged) == 1
+    assert [call["order_id"] for call in poller.direct] == ["order-1"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "account_mismatch",
+        "item_mismatch",
+        "buyer_mismatch",
+        "chat_mismatch",
+        "system_shipped",
+        "status_not_pending",
+        "payment_unconfirmed",
+        "listener_offline",
+        "message_operation_exists",
+    ),
+)
+def test_poller_verified_order_path_fails_closed(monkeypatch, case):
+    import XianyuAutoAsync
+    import invite_bridge_poller as poller_module
+
+    class _Database:
+        def __init__(self):
+            self.order = {
+                "order_id": "order-guard",
+                "cookie_id": "account-1",
+                "item_id": "item-1",
+                "buyer_id": "buyer-1",
+                "chat_id": "chat-1",
+                "order_status": "pending_ship",
+                "amount": "3.88",
+                "quantity": "1",
+                "system_shipped": 0,
+            }
+
+        def get_order_by_id(self, _order_id):
+            return dict(self.order)
+
+        def find_chat_id_by_buyer(self, _cookie_id, _buyer_id):
+            return None
+
+    class _Socket:
+        closed = False
+
+    class _Live:
+        ws = _Socket()
+
+    database = _Database()
+    payment_check = {
+        "allowed": True,
+        "status": "pending_ship",
+        "business_type": "ordinary",
+    }
+    live = _Live()
+    if case == "account_mismatch":
+        database.order["cookie_id"] = "account-2"
+    elif case == "item_mismatch":
+        database.order["item_id"] = "item-2"
+    elif case == "buyer_mismatch":
+        database.order["buyer_id"] = "buyer-2"
+    elif case == "chat_mismatch":
+        database.order["chat_id"] = "chat-2"
+    elif case == "system_shipped":
+        database.order["system_shipped"] = 1
+    elif case == "status_not_pending":
+        database.order["order_status"] = "shipped"
+    elif case == "payment_unconfirmed":
+        payment_check = {"allowed": False, "status": "unknown", "business_type": "ordinary"}
+    elif case == "listener_offline":
+        live.ws.closed = True
+
+    poller = poller_module.InviteBridgePoller()
+    sent = []
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _id: {"item-1"})
+    monkeypatch.setattr(
+        poller_module,
+        "_message_operation_exists",
+        lambda *_args: case == "message_operation_exists",
+    )
+    monkeypatch.setattr(poller_module, "_send_order_event_to_invite", lambda payload: sent.append(payload))
+    monkeypatch.setattr(
+        XianyuAutoAsync.XianyuLive,
+        "get_instance",
+        staticmethod(lambda _cookie_id: live),
+    )
+
+    assert asyncio.run(
+        poller.scan_trusted_order(
+            cookie_id="account-1",
+            order_id="order-guard",
+            item_id="item-1",
+            buyer_id="buyer-1",
+            chat_id="chat-1",
+            payment_check=payment_check,
+        )
+    ) == 0
+    assert sent == []
 
 
 def test_poller_discovery_failure_does_not_block_local_pending_order(monkeypatch):
