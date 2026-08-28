@@ -4,6 +4,7 @@ import {
   browserFamilyFromUserAgent,
   bytesToBase64Url,
   canonicalJson,
+  collectAllowedCookies,
   cookieFingerprint,
   isAllowedHost,
   isConsolePageUrl,
@@ -102,10 +103,20 @@ async function saveSessionMap(sessions) {
 }
 
 async function cookieStoreForTab(tabId) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const stores = await chrome.cookies.getAllCookieStores();
+    const matched = (stores || []).find((store) => (store.tabIds || []).includes(tabId));
+    if (matched) return matched.id;
+    await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+  }
   const stores = await chrome.cookies.getAllCookieStores();
   const store = selectCookieStore(stores, tabId);
   if (!store) throw new Error('未找到当前登录标签页的 Cookie Store');
   return store.id;
+}
+
+async function cookiesFromStore(storeId) {
+  return collectAllowedCookies(storeId, (details) => chrome.cookies.getAll(details));
 }
 
 async function signChallenge(identity, challenge, binding) {
@@ -284,7 +295,7 @@ async function checkRenewalTask(taskId) {
   if (!task || !['claimed', 'action_required'].includes(task.state)) return;
   const tab = await chrome.tabs.get(task.tabId).catch(() => null);
   if (!tab?.url) return;
-  const cookies = await chrome.cookies.getAll({ storeId: task.storeId });
+  const cookies = await cookiesFromStore(task.storeId);
   const hasIdentity = cookies.some((cookie) => cookie.name === 'unb' && cookie.value);
   const hasCore = cookies.some((cookie) => ['cookie2', '_m_h5_tk', 'sgcookie', 't'].includes(cookie.name) && cookie.value);
   const fingerprintChanged = cookieFingerprint(cookies) !== task.baselineFingerprint;
@@ -328,7 +339,7 @@ async function claimRenewalTask() {
     const tab = await chrome.tabs.create({ url: LOGIN_URL, active: false });
     if (!tab.id) throw new Error('未能打开当前设备续期标签页');
     const storeId = await cookieStoreForTab(tab.id);
-    const baselineCookies = await chrome.cookies.getAll({ storeId });
+    const baselineCookies = await cookiesFromStore(storeId);
     const tasks = await renewalMap();
     tasks[task.task_id] = {
       taskId: task.task_id,
@@ -381,7 +392,7 @@ async function tryImport(sessionId) {
   if (!tab?.url) return;
   const host = new URL(tab.url).hostname;
   if (!isAllowedHost(host)) return;
-  const cookies = await chrome.cookies.getAll({ storeId: session.storeId });
+  const cookies = await cookiesFromStore(session.storeId);
   const hasIdentity = cookies.some((cookie) => cookie.name === 'unb' && cookie.value);
   const hasCore = cookies.some((cookie) => ['cookie2', '_m_h5_tk', 'sgcookie', 't'].includes(cookie.name) && cookie.value);
   if (!hasIdentity || !hasCore) return;

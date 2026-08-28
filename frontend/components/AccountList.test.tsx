@@ -116,7 +116,7 @@ describe('AccountList session verification UI', () => {
         ? {
           deviceId: 'device_fixture_1234',
           browserFamily: 'chrome',
-          extensionVersion: '1.2.1',
+          extensionVersion: '1.2.2',
           protocolVersion: 1,
           signingPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-x', y: 'fixture-y' },
           encryptionPublicJwk: { kty: 'EC', crv: 'P-256', x: 'fixture-ex', y: 'fixture-ey' },
@@ -660,7 +660,7 @@ describe('AccountList session verification UI', () => {
     // 安装引导弹窗在扩展桥 3.5 秒超时后才自动弹出，需要更长等待
     expect(await screen.findByRole('link', { name: /下载浏览器扩展/ }, { timeout: 6500 })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-browser-bridge-1.2.1.zip',
+      '/static/downloads/xianyu-browser-bridge-1.2.2.zip',
     );
     expect(createClientBrowserLoginSession).not.toHaveBeenCalled();
     expect(createOfficialLoginSession).not.toHaveBeenCalled();
@@ -845,9 +845,9 @@ describe('AccountList session verification UI', () => {
     fireEvent.click(screen.getByRole('button', { name: '高级与运维方式' }));
     fireEvent.click(screen.getByRole('button', { name: '你的 Chrome' }));
     expect(await screen.findByText('从你的 Chrome 导入')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: '下载扩展 1.2.1' })).toHaveAttribute(
+    expect(screen.getByRole('link', { name: '下载扩展 1.2.2' })).toHaveAttribute(
       'href',
-      '/static/downloads/xianyu-browser-bridge-1.2.1.zip',
+      '/static/downloads/xianyu-browser-bridge-1.2.2.zip',
     );
     fireEvent.click(screen.getByRole('button', { name: '创建一次性配对' }));
 

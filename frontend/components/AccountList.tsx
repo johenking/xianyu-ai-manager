@@ -83,9 +83,9 @@ interface BrowserInteractionDescriptor {
 }
 
 const DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES = 1440;
-const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.1';
+const CLIENT_BROWSER_EXTENSION_VERSION = '1.2.2';
 const CLIENT_BROWSER_PROTOCOL_VERSION = 1;
-const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.1.zip';
+const CLIENT_BROWSER_EXTENSION_URL = '/static/downloads/xianyu-browser-bridge-1.2.2.zip';
 
 type ClientBrowserConnectionState = {
   state:
@@ -2877,7 +2877,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                             <div>
 	                              <h4 className="font-bold text-gray-900">从你的 Chrome 导入</h4>
 	                              <p className="mt-1 text-sm leading-6 text-gray-600">
-	                                扩展只在你点击时读取当前闲鱼登录状态，并使用五分钟一次性配对发送到监控台。
+	                                扩展读取当前 Chrome 里已登录的闲鱼 Cookie（不必把闲鱼保持为当前标签页），并用五分钟一次性配对发送到监控台。
                               </p>
                             </div>
                           </div>
@@ -2948,7 +2948,7 @@ const AccountList: React.FC<AccountListProps> = () => {
 
                         <ol className="list-decimal space-y-1 pl-5 text-xs leading-5 text-gray-500">
                           <li>解压 ZIP，在 chrome://extensions 开启开发者模式并加载已解压扩展。</li>
-                          <li>在你的 Chrome 登录闲鱼官网，并保持官方页面为当前标签页。</li>
+                          <li>在你的 Chrome 登录闲鱼官网；导入时不必把闲鱼保持为当前标签页。</li>
                           <li>创建配对、复制到扩展，然后点击“导入到咸鱼监控台”。</li>
                         </ol>
                       </div>

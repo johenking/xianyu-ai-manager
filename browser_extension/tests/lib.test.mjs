@@ -9,10 +9,14 @@ import {
   browserFamilyFromUserAgent,
   bytesToBase64Url,
   canonicalJson,
+  collectAllowedCookies,
   cookieFingerprint,
+  cookieQueryPlans,
+  formatConsoleError,
   isAllowedImportUrl,
   isAllowedCookie,
   isConsolePageUrl,
+  mergeCookieRecords,
   parsePairingBundle,
   selectCookieStore,
   serializeCookie,
@@ -27,6 +31,71 @@ test('selects the Cookie Store that owns the active tab', () => {
     8,
   );
   assert.equal(selected.id, 'incognito');
+});
+
+test('falls back to the default Cookie Store when the tab is not listed yet', () => {
+  const selected = selectCookieStore(
+    [
+      { id: '0', tabIds: [], incognito: false },
+      { id: '1', tabIds: [99], incognito: true },
+    ],
+    12,
+  );
+  assert.equal(selected.id, '0');
+});
+
+test('queries cookies by allowlisted domain instead of store-wide getAll', () => {
+  const plans = cookieQueryPlans('0');
+  assert.equal(plans.some((plan) => !plan.domain), false);
+  assert.equal(plans.some((plan) => plan.storeId !== '0'), false);
+  for (const suffix of ALLOWED_SUFFIXES) {
+    assert.equal(plans.some((plan) => plan.domain === suffix && !plan.partitionKey), true);
+    assert.equal(
+      plans.some((plan) => plan.domain === suffix && plan.partitionKey?.topLevelSite?.includes(suffix)),
+      true,
+    );
+  }
+});
+
+test('merges unpartitioned and partitioned cookies without dropping unb', () => {
+  const merged = mergeCookieRecords([
+    [{ name: 'unb', value: '123', domain: '.taobao.com', path: '/' }],
+    [{ name: 'cookie2', value: 'session', domain: '.goofish.com', path: '/', partitionKey: { topLevelSite: 'https://www.goofish.com' } }],
+    [{ name: 'unb', value: '123', domain: '.taobao.com', path: '/' }],
+  ]);
+  assert.equal(merged.length, 2);
+  assert.equal(merged.some((cookie) => cookie.name === 'unb'), true);
+  assert.equal(merged.some((cookie) => cookie.name === 'cookie2'), true);
+});
+
+test('collectAllowedCookies asks Chrome by domain and keeps partitioned records', async () => {
+  const calls = [];
+  const cookies = await collectAllowedCookies('0', async (details) => {
+    calls.push(details);
+    if (details.partitionKey) {
+      return [{ name: 'cookie2', value: 'part', domain: '.goofish.com', path: '/', partitionKey: details.partitionKey }];
+    }
+    if (details.domain === 'taobao.com') {
+      return [{ name: 'unb', value: '123', domain: '.taobao.com', path: '/' }];
+    }
+    return [];
+  });
+  assert.equal(calls.some((details) => details.domain && !details.url), true);
+  assert.equal(calls.some((details) => details.partitionKey), true);
+  assert.equal(cookies.some((cookie) => cookie.name === 'unb' && cookie.value === '123'), true);
+  assert.equal(cookies.some((cookie) => cookie.name === 'cookie2'), true);
+});
+
+test('surfaces FastAPI object details instead of [object Object]', () => {
+  assert.equal(
+    formatConsoleError({ detail: { code: 'pairing_expired', message: '配对已过期' } }, 410),
+    '配对已过期',
+  );
+  assert.equal(
+    formatConsoleError({ detail: [{ loc: ['body'], msg: 'Field required', type: 'missing' }] }, 422),
+    'Field required',
+  );
+  assert.equal(formatConsoleError({ detail: '配对码错误' }, 403), '配对码错误');
 });
 
 test('encodes URL-safe device proof material and distinguishes Edge', () => {
@@ -111,7 +180,7 @@ test('manifest provides a strict MV3 current-device bridge', async () => {
   assert.deepEqual(manifest.background, { service_worker: 'background.js', type: 'module' });
   assert.deepEqual(manifest.content_scripts[0].matches, ['https://xianyu.cxywjx.top/*']);
   assert.deepEqual(manifest.content_scripts[0].js, ['content.js']);
-  assert.equal(manifest.version, '1.2.1');
+  assert.equal(manifest.version, '1.2.2');
   assert.equal(manifest.host_permissions.length, 5);
   for (const suffix of ALLOWED_SUFFIXES) {
     assert.equal(
@@ -131,6 +200,10 @@ test('popup code never writes sensitive values to extension storage', async () =
   assert.equal(/chrome\.storage|localStorage|sessionStorage/.test(popup), false);
   assert.equal(isAllowedCookie({ domain: '.taobao.com' }), true);
   assert.equal(isAllowedCookie({ domain: '.example.com' }), false);
+  assert.match(popup, /collectAllowedCookies/);
+  assert.match(popup, /formatConsoleError/);
+  assert.equal(popup.includes('当前标签页不是闲鱼或淘宝官方页面'), false);
+  assert.equal(/getAll\(\{ storeId:/.test(popup), false);
 });
 
 test('background keeps secrets out of persistent extension storage', async () => {
@@ -149,6 +222,8 @@ test('background keeps secrets out of persistent extension storage', async () =>
   assert.match(background, /const LOGIN_URL = 'https:\/\/www\.goofish\.com\/login'/);
   assert.match(background, /chrome\.tabs\.create\(\{ url: LOGIN_URL, active: true \}\)/);
   assert.match(background, /chrome\.tabs\.update\(existingTab\.id, \{ active: true \}\)/);
+  assert.match(background, /collectAllowedCookies/);
+  assert.equal(/getAll\(\{ storeId:/.test(background), false);
   assert.match(background, /for \(const \[sessionId, session\] of Object\.entries\(sessions\)\)/);
   assert.match(background, /startedAt: Date\.now\(\) \/ 1000/);
   assert.match(content, /BRIDGE_INSTANCE_KEY/);

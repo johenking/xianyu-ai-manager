@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 const root = new URL('../', import.meta.url);
 const manifest = JSON.parse(await readFile(new URL('manifest.json', root), 'utf8'));
 assert.equal(manifest.manifest_version, 3);
-assert.equal(manifest.version, '1.2.1');
+assert.equal(manifest.version, '1.2.2');
 
 const packageFiles = [
   'manifest.json',

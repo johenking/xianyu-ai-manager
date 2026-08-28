@@ -43,7 +43,70 @@ export function isAllowedCookie(cookie) {
 }
 
 export function selectCookieStore(stores, tabId) {
-  return (stores || []).find((store) => (store.tabIds || []).includes(tabId)) || null;
+  const list = stores || [];
+  const matched = list.find((store) => (store.tabIds || []).includes(tabId));
+  if (matched) return matched;
+  return list.find((store) => store && store.incognito !== true) || list[0] || null;
+}
+
+export const COOKIE_PARTITION_SITES = [
+  'https://www.goofish.com',
+  'https://m.goofish.com',
+  'https://h5.m.goofish.com',
+  'https://www.taobao.com',
+  'https://login.taobao.com',
+];
+
+export function cookieQueryPlans(storeId) {
+  const plans = [];
+  for (const domain of ALLOWED_SUFFIXES) {
+    plans.push({ storeId, domain });
+    for (const topLevelSite of COOKIE_PARTITION_SITES) {
+      if (!topLevelSite.includes(domain)) continue;
+      plans.push({ storeId, domain, partitionKey: { topLevelSite } });
+    }
+  }
+  return plans;
+}
+
+export function mergeCookieRecords(cookieLists) {
+  const seen = new Map();
+  for (const cookies of cookieLists || []) {
+    for (const cookie of cookies || []) {
+      const partition = cookie?.partitionKey?.topLevelSite || '';
+      const key = [
+        String(cookie?.name || ''),
+        String(cookie?.domain || ''),
+        String(cookie?.path || '/'),
+        partition,
+      ].join('\0');
+      seen.set(key, cookie);
+    }
+  }
+  return [...seen.values()];
+}
+
+export async function collectAllowedCookies(storeId, getAll) {
+  const lists = [];
+  for (const plan of cookieQueryPlans(storeId)) {
+    try {
+      lists.push(await getAll(plan));
+    } catch (_) {
+      // Older Chrome builds reject partitionKey; unpartitioned queries still run.
+    }
+  }
+  return mergeCookieRecords(lists);
+}
+
+export function formatConsoleError(result, status) {
+  const detail = result?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (Array.isArray(detail) && detail[0]?.msg) return String(detail[0].msg);
+  if (detail && typeof detail === 'object' && typeof detail.message === 'string' && detail.message.trim()) {
+    return detail.message;
+  }
+  if (typeof result?.message === 'string' && result.message.trim()) return result.message;
+  return `监控台返回 ${status}`;
 }
 
 export function serializeCookie(cookie) {
