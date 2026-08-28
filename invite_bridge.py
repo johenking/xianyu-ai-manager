@@ -21,6 +21,12 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from db_manager import db_manager
+from delivery_stage_metrics import (
+    STAGE_CONFIRMATION,
+    STAGE_FULFILLMENT,
+    STAGE_SHIPPED,
+    record_stage as record_delivery_stage,
+)
 
 
 invite_bridge_router = APIRouter(tags=["invite-bridge"])
@@ -372,7 +378,7 @@ async def send_invite_message(request: Request, body: SendMessageRequest):
                 "failed",
                 error=f"platform message rejected: code={response_code}",
             )
-        return _set_operation(
+        operation_response = _set_operation(
             body.operation_key,
             "succeeded",
             provider_ref=body.operation_key,
@@ -383,6 +389,11 @@ async def send_invite_message(request: Request, body: SendMessageRequest):
                 "chatCanonicalized": effective_chat != body.chat_id,
             },
         )
+        if body.operation_key.startswith("confirmation-message-"):
+            record_delivery_stage(body.order_id, body.cookie_id, STAGE_CONFIRMATION)
+        elif is_fulfillment_message:
+            record_delivery_stage(body.order_id, body.cookie_id, STAGE_FULFILLMENT)
+        return operation_response
     except Exception as exc:
         from XianyuAutoAsync import DirectMessageNotSubmitted
 
@@ -488,12 +499,14 @@ async def mark_invite_fulfilled(request: Request, body: MarkFulfilledRequest):
             return _set_operation(body.operation_key, "failed", error="platform status_only confirmation failed")
         if not db_manager.insert_or_update_order(order_id=body.order_id, cookie_id=body.cookie_id, order_status="shipped", system_shipped=True):
             return _set_operation(body.operation_key, "needs_review", error="local order state update failed")
-        return _set_operation(
+        operation_response = _set_operation(
             body.operation_key,
             "succeeded",
             provider_ref=body.order_id,
             response={"platformStatus": "shipped", "deliveryMode": delivery_mode},
         )
+        record_delivery_stage(body.order_id, body.cookie_id, STAGE_SHIPPED)
+        return operation_response
     except Exception as exc:
         return _set_operation(body.operation_key, "needs_review", error=f"platform confirmation outcome unknown: {type(exc).__name__}")
 

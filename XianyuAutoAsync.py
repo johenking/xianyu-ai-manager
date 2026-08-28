@@ -27,6 +27,11 @@ import sys
 import aiohttp
 from collections import defaultdict
 from db_manager import FULFILLMENT_API_PROTOCOL, db_manager
+from delivery_stage_metrics import (
+    STAGE_GATE,
+    STAGE_PAID,
+    record_stage as record_delivery_stage,
+)
 from account_session_refresh import (
     RETRYABLE_SESSION_ERROR_CODES,
     is_retryable_session_error_code,
@@ -1571,6 +1576,8 @@ class XianyuLive:
 
         expected_item_id = str(item_id or "").strip()
         expected_buyer_id = str(buyer_id or "").strip()
+        order_sync_lock_wait_ms = 0.0
+        order_sync_lock_hold_ms = 0.0
         # 已知订单号优先查单订单详情，避免刚付款事件排在批量订单同步之后。
         # 详情不可用时再回退到有页数上限的订单列表。
         client = XianyuOrderListClient(max_pages=DELIVERY_VERIFY_MAX_PAGES)
@@ -1587,15 +1594,28 @@ class XianyuLive:
                     self.cookie_id,
                 )
             if not discovery.get("success"):
+                lock_wait_started = time.perf_counter()
                 async with get_order_sync_lock(self.cookie_id):
-                    discovery = await client.discover(
-                        cookie_id=self.cookie_id,
-                        cookie_string=self.cookies_str,
-                        days=365,
-                        user_agent=self.browser_user_agent,
-                        target_order_id=str(order_id),
-                    )
+                    lock_acquired_at = time.perf_counter()
+                    order_sync_lock_wait_ms = (lock_acquired_at - lock_wait_started) * 1000
+                    try:
+                        discovery = await client.discover(
+                            cookie_id=self.cookie_id,
+                            cookie_string=self.cookies_str,
+                            days=365,
+                            user_agent=self.browser_user_agent,
+                            target_order_id=str(order_id),
+                        )
+                    finally:
+                        order_sync_lock_hold_ms = (time.perf_counter() - lock_acquired_at) * 1000
         except Exception as exc:
+            logger.info(
+                "invite_delivery_lock_latency order_ref={} account_ref={} order_sync_lock_wait_ms={:.1f} order_sync_lock_hold_ms={:.1f}",
+                hashlib.sha256(str(order_id).encode("utf-8")).hexdigest()[:12],
+                hashlib.sha256(str(self.cookie_id).encode("utf-8")).hexdigest()[:12],
+                order_sync_lock_wait_ms,
+                order_sync_lock_hold_ms,
+            )
             reason = sanitize_runtime_error(
                 f"实时订单状态查询异常: {type(exc).__name__}"
             )
@@ -1605,6 +1625,14 @@ class XianyuLive:
                 "reason": reason,
                 "attempts": 1,
             }
+
+        logger.info(
+            "invite_delivery_lock_latency order_ref={} account_ref={} order_sync_lock_wait_ms={:.1f} order_sync_lock_hold_ms={:.1f}",
+            hashlib.sha256(str(order_id).encode("utf-8")).hexdigest()[:12],
+            hashlib.sha256(str(self.cookie_id).encode("utf-8")).hexdigest()[:12],
+            order_sync_lock_wait_ms,
+            order_sync_lock_hold_ms,
+        )
 
         if not discovery.get("success"):
             return {
@@ -1980,19 +2008,25 @@ class XianyuLive:
             logger.info(f'[{msg_time}] 【{self.cookie_id}】提取到订单ID: {order_id}，将在自动发货时处理确认发货')
 
             if _invite_bridge_owns_item(self.cookie_id, item_id):
+                record_delivery_stage(order_id, self.cookie_id, STAGE_PAID)
+                hot_path_started = time.perf_counter()
+                payment_started = time.perf_counter()
                 payment_check = await self._verify_paid_order_for_delivery(
                     order_id=order_id,
                     item_id=item_id,
                     buyer_id=send_user_id,
                 )
+                payment_verify_ms = (time.perf_counter() - payment_started) * 1000
                 if not payment_check.get("allowed"):
                     logger.warning(
                         "邀请商品付款状态未通过，等待主动订单发现重试: status={}",
                         payment_check.get("status") or "unknown",
                     )
                     return
+                record_delivery_stage(order_id, self.cookie_id, STAGE_GATE)
                 from invite_bridge_poller import invite_bridge_poller
 
+                stage_started = time.perf_counter()
                 staged = invite_bridge_poller.stage_order(
                     cookie_id=self.cookie_id,
                     order_id=order_id,
@@ -2009,6 +2043,7 @@ class XianyuLive:
                         or bool(payment_check.get("is_bargain"))
                     ),
                 )
+                stage_order_ms = (time.perf_counter() - stage_started) * 1000
                 if not staged:
                     logger.warning("邀请商品订单上下文保存失败或订单已完成")
                     return
@@ -2016,9 +2051,24 @@ class XianyuLive:
                     "邀请商品订单已保存并提交桥接扫描: delivery_source={}",
                     delivery_source,
                 )
-                await invite_bridge_poller.scan_once(
-                    discover=False,
-                    trusted_order_ids={order_id},
+                bridge_started = time.perf_counter()
+                await invite_bridge_poller.scan_trusted_order(
+                    cookie_id=self.cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=send_user_id,
+                    chat_id=chat_id,
+                    payment_check=payment_check,
+                )
+                bridge_event_ms = (time.perf_counter() - bridge_started) * 1000
+                logger.info(
+                    "invite_delivery_latency order_ref={} account_ref={} payment_verify_ms={:.1f} stage_order_ms={:.1f} bridge_event_ms={:.1f} hot_path_total_ms={:.1f}",
+                    hashlib.sha256(str(order_id).encode("utf-8")).hexdigest()[:12],
+                    hashlib.sha256(str(self.cookie_id).encode("utf-8")).hexdigest()[:12],
+                    payment_verify_ms,
+                    stage_order_ms,
+                    bridge_event_ms,
+                    (time.perf_counter() - hot_path_started) * 1000,
                 )
                 return
 
