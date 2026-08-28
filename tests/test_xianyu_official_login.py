@@ -185,6 +185,8 @@ class FakeChromium:
 
     def launch_persistent_context(self, user_data_dir, **kwargs):
         self.factory.launches.append((Path(user_data_dir), kwargs))
+        if isinstance(self.context, BaseException):
+            raise self.context
         return self.context
 
 
@@ -431,6 +433,45 @@ class XianyuOfficialLoginTests(unittest.TestCase):
         self.assertNotIn("--disable-blink-features=AutomationControlled", launch_options["args"])
         self.assertNotIn("--disable-web-security", launch_options["args"])
         self.assertEqual(context.pages[0].goto_calls[0][0], GOOFISH_LOGIN_URL)
+
+    def test_root_launch_uses_bundled_chromium_without_sandbox(self):
+        context, _elements = make_password_context(unb="9988")
+        factory = SequencePlaywrightFactory([context])
+        service = self.make_service(factory)
+
+        with (
+            patch("utils.browser_runtime.os.geteuid", return_value=0),
+            patch.dict(os.environ, {"XIANYU_BROWSER_CHANNEL": ""}),
+        ):
+            result = service.login_with_password(
+                account="13800138000",
+                password="secret",
+                show_browser=False,
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(factory.launches[0][1]["channel"])
+        self.assertFalse(factory.launches[0][1]["chromium_sandbox"])
+
+    def test_launch_error_does_not_treat_generic_profile_text_as_in_use(self):
+        cases = [
+            (
+                "Running as root without --no-sandbox for profile /tmp/fresh",
+                "browser_error",
+            ),
+            ("Missing X server or $DISPLAY for browser profile", "browser_error"),
+            ("ProcessSingleton lock held", "profile_in_use"),
+            ("SingletonLock exists", "profile_in_use"),
+        ]
+
+        for message, expected in cases:
+            with self.subTest(message=message):
+                service = self.make_service(
+                    SequencePlaywrightFactory([RuntimeError(message)])
+                )
+                result = service.login_with_qr(show_browser=False)
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.error_code, expected)
 
     def test_refresh_reuses_canonical_profile_without_password(self):
         page = FakePage()

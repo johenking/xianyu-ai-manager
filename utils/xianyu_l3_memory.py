@@ -16,6 +16,10 @@ from typing import Any, Callable, Mapping, Optional
 
 from loguru import logger
 
+from utils.browser_runtime import (
+    chromium_runtime_options,
+    classify_browser_launch_error,
+)
 from utils.xianyu_official_login import (
     COOKIE_URLS,
     XianyuOfficialLoginService,
@@ -376,8 +380,7 @@ class L3MemoryService:
             context = started.chromium.launch_persistent_context(
                 str(profile_path),
                 headless=False,
-                channel=os.getenv("XIANYU_BROWSER_CHANNEL") or None,
-                chromium_sandbox=True,
+                **chromium_runtime_options(),
                 args=[
                     "--lang=zh-CN",
                     "--password-store=basic",
@@ -523,15 +526,13 @@ class L3MemoryService:
         )
 
     def _launch_failure(self, exc: Exception) -> L3MemoryResult:
-        text = str(exc)
-        error_code = (
-            "profile_in_use"
-            if "ProcessSingleton" in text or "SingletonLock" in text
-            else "profile_corrupt"
-            if "corrupt" in text.lower() or "failed to create" in text.lower()
-            else "browser_error"
-        )
-        logger.error("L3 浏览器会话失败: {}", type(exc).__name__)
+        text = str(exc).lower()
+        error_code = classify_browser_launch_error(exc)
+        if error_code == "browser_error" and (
+            "corrupt" in text or "failed to create" in text
+        ):
+            error_code = "profile_corrupt"
+        logger.error("L3 浏览器会话失败: {}", error_code)
         return self._failed(
             error_code,
             "闲鱼官方浏览器档案正在使用，请关闭对应窗口后重试"

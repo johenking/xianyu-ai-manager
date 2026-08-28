@@ -157,8 +157,8 @@ const isLoopbackHostname = (hostname: string) => {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1';
 };
 
-// 正式控制台域名与回环同等视为“本机”：服务与用户都在这台 Mac 上，公网域名只是
-// 经本机 cloudflared 隧道回流，不应因地址栏写法被当成远程用户。
+// 正式控制台域名使用服务端 Chrome，但与回环的窗口呈现方式不同：回环弹出本机
+// 窗口，正式域名在网页内显示云端画面；陌生域名继续使用浏览器扩展。
 // 与后端 browser_extension_pairing.PUBLIC_CONSOLE_ORIGIN 保持一致。
 const SERVER_BROWSER_CONSOLE_HOSTS = ['xianyu.cxywjx.top'];
 
@@ -203,9 +203,11 @@ const sessionStatusMessage = (status: AccountSessionRefreshStatus) => (
 );
 
 const AccountList: React.FC<AccountListProps> = () => {
-  // 服务就运行在用户本机 Mac 上，服务端 Chrome 登录是零安装主路径。回环与正式
-  // 控制台域名都视为“本机”；其余（陌生域名）回落到网页二维码/扩展。
-  const canUseServerBrowser = isServerBrowserHostname(window.location.hostname);
+  const consoleHostname = window.location.hostname;
+  const isLoopbackConsole = isLoopbackHostname(consoleHostname);
+  const canUseServerBrowser = isServerBrowserHostname(consoleHostname);
+  const usesEmbeddedCloudBrowser = canUseServerBrowser && !isLoopbackConsole;
+  const serverBrowserLabel = usesEmbeddedCloudBrowser ? '云端 Chrome' : '本机 Chrome';
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -853,8 +855,8 @@ const AccountList: React.FC<AccountListProps> = () => {
     }
   };
 
-  // 本机助手已彻底移除：非回环（远程）访问时，“当前设备浏览器”通道统一由浏览器扩展
-  // 桥接承接；回环访问的主路径是服务端本机 Chrome（startBrowserQRLogin）。
+  // 本机助手已彻底移除：陌生域名的“当前设备浏览器”通道由扩展承接；回环弹出
+  // 服务端本机 Chrome，正式域名则在网页内嵌同一个服务端 Chrome 会话。
   const startClientBrowserLogin = (mode: 'qr' | 'sms' | 'password') => (
     startExtensionClientBrowserLogin(mode)
   );
@@ -1655,7 +1657,7 @@ const AccountList: React.FC<AccountListProps> = () => {
       }
       setQrSessionId('');
     }
-    // 本机场景直接弹本机 Chrome 窗口完成风控验证；陌生域名远程访问走扩展桥接。
+    // 回环弹本机窗口，正式域名显示云端画面；陌生域名继续走扩展桥接。
     if (canUseServerBrowser) {
       await startBrowserQRLogin();
     } else {
@@ -1748,7 +1750,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     if (flowGeneration !== loginFlowGenerationRef.current) return false;
     const interactionImage = status.verification_image_url || status.qr_image_url || '';
     const interaction = (
-      status.required_action === 'interact_in_console'
+      (status.required_action === 'interact_in_console' || usesEmbeddedCloudBrowser)
       && status.interaction_supported
       && status.frame_revision
       && interactionImage
@@ -1765,7 +1767,11 @@ const AccountList: React.FC<AccountListProps> = () => {
     if (activeStates.includes(status.state)) {
       if (mode === 'qr') {
         setQrStatus('waiting');
-        setQrMessage(status.message || '请在服务器 Chrome 运维窗口内扫码');
+        setQrMessage(status.message || (
+          usesEmbeddedCloudBrowser
+            ? '请扫描网页中的云端 Chrome 二维码'
+            : '请在本机 Chrome 窗口内扫码'
+        ));
         if (status.qr_image_url) setQrCodeUrl(status.qr_image_url);
       } else {
         setOfficialWindowStatus('processing');
@@ -1776,7 +1782,11 @@ const AccountList: React.FC<AccountListProps> = () => {
     if (status.state === 'verification_required') {
       if (mode === 'qr') {
         setQrStatus('verification_required');
-        setQrMessage(status.message || '请在服务器 Chrome 运维窗口完成身份验证');
+        setQrMessage(status.message || (
+          usesEmbeddedCloudBrowser
+            ? '请在网页内完成云端 Chrome 身份验证'
+            : '请在本机 Chrome 窗口完成身份验证'
+        ));
         setQrVerificationImage(status.verification_image_url || '');
       } else {
         setOfficialWindowStatus('verification_required');
@@ -1790,7 +1800,7 @@ const AccountList: React.FC<AccountListProps> = () => {
       if (mode === 'qr') {
         setQrInteraction(null);
         setQrStatus('success');
-        setQrMessage(status.message || '本机 Chrome 登录成功');
+        setQrMessage(status.message || `${serverBrowserLabel} 登录成功`);
       } else {
         setOfficialInteraction(null);
         setOfficialWindowStatus('success');
@@ -1812,7 +1822,7 @@ const AccountList: React.FC<AccountListProps> = () => {
       if (mode === 'qr') {
         setQrInteraction(null);
         setQrStatus('error');
-        setQrMessage(status.message || '本机 Chrome 登录未完成，请重新发起');
+        setQrMessage(status.message || `${serverBrowserLabel} 登录未完成，请重新发起`);
       } else {
         setOfficialInteraction(null);
         setOfficialWindowStatus('failed');
@@ -1856,7 +1866,7 @@ const AccountList: React.FC<AccountListProps> = () => {
   const startBrowserQRLogin = async () => {
     if (!canUseServerBrowser) {
       setQrStatus('error');
-      setQrMessage('本机 Chrome 登录仅在本机监控台（127.0.0.1）可用；远程访问请改用网页二维码或浏览器扩展');
+      setQrMessage('服务端 Chrome 登录仅在回环地址或正式控制台域名可用；请改用网页二维码或浏览器扩展');
       return;
     }
     loginFlowGenerationRef.current += 1;
@@ -1878,13 +1888,17 @@ const AccountList: React.FC<AccountListProps> = () => {
     setQrStatus('loading');
     setQrCodeUrl('');
     setQrSessionId('');
-    setQrMessage('正在本机打开 Chrome 登录窗口');
+    setQrMessage(
+      usesEmbeddedCloudBrowser
+        ? '正在网页内启动云端 Chrome'
+        : '正在本机打开 Chrome 登录窗口',
+    );
     setQrVerificationImage('');
     setQrInteraction(null);
     try {
       const result = await createOfficialLoginSession({
         mode: 'qr',
-        show_browser: true,
+        show_browser: isLoopbackConsole,
       });
       if (flowGeneration !== loginFlowGenerationRef.current) {
         await cancelOfficialSessionById(result.session_id);
@@ -1892,7 +1906,7 @@ const AccountList: React.FC<AccountListProps> = () => {
       }
       if (!result.success || !result.session_id) {
         setQrStatus('error');
-        setQrMessage(result.message || '本机 Chrome 登录启动失败');
+        setQrMessage(result.message || `${serverBrowserLabel} 登录启动失败`);
         return;
       }
       activeOfficialSessionRef.current = result.session_id;
@@ -1903,7 +1917,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     } catch (error) {
       if (flowGeneration !== loginFlowGenerationRef.current) return;
       setQrStatus('error');
-      setQrMessage(error instanceof Error ? error.message : '本机 Chrome 登录请求失败');
+      setQrMessage(error instanceof Error ? error.message : `${serverBrowserLabel} 登录请求失败`);
     }
   };
 
@@ -1942,7 +1956,7 @@ const AccountList: React.FC<AccountListProps> = () => {
   const handleOfficialWindowLogin = async () => {
     setOfficialWindowSubmitting(true);
     try {
-      // 本机场景弹本机 Chrome 官方登录页（页内可选手机号验证码方式）；远程走扩展。
+      // 回环弹本机窗口，正式域名显示云端画面；陌生域名走扩展。
       if (canUseServerBrowser) {
         await startBrowserQRLogin();
       } else {
@@ -2027,7 +2041,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     resetPasswordStatus();
     setPasswordSubmitting(true);
     try {
-      // 本机场景弹本机 Chrome 官方登录页（页内可选账号密码方式）；远程走扩展。
+      // 回环弹本机窗口，正式域名显示云端画面；陌生域名走扩展。
       if (canUseServerBrowser) {
         await startBrowserQRLogin();
       } else {
@@ -2458,7 +2472,9 @@ const AccountList: React.FC<AccountListProps> = () => {
                       <h3 id="add-account-title" className="text-2xl font-extrabold text-gray-900">添加账号</h3>
                       <p className="text-sm text-gray-500 mt-1">
                         {canUseServerBrowser
-                          ? '推荐用手机扫“网页二维码”登录，零安装最稳定；也可用“本机 Chrome 登录”窗口作为备选。'
+                          ? usesEmbeddedCloudBrowser
+                            ? '推荐用手机扫“网页二维码”登录；也可在本页直接操作“云端 Chrome”作为备选。'
+                            : '推荐用手机扫“网页二维码”登录，零安装最稳定；也可用“本机 Chrome 登录”窗口作为备选。'
                           : '登录和安全验证在你当前的 Chrome 或 Edge 中完成。'}
                       </p>
                     </div>
@@ -2543,7 +2559,11 @@ const AccountList: React.FC<AccountListProps> = () => {
                             <QrCode className="mt-0.5 h-5 w-5 shrink-0 text-yellow-700" />
                             <div>
 	                              <h4 className="font-bold text-gray-900">选择扫码方式</h4>
-	                              <p className="mt-1 text-sm leading-6 text-gray-600">推荐用手机扫网页二维码，零安装、最稳定，不受浏览器风控影响；本机 Chrome 登录作为备选（适合账号密码，遇滑块/人脸可能不稳）。</p>
+	                              <p className="mt-1 text-sm leading-6 text-gray-600">
+                                  {usesEmbeddedCloudBrowser
+                                    ? '推荐用手机扫网页二维码；云端 Chrome 会直接显示在本页，可继续点击、拖动滑块、输入文字或按键。'
+                                    : '推荐用手机扫网页二维码，零安装、最稳定，不受浏览器风控影响；本机 Chrome 登录作为备选（适合账号密码，遇滑块/人脸可能不稳）。'}
+                                </p>
                             </div>
                           </div>
                         </div>
@@ -2562,15 +2582,17 @@ const AccountList: React.FC<AccountListProps> = () => {
                           </button>
                           <button
                             type="button"
-                            aria-label="本机 Chrome 登录"
+                            aria-label={`${serverBrowserLabel} 登录`}
                             onClick={() => void (canUseServerBrowser ? startBrowserQRLogin() : startClientBrowserLogin('qr'))}
                             className="flex min-h-11 items-start gap-3 rounded-2xl border border-gray-200 bg-white p-4 text-left text-gray-900 transition-colors hover:bg-gray-50"
                           >
                             <Chrome className="mt-0.5 h-5 w-5 shrink-0 text-gray-600" />
                             <span>
-                              <span className="block font-bold">本机 Chrome 登录（备选）</span>
+                              <span className="block font-bold">{serverBrowserLabel} 登录（备选）</span>
                               <span className="mt-1 block text-xs font-medium text-gray-500">
-                                {canUseServerBrowser
+                                {usesEmbeddedCloudBrowser
+                                  ? '在本页显示云端 Chrome 官方登录页，扫码和全部验证都在当前网页处理'
+                                  : canUseServerBrowser
                                   ? '在本机打开 Chrome 官方登录页；适合账号密码，遇滑块 / 人脸时可能不稳定'
                                   : '打开你电脑上的 Chrome 或 Edge，完成扫码和全部验证'}
                               </span>
@@ -2637,7 +2659,9 @@ const AccountList: React.FC<AccountListProps> = () => {
                               className="ios-btn-primary inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-bold"
                             >
                               <Chrome className="h-4 w-4" />
-                              {canUseServerBrowser ? '在本机 Chrome 窗口继续' : '在当前设备浏览器继续'}
+                              {usesEmbeddedCloudBrowser
+                                ? '在本页云端 Chrome 继续'
+                                : canUseServerBrowser ? '在本机 Chrome 窗口继续' : '在当前设备浏览器继续'}
                             </button>
                           )}
 	                          {qrSessionId && ACTIVE_API_QR_STATES.has(qrStatus) && (
@@ -2668,7 +2692,9 @@ const AccountList: React.FC<AccountListProps> = () => {
                         </div>
                         <p className="mt-4 rounded-xl bg-gray-50 py-2 text-xs font-medium text-gray-400">
                           {canUseServerBrowser
-                            ? '手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证会在本机自动弹出的 Chrome 窗口中完成。'
+                            ? usesEmbeddedCloudBrowser
+                              ? '手机扫码型验证继续显示图片；滑块、短信或其他交互验证会直接显示在本页云端 Chrome 中。'
+                              : '手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证会在本机自动弹出的 Chrome 窗口中完成。'
                             : '手机扫码型验证继续显示图片；滑块、人脸、短信或其他交互验证转到当前设备浏览器。'}
                         </p>
                       </div>
@@ -2702,8 +2728,14 @@ const AccountList: React.FC<AccountListProps> = () => {
                           <div className="flex items-start gap-3">
                             <Chrome className="mt-0.5 h-5 w-5 shrink-0 text-yellow-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">本机 Chrome 登录窗口</h4>
-                              <p className="mt-1 text-sm leading-6 text-gray-600">Chrome 窗口会在运行服务的这台 Mac 上打开。请在该窗口用闲鱼 App 扫码（或在官方页切换短信 / 密码），并按提示完成滑块、人脸等验证；账号落库并确认后窗口会自动关闭。</p>
+                              <h4 className="font-bold text-gray-900">
+                                {usesEmbeddedCloudBrowser ? '云端 Chrome 登录' : '本机 Chrome 登录窗口'}
+                              </h4>
+                              <p className="mt-1 text-sm leading-6 text-gray-600">
+                                {usesEmbeddedCloudBrowser
+                                  ? '云端 Chrome 画面会持续显示在本页。请用闲鱼 App 扫码，或直接点击、拖动、输入文字和发送按键完成官方验证；账号落库后会话自动退出。'
+                                  : 'Chrome 窗口会在运行服务的这台 Mac 上打开。请在该窗口用闲鱼 App 扫码（或在官方页切换短信 / 密码），并按提示完成滑块、人脸等验证；账号落库并确认后窗口会自动关闭。'}
+                              </p>
                             </div>
                           </div>
                         </div>
@@ -2718,7 +2750,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                           <div className="flex max-h-[360px] min-h-[220px] items-center justify-center overflow-hidden rounded-2xl border border-gray-200 bg-gray-50 p-3">
                             <AuthenticatedImage
                               src={qrVerificationImage || qrCodeUrl}
-                              alt={qrVerificationImage ? '服务器 Chrome 闲鱼验证页面' : '服务器 Chrome 闲鱼二维码'}
+                              alt={qrVerificationImage ? `${serverBrowserLabel} 闲鱼验证页面` : `${serverBrowserLabel} 闲鱼二维码`}
                               className="max-h-[330px] w-full object-contain"
                             />
                           </div>
@@ -2734,27 +2766,29 @@ const AccountList: React.FC<AccountListProps> = () => {
                                 : 'bg-blue-50 text-blue-700'
                         }`}>
                           {qrStatus === 'loading' && <Loader2 className="mr-2 inline h-4 w-4 animate-spin" />}
-                          {qrMessage || '正在准备本机 Chrome 登录会话'}
+                          {qrMessage || `正在准备${serverBrowserLabel}登录会话`}
                         </div>
 
                         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
                           {ACTIVE_BROWSER_QR_VIEW_STATES.has(qrStatus) && (
                             <>
-                              <button
-                                type="button"
-                                onClick={() => void handleShowOfficialBrowser()}
-                                className="ios-btn-primary inline-flex min-h-11 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold"
-                              >
-                                <ExternalLink className="h-4 w-4" />
-                                重新显示 Chrome 窗口
-                              </button>
+                              {isLoopbackConsole && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleShowOfficialBrowser()}
+                                  className="ios-btn-primary inline-flex min-h-11 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold"
+                                >
+                                  <ExternalLink className="h-4 w-4" />
+                                  重新显示 Chrome 窗口
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={() => void handleCancelOfficialLogin()}
                                 className="inline-flex min-h-11 items-center justify-center gap-2 rounded-xl border border-red-200 bg-white px-4 text-sm font-bold text-red-600 hover:bg-red-50"
                               >
                                 <X className="h-4 w-4" />
-                                取消服务器扫码
+                                {usesEmbeddedCloudBrowser ? '取消云端扫码' : '取消服务器扫码'}
                               </button>
                             </>
                           )}
@@ -2765,7 +2799,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                               className="ios-btn-primary inline-flex min-h-11 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-sm font-bold"
                             >
                               <RefreshCw className="h-4 w-4" />
-                              重新发起服务器扫码
+                              {usesEmbeddedCloudBrowser ? '重新发起云端扫码' : '重新发起服务器扫码'}
                             </button>
                           )}
                           <button
@@ -2785,9 +2819,11 @@ const AccountList: React.FC<AccountListProps> = () => {
                           <div className="flex items-start gap-3">
                             <Smartphone className="mt-0.5 h-5 w-5 shrink-0 text-blue-700" />
                             <div>
-                              <h4 className="font-bold text-gray-900">{canUseServerBrowser ? '在本机 Chrome 窗口完成手机号验证码登录' : '在当前设备浏览器完成手机号验证码登录'}</h4>
+                              <h4 className="font-bold text-gray-900">{usesEmbeddedCloudBrowser ? '在本页云端 Chrome 完成手机号验证码登录' : canUseServerBrowser ? '在本机 Chrome 窗口完成手机号验证码登录' : '在当前设备浏览器完成手机号验证码登录'}</h4>
                               <p className="mt-1 text-sm leading-6 text-gray-600">
-                                {canUseServerBrowser
+                                {usesEmbeddedCloudBrowser
+                                  ? '云端 Chrome 官方页面会显示在本页；手机号、验证码、滑块和后续验证都通过下方画面完成。'
+                                  : canUseServerBrowser
                                   ? '会在运行服务的这台 Mac 上弹出 Chrome 官方登录页；手机号、验证码、滑块和后续验证都只在该窗口输入。'
                                   : '将在你的 Chrome 或 Edge 打开官方页面；手机号、验证码、滑块和后续验证都只在该页面输入。'}
                               </p>
@@ -2818,7 +2854,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                               : <Smartphone className="h-4 w-4" />}
                             {['processing', 'verification_required'].includes(officialWindowStatus)
                               ? '等待登录完成'
-                              : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
+                              : usesEmbeddedCloudBrowser ? '打开云端 Chrome' : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
                           </button>
                           {['processing', 'verification_required'].includes(officialWindowStatus) && (
                             <button
@@ -2923,9 +2959,11 @@ const AccountList: React.FC<AccountListProps> = () => {
                         <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
                           <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-700" />
                           <div>
-                            <h4 className="font-bold text-gray-900">{canUseServerBrowser ? '在本机 Chrome 窗口完成账号密码登录' : '在当前设备浏览器完成账号密码登录'}</h4>
+                            <h4 className="font-bold text-gray-900">{usesEmbeddedCloudBrowser ? '在本页云端 Chrome 完成账号密码登录' : canUseServerBrowser ? '在本机 Chrome 窗口完成账号密码登录' : '在当前设备浏览器完成账号密码登录'}</h4>
                             <p className="mt-1 text-sm text-gray-600">
-                              {canUseServerBrowser
+                              {usesEmbeddedCloudBrowser
+                                ? '云端 Chrome 官方页面会显示在本页；账号、密码、滑块和后续验证都通过下方画面完成。登录成功后不会自动保存密码。'
+                                : canUseServerBrowser
                                 ? '会在运行服务的这台 Mac 上弹出 Chrome 官方登录页；账号、密码、滑块和人脸验证只在该窗口输入。登录成功后不会自动保存密码。'
                                 : '普通用户的账号、密码、滑块和人脸验证只在你的 Chrome 或 Edge 官方页面输入。登录成功后不会自动保存密码。'}
                             </p>
@@ -2978,7 +3016,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                         )}
                         {passwordStatus === 'verification_required' && (
                           <p className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-800">
-                            {canUseServerBrowser ? '请在本机弹出的 Chrome 窗口完成官方验证。' : '请回到当前设备浏览器完成官方验证。'}
+                            {usesEmbeddedCloudBrowser ? '请在本页云端 Chrome 画面完成官方验证。' : canUseServerBrowser ? '请在本机弹出的 Chrome 窗口完成官方验证。' : '请回到当前设备浏览器完成官方验证。'}
                           </p>
                         )}
                         {(passwordStatus === 'processing' || passwordStatus === 'verification_required') && (
@@ -2999,7 +3037,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                           className="w-full ios-btn-primary px-6 py-3 rounded-xl font-bold flex items-center justify-center gap-2 disabled:opacity-60"
                         >
                           {passwordSubmitting || passwordStatus === 'processing' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
-                          {passwordSubmitting || passwordStatus === 'processing' ? '等待登录完成' : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
+                          {passwordSubmitting || passwordStatus === 'processing' ? '等待登录完成' : usesEmbeddedCloudBrowser ? '打开云端 Chrome' : canUseServerBrowser ? '打开本机 Chrome 登录窗口' : '在当前设备浏览器继续'}
                         </button>
                       </form>
                     )}

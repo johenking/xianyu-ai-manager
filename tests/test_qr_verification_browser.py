@@ -1,3 +1,4 @@
+import os
 import unittest
 import tempfile
 from unittest.mock import Mock, patch
@@ -50,8 +51,10 @@ class _FakeContext:
 class _FakeChromium:
     def __init__(self, context):
         self.context = context
+        self.launch_kwargs = []
 
-    def launch_persistent_context(self, *_args, **_kwargs):
+    def launch_persistent_context(self, *_args, **kwargs):
+        self.launch_kwargs.append(kwargs)
         return self.context
 
 
@@ -93,6 +96,30 @@ class QRVerificationBrowserTests(unittest.TestCase):
         {"name": "unb", "value": "account-1"},
         {"name": "cookie2", "value": "session"},
     ]
+
+    def test_root_launch_uses_bundled_chromium_without_sandbox(self):
+        context = _FakeContext([])
+        manager = _FakePlaywrightManager(context)
+        with tempfile.TemporaryDirectory() as profile_root:
+            browser = _TestBrowser(
+                profile_root=profile_root,
+                playwright_factory=lambda: manager,
+                session_validator=None,
+            )
+            with (
+                patch("utils.browser_runtime.os.geteuid", return_value=0),
+                patch.dict(os.environ, {"XIANYU_BROWSER_CHANNEL": ""}),
+            ):
+                result = browser.run(
+                    "session-runtime",
+                    "https://passport.goofish.com/verify",
+                    should_stop=lambda: True,
+                )
+
+        self.assertEqual(result["status"], "cancelled")
+        options = manager.playwright.chromium.launch_kwargs[0]
+        self.assertIsNone(options["channel"])
+        self.assertFalse(options["chromium_sandbox"])
 
     def test_existing_unb_does_not_finish_while_probe_requires_verification(self):
         validator = Mock(return_value=SessionProbeResult(

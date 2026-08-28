@@ -136,8 +136,10 @@ class _FakeChromium:
         self.connect_cookies = connect_cookies or {}
         self.fail_launch_message = fail_launch_message
         self.connected_endpoint = None
+        self.launch_kwargs = []
 
-    def launch_persistent_context(self, profile_path, **_kwargs):
+    def launch_persistent_context(self, profile_path, **kwargs):
+        self.launch_kwargs.append(kwargs)
         if self.fail_launch_message:
             raise RuntimeError(self.fail_launch_message)
         Path(profile_path).mkdir(parents=True, exist_ok=True)
@@ -229,6 +231,26 @@ class L3MemoryServiceTests(unittest.TestCase):
         self.assertTrue(any(profile.iterdir()))
         self.assertIn("https://www.goofish.com/bought", page.goto_calls)
         self.assertEqual(result.unb, "9988")
+
+    def test_root_launch_uses_bundled_chromium_without_sandbox(self):
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context)
+        service = self._service(context, chromium=chromium)
+
+        with (
+            patch("utils.browser_runtime.os.geteuid", return_value=0),
+            patch.dict(os.environ, {"XIANYU_BROWSER_CHANNEL": ""}),
+        ):
+            result = service.seed_profile_from_cookies(
+                "9988",
+                FRESH_COOKIES,
+                settle_seconds=0,
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(chromium.launch_kwargs[0]["channel"])
+        self.assertFalse(chromium.launch_kwargs[0]["chromium_sandbox"])
 
     def test_passwordless_refresh_clicks_quick_enter_and_requires_cookie2(self):
         frame = _FakeFrame(clickable=True)

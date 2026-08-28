@@ -86,14 +86,14 @@ vi.mock('../services/api', () => ({
   updateAiReplyStrategies: vi.fn(),
 }));
 
-// canUseServerBrowser 由 window.location 决定：回环与正式控制台域名（xianyu.cxywjx.top）
-// 都视为“本机”，isAdmin 已无效果。jsdom 默认 hostname 是 localhost（回环）；
+// canUseServerBrowser 由 window.location 决定：回环弹本机窗口，正式控制台域名
+// （xianyu.cxywjx.top）显示云端嵌入画面。jsdom 默认 hostname 是 localhost（回环）；
 // 构造“远程用户”场景必须改写 location 为陌生域名，afterEach 用 vi.unstubAllGlobals() 恢复。
 const stubRemoteConsoleHostname = (hostname = 'remote.example.com') => {
   vi.stubGlobal('location', { ...window.location, hostname, host: hostname });
 };
 
-// 正式控制台域名场景：Host 是公网域名但服务与用户都在本机。
+// 正式控制台域名场景：使用服务端 Chrome，但画面只在当前网页内显示。
 const stubOfficialConsoleHostname = () => {
   vi.stubGlobal('location', { ...window.location, hostname: 'xianyu.cxywjx.top', host: 'xianyu.cxywjx.top' });
 };
@@ -751,20 +751,50 @@ describe('AccountList session verification UI', () => {
     });
   });
 
-  it('treats the official console hostname as local and starts server Chrome from the primary button', async () => {
+  it('starts embedded cloud Chrome on the official hostname without exposing a server window', async () => {
     stubOfficialConsoleHostname();
+    vi.mocked(createOfficialLoginSession).mockResolvedValue({
+      success: true,
+      session_id: 'official-session',
+      mode: 'qr',
+      state: 'waiting_user',
+      message: '请扫描网页中的云端 Chrome 二维码',
+      error_code: '',
+      qr_image_url: '/api/official-login/sessions/official-session/image',
+      verification_image_url: '',
+      verification_kind: 'mobile_scan',
+      required_action: 'scan_image',
+      interaction_supported: true,
+      frame_revision: 4,
+      account_id: '',
+      is_new_account: false,
+      created_at: 1,
+      updated_at: 1,
+      expires_at: 9999999999,
+    });
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
     fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
-    fireEvent.click(screen.getByRole('button', { name: '本机 Chrome 登录' }));
+    fireEvent.click(screen.getByRole('button', { name: '云端 Chrome 登录' }));
 
     await waitFor(() => expect(createOfficialLoginSession).toHaveBeenCalledWith({
       mode: 'qr',
-      show_browser: true,
+      show_browser: false,
     }));
     expect(clientBridgeRequests).not.toContain('XMC_GET_DEVICE');
-    expect(await screen.findByText('本机 Chrome 登录窗口')).toBeInTheDocument();
+    expect(await screen.findByText('云端 Chrome 登录')).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '闲鱼登录页面远程操作' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新显示 Chrome 窗口' })).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('向闲鱼页面输入文字'), {
+      target: { value: '482615' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '发送到闲鱼页面' }));
+    await waitFor(() => expect(interactWithOfficialLogin).toHaveBeenCalledWith(
+      'official-session',
+      { kind: 'text', frame_revision: 4, text: '482615' },
+    ));
   });
 
   it('offers current-device QR, web QR, SMS, and advanced manual import to remote users', async () => {

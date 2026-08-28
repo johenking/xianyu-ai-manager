@@ -14,6 +14,10 @@ from typing import Any, Callable, Optional
 
 from loguru import logger
 from utils.browser_interaction import BrowserInteractionChannel
+from utils.browser_runtime import (
+    chromium_runtime_options,
+    classify_browser_launch_error,
+)
 from utils.xianyu_session_probe import (
     PROBE_EXPIRED,
     PROBE_RETRYABLE_ERROR,
@@ -553,8 +557,7 @@ class XianyuOfficialLoginService:
                     # 未显式配置 XIANYU_BROWSER_CHANNEL 时回退到 Playwright 自带的
                     # Chromium（channel=None），实现零安装：本机无需另装系统 Chrome。
                     # 配置了该变量（如 chrome/msedge）则沿用系统浏览器渠道。
-                    channel=os.getenv("XIANYU_BROWSER_CHANNEL") or None,
-                    chromium_sandbox=True,
+                    **chromium_runtime_options(),
                     args=browser_args,
                     viewport={"width": 1440, "height": 960},
                     locale="zh-CN",
@@ -625,7 +628,11 @@ class XianyuOfficialLoginService:
                             on_status,
                             OfficialLoginResult(
                                 status="waiting_user",
-                                message="请使用闲鱼 App 扫码，或在本机官方窗口完成登录",
+                                message=(
+                                    "请使用闲鱼 App 扫码，或在本机官方窗口完成登录"
+                                    if show_browser
+                                    else "请使用闲鱼 App 扫描网页中的云端 Chrome 二维码"
+                                ),
                                 verification_image_path=verification_image_path,
                                 requires_manual_action=True,
                             ),
@@ -703,14 +710,8 @@ class XianyuOfficialLoginService:
             except Exception as exc:
                 if worker.cancel_event.is_set():
                     return self._cancelled_result(used_password)
-                exception_text = str(exc)
-                error_code = (
-                    "profile_in_use"
-                    if "ProcessSingleton" in exception_text
-                    or "profile" in exception_text.lower()
-                    else "browser_error"
-                )
-                logger.error(f"闲鱼官方浏览器会话执行失败: {type(exc).__name__}")
+                error_code = classify_browser_launch_error(exc)
+                logger.error("闲鱼官方浏览器会话执行失败: {}", error_code)
                 return OfficialLoginResult(
                     status="failed",
                     error_code=error_code,

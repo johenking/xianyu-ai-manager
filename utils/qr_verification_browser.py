@@ -18,6 +18,10 @@ from urllib.parse import urlparse
 
 from loguru import logger
 from utils.browser_interaction import BrowserInteractionChannel
+from utils.browser_runtime import (
+    chromium_runtime_options,
+    classify_browser_launch_error,
+)
 from utils.verification_images import (
     ensure_private_verification_root,
     remove_private_verification_image,
@@ -128,8 +132,7 @@ class QRVerificationBrowser:
                 context = playwright.chromium.launch_persistent_context(
                     str(user_data_dir),
                     headless=False,
-                    channel=os.getenv("XIANYU_BROWSER_CHANNEL", "chrome"),
-                    chromium_sandbox=True,
+                    **chromium_runtime_options(),
                     args=self._browser_args(),
                     viewport={"width": 1280, "height": 860},
                     locale="zh-CN",
@@ -287,14 +290,20 @@ class QRVerificationBrowser:
                 }
 
         except Exception as exc:
+            error_code = classify_browser_launch_error(exc)
             logger.error(
                 f"扫码二次验证浏览器异常: session={session_id}, "
-                f"错误类型: {type(exc).__name__}"
+                f"错误类别: {error_code}"
             )
             return {
                 "status": "failed",
+                "error_code": error_code,
                 "screenshot_path": screenshot_path,
-                "message": "安全验证浏览器处理失败，请重新生成二维码",
+                "message": (
+                    "安全验证浏览器档案正在使用，请稍后重试"
+                    if error_code == "profile_in_use"
+                    else "安全验证浏览器处理失败，请重新生成二维码"
+                ),
             }
         finally:
             if interaction_channel is not None:
