@@ -179,12 +179,27 @@ def normalize_order_status(raw_status: Any, status_text: str = "") -> str:
     return PLATFORM_STATUS_MAP.get(raw.upper(), "unknown")
 
 
+# 履约推进链只进不退：系统消息（如「我已付款」）常在发货动作之后才被
+# 匹配落库，若放行会把已发货/已完成刷回待发货并重新触发履约。退款族
+# （refunding/refunded/refund_cancelled）与关闭不在链内，任何阶段都放行。
+_FULFILLMENT_STAGE_RANK: Dict[str, int] = {
+    "processing": 0,
+    "pending_ship": 1,
+    "shipped": 2,
+    "completed": 3,
+}
+
+
 def choose_order_status(current_status: Any, incoming_status: Any) -> str:
     current = normalize_order_status(current_status)
     incoming = normalize_order_status(incoming_status)
     if incoming == "unknown":
         return current
     if current in {"refunded", "cancelled"} and incoming not in {"refunded", "cancelled"}:
+        return current
+    current_rank = _FULFILLMENT_STAGE_RANK.get(current)
+    incoming_rank = _FULFILLMENT_STAGE_RANK.get(incoming)
+    if current_rank is not None and incoming_rank is not None and incoming_rank < current_rank:
         return current
     return incoming
 

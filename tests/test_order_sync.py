@@ -56,6 +56,23 @@ class OrderStatusNormalizationTests(unittest.TestCase):
         self.assertEqual(choose_order_status("completed", "refunding"), "refunding")
         self.assertEqual(choose_order_status("completed", "refunded"), "refunded")
 
+    def test_fulfillment_stages_never_regress(self):
+        # 迟到的「我已付款」等前置阶段回波不得把已发货/已完成刷回待发货
+        self.assertEqual(choose_order_status("shipped", "pending_ship"), "shipped")
+        self.assertEqual(choose_order_status("shipped", "processing"), "shipped")
+        self.assertEqual(choose_order_status("completed", "pending_ship"), "completed")
+        self.assertEqual(choose_order_status("completed", "shipped"), "completed")
+        self.assertEqual(choose_order_status("pending_ship", "processing"), "pending_ship")
+
+    def test_forward_progress_and_refund_family_still_apply(self):
+        self.assertEqual(choose_order_status("pending_ship", "shipped"), "shipped")
+        self.assertEqual(choose_order_status("shipped", "completed"), "completed")
+        self.assertEqual(choose_order_status("shipped", "refunding"), "refunding")
+        self.assertEqual(choose_order_status("shipped", "cancelled"), "cancelled")
+        self.assertEqual(choose_order_status("pending_ship", "refunded"), "refunded")
+        # 退款撤销/驳回后回到履约态仍放行（refunding 不在推进链内）
+        self.assertEqual(choose_order_status("refunding", "shipped"), "shipped")
+
     def test_session_expired_is_a_blocking_platform_error(self):
         result = classify_platform_error(["FAIL_SYS_SESSION_EXPIRED::Session过期"])
         self.assertEqual(result["code"], "session_expired")
@@ -494,6 +511,57 @@ class OrderStatusPersistenceTests(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in right_matches], [event_id])
         self.assertEqual(self.db.get_order_by_id("order-a")["order_status"], "refunded")
         self.assertEqual(self.db.get_order_by_id("order-b")["order_status"], "completed")
+
+    def test_stale_payment_event_does_not_regress_shipped_order(self):
+        self.db.insert_or_update_order(
+            order_id="order-shipped",
+            item_id="item-s",
+            buyer_id="buyer-s",
+            order_status="shipped",
+            cookie_id="account-1",
+            system_shipped=True,
+        )
+        event_id = self.db.record_order_status_event(
+            cookie_id="account-1",
+            normalized_status="pending_ship",
+            raw_status="我已付款，等待卖家发货",
+            order_id="order-shipped",
+            occurred_at=time.time(),
+        )
+
+        matches = self.db.reconcile_order_status_events(
+            cookie_id="account-1",
+            order_id="order-shipped",
+            item_id="item-s",
+            buyer_id="buyer-s",
+        )
+
+        # 事件仍要被消费掉（避免反复重放），但状态不得回退
+        self.assertEqual([entry["id"] for entry in matches], [event_id])
+        order = self.db.get_order_by_id("order-shipped")
+        self.assertEqual(order["order_status"], "shipped")
+        self.assertTrue(order["system_shipped"])
+
+    def test_sync_echo_does_not_regress_shipped_order(self):
+        self.db.insert_or_update_order(
+            order_id="order-echo",
+            order_status="shipped",
+            cookie_id="account-1",
+            system_shipped=True,
+        )
+
+        result = self.db.apply_order_sync_update(
+            order_id="order-echo",
+            cookie_id="account-1",
+            incoming_status="pending_ship",
+            platform_status_code="2",
+            platform_status_text="等待卖家发货",
+            status_source="order_list",
+        )
+        order = self.db.get_order_by_id("order-echo")
+
+        self.assertFalse(result["status_changed"])
+        self.assertEqual(order["order_status"], "shipped")
 
     def test_unknown_sync_result_records_error_without_overwriting_known_status(self):
         self.db.insert_or_update_order(

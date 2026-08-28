@@ -452,31 +452,40 @@ async def mark_invite_fulfilled(request: Request, body: MarkFulfilledRequest):
                     timeout=35,
                 )
 
-        # 免拼发货与确认发货互为回退：拼单标记可能在轮询补单时丢失（平台订单列表
-        # 不返回该标记），主接口若因"订单类型不匹配"等未知业务失败，回退到另一种
-        # 发货接口再试一次，避免用错接口导致漏发货。会话失效/风控/限流等已知失败
-        # 不回退（换接口也无益或加重风控）。
+        # 「免拼」（groupon freeshipping）只是拼团成团动作：成团后平台订单仍是
+        # 待发货，只有虚拟发货（consign.dummy，即 _do_confirm）才能把订单推进到
+        # 已发货。因此不论哪种订单，最终都必须成功调用一次 _do_confirm；小刀/
+        # 拼团单需要先免拼成团（「已免拼/已成团」按幂等通过）再发货。免拼报
+        # unknown_failure 多半是拼单标记误判（其实是普通单），直接尝试发货；
+        # 会话失效/风控/限流耗尽等已知失败立即失败关闭，不盲目连打平台。
+        freeshipping_done = False
+        freeshipping_attempted = False
         if is_bargain:
-            primary, fallback = _do_freeshipping, _do_confirm
-            primary_mode, fallback_mode = "free_shipping", "status_only"
-        else:
-            primary, fallback = _do_confirm, _do_freeshipping
-            primary_mode, fallback_mode = "status_only", "free_shipping"
+            freeshipping_attempted = True
+            freeshipping_result = await _do_freeshipping()
+            if freeshipping_result and freeshipping_result.get("success"):
+                freeshipping_done = True
+            elif str((freeshipping_result or {}).get("category") or "") != "unknown_failure":
+                return _set_operation(body.operation_key, "failed", error="platform free-shipping confirmation failed")
 
-        result = await primary()
-        delivery_mode = primary_mode
+        result = await _do_confirm()
         if (
             (not result or not result.get("success"))
+            and not freeshipping_attempted
             and str((result or {}).get("category") or "") == "unknown_failure"
         ):
-            fallback_result = await fallback()
-            if fallback_result and fallback_result.get("success"):
-                result = fallback_result
-                delivery_mode = fallback_mode
+            # 确认发货报未知业务失败且本次还未免拼过：拼单标记可能在轮询补单时
+            # 丢失（平台订单列表不返回该标记），未成团的拼团单无法直接发货。
+            # 补一次免拼后重试真发货。
+            freeshipping_attempted = True
+            freeshipping_result = await _do_freeshipping()
+            if freeshipping_result and freeshipping_result.get("success"):
+                freeshipping_done = True
+                result = await _do_confirm()
 
+        delivery_mode = "free_shipping_then_status_only" if freeshipping_done else "status_only"
         if not result or not result.get("success"):
-            error = "platform free-shipping confirmation failed" if is_bargain else "platform status_only confirmation failed"
-            return _set_operation(body.operation_key, "failed", error=error)
+            return _set_operation(body.operation_key, "failed", error="platform status_only confirmation failed")
         if not db_manager.insert_or_update_order(order_id=body.order_id, cookie_id=body.cookie_id, order_status="shipped", system_shipped=True):
             return _set_operation(body.operation_key, "needs_review", error="local order state update failed")
         return _set_operation(

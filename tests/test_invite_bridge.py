@@ -1587,7 +1587,8 @@ def test_direct_message_retries_only_when_previous_attempt_never_submitted(monke
     assert live.calls == 2
 
 
-def test_mark_fulfilled_uses_free_shipping_for_bargain(monkeypatch, bridge_database):
+def test_mark_fulfilled_bargain_runs_free_shipping_then_real_consign(monkeypatch, bridge_database):
+    """小刀/拼团单必须两段式：免拼成团后仍要调真发货（consign.dummy）。"""
     import XianyuAutoAsync
     import secure_confirm_decrypted
 
@@ -1636,11 +1637,20 @@ def test_mark_fulfilled_uses_free_shipping_for_bargain(monkeypatch, bridge_datab
         staticmethod(lambda _cookie_id: live),
     )
 
-    class _UnexpectedSecureConfirm:
-        def __init__(self, *_args):
-            raise AssertionError("bargain order used normal status_only confirmation")
+    class _SecureConfirm:
+        calls = 0
 
-    monkeypatch.setattr(secure_confirm_decrypted, "SecureConfirm", _UnexpectedSecureConfirm)
+        def __init__(self, *_args):
+            pass
+
+        async def auto_confirm(self, order_id, item_id):
+            assert order_id == "order-bargain"
+            assert item_id == "item-1"
+            self.__class__.calls += 1
+            return {"success": True}
+
+    _SecureConfirm.calls = 0
+    monkeypatch.setattr(secure_confirm_decrypted, "SecureConfirm", _SecureConfirm)
     payload = {
         "operationKey": "fulfillment-bargain-1",
         "orderId": "order-bargain",
@@ -1660,9 +1670,93 @@ def test_mark_fulfilled_uses_free_shipping_for_bargain(monkeypatch, bridge_datab
 
     assert response.status_code == 200
     assert response.json()["state"] == "succeeded"
-    assert response.json()["deliveryMode"] == "free_shipping"
+    assert response.json()["deliveryMode"] == "free_shipping_then_status_only"
     assert live.free_shipping_calls == [("order-bargain", "item-1", "buyer-1")]
+    assert _SecureConfirm.calls == 1
     assert order["order_status"] == "shipped"
+
+
+def test_mark_fulfilled_bargain_free_shipping_alone_is_not_fulfillment(monkeypatch, bridge_database):
+    """免拼只是成团不是发货：真发货失败时整单必须失败，禁止误标已履约。"""
+    import XianyuAutoAsync
+    import secure_confirm_decrypted
+
+    monkeypatch.setenv("XIANYU_INVITE_BRIDGE_ENABLED", "true")
+    monkeypatch.setenv("XIANYU_INVITE_BRIDGE_SECRET", "bridge-test-secret")
+    invite_bridge.db_manager.enabled_items.add(("account-1", "item-1"))
+    invite_bridge._seen_nonces.clear()
+    database = invite_bridge.db_manager
+    order = {
+        "order_id": "order-bargain",
+        "cookie_id": "account-1",
+        "item_id": "item-1",
+        "buyer_id": "buyer-1",
+        "chat_id": "chat-1",
+        "order_status": "pending_ship",
+        "is_bargain": 1,
+        "system_shipped": 0,
+    }
+    database.get_order_by_id = lambda _order_id: order
+    database.get_cookie = lambda _cookie_id: "fixture-cookie"
+    database.insert_or_update_order = lambda **_values: pytest.fail(
+        "unshipped bargain order must not be stored as shipped"
+    )
+
+    class _Socket:
+        closed = False
+
+    class _Live:
+        ws = _Socket()
+
+        def __init__(self):
+            self.free_shipping_calls = []
+
+        async def auto_freeshipping(self, order_id, item_id, buyer_id):
+            self.free_shipping_calls.append((order_id, item_id, buyer_id))
+            return {"success": True, "already_shipped": True}
+
+    live = _Live()
+    monkeypatch.setattr(
+        XianyuAutoAsync.XianyuLive,
+        "get_instance",
+        staticmethod(lambda _cookie_id: live),
+    )
+
+    class _SecureConfirm:
+        calls = 0
+
+        def __init__(self, *_args):
+            pass
+
+        async def auto_confirm(self, order_id, item_id):
+            self.__class__.calls += 1
+            return {"success": False, "category": "unknown_failure", "error": "发货失败"}
+
+    _SecureConfirm.calls = 0
+    monkeypatch.setattr(secure_confirm_decrypted, "SecureConfirm", _SecureConfirm)
+    payload = {
+        "operationKey": "fulfillment-bargain-noconsign",
+        "orderId": "order-bargain",
+        "cookieId": "account-1",
+        "itemId": "item-1",
+        "requestId": "request-bargain-2",
+    }
+    app = FastAPI()
+    app.include_router(invite_bridge.invite_bridge_router)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/internal/invite/mark-fulfilled",
+            json=payload,
+            headers=invite_bridge._signature_headers(payload, "bridge-test-secret"),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "failed"
+    assert live.free_shipping_calls == [("order-bargain", "item-1", "buyer-1")]
+    assert _SecureConfirm.calls == 1
+    assert order["order_status"] == "pending_ship"
+    assert order["system_shipped"] == 0
 
 
 def test_poller_recovers_platform_order_missing_from_local_database(monkeypatch):
