@@ -17,17 +17,22 @@ from delivery_stage_metrics import (
 )
 from invite_bridge import (
     _allowed_item_ids,
+    _execute_platform_ship,
+    _fetch_platform_order_status,
     _is_provisional_chat,
     _send_order_event_to_invite,
     bridge_enabled,
 )
 from order_sync_service import (
     XianyuOrderListClient,
+    ORDER_BUSINESS_LEAD,
     ORDER_BUSINESS_ORDINARY,
+    fetch_xianyu_pending_order_page,
     get_order_sync_lock,
     mark_order_session_expired,
     parse_amount_fen,
     parse_order_time_utc,
+    parse_pending_order_api_payload,
     session_refresh_blocks_order_requests,
 )
 from session_registry import sanitize_runtime_error
@@ -86,6 +91,25 @@ REAUTH_WARN_INTERVAL_SECONDS = max(
     60.0, float(os.getenv("XIANYU_INVITE_REAUTH_WARN_INTERVAL_SECONDS", "1800"))
 )
 
+# 对账重发器（reconciliation sweep）：把「本地已发 × 平台待发货」的漂移单
+# 自动补免拼+虚拟发货。背景（2026-08-28 全量对账）：mark-fulfilled 幂等护栏
+# 曾只信本地 system_shipped，10 笔活跃账号订单码已发出、平台却永远停在待发
+# 货且零告警。候选完全来自既有平台发现的实况，本身零额外列表请求；补发前
+# 逐笔回查平台详情双确认，每轮每账号补发上限固定，防对平台连打。
+SHIP_RECONCILE_INTERVAL_SECONDS = max(
+    60.0, float(os.getenv("XIANYU_SHIP_RECONCILE_INTERVAL_SECONDS", "600"))
+)
+SHIP_RECONCILE_MAX_PER_ACCOUNT = 5
+
+# 同买家定向发现（fan-out）：热路径完成一笔可信投递后，立刻定向查该买家
+# 其余待发货单。背景（近 7 天 578 笔实测）：同买家连拍多单时第 2、3 笔
+# 常无独立付款消息，只能等 30 秒兜底轮询（p90 96s vs 单买家单单 61s）。
+# 冷却窗防同买家连续付款消息触发请求风暴；单次补投上限防对平台连打。
+BUYER_FANOUT_COOLDOWN_SECONDS = max(
+    5.0, float(os.getenv("XIANYU_INVITE_BUYER_FANOUT_COOLDOWN_SECONDS", "15"))
+)
+BUYER_FANOUT_MAX_ORDERS = 5
+
 
 class InviteBridgePoller:
     def __init__(self) -> None:
@@ -96,6 +120,11 @@ class InviteBridgePoller:
         self._scan_lock = asyncio.Lock()
         self._reauth_blocked_since: dict[str, float] = {}
         self._reauth_last_warned: dict[str, float] = {}
+        # 「本地已发 × 平台待发货」漂移单登记表：(cookie_id, order_id) -> 上下文。
+        # 由平台发现顺带写入，对账重发器消费；补发成功或平台已推进即出队。
+        self._ship_drift: dict[tuple[str, str], dict[str, Any]] = {}
+        self._last_ship_reconcile_at = 0.0
+        self._last_buyer_fanout: dict[tuple[str, str], float] = {}
 
     def _note_reauth_skip(self, cookie_id: str, where: str, detail: str = "") -> None:
         """记录一次 skipped_reauth 跳过：短期保留逐轮 INFO，超阈值后降噪并升级告警。
@@ -362,6 +391,13 @@ class InviteBridgePoller:
                                     ),
                                 )
                             continue
+                        if self._note_ship_drift(
+                            cookie_id=cookie_id,
+                            order_id=order_id,
+                            item_id=item_id,
+                            buyer_id=buyer_id,
+                        ):
+                            continue
                         if self.stage_order(
                             cookie_id=cookie_id,
                             order_id=order_id,
@@ -405,6 +441,308 @@ class InviteBridgePoller:
             len(accounts),
             (time.perf_counter() - discovery_started) * 1000,
         )
+
+    def _note_ship_drift(
+        self,
+        *,
+        cookie_id: str,
+        order_id: str,
+        item_id: str,
+        buyer_id: str,
+    ) -> bool:
+        """平台报待发货但本地已发时登记漂移单，返回是否属于漂移。
+
+        这类单多因平台侧确认发货只完成一半（如拼团只点了免拼没发货）而
+        滞留，历史上被 mark-fulfilled 的本地幂等护栏假成功吞掉后永久无人
+        补救（2026-08 全量对账实测 10 笔活跃账号卡单、零告警）。登记后由
+        对账重发器限流补发。
+        """
+        local = db_manager.get_order_by_id(order_id)
+        if not local or str(local.get("cookie_id") or "") != cookie_id:
+            return False
+        locally_shipped = (
+            str(local.get("order_status") or local.get("status") or "")
+            in {"shipped", "completed"}
+            or bool(local.get("system_shipped"))
+        )
+        if not locally_shipped:
+            return False
+        key = (cookie_id, order_id)
+        if key not in self._ship_drift:
+            logger.warning(
+                "邀请桥发现平台状态漂移（本地已发×平台待发货），已列入对账补发: "
+                "order_ref={} account_ref={}",
+                _opaque_ref(order_id),
+                _opaque_ref(cookie_id),
+            )
+        self._ship_drift[key] = {
+            "cookie_id": cookie_id,
+            "order_id": order_id,
+            "item_id": item_id,
+            "buyer_id": buyer_id,
+            "observed_at": time.time(),
+        }
+        return True
+
+    async def _reconcile_shipped_drift(self) -> int:
+        """对账重发器：把「本地已发 × 平台待发货」的漂移单补到真正已发货。
+
+        候选完全来自平台发现的顺带观测（零额外列表请求）。补发前逐笔用
+        订单详情回查双确认——列表观测可能滞后于真实状态；平台已推进的
+        直接出队自愈。免拼与虚拟发货平台侧均幂等，绝不重发兑换码。每轮
+        间隔 SHIP_RECONCILE_INTERVAL_SECONDS、每账号最多
+        SHIP_RECONCILE_MAX_PER_ACCOUNT 笔，防对平台连打。
+        """
+        if not self._ship_drift:
+            return 0
+        now = time.time()
+        if now - self._last_ship_reconcile_at < SHIP_RECONCILE_INTERVAL_SECONDS:
+            return 0
+        self._last_ship_reconcile_at = now
+        repaired = 0
+        attempts_per_account: dict[str, int] = {}
+        for key in list(self._ship_drift.keys()):
+            candidate = self._ship_drift.get(key)
+            if not candidate:
+                continue
+            cookie_id = str(candidate.get("cookie_id") or "")
+            order_id = str(candidate.get("order_id") or "")
+            item_id = str(candidate.get("item_id") or "")
+            if item_id not in _allowed_item_ids(cookie_id):
+                # 商品配置已变更，不再归邀请桥管，出队交人工。
+                self._ship_drift.pop(key, None)
+                continue
+            if attempts_per_account.get(cookie_id, 0) >= SHIP_RECONCILE_MAX_PER_ACCOUNT:
+                continue
+            if _order_requests_blocked(cookie_id):
+                self._note_reauth_skip(
+                    cookie_id, "对账补发货", detail=f"order_ref={_opaque_ref(order_id)}"
+                )
+                continue
+            cookies = db_manager.get_cookie(cookie_id)
+            if not cookies:
+                continue
+            attempts_per_account[cookie_id] = attempts_per_account.get(cookie_id, 0) + 1
+            try:
+                platform = await _fetch_platform_order_status(cookie_id, order_id, cookies)
+                if not platform.get("success"):
+                    logger.warning(
+                        "邀请桥对账回查平台状态失败，留待下轮: order_ref={} account_ref={} error={}",
+                        _opaque_ref(order_id),
+                        _opaque_ref(cookie_id),
+                        str(platform.get("error") or "unknown")[:80],
+                    )
+                    continue
+                if str(platform.get("status") or "") != "pending_ship":
+                    # 平台已自行推进（含人工补点），漂移自愈，出队。
+                    self._ship_drift.pop(key, None)
+                    continue
+                local = db_manager.get_order_by_id(order_id) or {}
+                is_bargain = str(
+                    local.get("is_bargain") or ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                ship = await _execute_platform_ship(
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=str(local.get("buyer_id") or candidate.get("buyer_id") or ""),
+                    is_bargain=is_bargain,
+                    cookies=cookies,
+                )
+                if not ship.get("success"):
+                    logger.warning(
+                        "邀请桥对账补发货失败，留待下轮: order_ref={} account_ref={} error={}",
+                        _opaque_ref(order_id),
+                        _opaque_ref(cookie_id),
+                        str(ship.get("error") or "unknown")[:80],
+                    )
+                    continue
+                db_manager.insert_or_update_order(
+                    order_id=order_id,
+                    cookie_id=cookie_id,
+                    order_status="shipped",
+                    system_shipped=True,
+                )
+                self._ship_drift.pop(key, None)
+                repaired += 1
+                logger.warning(
+                    "邀请桥对账补发货成功（本地已发×平台待发货已收敛）: "
+                    "order_ref={} account_ref={} delivery_mode={}",
+                    _opaque_ref(order_id),
+                    _opaque_ref(cookie_id),
+                    str(ship.get("delivery_mode") or ""),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "邀请桥对账补发货异常，留待下轮: order_ref={} {}",
+                    _opaque_ref(order_id),
+                    _exception_summary(exc),
+                )
+        return repaired
+
+    async def scan_buyer_orders(
+        self,
+        *,
+        cookie_id: str,
+        buyer_id: str,
+        chat_id: str = "",
+        exclude_order_ids: set[str] | None = None,
+    ) -> int:
+        """热路径完成一笔可信投递后，定向补发现同买家其余待发货单。
+
+        同买家连拍多单时第 2、3 笔常无独立付款消息，只能等 30 秒兜底轮询。
+        这里用一次 NOT_SHIP 待发货页定向查该买家其余待发货单（loader 单页
+        语义，最多 1 次列表请求），逐笔走与热路径完全一致的
+        _verify_paid_order_for_delivery fail-closed 门禁 + stage_order +
+        scan_trusted_order。查不到或任何失败都静默交还兜底轮询。
+        """
+        cookie_id = str(cookie_id or "").strip()
+        buyer_id = str(buyer_id or "").strip()
+        if not cookie_id or not buyer_id:
+            return 0
+        allowed_items = _allowed_item_ids(cookie_id)
+        if not allowed_items:
+            return 0
+        excluded = {
+            str(order_id)
+            for order_id in (exclude_order_ids or set())
+            if str(order_id).strip()
+        }
+        now = time.time()
+        fanout_key = (cookie_id, buyer_id)
+        if now - self._last_buyer_fanout.get(fanout_key, 0.0) < BUYER_FANOUT_COOLDOWN_SECONDS:
+            return 0
+        self._last_buyer_fanout[fanout_key] = now
+        if len(self._last_buyer_fanout) > 2_000:
+            cutoff = now - BUYER_FANOUT_COOLDOWN_SECONDS
+            self._last_buyer_fanout = {
+                key: seen_at
+                for key, seen_at in self._last_buyer_fanout.items()
+                if seen_at >= cutoff
+            }
+        if _order_requests_blocked(cookie_id):
+            self._note_reauth_skip(cookie_id, "同买家定向发现")
+            return 0
+        cookie_string = str(db_manager.get_cookie(cookie_id) or "")
+        if not cookie_string:
+            return 0
+        from XianyuAutoAsync import XianyuLive
+
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if not live_instance or not live_instance.ws or live_instance.ws.closed:
+            # 无在线监听发不了确认链接，静默交还兜底轮询。
+            return 0
+        details = db_manager.get_cookie_details(cookie_id) or {}
+        try:
+            async with get_order_sync_lock(cookie_id):
+                payload = await fetch_xianyu_pending_order_page(
+                    cookie_id=cookie_id,
+                    cookie_string=cookie_string,
+                    page_number=1,
+                    page_size=20,
+                    user_id="",
+                    user_agent=str(details.get("browser_user_agent") or ""),
+                )
+        except Exception as exc:
+            logger.info(
+                "邀请桥同买家定向发现请求失败，交还兜底轮询: account_ref={} {}",
+                _opaque_ref(cookie_id),
+                _exception_summary(exc),
+            )
+            return 0
+        parsed = parse_pending_order_api_payload(payload, cookie_id)
+        if not parsed.get("success"):
+            if parsed.get("error_code") == "session_expired":
+                mark_order_session_expired(db_manager, cookie_id)
+            logger.info(
+                "邀请桥同买家定向发现失败，交还兜底轮询: account_ref={} error_code={}",
+                _opaque_ref(cookie_id),
+                str(parsed.get("error_code") or "unknown")[:40],
+            )
+            return 0
+        candidates: list[tuple[str, str]] = []
+        for row in parsed.get("orders") or []:
+            order_id = str(row.get("order_id") or "")
+            item_id = str(row.get("item_id") or "")
+            business_type = str(row.get("order_business_type") or "").strip().lower()
+            if (
+                not order_id
+                or order_id in excluded
+                or str(row.get("buyer_id") or "") != buyer_id
+                or item_id not in allowed_items
+                # lead 单确定不可发；unknown 交给下方逐笔核验做权威判定。
+                or business_type == ORDER_BUSINESS_LEAD
+            ):
+                continue
+            existing = db_manager.get_order_by_id(order_id)
+            if existing and (
+                str(existing.get("order_status") or existing.get("status") or "")
+                in {"shipped", "completed"}
+                or bool(existing.get("system_shipped"))
+            ):
+                continue
+            if _message_operation_exists(order_id, cookie_id):
+                continue
+            candidates.append((order_id, item_id))
+            if len(candidates) >= BUYER_FANOUT_MAX_ORDERS:
+                break
+        sent = 0
+        for order_id, item_id in candidates:
+            try:
+                # 与热路径同一 fail-closed 门禁：逐笔实时核验付款与业务类型，
+                # lead/unknown/非 pending_ship 一律不发。
+                payment_check = await live_instance._verify_paid_order_for_delivery(
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                )
+                if not payment_check.get("allowed"):
+                    logger.info(
+                        "邀请桥同买家定向发现订单未过核验门禁: order_ref={} error_code={}",
+                        _opaque_ref(order_id),
+                        str(
+                            payment_check.get("error_code")
+                            or payment_check.get("status")
+                            or "unknown"
+                        )[:40],
+                    )
+                    continue
+                if not self.stage_order(
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    amount=payment_check.get("amount"),
+                    quantity=payment_check.get("quantity") or 1,
+                    item_title=str(payment_check.get("item_title") or ""),
+                    created_at=payment_check.get("created_at"),
+                    chat_id=chat_id,
+                    is_bargain=bool(payment_check.get("is_bargain")),
+                    order_business_type=str(payment_check.get("business_type") or ""),
+                ):
+                    continue
+                sent += await self.scan_trusted_order(
+                    cookie_id=cookie_id,
+                    order_id=order_id,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    chat_id=chat_id,
+                    payment_check=payment_check,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "邀请桥同买家定向发现单笔处理失败: order_ref={} {}",
+                    _opaque_ref(order_id),
+                    _exception_summary(exc),
+                )
+        if sent:
+            logger.info(
+                "邀请桥同买家定向发现补投完成: account_ref={} buyer_ref={} sent={}",
+                _opaque_ref(cookie_id),
+                _opaque_ref(buyer_id),
+                sent,
+            )
+        return sent
 
     async def scan_trusted_order(
         self,
@@ -549,6 +887,10 @@ class InviteBridgePoller:
         }
         if discover:
             await self._discover_platform_orders()
+            try:
+                await self._reconcile_shipped_drift()
+            except Exception as exc:
+                logger.warning("邀请桥对账重发器异常: {}", _exception_summary(exc))
         for cookie_id in db_manager.get_all_cookies():
             account_ref = _opaque_ref(cookie_id)
             if _order_requests_blocked(str(cookie_id)):

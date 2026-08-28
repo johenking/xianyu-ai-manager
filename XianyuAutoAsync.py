@@ -74,6 +74,12 @@ WS_SEND_TIMEOUT = 10      # 单次业务帧发送上限，避免 await send 永�
 DELIVERY_VERIFY_MAX_PAGES = 5
 FULFILLMENT_API_MAX_ATTEMPTS = 4
 
+# 付款核验 order_not_observed 的短退避重试间隔（秒）。平台订单详情/列表
+# 相对付款消息有秒级同步延迟：实测正常单 2~10 秒可见，但个别单在核验段
+# 空耗 23~49 秒才被 30 秒兜底轮询捞回。仅对「平台暂未返回该订单」这一种
+# 结果重试；登录失效、身份不符、业务类型不符等其它失败一律立即放弃。
+INVITE_VERIFY_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0)
+
 # Shadow 默认开启，仍可通过环境变量立即关闭。
 AI_REPLY_SHADOW_ENABLED = os.getenv("AI_REPLY_SHADOW_ENABLED", "true").strip().lower() in {
     "1", "true", "yes", "on",
@@ -2016,6 +2022,20 @@ class XianyuLive:
                     item_id=item_id,
                     buyer_id=send_user_id,
                 )
+                # 平台订单接口相对付款消息有秒级同步延迟：仅当结果是
+                # order_not_observed（平台暂未返回该订单）时短退避重试，
+                # 吃掉大部分延迟；其它失败保持立即放弃，不放宽任何门禁。
+                for retry_delay in INVITE_VERIFY_RETRY_DELAYS_SECONDS:
+                    if payment_check.get("allowed") or str(
+                        payment_check.get("error_code") or ""
+                    ) != "order_not_observed":
+                        break
+                    await asyncio.sleep(retry_delay)
+                    payment_check = await self._verify_paid_order_for_delivery(
+                        order_id=order_id,
+                        item_id=item_id,
+                        buyer_id=send_user_id,
+                    )
                 payment_verify_ms = (time.perf_counter() - payment_started) * 1000
                 if not payment_check.get("allowed"):
                     logger.warning(
@@ -2061,13 +2081,32 @@ class XianyuLive:
                     payment_check=payment_check,
                 )
                 bridge_event_ms = (time.perf_counter() - bridge_started) * 1000
+                # 同买家 fan-out：连拍多单时第 2、3 笔常无独立付款消息，
+                # 借本笔热路径立即定向补发现，不再等 30 秒兜底轮询。
+                fanout_started = time.perf_counter()
+                fanout_sent = 0
+                try:
+                    fanout_sent = await invite_bridge_poller.scan_buyer_orders(
+                        cookie_id=self.cookie_id,
+                        buyer_id=send_user_id,
+                        chat_id=chat_id,
+                        exclude_order_ids={order_id},
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "邀请桥同买家定向发现失败，交还兜底轮询: error_type={}",
+                        type(exc).__name__,
+                    )
+                buyer_fanout_ms = (time.perf_counter() - fanout_started) * 1000
                 logger.info(
-                    "invite_delivery_latency order_ref={} account_ref={} payment_verify_ms={:.1f} stage_order_ms={:.1f} bridge_event_ms={:.1f} hot_path_total_ms={:.1f}",
+                    "invite_delivery_latency order_ref={} account_ref={} payment_verify_ms={:.1f} stage_order_ms={:.1f} bridge_event_ms={:.1f} buyer_fanout_ms={:.1f} buyer_fanout_sent={} hot_path_total_ms={:.1f}",
                     hashlib.sha256(str(order_id).encode("utf-8")).hexdigest()[:12],
                     hashlib.sha256(str(self.cookie_id).encode("utf-8")).hexdigest()[:12],
                     payment_verify_ms,
                     stage_order_ms,
                     bridge_event_ms,
+                    buyer_fanout_ms,
+                    fanout_sent,
                     (time.perf_counter() - hot_path_started) * 1000,
                 )
                 return

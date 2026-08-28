@@ -723,44 +723,118 @@ def test_terminal_order_rejects_non_fulfillment_message(
     assert response.json()["lastError"] == "order is not pending_ship"
 
 
-def test_mark_fulfilled_already_shipped_without_platform_call(
-    monkeypatch, bridge_database
-):
+def _post_mark_fulfilled(payload):
+    app = FastAPI()
+    app.include_router(invite_bridge.invite_bridge_router)
+    with TestClient(app) as client:
+        return client.post(
+            "/internal/invite/mark-fulfilled",
+            json=payload,
+            headers=invite_bridge._signature_headers(payload, "bridge-test-secret"),
+        )
+
+
+def _already_shipped_mark_fulfilled_setup(monkeypatch):
+    """本地已发×平台状态未知的 mark-fulfilled 场景公共装配。
+
+    旧契约（已废弃）：本地 system_shipped/shipped 直接返回 succeeded、
+    禁止读取平台凭据——正是这个"假成功"把码已发、平台仍待发货的订单
+    永久吞掉（2026-08 实测 10 笔活跃账号卡单）。新契约必须回查平台。
+    """
     monkeypatch.setenv("XIANYU_INVITE_BRIDGE_ENABLED", "true")
     monkeypatch.setenv("XIANYU_INVITE_BRIDGE_SECRET", "bridge-test-secret")
     invite_bridge.db_manager.enabled_items.add(("account-1", "item-1"))
     invite_bridge._seen_nonces.clear()
-    invite_bridge.db_manager.get_order_by_id = lambda _order_id: {
+    order = {
         "order_id": "order-1",
         "cookie_id": "account-1",
         "item_id": "item-1",
         "buyer_id": "buyer-1",
         "order_status": "shipped",
-        "system_shipped": 0,
+        "system_shipped": 1,
     }
-    invite_bridge.db_manager.get_cookie = lambda _cookie_id: pytest.fail(
-        "already shipped order read platform credentials"
-    )
-    payload = {
+    invite_bridge.db_manager.get_order_by_id = lambda _order_id: dict(order)
+    invite_bridge.db_manager.get_cookie = lambda _cookie_id: "fixture-cookie"
+    return {
         "operationKey": "fulfillment-mark-already-shipped",
         "orderId": "order-1",
         "cookieId": "account-1",
         "itemId": "item-1",
         "requestId": "request-1",
     }
-    app = FastAPI()
-    app.include_router(invite_bridge.invite_bridge_router)
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/internal/invite/mark-fulfilled",
-            json=payload,
-            headers=invite_bridge._signature_headers(payload, "bridge-test-secret"),
-        )
+
+def test_mark_fulfilled_already_shipped_confirms_platform_progressed(
+    monkeypatch, bridge_database
+):
+    payload = _already_shipped_mark_fulfilled_setup(monkeypatch)
+    recheck_calls = []
+
+    async def fake_status(cookie_id, order_id, cookies):
+        recheck_calls.append((cookie_id, order_id, cookies))
+        return {"success": True, "status": "shipped"}
+
+    async def unexpected_ship(**_kwargs):
+        raise AssertionError("platform already progressed but ship was re-executed")
+
+    monkeypatch.setattr(invite_bridge, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(invite_bridge, "_execute_platform_ship", unexpected_ship)
+
+    response = _post_mark_fulfilled(payload)
 
     assert response.json()["state"] == "succeeded"
     assert response.json()["platformStatus"] == "shipped"
-    assert response.json()["attempts"] == 1
+    assert recheck_calls == [("account-1", "order-1", "fixture-cookie")]
+
+
+def test_mark_fulfilled_already_shipped_locally_reships_platform_pending(
+    monkeypatch, bridge_database
+):
+    """反自锁核心用例：本地已发但平台仍待发货时必须补真实发货。"""
+    payload = _already_shipped_mark_fulfilled_setup(monkeypatch)
+    updates = []
+    invite_bridge.db_manager.insert_or_update_order = lambda **values: (
+        updates.append(values) or True
+    )
+    ship_calls = []
+
+    async def fake_status(_cookie_id, _order_id, _cookies):
+        return {"success": True, "status": "pending_ship"}
+
+    async def fake_ship(**kwargs):
+        ship_calls.append(kwargs)
+        return {"success": True, "delivery_mode": "status_only"}
+
+    monkeypatch.setattr(invite_bridge, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(invite_bridge, "_execute_platform_ship", fake_ship)
+
+    response = _post_mark_fulfilled(payload)
+
+    assert response.json()["state"] == "succeeded"
+    assert response.json()["platformStatus"] == "shipped"
+    assert [call["order_id"] for call in ship_calls] == ["order-1"]
+    assert updates[-1]["order_status"] == "shipped"
+    assert updates[-1]["system_shipped"] is True
+
+
+def test_mark_fulfilled_already_shipped_recheck_failure_fails_closed(
+    monkeypatch, bridge_database
+):
+    payload = _already_shipped_mark_fulfilled_setup(monkeypatch)
+
+    async def fake_status(_cookie_id, _order_id, _cookies):
+        return {"success": False, "error": "platform detail fetch failed"}
+
+    async def unexpected_ship(**_kwargs):
+        raise AssertionError("platform state unknown but ship was executed blindly")
+
+    monkeypatch.setattr(invite_bridge, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(invite_bridge, "_execute_platform_ship", unexpected_ship)
+
+    response = _post_mark_fulfilled(payload)
+
+    assert response.json()["state"] == "needs_review"
+    assert "platform status recheck failed" in response.json()["lastError"]
 
 
 def test_mark_fulfilled_uses_status_only_once(monkeypatch, bridge_database):
@@ -2360,6 +2434,7 @@ def test_paid_invite_notice_calls_only_the_verified_order_path(monkeypatch):
         def __init__(self):
             self.staged = []
             self.direct = []
+            self.fanout = []
 
         def stage_order(self, **kwargs):
             self.staged.append(kwargs)
@@ -2368,6 +2443,10 @@ def test_paid_invite_notice_calls_only_the_verified_order_path(monkeypatch):
         async def scan_trusted_order(self, **kwargs):
             self.direct.append(kwargs)
             return 1
+
+        async def scan_buyer_orders(self, **kwargs):
+            self.fanout.append(kwargs)
+            return 0
 
         async def scan_once(self, **_kwargs):
             raise AssertionError("paid invite notice entered the batch scanner")
@@ -2405,6 +2484,9 @@ def test_paid_invite_notice_calls_only_the_verified_order_path(monkeypatch):
 
     assert len(poller.staged) == 1
     assert [call["order_id"] for call in poller.direct] == ["order-1"]
+    # 热路径完成可信投递后必须立刻发起同买家定向补发现，且排除本单。
+    assert [call["buyer_id"] for call in poller.fanout] == ["buyer-1"]
+    assert poller.fanout[0]["exclude_order_ids"] == {"order-1"}
 
 
 @pytest.mark.parametrize(
@@ -2829,3 +2911,559 @@ def test_poller_enriches_recent_local_terminal_order_without_sending_event(
     assert database.order["paid_amount_fen"] == 999
     assert database.order["ordered_at_utc"] == pytest.approx(observed_at)
     assert database.order["ordered_at_source"] == "epoch"
+
+
+# ---------------------------------------------------------------------------
+# 付款核验 order_not_observed 短退避重试（热路径提速修复）
+# ---------------------------------------------------------------------------
+
+
+def _hot_path_retry_setup(monkeypatch, verify_results):
+    """搭一个只覆盖邀请热路径核验重试的最小环境，返回 (live, poller, sleeps)。"""
+    import XianyuAutoAsync
+    import db_manager as db_module
+    import invite_bridge_poller as poller_module
+
+    class _Database:
+        def get_item_info(self, _cookie_id, item_id):
+            return {"item_id": item_id}
+
+    class _Poller:
+        def __init__(self):
+            self.staged = []
+            self.direct = []
+            self.fanout = []
+
+        def stage_order(self, **kwargs):
+            self.staged.append(kwargs)
+            return True
+
+        async def scan_trusted_order(self, **kwargs):
+            self.direct.append(kwargs)
+            return 1
+
+        async def scan_buyer_orders(self, **kwargs):
+            self.fanout.append(kwargs)
+            return 0
+
+        async def scan_once(self, **_kwargs):
+            raise AssertionError("hot path entered the batch scanner")
+
+    class _Live:
+        cookie_id = "account-1"
+        _extract_order_id = staticmethod(lambda _message: "order-1")
+
+        def __init__(self):
+            self.verify_calls = 0
+
+        async def _verify_paid_order_for_delivery(self, **_kwargs):
+            result = verify_results[min(self.verify_calls, len(verify_results) - 1)]
+            self.verify_calls += 1
+            return dict(result)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    poller = _Poller()
+    monkeypatch.setattr(db_module, "db_manager", _Database())
+    monkeypatch.setattr(XianyuAutoAsync, "_invite_bridge_owns_item", lambda *_args: True)
+    monkeypatch.setattr(poller_module, "invite_bridge_poller", poller)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return _Live(), poller, sleeps
+
+
+def _run_hot_path(live):
+    import XianyuAutoAsync
+
+    asyncio.run(
+        XianyuAutoAsync.XianyuLive._handle_auto_delivery(
+            live,
+            websocket=object(),
+            message={},
+            send_user_name="buyer",
+            send_user_id="buyer-1",
+            item_id="item-1",
+            chat_id="chat-1",
+            msg_time="now",
+        )
+    )
+
+
+def test_paid_invite_notice_retries_unobserved_order_then_delivers(monkeypatch):
+    not_observed = {
+        "allowed": False,
+        "status": "unknown",
+        "error_code": "order_not_observed",
+    }
+    allowed = {
+        "allowed": True,
+        "status": "pending_ship",
+        "business_type": "ordinary",
+        "amount": "3.88",
+        "quantity": 1,
+    }
+    live, poller, sleeps = _hot_path_retry_setup(
+        monkeypatch, [not_observed, not_observed, allowed]
+    )
+
+    _run_hot_path(live)
+
+    # 平台列表滞后被 2s/4s 两次短退避吃掉，第三次核验通过后正常投递。
+    assert live.verify_calls == 3
+    assert sleeps == [2.0, 4.0]
+    assert [call["order_id"] for call in poller.staged] == ["order-1"]
+    assert [call["order_id"] for call in poller.direct] == ["order-1"]
+
+
+def test_paid_invite_notice_gives_up_after_bounded_unobserved_retries(monkeypatch):
+    not_observed = {
+        "allowed": False,
+        "status": "unknown",
+        "error_code": "order_not_observed",
+    }
+    live, poller, sleeps = _hot_path_retry_setup(monkeypatch, [not_observed])
+
+    _run_hot_path(live)
+
+    # 1 次首查 + 3 次重试后交还 30 秒兜底轮询，绝不无界重试。
+    assert live.verify_calls == 4
+    assert sleeps == [2.0, 4.0, 8.0]
+    assert poller.staged == []
+    assert poller.direct == []
+    assert poller.fanout == []
+
+
+def test_paid_invite_notice_does_not_retry_terminal_verification_failures(monkeypatch):
+    for error_code in ("lead_order_not_fulfillable", "requires_login", "not_paid"):
+        terminal = {
+            "allowed": False,
+            "status": "unknown",
+            "error_code": error_code,
+        }
+        live, poller, sleeps = _hot_path_retry_setup(monkeypatch, [terminal])
+
+        _run_hot_path(live)
+
+        # 只有 order_not_observed 值得重试；其它失败立即放弃，不拖热路径。
+        assert live.verify_calls == 1, error_code
+        assert sleeps == [], error_code
+        assert poller.staged == []
+        assert poller.direct == []
+
+
+# ---------------------------------------------------------------------------
+# 同买家多单定向发现（scan_buyer_orders fan-out）
+# ---------------------------------------------------------------------------
+
+
+def _pending_row(order_id, buyer_id, item_id="item-1"):
+    """普通卖家 NOT_SHIP 待发货页的一行真实结构（ordinary + 待发货）。"""
+    return {
+        "bizOrderId": order_id,
+        "auctionId": item_id,
+        "buyerId": buyer_id,
+        "buyAmount": "1",
+        "totalFee": "3.88",
+        "orderStatusMsg": "等待卖家发货",
+        "idleBizCode": "6",
+        "auctionTitle": "Fixture item",
+        "createTime": "2026-08-28 10:00:00",
+    }
+
+
+class _FanoutDatabase:
+    def __init__(self):
+        self.orders = {}
+        self.sync_updates = []
+
+    def get_cookie(self, _cookie_id):
+        return "unb=account-1; _m_h5_tk=token_value"
+
+    def get_cookie_details(self, _cookie_id):
+        return {"browser_user_agent": "fixture-agent"}
+
+    def get_order_by_id(self, order_id):
+        row = self.orders.get(order_id)
+        return dict(row) if row else None
+
+    def insert_or_update_order(self, **values):
+        self.orders[values["order_id"]] = dict(values)
+        return True
+
+    def apply_order_sync_update(self, **values):
+        self.sync_updates.append(values)
+        return {"updated": True, "status_changed": False, "details_changed": False}
+
+    def find_chat_id_by_buyer(self, _cookie_id, _buyer_id):
+        return None
+
+
+class _AsyncNullLock:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+def _fanout_setup(monkeypatch, *, pending_payload, verify_result=None):
+    """搭 scan_buyer_orders 的最小环境，返回 (poller, database, calls)。"""
+    import XianyuAutoAsync
+    import invite_bridge_poller as poller_module
+
+    database = _FanoutDatabase()
+    poller = poller_module.InviteBridgePoller()
+    calls = {"page": 0, "verify": [], "sent": []}
+
+    async def fake_pending_page(**_kwargs):
+        calls["page"] += 1
+        return pending_payload
+
+    class _Socket:
+        closed = False
+
+    class _Live:
+        ws = _Socket()
+
+        async def _verify_paid_order_for_delivery(self, *, order_id, item_id, buyer_id):
+            calls["verify"].append((order_id, item_id, buyer_id))
+            if verify_result is not None:
+                return dict(verify_result)
+            return {
+                "allowed": True,
+                "status": "pending_ship",
+                "business_type": "ordinary",
+                "amount": "3.88",
+                "quantity": 1,
+                "item_title": "Fixture item",
+                "created_at": "2026-08-28 10:00:00",
+            }
+
+    async def send_event(payload):
+        calls["sent"].append(payload["orderId"])
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _cookie_id: {"item-1"})
+    monkeypatch.setattr(poller_module, "fetch_xianyu_pending_order_page", fake_pending_page)
+    monkeypatch.setattr(poller_module, "get_order_sync_lock", lambda _cookie_id: _AsyncNullLock())
+    monkeypatch.setattr(poller_module, "_message_operation_exists", lambda *_args: False)
+    monkeypatch.setattr(poller_module, "_send_order_event_to_invite", send_event)
+    monkeypatch.setattr(
+        XianyuAutoAsync.XianyuLive,
+        "get_instance",
+        staticmethod(lambda _cookie_id: _Live()),
+    )
+    return poller, database, calls
+
+
+def test_scan_buyer_orders_delivers_sibling_paid_orders(monkeypatch):
+    """同买家第 2 笔无独立付款消息时，fan-out 应立即核验并补投递。"""
+    payload = {
+        "ret": ["SUCCESS::调用成功"],
+        "data": {
+            "items": [
+                _pending_row("9001", "buyer-1"),  # 触发单，必须被排除
+                _pending_row("9002", "buyer-1"),  # 同买家第 2 笔，应补投
+                _pending_row("9003", "buyer-2"),  # 其他买家，不属于 fan-out
+                _pending_row("9004", "buyer-1", item_id="item-other"),  # 非邀请商品
+            ]
+        },
+    }
+    poller, database, calls = _fanout_setup(monkeypatch, pending_payload=payload)
+
+    sent = asyncio.run(
+        poller.scan_buyer_orders(
+            cookie_id="account-1",
+            buyer_id="buyer-1",
+            chat_id="chat-1",
+            exclude_order_ids={"9001"},
+        )
+    )
+
+    assert sent == 1
+    assert calls["page"] == 1
+    # 只对同买家、未排除、邀请商品的候选做付款核验，绝不批量扫全量。
+    assert calls["verify"] == [("9002", "item-1", "buyer-1")]
+    assert calls["sent"] == ["9002"]
+    assert database.orders["9002"]["order_status"] == "pending_ship"
+
+
+def test_scan_buyer_orders_fails_closed_when_payment_unverified(monkeypatch):
+    payload = {
+        "ret": ["SUCCESS::调用成功"],
+        "data": {"items": [_pending_row("9002", "buyer-1")]},
+    }
+    poller, database, calls = _fanout_setup(
+        monkeypatch,
+        pending_payload=payload,
+        verify_result={
+            "allowed": False,
+            "status": "unknown",
+            "error_code": "order_not_observed",
+        },
+    )
+
+    sent = asyncio.run(
+        poller.scan_buyer_orders(cookie_id="account-1", buyer_id="buyer-1")
+    )
+
+    # 核验门禁不放行就一单不发、一单不落库，静默交还兜底轮询。
+    assert sent == 0
+    assert calls["verify"] == [("9002", "item-1", "buyer-1")]
+    assert calls["sent"] == []
+    assert database.orders == {}
+
+
+def test_scan_buyer_orders_cooldown_bounds_platform_requests(monkeypatch):
+    payload = {"ret": ["SUCCESS::调用成功"], "data": {"items": []}}
+    poller, _database, calls = _fanout_setup(monkeypatch, pending_payload=payload)
+
+    first = asyncio.run(
+        poller.scan_buyer_orders(cookie_id="account-1", buyer_id="buyer-1")
+    )
+    second = asyncio.run(
+        poller.scan_buyer_orders(cookie_id="account-1", buyer_id="buyer-1")
+    )
+
+    # 冷却窗内同买家重复触发不再打平台，防付款消息风暴放大请求量。
+    assert (first, second) == (0, 0)
+    assert calls["page"] == 1
+
+
+def test_scan_buyer_orders_marks_session_expired_and_hands_back(monkeypatch):
+    import invite_bridge_poller as poller_module
+
+    payload = {"ret": ["FAIL_SYS_SESSION_EXPIRED::Session过期"]}
+    poller, _database, calls = _fanout_setup(monkeypatch, pending_payload=payload)
+    expired = []
+    monkeypatch.setattr(
+        poller_module,
+        "mark_order_session_expired",
+        lambda _db, cookie_id: expired.append(cookie_id),
+    )
+
+    sent = asyncio.run(
+        poller.scan_buyer_orders(cookie_id="account-1", buyer_id="buyer-1")
+    )
+
+    assert sent == 0
+    assert calls["sent"] == []
+    assert expired == ["account-1"]
+
+
+# ---------------------------------------------------------------------------
+# 对账重发器：本地已发 × 平台待发货 的漂移收敛
+# ---------------------------------------------------------------------------
+
+
+class _ReconcileDatabase:
+    def __init__(self, orders):
+        self.orders = {order["order_id"]: dict(order) for order in orders}
+        self.updates = []
+
+    def get_all_cookies(self):
+        return {"account-1": "fixture-cookie"}
+
+    def get_cookie(self, _cookie_id):
+        return "fixture-cookie"
+
+    def get_cookie_details(self, _cookie_id):
+        return {"browser_user_agent": "fixture-agent"}
+
+    def get_order_by_id(self, order_id):
+        row = self.orders.get(order_id)
+        return dict(row) if row else None
+
+    def insert_or_update_order(self, **values):
+        self.updates.append(values)
+        self.orders.setdefault(values["order_id"], {}).update(values)
+        return True
+
+
+def test_ship_reconciler_repairs_local_shipped_platform_pending_drift(monkeypatch):
+    """反向验证：制造「本地已发×平台待发货」样本，证明重发器补发货并告警。"""
+    import invite_bridge_poller as poller_module
+    from loguru import logger as loguru_logger
+
+    drifted = {
+        "order_id": "order-drift",
+        "cookie_id": "account-1",
+        "item_id": "item-1",
+        "buyer_id": "buyer-1",
+        "order_status": "shipped",
+        "system_shipped": 1,
+        "is_bargain": 1,
+    }
+    database = _ReconcileDatabase([drifted])
+    poller = poller_module.InviteBridgePoller()
+
+    class _OrderClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def discover(self, **_kwargs):
+            return {
+                "success": True,
+                "orders": [
+                    {
+                        "order_id": "order-drift",
+                        "item_id": "item-1",
+                        "buyer_id": "buyer-1",
+                        "order_status": "pending_ship",
+                        "order_business_type": "ordinary",
+                        "amount": "3.88",
+                        "quantity": "1",
+                    }
+                ],
+            }
+
+    ship_calls = []
+
+    async def fake_status(cookie_id, order_id, _cookies):
+        assert (cookie_id, order_id) == ("account-1", "order-drift")
+        return {"success": True, "status": "pending_ship"}
+
+    async def fake_ship(**kwargs):
+        ship_calls.append(kwargs)
+        return {"success": True, "delivery_mode": "free_shipping_then_status_only"}
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _cookie_id: {"item-1"})
+    monkeypatch.setattr(poller_module, "XianyuOrderListClient", _OrderClient)
+    monkeypatch.setattr(poller_module, "get_order_sync_lock", lambda _cookie_id: _AsyncNullLock())
+    monkeypatch.setattr(poller_module, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(poller_module, "_execute_platform_ship", fake_ship)
+
+    warnings = []
+    sink_id = loguru_logger.add(
+        lambda message: warnings.append(str(message)), level="WARNING"
+    )
+    try:
+
+        async def run():
+            await poller._discover_platform_orders()
+            return await poller._reconcile_shipped_drift()
+
+        repaired = asyncio.run(run())
+    finally:
+        loguru_logger.remove(sink_id)
+
+    assert repaired == 1
+    # 补发货动作带上了拼团标记与买家身份，且只执行一次。
+    assert [
+        (call["order_id"], call["is_bargain"], call["buyer_id"]) for call in ship_calls
+    ] == [("order-drift", True, "buyer-1")]
+    assert database.updates[-1]["order_status"] == "shipped"
+    assert database.updates[-1]["system_shipped"] is True
+    assert poller._ship_drift == {}
+    assert any("平台状态漂移" in message for message in warnings)
+    assert any("对账补发货成功" in message for message in warnings)
+
+
+def test_ship_reconciler_self_heals_when_platform_already_progressed(monkeypatch):
+    import invite_bridge_poller as poller_module
+
+    database = _ReconcileDatabase(
+        [
+            {
+                "order_id": "order-drift",
+                "cookie_id": "account-1",
+                "item_id": "item-1",
+                "buyer_id": "buyer-1",
+                "order_status": "shipped",
+                "system_shipped": 1,
+            }
+        ]
+    )
+    poller = poller_module.InviteBridgePoller()
+    poller._ship_drift[("account-1", "order-drift")] = {
+        "cookie_id": "account-1",
+        "order_id": "order-drift",
+        "item_id": "item-1",
+        "buyer_id": "buyer-1",
+    }
+
+    async def fake_status(_cookie_id, _order_id, _cookies):
+        return {"success": True, "status": "shipped"}
+
+    async def unexpected_ship(**_kwargs):
+        raise AssertionError("platform already progressed but ship was re-executed")
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _cookie_id: {"item-1"})
+    monkeypatch.setattr(poller_module, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(poller_module, "_execute_platform_ship", unexpected_ship)
+
+    assert asyncio.run(poller._reconcile_shipped_drift()) == 0
+    assert poller._ship_drift == {}
+    assert database.updates == []
+
+
+def test_ship_reconciler_keeps_candidate_when_recheck_fails_closed(monkeypatch):
+    import invite_bridge_poller as poller_module
+
+    database = _ReconcileDatabase([])
+    poller = poller_module.InviteBridgePoller()
+    candidate = {
+        "cookie_id": "account-1",
+        "order_id": "order-drift",
+        "item_id": "item-1",
+        "buyer_id": "buyer-1",
+    }
+    poller._ship_drift[("account-1", "order-drift")] = dict(candidate)
+
+    async def fake_status(_cookie_id, _order_id, _cookies):
+        return {"success": False, "error": "platform detail fetch failed"}
+
+    async def unexpected_ship(**_kwargs):
+        raise AssertionError("platform state unknown but ship was executed blindly")
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _cookie_id: {"item-1"})
+    monkeypatch.setattr(poller_module, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(poller_module, "_execute_platform_ship", unexpected_ship)
+
+    assert asyncio.run(poller._reconcile_shipped_drift()) == 0
+    # 查不清平台状态就保留候选下轮再试，绝不盲发。
+    assert ("account-1", "order-drift") in poller._ship_drift
+    assert database.updates == []
+
+
+def test_ship_reconciler_respects_per_account_budget_and_interval(monkeypatch):
+    import invite_bridge_poller as poller_module
+
+    database = _ReconcileDatabase([])
+    poller = poller_module.InviteBridgePoller()
+    for index in range(7):
+        order_id = f"order-drift-{index}"
+        poller._ship_drift[("account-1", order_id)] = {
+            "cookie_id": "account-1",
+            "order_id": order_id,
+            "item_id": "item-1",
+            "buyer_id": "buyer-1",
+        }
+
+    ship_calls = []
+
+    async def fake_status(_cookie_id, _order_id, _cookies):
+        return {"success": True, "status": "pending_ship"}
+
+    async def fake_ship(**kwargs):
+        ship_calls.append(kwargs["order_id"])
+        return {"success": True, "delivery_mode": "status_only"}
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _cookie_id: {"item-1"})
+    monkeypatch.setattr(poller_module, "_fetch_platform_order_status", fake_status)
+    monkeypatch.setattr(poller_module, "_execute_platform_ship", fake_ship)
+
+    repaired_first = asyncio.run(poller._reconcile_shipped_drift())
+    repaired_second = asyncio.run(poller._reconcile_shipped_drift())
+
+    # 每轮每账号最多补 5 笔；未到间隔的下一轮直接空转，剩余留给后续轮。
+    assert repaired_first == poller_module.SHIP_RECONCILE_MAX_PER_ACCOUNT
+    assert len(ship_calls) == poller_module.SHIP_RECONCILE_MAX_PER_ACCOUNT
+    assert repaired_second == 0
+    assert len(poller._ship_drift) == 7 - poller_module.SHIP_RECONCILE_MAX_PER_ACCOUNT

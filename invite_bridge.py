@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Request
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from db_manager import db_manager
@@ -60,6 +61,11 @@ def _canonical(value: Any) -> str:
 def _is_provisional_chat(chat_id: str) -> bool:
     """Synthetic direct references are placeholders until a real IM cid exists."""
     return str(chat_id or "").strip().startswith("direct:")
+
+
+def _opaque_ref(value: Any) -> str:
+    """Return a short log reference without exposing an account or order id."""
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:12]
 
 
 def _signature_headers(body: Dict[str, Any], secret: str, operation_key: str = "") -> Dict[str, str]:
@@ -222,6 +228,135 @@ def _order_or_error(order_id: str, cookie_id: str, item_id: str = "") -> Dict[st
     if item_id and str(order.get("item_id") or "") != item_id:
         raise HTTPException(status_code=409, detail="order item mismatch")
     return order
+
+
+async def _fetch_platform_order_status(cookie_id: str, order_id: str, cookies: str) -> Dict[str, Any]:
+    """回查平台订单真实状态；任何不确定一律按查询失败返回（fail-closed）。
+
+    本地 order_status / system_shipped 只是缓存，不是平台事实：护栏与对账
+    都必须以这里的平台详情为准来决定要不要补发货。
+    """
+    if not str(order_id or "").isdigit():
+        return {"success": False, "error": "order id is not a platform order number"}
+    from order_sync_service import fetch_xianyu_order_detail, parse_order_detail_payload
+
+    user_agent = ""
+    try:
+        details = db_manager.get_cookie_details(cookie_id) or {}
+        user_agent = str(details.get("browser_user_agent") or "")
+    except Exception:
+        user_agent = ""
+    try:
+        parsed = parse_order_detail_payload(
+            await fetch_xianyu_order_detail(
+                cookie_id=cookie_id,
+                cookie_string=cookies,
+                order_id=str(order_id),
+                user_agent=user_agent,
+            ),
+            cookie_id,
+        )
+    except Exception as exc:
+        return {"success": False, "error": f"platform detail fetch failed: {type(exc).__name__}"}
+    if not parsed.get("success"):
+        return {"success": False, "error": str(parsed.get("error_code") or "platform_error")}
+    row = next(
+        (
+            item
+            for item in parsed.get("orders") or []
+            if str(item.get("order_id") or "") == str(order_id)
+        ),
+        None,
+    )
+    if not row:
+        return {"success": False, "error": "order missing from platform detail"}
+    return {"success": True, "status": str(row.get("order_status") or "")}
+
+
+async def _execute_platform_ship(
+    *,
+    cookie_id: str,
+    order_id: str,
+    item_id: str,
+    buyer_id: str,
+    is_bargain: bool,
+    cookies: str,
+) -> Dict[str, Any]:
+    """对平台执行「免拼成团 + 虚拟发货」；两个动作平台侧幂等。
+
+    「免拼」（groupon freeshipping）只是拼团成团动作：成团后平台订单仍是
+    待发货，只有虚拟发货（consign.dummy，即 _do_confirm）才能把订单推进到
+    已发货。因此不论哪种订单，最终都必须成功调用一次 _do_confirm；小刀/
+    拼团单需要先免拼成团（「已免拼/已成团」按幂等通过）再发货。免拼报
+    unknown_failure 多半是拼单标记误判（其实是普通单），直接尝试发货；
+    会话失效/风控/限流耗尽等已知失败立即失败关闭，不盲目连打平台。
+    """
+
+    async def _do_freeshipping():
+        from XianyuAutoAsync import XianyuLive
+
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if live_instance:
+            return await asyncio.wait_for(
+                live_instance.auto_freeshipping(order_id, item_id, buyer_id),
+                timeout=35,
+            )
+        from secure_freeshipping_decrypted import SecureFreeshipping
+
+        async with aiohttp.ClientSession(
+            headers={"cookie": cookies},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as session:
+            return await asyncio.wait_for(
+                SecureFreeshipping(session, cookies, cookie_id).auto_freeshipping(
+                    order_id, item_id, buyer_id
+                ),
+                timeout=35,
+            )
+
+    async def _do_confirm():
+        from secure_confirm_decrypted import SecureConfirm
+
+        async with aiohttp.ClientSession(
+            headers={"cookie": cookies},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as session:
+            return await asyncio.wait_for(
+                SecureConfirm(session, cookies, cookie_id, None).auto_confirm(
+                    order_id, item_id
+                ),
+                timeout=35,
+            )
+
+    freeshipping_done = False
+    freeshipping_attempted = False
+    if is_bargain:
+        freeshipping_attempted = True
+        freeshipping_result = await _do_freeshipping()
+        if freeshipping_result and freeshipping_result.get("success"):
+            freeshipping_done = True
+        elif str((freeshipping_result or {}).get("category") or "") != "unknown_failure":
+            return {"success": False, "error": "platform free-shipping confirmation failed"}
+
+    result = await _do_confirm()
+    if (
+        (not result or not result.get("success"))
+        and not freeshipping_attempted
+        and str((result or {}).get("category") or "") == "unknown_failure"
+    ):
+        # 确认发货报未知业务失败且本次还未免拼过：拼单标记可能在轮询补单时
+        # 丢失（平台订单列表不返回该标记），未成团的拼团单无法直接发货。
+        # 补一次免拼后重试真发货。
+        freeshipping_attempted = True
+        freeshipping_result = await _do_freeshipping()
+        if freeshipping_result and freeshipping_result.get("success"):
+            freeshipping_done = True
+            result = await _do_confirm()
+
+    delivery_mode = "free_shipping_then_status_only" if freeshipping_done else "status_only"
+    if not result or not result.get("success"):
+        return {"success": False, "error": "platform status_only confirmation failed"}
+    return {"success": True, "delivery_mode": delivery_mode}
 
 
 async def _send_order_event_to_invite(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -416,94 +551,63 @@ async def mark_invite_fulfilled(request: Request, body: MarkFulfilledRequest):
             return _set_operation(body.operation_key, "needs_review", error="previous fulfillment attempt was interrupted")
         return _operation_response(operation)
     order = _order_or_error(body.order_id, body.cookie_id, body.item_id)
-    if str(order.get("order_status") or "") in {"shipped", "completed"} or bool(order.get("system_shipped")):
-        return _set_operation(body.operation_key, "succeeded", provider_ref=body.order_id, response={"platformStatus": order.get("order_status")})
-    if str(order.get("order_status") or "") != "pending_ship":
+    local_status = str(order.get("order_status") or "")
+    locally_shipped = local_status in {"shipped", "completed"} or bool(order.get("system_shipped"))
+    if not locally_shipped and local_status != "pending_ship":
         return _set_operation(body.operation_key, "needs_review", error="order is not pending_ship")
     cookies = db_manager.get_cookie(body.cookie_id)
     if not cookies:
         return _set_operation(body.operation_key, "needs_review", error="account cookie is unavailable")
+    if locally_shipped:
+        # 本地已发标记只是缓存，不是平台事实。以前这里直接按本地标记返回
+        # succeeded，导致「码已发、平台仍待发货」的订单被幂等护栏永久吞掉
+        # （2026-08 实测 10 笔活跃账号卡单）。现在回查平台真实状态：平台
+        # 确认已推进才算成功；平台仍待发货就继续走补发货；查询失败一律
+        # needs_review 关闭，不盲发。
+        platform = await _fetch_platform_order_status(body.cookie_id, body.order_id, cookies)
+        if not platform.get("success"):
+            return _set_operation(
+                body.operation_key,
+                "needs_review",
+                error=f"platform status recheck failed: {platform.get('error')}",
+            )
+        platform_status = str(platform.get("status") or "")
+        if platform_status != "pending_ship":
+            return _set_operation(
+                body.operation_key,
+                "succeeded",
+                provider_ref=body.order_id,
+                response={"platformStatus": platform_status or order.get("order_status")},
+            )
+        logger.warning(
+            "邀请桥本地已发但平台仍待发货，执行补发货: order_ref={} account_ref={}",
+            _opaque_ref(body.order_id),
+            _opaque_ref(body.cookie_id),
+        )
     try:
         is_bargain = str(order.get("is_bargain") or "").strip().lower() in {"1", "true", "yes", "on"}
         buyer_id = str(order.get("buyer_id") or "")
-
-        async def _do_freeshipping():
-            from XianyuAutoAsync import XianyuLive
-
-            live_instance = XianyuLive.get_instance(body.cookie_id)
-            if live_instance:
-                return await asyncio.wait_for(
-                    live_instance.auto_freeshipping(body.order_id, body.item_id, buyer_id),
-                    timeout=35,
-                )
-            from secure_freeshipping_decrypted import SecureFreeshipping
-
-            async with aiohttp.ClientSession(
-                headers={"cookie": cookies},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as session:
-                return await asyncio.wait_for(
-                    SecureFreeshipping(session, cookies, body.cookie_id).auto_freeshipping(
-                        body.order_id, body.item_id, buyer_id
-                    ),
-                    timeout=35,
-                )
-
-        async def _do_confirm():
-            from secure_confirm_decrypted import SecureConfirm
-
-            async with aiohttp.ClientSession(
-                headers={"cookie": cookies},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as session:
-                return await asyncio.wait_for(
-                    SecureConfirm(session, cookies, body.cookie_id, None).auto_confirm(
-                        body.order_id, body.item_id
-                    ),
-                    timeout=35,
-                )
-
-        # 「免拼」（groupon freeshipping）只是拼团成团动作：成团后平台订单仍是
-        # 待发货，只有虚拟发货（consign.dummy，即 _do_confirm）才能把订单推进到
-        # 已发货。因此不论哪种订单，最终都必须成功调用一次 _do_confirm；小刀/
-        # 拼团单需要先免拼成团（「已免拼/已成团」按幂等通过）再发货。免拼报
-        # unknown_failure 多半是拼单标记误判（其实是普通单），直接尝试发货；
-        # 会话失效/风控/限流耗尽等已知失败立即失败关闭，不盲目连打平台。
-        freeshipping_done = False
-        freeshipping_attempted = False
-        if is_bargain:
-            freeshipping_attempted = True
-            freeshipping_result = await _do_freeshipping()
-            if freeshipping_result and freeshipping_result.get("success"):
-                freeshipping_done = True
-            elif str((freeshipping_result or {}).get("category") or "") != "unknown_failure":
-                return _set_operation(body.operation_key, "failed", error="platform free-shipping confirmation failed")
-
-        result = await _do_confirm()
-        if (
-            (not result or not result.get("success"))
-            and not freeshipping_attempted
-            and str((result or {}).get("category") or "") == "unknown_failure"
-        ):
-            # 确认发货报未知业务失败且本次还未免拼过：拼单标记可能在轮询补单时
-            # 丢失（平台订单列表不返回该标记），未成团的拼团单无法直接发货。
-            # 补一次免拼后重试真发货。
-            freeshipping_attempted = True
-            freeshipping_result = await _do_freeshipping()
-            if freeshipping_result and freeshipping_result.get("success"):
-                freeshipping_done = True
-                result = await _do_confirm()
-
-        delivery_mode = "free_shipping_then_status_only" if freeshipping_done else "status_only"
-        if not result or not result.get("success"):
-            return _set_operation(body.operation_key, "failed", error="platform status_only confirmation failed")
+        ship = await _execute_platform_ship(
+            cookie_id=body.cookie_id,
+            order_id=body.order_id,
+            item_id=body.item_id,
+            buyer_id=buyer_id,
+            is_bargain=is_bargain,
+            cookies=cookies,
+        )
+        if not ship.get("success"):
+            return _set_operation(
+                body.operation_key,
+                "failed",
+                error=str(ship.get("error") or "platform confirmation failed"),
+            )
         if not db_manager.insert_or_update_order(order_id=body.order_id, cookie_id=body.cookie_id, order_status="shipped", system_shipped=True):
             return _set_operation(body.operation_key, "needs_review", error="local order state update failed")
         operation_response = _set_operation(
             body.operation_key,
             "succeeded",
             provider_ref=body.order_id,
-            response={"platformStatus": "shipped", "deliveryMode": delivery_mode},
+            response={"platformStatus": "shipped", "deliveryMode": ship.get("delivery_mode")},
         )
         record_delivery_stage(body.order_id, body.cookie_id, STAGE_SHIPPED)
         return operation_response
