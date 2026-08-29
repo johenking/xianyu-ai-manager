@@ -8025,14 +8025,15 @@ class XianyuLive:
                         break
 
                     # L3 主动保活：独立于预防性 Cookie 刷新开关——即便后者关着，有 L3
-                    # 记忆的账号也趁会话仍有效时免密续期，避免"死后才续必失败"。默认由
-                    # config.L3_KEEPALIVE_ENABLED 关闭（需代理灰度验证后再开），双保险。
+                    # 记忆的账号也趁会话仍有效时免密续期，避免"死后才续必失败"。开关取
+                    # 「全局 config.L3_KEEPALIVE_ENABLED 或该号灰度开关」的或，便于只给
+                    # 配了住宅代理的号先开。
                     # getattr 兜底：测试常用 object.__new__ 构造骨架实例，不应因此炸循环。
                     if XianyuLive._l3_keepalive_due(
                         time.time(),
                         getattr(self, 'last_l3_keepalive_time', 0),
                         getattr(self, 'l3_keepalive_interval', 0),
-                        enabled=L3_KEEPALIVE_ENABLED,
+                        enabled=self._l3_keepalive_switch(),
                     ):
                         self.last_l3_keepalive_time = time.time()
                         asyncio.create_task(self._execute_l3_keepalive())
@@ -8130,29 +8131,40 @@ class XianyuLive:
             return False
         return (float(now) - float(last_time or 0)) >= float(interval)
 
-    async def _execute_l3_keepalive(self):
+    def _l3_keepalive_switch(self) -> bool:
+        """保活是否对本号开启：全局开关或该号的按号灰度开关任一为真。
+
+        按号开关让「只给配了住宅代理的号开保活」成为可能，避免全局一开、
+        没配代理的号从机房 IP 去打 passport。
+        """
+        return bool(L3_KEEPALIVE_ENABLED or getattr(self, "l3_keepalive_enabled", False))
+
+    async def _execute_l3_keepalive(self, *, manual: bool = False) -> dict:
         """趁会话仍有效时用 L3「快速进入」免密续签，让 cookie2 常青。
 
         安全铁律：只有成功拿到新会话才交接监听；任何失败/未续新都只记日志，
         绝不清 has_l3_memory、不标过期、不动现有监听——绝不因保活打扰在跑的账号。
+
+        manual=True 由「立即刷新 Cookie」按钮触发，只绕过保活开关与调度间隔，
+        其余护栏（并发锁、记忆存在性、代理健康门禁）一律照旧。
         """
-        if not L3_KEEPALIVE_ENABLED:
-            return
+        if not manual and not self._l3_keepalive_switch():
+            return {"ok": False, "code": "keepalive_disabled", "message": "该账号未开启主动保活"}
         if self.l3_keepalive_lock.locked() or self.cookie_refresh_lock.locked():
-            return
+            return {"ok": False, "code": "busy", "message": "该账号正在续签中，请稍后再试"}
         from db_manager import db_manager
         from account_session_refresh import active_refresh_registry
 
         if active_refresh_registry.is_active(self.cookie_id):
-            return
+            return {"ok": False, "code": "busy", "message": "该账号已有登录或刷新会话在进行"}
         account_info = await asyncio.to_thread(db_manager.get_cookie_details, self.cookie_id)
         if not account_info or not bool(account_info.get("has_l3_memory")):
-            return
+            return {"ok": False, "code": "no_l3_memory", "message": "该账号还没有浏览器登录记忆"}
         profile_unb = str(account_info.get("xianyu_unb") or "").strip()
         if not profile_unb:
-            return
+            return {"ok": False, "code": "no_unb", "message": "该账号缺少稳定身份标识"}
         if not await self._proxy_preflight_ok("L3 主动保活"):
-            return
+            return {"ok": False, "code": "proxy_unhealthy", "message": "账号代理不可用，已跳过续签"}
         async with self.l3_keepalive_lock:
             try:
                 l3_cookie = await self._recover_via_passwordless_refresh(
@@ -8162,7 +8174,11 @@ class XianyuLive:
                 logger.warning(
                     f"【{self.cookie_id}】L3 主动保活异常（忽略，不影响现有会话）: {self._safe_str(exc)}"
                 )
-                return
+                return {
+                    "ok": False,
+                    "code": "l3_exception",
+                    "message": "免密续签执行异常，现有会话不受影响",
+                }
             if not l3_cookie:
                 error_code = str(getattr(self, "_last_l3_error_code", "") or "")
                 if error_code in L3_KEEPALIVE_RESEED_CODES:
@@ -8170,12 +8186,20 @@ class XianyuLive:
                         f"【{self.cookie_id}】L3 记忆不可用（{error_code}），趁会话仍有效重建档案"
                     )
                     await self._reseed_l3_memory(profile_unb)
-                else:
-                    logger.info(
-                        f"【{self.cookie_id}】L3 主动保活本次未续新"
-                        f"（{error_code or 'no-op'}），保持现有会话"
-                    )
-                return
+                    return {
+                        "ok": False,
+                        "code": "l3_reseeded",
+                        "message": "浏览器记忆已重建，稍后会自动续签",
+                    }
+                logger.info(
+                    f"【{self.cookie_id}】L3 主动保活本次未续新"
+                    f"（{error_code or 'no-op'}），保持现有会话"
+                )
+                return {
+                    "ok": False,
+                    "code": error_code or "l3_no_op",
+                    "message": "本次未续新，现有会话保持不变",
+                }
             updated = await self._update_cookies_and_restart(
                 l3_cookie,
                 browser_user_agent=self.browser_user_agent or detect_default_browser_user_agent(),
@@ -8184,10 +8208,15 @@ class XianyuLive:
             if updated:
                 await asyncio.to_thread(db_manager.mark_cookie_validated, self.cookie_id)
                 logger.info(f"【{self.cookie_id}】L3 主动保活成功，会话已提前续新")
-            else:
-                logger.warning(
-                    f"【{self.cookie_id}】L3 主动保活拿到 Cookie 但监听交接失败（现有会话不受影响）"
-                )
+                return {"ok": True, "code": "renewed", "message": "免密续签成功，会话已续新"}
+            logger.warning(
+                f"【{self.cookie_id}】L3 主动保活拿到 Cookie 但监听交接失败（现有会话不受影响）"
+            )
+            return {
+                "ok": False,
+                "code": "handover_failed",
+                "message": "已续到新会话但监听交接失败",
+            }
 
     async def _reseed_l3_memory(self, profile_unb: str):
         """记忆已死但会话还活着：趁活用当前 Cookie 重建浏览器档案（含就地验证）。

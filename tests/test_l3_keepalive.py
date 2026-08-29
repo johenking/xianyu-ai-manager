@@ -198,6 +198,96 @@ class ExecuteKeepaliveTests(unittest.IsolatedAsyncioTestCase):
             "acct-l3", ip="", status="unsupported_scheme"
         )
 
+    async def test_manual_run_bypasses_switch_but_keeps_guards(self):
+        """手动触发（刷新按钮）绕过保活开关，代理门禁等护栏一律照旧。"""
+        live = _make_live()
+        live._recover_via_passwordless_refresh = AsyncMock(return_value="unb=123; cookie2=new")
+        db = _fake_db(unb="123")
+        with patch("XianyuAutoAsync.L3_KEEPALIVE_ENABLED", False), \
+                patch("db_manager.db_manager", db), \
+                patch("account_session_refresh.active_refresh_registry", _fake_registry()):
+            result = await live._execute_l3_keepalive(manual=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "renewed")
+        live._update_cookies_and_restart.assert_awaited_once()
+
+    async def test_manual_run_still_blocked_by_unhealthy_proxy(self):
+        live = _make_live()
+        db = _fake_db(proxy={"server": "socks5://u:p@h:9"})
+        with patch("XianyuAutoAsync.L3_KEEPALIVE_ENABLED", False), \
+                patch("db_manager.db_manager", db), \
+                patch("account_session_refresh.active_refresh_registry", _fake_registry()):
+            result = await live._execute_l3_keepalive(manual=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "proxy_unhealthy")
+        live._recover_via_passwordless_refresh.assert_not_awaited()
+
+    async def test_manual_run_reports_missing_l3_memory(self):
+        """没有浏览器记忆时如实报错，绝不改动账号任何状态。"""
+        live = _make_live()
+        db = _fake_db(has_l3_memory=0)
+        with patch("XianyuAutoAsync.L3_KEEPALIVE_ENABLED", False), \
+                patch("db_manager.db_manager", db), \
+                patch("account_session_refresh.active_refresh_registry", _fake_registry()):
+            result = await live._execute_l3_keepalive(manual=True)
+
+        self.assertEqual(result["code"], "no_l3_memory")
+        live._recover_via_passwordless_refresh.assert_not_awaited()
+        db.mark_cookie_validated.assert_not_called()
+
+    async def test_per_account_switch_enables_scheduled_keepalive(self):
+        """全局关、按号开 → 定时保活照跑（按号灰度的核心语义）。"""
+        live = _make_live(l3_keepalive_enabled=True)
+        live._recover_via_passwordless_refresh = AsyncMock(return_value="unb=123; cookie2=new")
+        db = _fake_db(unb="123")
+        with patch("XianyuAutoAsync.L3_KEEPALIVE_ENABLED", False), \
+                patch("db_manager.db_manager", db), \
+                patch("account_session_refresh.active_refresh_registry", _fake_registry()):
+            result = await live._execute_l3_keepalive()
+
+        self.assertTrue(result["ok"])
+        live._update_cookies_and_restart.assert_awaited_once()
+
+    async def test_both_switches_off_is_hard_noop_for_scheduled_run(self):
+        live = _make_live(l3_keepalive_enabled=False)
+        db = _fake_db()
+        with patch("XianyuAutoAsync.L3_KEEPALIVE_ENABLED", False), \
+                patch("db_manager.db_manager", db):
+            result = await live._execute_l3_keepalive()
+
+        self.assertEqual(result["code"], "keepalive_disabled")
+        db.get_cookie_details.assert_not_called()
+
+
+class ManualRefreshChannelTests(unittest.IsolatedAsyncioTestCase):
+    """CookieManager 手动续签通道：只对在跑的监听可用。"""
+
+    def _manager(self):
+        from cookie_manager import CookieManager
+
+        manager = object.__new__(CookieManager)
+        manager.live_instances = {}
+        return manager
+
+    async def test_missing_listener_reports_instead_of_raising(self):
+        manager = self._manager()
+        result = await manager.trigger_manual_l3_refresh("acct-l3")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "listener_not_running")
+
+    async def test_delegates_to_live_instance_in_manual_mode(self):
+        manager = self._manager()
+        live = Mock()
+        live._execute_l3_keepalive = AsyncMock(return_value={"ok": True, "code": "renewed"})
+        manager.live_instances["acct-l3"] = live
+
+        result = await manager.trigger_manual_l3_refresh("acct-l3")
+
+        live._execute_l3_keepalive.assert_awaited_once_with(manual=True)
+        self.assertTrue(result["ok"])
+
 
 class ProxyPreflightTests(unittest.IsolatedAsyncioTestCase):
     """代理健康门禁：无代理零打扰放行；坏代理拒绝放行且落库状态。"""
