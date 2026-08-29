@@ -4874,6 +4874,18 @@ class DBManager:
             ''', (profile_id, user_id)).fetchone()
             return self._serialize_ai_provider_profile(row, include_secret) if row else None
 
+    def get_site_admin_user_id(self) -> Optional[int]:
+        """站级共享属主：admin 用户 id（与 reply_server.ADMIN_USERNAME 口径一致）。
+
+        代理（子账号）无自有发货规则时回退匹配该用户的规则并消耗其卡密库存
+        （产品决策见 2026-08-29 会话：代理完全同步主站）。
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM users WHERE lower(username) = 'admin' LIMIT 1"
+            ).fetchone()
+            return int(row[0]) if row else None
+
     def get_site_default_ai_provider_profile(self, include_secret: bool = False) -> Optional[dict]:
         """站级共享 AI 平台配置：admin 账号的默认且已验证的平台配置。
 

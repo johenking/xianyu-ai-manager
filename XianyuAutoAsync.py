@@ -5901,6 +5901,25 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
+    @staticmethod
+    def _match_rules_with_site_fallback(database, rule_owner_user_id, matcher, log_label):
+        """账号归属用户无匹配规则时回退主站（admin）共享规则。
+
+        代理零配置开箱即用：命中主站规则即消耗主站卡密库存（用户拍板，
+        见 2026-08-29 会话）。代理自有规则永远优先；admin 自己的账号
+        不重复查询。matcher 是按 user_id 查规则的闭包，两级查询共用。
+        """
+        rules = matcher(rule_owner_user_id)
+        if rules:
+            return rules
+        site_owner_id = database.get_site_admin_user_id()
+        if site_owner_id is None or int(site_owner_id) == int(rule_owner_user_id):
+            return rules
+        site_rules = matcher(site_owner_id)
+        if site_rules:
+            logger.info(f"账号内无{log_label}发货规则，回退主站共享规则（{len(site_rules)}个）")
+        return site_rules
+
     async def _auto_delivery(
         self,
         item_id: str,
@@ -6086,9 +6105,17 @@ class XianyuLive:
                     # 多规格商品：只匹配多规格发货规则
                     if spec_name and spec_value:
                         logger.info("多规格商品开始匹配账号内发货规则")
-                        delivery_rules = database.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value, user_id=rule_owner_user_id)
-                        # 过滤只保留多规格卡券
-                        delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
+                        delivery_rules = self._match_rules_with_site_fallback(
+                            database,
+                            rule_owner_user_id,
+                            lambda owner_id: [
+                                r for r in database.get_delivery_rules_by_keyword_and_spec(
+                                    search_text, spec_name, spec_value, user_id=owner_id
+                                )
+                                if r.get('is_multi_spec')
+                            ],
+                            "多规格",
+                        )
 
                         if delivery_rules:
                             logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
@@ -6101,9 +6128,17 @@ class XianyuLive:
                 else:
                     # 非多规格商品：只匹配非多规格发货规则
                     logger.info("非多规格商品开始匹配账号内普通发货规则")
-                    delivery_rules = database.get_delivery_rules_by_keyword(search_text, user_id=rule_owner_user_id)
-                    # 过滤只保留非多规格卡券
-                    delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
+                    delivery_rules = self._match_rules_with_site_fallback(
+                        database,
+                        rule_owner_user_id,
+                        lambda owner_id: [
+                            r for r in database.get_delivery_rules_by_keyword(
+                                search_text, user_id=owner_id
+                            )
+                            if not r.get('is_multi_spec')
+                        ],
+                        "普通",
+                    )
 
                     if delivery_rules:
                         logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
