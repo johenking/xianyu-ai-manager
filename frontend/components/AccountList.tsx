@@ -297,6 +297,9 @@ const AccountList: React.FC<AccountListProps> = () => {
   const [passwordInteraction, setPasswordInteraction] = useState<BrowserInteractionDescriptor | null>(null);
   const [passwordSubmitting, setPasswordSubmitting] = useState(false);
   const [officialWindowAccount, setOfficialWindowAccount] = useState('');
+  // 重登流程锁定的账号 id：扫码时据此把该账号的住宅代理透传给后端；
+  // 新增账号流程为空串（直连原行为）。
+  const reauthAccountIdRef = useRef<string>('');
   const [officialWindowStatus, setOfficialWindowStatus] = useState<AddLoginStatus>('idle');
   const [officialWindowMessage, setOfficialWindowMessage] = useState('');
   const [officialInteraction, setOfficialInteraction] = useState<BrowserInteractionDescriptor | null>(null);
@@ -635,6 +638,7 @@ const AccountList: React.FC<AccountListProps> = () => {
 
   const openAddAccountModal = () => {
     setReauthReminderAccounts([]);
+    reauthAccountIdRef.current = '';
     setShowAddModal(true);
   };
 
@@ -1177,6 +1181,7 @@ const AccountList: React.FC<AccountListProps> = () => {
 
   const openReauthMethod = (account: AccountDetail) => {
     loginFlowGenerationRef.current += 1;
+    reauthAccountIdRef.current = account.id;
     setReauthReminderAccounts([]);
     setActiveModal(null);
     setShowAddModal(true);
@@ -1673,7 +1678,7 @@ const AccountList: React.FC<AccountListProps> = () => {
     setQrInteraction(null);
     qrHadVerificationRef.current = false;
     try {
-      const res = await generateQRLogin();
+      const res = await generateQRLogin(reauthAccountIdRef.current || undefined);
       if (flowGeneration !== loginFlowGenerationRef.current) {
         if (res.session_id) {
           await cancelQRSessionById(res.session_id, 'switched_method');

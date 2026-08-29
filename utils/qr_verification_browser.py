@@ -121,8 +121,15 @@ class QRVerificationBrowser:
         on_update: Optional[BrowserUpdateCallback] = None,
         should_stop: Optional[StopCallback] = None,
         interaction_channel: Optional[BrowserInteractionChannel] = None,
+        *,
+        proxy: Any = None,
     ) -> Dict[str, object]:
-        """打开验证页并等待用户完成身份验证。"""
+        """打开验证页并等待用户完成身份验证。
+
+        proxy 为本次扫码会话绑定的账号代理：验证页必须与扫码接口走同一
+        出口 IP，否则风控侧看到的 IP 跳变会加剧验证失败。缺省沿用实例级
+        代理（None=直连原行为）。
+        """
         if not verification_url:
             return {
                 "status": "failed",
@@ -154,7 +161,7 @@ class QRVerificationBrowser:
                 context = playwright.chromium.launch_persistent_context(
                     str(user_data_dir),
                     headless=False,
-                    **chromium_runtime_options(self._proxy),
+                    **chromium_runtime_options(proxy if proxy is not None else self._proxy),
                     args=self._browser_args(),
                     **context_kwargs,
                 )

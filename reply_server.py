@@ -3982,11 +3982,27 @@ def _require_owned_qr_session(
     return registry, persisted
 
 
+class QRLoginGenerateIn(BaseModel):
+    # 重登已有账号时带上其 cid：扫码全流程走该账号的住宅代理出口，规避
+    # 机房 IP 风控。新增账号不带 cid，保持直连原行为。
+    cid: Optional[str] = None
+
+
 @accounts_router.post("/qr-login/generate")
-async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_user)):
+async def generate_qr_code(
+    payload: Optional[QRLoginGenerateIn] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
     """Generate the default login QR without starting a browser."""
     try:
-        result = await qr_login_manager.generate_qr_code()
+        cid = (payload.cid or "").strip() if payload else ""
+        if cid:
+            # 归属校验后按账号代理注入；查不到配置则 None=直连（原行为）。
+            _require_owned_cookie(cid, current_user['user_id'])
+            proxy_config = db_manager.get_account_proxy_config(cid)
+            result = await qr_login_manager.generate_qr_code(proxy=proxy_config)
+        else:
+            result = await qr_login_manager.generate_qr_code()
         if result.get("success"):
             session_id = result["session_id"]
             get_session_registry().register(
