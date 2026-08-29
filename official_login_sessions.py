@@ -13,6 +13,7 @@ from account_session_refresh import (
     official_login_error_message,
     remove_verification_image,
 )
+from db_manager import db_manager
 from session_registry import get_session_registry, sanitize_runtime_error
 from utils.xianyu_official_login import (
     OfficialLoginResult,
@@ -83,6 +84,24 @@ class OfficialLoginSessionCoordinator:
     def _flight_key(owner_user_id: int, mode: str, account: str) -> str:
         account_key = account.strip().lower() if mode in {"password", "sms"} else "official-qr"
         return f"{owner_user_id}:{mode}:{account_key}"
+
+    def _resolve_account_proxy(self, record: OfficialLoginSessionRecord) -> Any:
+        """按 expected_unb 反查账号，取其住宅代理配置。
+
+        人工重登是滑块最集中的一跳，必须和自动续签走同一个出口 IP，否则
+        账号轨迹会在住宅 IP 与机房 IP 之间跳变。新账号首登拿不到 unb，返回
+        None 走原有无代理路径。任何异常都吞掉：代理解析失败绝不能挡住登录。
+        """
+        unb = (record.expected_unb or "").strip()
+        if not unb:
+            return None
+        try:
+            cookie_id = db_manager.find_cookie_id_by_unb(record.owner_user_id, unb)
+            if not cookie_id:
+                return None
+            return db_manager.get_account_proxy_config(cookie_id)
+        except Exception:
+            return None
 
     async def start(
         self,
@@ -193,7 +212,12 @@ class OfficialLoginSessionCoordinator:
             return True
 
         try:
-            service = self.service_factory()
+            account_proxy = await asyncio.to_thread(self._resolve_account_proxy, record)
+            service = (
+                self.service_factory(proxy=account_proxy)
+                if account_proxy
+                else self.service_factory()
+            )
             if record.mode == "qr":
                 result = await asyncio.to_thread(
                     service.login_with_qr,
