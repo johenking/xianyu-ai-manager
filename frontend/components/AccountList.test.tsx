@@ -1348,6 +1348,50 @@ describe('AccountList session verification UI', () => {
     },
   );
 
+  it('passes the account cid when re-scanning an expired account so login uses its residential proxy', async () => {
+    vi.mocked(getAccountDetails).mockResolvedValue([{
+      id: 'expired-proxy-account',
+      enabled: true,
+      auto_confirm: false,
+      remark: '住宅代理账号',
+      nickname: '住宅代理账号',
+      pause_duration: 0,
+      login_method: 'qr',
+      login_method_label: '扫码登录',
+      auto_refresh_supported: false,
+      reauth_required: true,
+      reauth_action: 'qr_login',
+      last_expired_at: 4321,
+    } as any]);
+    vi.mocked(getAccountSessionStatus).mockResolvedValue({
+      state: 'manual_reauth_required',
+      trigger: 'expired',
+      message: '需要重新扫码',
+      error_code: 'manual_reauth_required',
+      verification_image_url: '',
+      last_expired_at: 4321,
+      updated_at: 2000,
+    });
+
+    render(<AccountList />);
+    const reminder = await screen.findByRole('dialog', { name: '账号登录已过期' });
+    fireEvent.click(within(reminder).getByRole('button', { name: '重新扫码' }));
+    fireEvent.click(await screen.findByRole('button', { name: '网页二维码' }));
+
+    await screen.findByAltText('闲鱼登录二维码');
+    expect(generateQRLogin).toHaveBeenCalledWith('expired-proxy-account');
+  });
+
+  it('adds a brand-new account without a cid so the QR flow stays a direct connection', async () => {
+    render(<AccountList />);
+    await screen.findByText('可自动续期 · 定时关闭');
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(screen.getByRole('button', { name: '网页二维码' }));
+
+    await screen.findByAltText('闲鱼登录二维码');
+    expect(generateQRLogin).toHaveBeenCalledWith(undefined);
+  });
+
   it('shows one reminder for the same account expiry and shows a new one when last_expired_at changes', async () => {
     let lastExpiredAt = 1234;
     const expiredAccount = () => ({

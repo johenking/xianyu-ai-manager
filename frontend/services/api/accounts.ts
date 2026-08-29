@@ -331,8 +331,10 @@ export const addAccountCookie = async (data: { id?: string; value: string }): Pr
   return post('/cookies', data);
 };
 
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string; error_code?: string; retryable?: boolean }> => {
-  return post('/qr-login/generate');
+export const generateQRLogin = async (cid?: string): Promise<{ success: boolean; session_id?: string; qr_code_url?: string; message?: string; error_code?: string; retryable?: boolean }> => {
+  // 重登已有账号时带 cid：后端据此让扫码全流程走该账号的住宅代理出口；
+  // 新增账号不传 cid，保持直连原行为。
+  return post('/qr-login/generate', cid ? { cid } : undefined);
 };
 
 export const checkQRLoginStatus = async (sessionId: string): Promise<QRLoginStatusResponse> => {

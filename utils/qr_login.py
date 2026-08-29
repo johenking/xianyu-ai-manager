@@ -69,8 +69,19 @@ class NotLoginError(Exception):
 class QRLoginSession:
     """二维码登录会话"""
 
-    def __init__(self, session_id: str):
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        proxy: Optional[str] = None,
+        proxy_config: Any = None,
+    ):
         self.session_id = session_id
+        # 本次扫码全流程使用的出口代理（httpx 内联账密 URL；None=直连）。
+        # 重登已有账号时绑定该账号的住宅代理，避免机房 IP 触发风控。
+        self.proxy = proxy
+        # 原始代理配置，供安全验证浏览器（Chromium）使用同一出口。
+        self.proxy_config = proxy_config
         self.status = 'waiting'  # waiting, scanned, success, expired, cancelled, verification_required, verification_checking
         self.qr_code_url = None
         self.qr_content = None
@@ -234,7 +245,7 @@ class QRLoginManager:
         app_key = "34839810"
 
         # 先发一次 GET 请求，获取 cookie 中的 m_h5_tk
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, proxy=session.proxy) as client:
             try:
                 resp = await client.get(
                     self.api_h5_tk,
@@ -307,7 +318,7 @@ class QRLoginManager:
             "rnd": random(),
         }
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=session.proxy) as client:
             try:
                 resp = await client.get(
                     self.api_mini_login,
@@ -342,12 +353,22 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
 
-    async def generate_qr_code(self) -> Dict[str, Any]:
-        """生成二维码"""
+    async def generate_qr_code(self, *, proxy: Any = None) -> Dict[str, Any]:
+        """生成二维码。
+
+        proxy 传入账号住宅代理配置时，本次扫码全流程（h5 令牌、登录参数、
+        二维码生成、状态轮询、安全验证浏览器）都从该出口发出；未配置或
+        配置非法时回落到实例级代理（全局单例为 None，即直连原行为）。
+        """
         try:
             # 创建新的会话
             session_id = str(uuid.uuid4())
-            session = QRLoginSession(session_id)
+            session_proxy = httpx_proxy_url(proxy)
+            session = QRLoginSession(
+                session_id,
+                proxy=session_proxy or self.proxy,
+                proxy_config=proxy if session_proxy else None,
+            )
 
             # 1. 获取m_h5_tk
             await self._get_mh5tk(session)
@@ -358,7 +379,7 @@ class QRLoginManager:
             logger.info(f"获取登录参数成功: {session_id}")
 
             # 3. 生成二维码
-            async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=session.proxy) as client:
                 resp = await client.get(
                     self.api_generate_qr,
                     params=login_params,
@@ -455,7 +476,7 @@ class QRLoginManager:
 
     async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
         """获取二维码扫描状态"""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=session.proxy) as client:
             resp = await client.post(
                 self.api_scan_status,
                 data=session.params,
@@ -792,6 +813,7 @@ class QRLoginManager:
             lambda update: self._apply_verification_browser_update(session_id, update),
             lambda: self._should_stop_verification_browser(session_id),
             session.interaction_channel,
+            proxy=session.proxy_config,
         )
 
         session = self.sessions.get(session_id)
