@@ -26,18 +26,23 @@ BACKOFF_JITTER_RANGE = (0.5, 1.5)
 
 # 已发货/重复确认：平台已处于发货终态，按幂等成功处理，不重试
 ALREADY_SHIPPED_MARKERS = ("已发货", "重复发货", "重复确认", "请勿重复")
-# 会话/令牌失效：重试无意义，立即失败并交由登录维护流程处理
+# 会话失效：重试无意义，立即失败并交由登录维护流程处理
 SESSION_INVALID_MARKERS = (
     "FAIL_SYS_SESSION_EXPIRED",
     "SESSION_EXPIRED",
     "SESSION过期",
-    "FAIL_SYS_TOKEN_EXOIRED",
-    "FAIL_SYS_TOKEN_EXPIRED",
-    "FAIL_SYS_TOKEN_EMPTY",
-    "令牌过期",
-    "TOKEN过期",
     "MINI_LOGIN",
     "PASSPORT.GOOFISH.COM",
+)
+# 令牌过期：短暂状态，平台随失败响应即下发新 _m_h5_tk（已被 _post_confirm 合并进
+# cookies_str），可用新令牌就地重试一次；单列一类以区别于会话失效。
+TOKEN_EXPIRED_MARKERS = (
+    "FAIL_SYS_TOKEN_EXPIRED",
+    "FAIL_SYS_TOKEN_EXOIRED",
+    "FAIL_SYS_TOKEN_EMPTY",
+    "令牌过期",
+    "令牌为空",
+    "TOKEN过期",
 )
 # 风控/需真人验证：继续重试只会加重风控，立即失败并转人工
 HUMAN_INTERVENTION_MARKERS = (
@@ -75,11 +80,14 @@ def classify_confirm_ret(ret_values):
     返回 (category, ret_text)，category 取值：
     - success              调用成功
     - already_shipped      已发货/重复确认，幂等成功
-    - session_invalid      会话/令牌失效，立即失败不重试
+    - token_expired        令牌过期，可用响应新令牌就地重试一次
+    - session_invalid      会话失效，立即失败不重试
     - human_intervention   风控/需真人验证，立即失败不重试
     - rate_limited         限流，可退避重试
     - platform_unavailable 5xx/网关类暂时不可用，可退避重试
     - unknown_failure      无法确定的失败，一律失败关闭不重试
+
+    令牌类先于会话类判定：令牌过期是短暂状态、可就地重试，语义上与会话失效不同。
     """
     values = [str(value) for value in (ret_values or [])]
     ret_text = " | ".join(values)
@@ -90,6 +98,8 @@ def classify_confirm_ret(ret_values):
         return "success", ret_text
     if any(marker in upper for marker in ALREADY_SHIPPED_MARKERS):
         return "already_shipped", ret_text
+    if any(marker in upper for marker in TOKEN_EXPIRED_MARKERS):
+        return "token_expired", ret_text
     if any(marker in upper for marker in SESSION_INVALID_MARKERS):
         return "session_invalid", ret_text
     if any(marker in upper for marker in HUMAN_INTERVENTION_MARKERS):
@@ -180,6 +190,11 @@ class SecureConfirm:
             logger.debug(f"【{self.cookie_id}】已更新数据库中的Cookie")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
+
+    def _current_token(self):
+        """取当前 cookies_str 里的 _m_h5_tk 令牌值（`_` 前段），无则空串。"""
+        cookies = trans_cookies(self.cookies_str or "")
+        return str(cookies.get('_m_h5_tk') or '').split('_', 1)[0]
 
     def _build_confirm_request(self, order_id):
         """构造一次确认发货请求的 params/data（纯本地计算，不发网络）。
@@ -274,6 +289,7 @@ class SecureConfirm:
         attempts_used = max(0, int(retry_count))
         last_error = "自动确认发货失败，重试次数过多"
         last_category = "retry_exhausted"
+        token_retry_used = False
 
         while attempts_used < MAX_CONFIRM_ATTEMPTS:
             attempts_used += 1
@@ -282,6 +298,7 @@ class SecureConfirm:
                 f"第{attempts_used}次尝试"
             )
             params, data = self._build_confirm_request(order_id)
+            attempt_token = self._current_token()
 
             try:
                 res_json = await self._post_confirm(params, data)
@@ -312,6 +329,32 @@ class SecureConfirm:
                     f"【{self.cookie_id}】订单已是发货状态，按幂等成功处理，订单ID: {order_id}"
                 )
                 return {"success": True, "order_id": order_id, "already_shipped": True}
+
+            if category == "token_expired":
+                # 平台随失败响应已下发新 _m_h5_tk（_post_confirm 已合并进 cookies_str）。
+                # 令牌确实换新且本单未重试过 → 立即原地重试一次；否则按会话失效失败关闭。
+                fresh_token = self._current_token()
+                if (
+                    not token_retry_used
+                    and fresh_token
+                    and fresh_token != attempt_token
+                    and attempts_used < MAX_CONFIRM_ATTEMPTS
+                ):
+                    token_retry_used = True
+                    logger.warning(
+                        f"【{self.cookie_id}】确认发货遇令牌过期，令牌已换新，立即重试，"
+                        f"订单ID: {order_id}"
+                    )
+                    continue
+                logger.warning(
+                    f"【{self.cookie_id}】❌ 确认发货令牌过期且无法换新，失败关闭，"
+                    f"错误码={error_code}"
+                )
+                return {
+                    "error": f"自动确认发货失败: {error_code}",
+                    "order_id": order_id,
+                    "category": "session_invalid",
+                }
 
             if category in ("session_invalid", "human_intervention"):
                 # 会话失效/风控：重试只会加重风控，立即失败关闭并交人工处理
