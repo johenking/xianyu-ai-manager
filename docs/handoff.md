@@ -1,5 +1,9 @@
 # Handoff
 
+## 2026-08-29 AI 回复图片降级发布（15:30）
+
+云生产 APP_A 切到 `xianyu-ai-manager:ai-image-fallback-20260829-152854`（基底 `pingroup-fix-20260829-144558`，仅 COPY `ai_reply_engine.py`，本地=staging=容器 sha256 三方一致）。修复：买家图片消息在 `_prepare_image_parts` 六种安全校验（provider 兼容/CDN 白名单/响应类型/解码/像素/格式）任一失败时，不再放弃整条回复——两处调用点（订单感知主路径+legacy）捕获 ValueError 降级为无图：纯图片消息回固定引导「图片我这边看不了，麻烦文字描述下问题」并落 draft，混合消息走无图正常生成；warning 记录具体失败原因（固定文案）。校验零放宽，失败图片绝不进模型。门禁：全量 `pytest tests/` 1103 passed + 205 subtests（基线 1101+2）、2 条新测试反向验证、Ruff/py_compile 过。发布后：`DEPLOY_APP_A=PASS`、容器 healthy、拼团修复标记仍在（派生链未丢）、部署后 4 分钟日志无 traceback、心跳/API/邀请桥轮询正常。观察项：ValueError 归零（历史 ~20 次/天）+ 新 warning 的 reason 分布首次揭示实际失败原因。回滚 `outputs/ai-image-fallback-20260829T152854+0800/rollback/rollback.sh`。
+
 ## 2026-08-29 拼单发货修复发布（14:48）
 
 云生产 APP_A 切到 `xianyu-ai-manager:pingroup-fix-20260829-144558`（基底=部署时刻运行镜像 `browser-ext-1.2.3-20260829-0745`，仅 COPY `order_sync_service.py` / `XianyuAutoAsync.py`，容器内 sha256 与维护源工作树一致）。修复：`classify_order_business_type` 认识拼团单（bizCode=="6000" 或含 "pinGroup" → ordinary，失败关闭语义未放宽），一处改动同时修热路径门禁 / send-message 门禁 / 30s 轮询 / 对账重发器四条链路；热路径 2/4/8s 退避重试扩展到 `order_business_type_unconfirmed`。门禁：全量 1101 passed + 205 subtests、3 条新测试反向验证、Ruff/py_compile 过。发布后：`DEPLOY_APP_A=PASS`、双公网域名 ready、迁移 `2026082502` 不变、启动切片零错误、心跳恢复、「跳过非普通业务类型」拦截日志归零。存量 ~10 笔按用户拍板随修复自动收敛（幂等不重码；已发过链接的等买家点击，本地已发×平台待发货走 600s 对账重发器，过期账号上的等重登）。退款单（尾号 005037）系统正确拒发，留用户人工处理。回滚 `outputs/pingroup-fix-20260829T144558+0800/rollback/rollback.sh`。

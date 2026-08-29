@@ -38,6 +38,15 @@
 - 退款单（尾号 005037，ref_8e58c959c5）系统正确拒发（status=refunding），留用户人工处理。
 - 证据：`outputs/pingroup-fix-20260829T144558+0800/evidence/verification-record.md`；回滚 `outputs/pingroup-fix-20260829T144558+0800/rollback/rollback.sh --check|--execute`（回 browser-ext-1.2.3）。
 
+## AI 回复图片降级修复（已上云 · 2026-08-29 15:30）
+
+- 根因（当日调查实证）：买家发图片消息时 `generate_reply` 先经 `_prepare_image_parts` 下载+六种安全校验（provider 兼容/CDN 白名单/响应类型/解码/像素上限/格式），任一失败抛 ValueError → 外层 except 只记 error_type 不记原因 → 整条回复放弃 → 买家收不到任何回复。08-27 上云起 ~20 次/天（18/27/18），与发货链路无关。
+- 修复（ai_reply_engine.py 单文件）：两处调用点（订单感知主路径+legacy）捕获 ValueError 降级——warning 记具体失败原因（固定文案无敏感数据）+ image_parts 置空；纯图片消息由既有非文本引导接管（回「图片我这边看不了，麻烦文字描述下问题」并落 draft），混合消息走无图正常生成。六种校验零放宽，失败图片绝不进模型。
+- 测试：新增 2 条（主路径纯图降级引导+不触模型+draft 落库 / legacy 降级无图生成），反向验证 stash 后恰好 2 红。全量 `pytest tests/` **1103 passed + 205 subtests**（基线 1101+2 对账吻合）；Ruff/py_compile 过。注意全量口径必须 `pytest tests/`，裸 `pytest` 会误采集 outputs/ 快照测试报 35 collection errors。
+- 发布（15:30）：镜像 `xianyu-ai-manager:ai-image-fallback-20260829-152854`（基底 pingroup-fix-144558，仅 COPY 1 文件）。`DEPLOY_APP_A=PASS`；双哈希一致（本地=staging=容器 `bcdeabfb…`）；拼团修复标记仍在（派生链未丢）；`rollback.sh --check`=PASS（回 pingroup-fix）；部署后 4 分钟日志无 traceback，心跳/API/邀请桥轮询正常。
+- 观察项：ValueError 应归零；新 warning `入站图片处理失败，降级为无图回复: reason=…` 将首次揭示线上实际失败原因是六种中哪一种（旧日志不记原因无法定位）。
+- 证据：`outputs/ai-image-fallback-20260829T152854+0800/evidence/verification-record.md`；回滚 `outputs/ai-image-fallback-20260829T152854+0800/rollback/rollback.sh --check|--execute`。
+
 # 扫码账号免密自动续签（五阶段）：已发布上线
 
 - 目标：扫码账号留下持久浏览器记忆（L3），cookie 失效后免密自动续签，不必再绑密码。
@@ -47,8 +56,8 @@
 
 # 当前生产状态
 
-- 最终复核时间：2026-08-29 14:50。唯一活跃生产是云 HOST `app-suite-candidate` 容器 `app-a-cloud-app-a-1`，镜像 `xianyu-ai-manager:pingroup-fix-20260829-144558`。公网 `/health/ready` = ready，迁移 `2026082502`。Mac LaunchAgent / `8091` 已冻结，不得再据其推导线上状态。
-- 镜像链（新→旧）：拼单修复（本镜像）→ 浏览器扩展导入修复 `browser-ext-1.2.3-20260829-0745` → 发货提速+破自锁+对账 `ship-speedup-20260829-072150` → P0/P2 埋点 `p0p2-observability-20260828-2120` → 小刀两段式、白屏固化、404 no-store、Bundle A / L3 / Toast / 仪表盘等。
+- 最终复核时间：2026-08-29 15:35。唯一活跃生产是云 HOST `app-suite-candidate` 容器 `app-a-cloud-app-a-1`，镜像 `xianyu-ai-manager:ai-image-fallback-20260829-152854`。容器 healthy，迁移 `2026082502`。Mac LaunchAgent / `8091` 已冻结，不得再据其推导线上状态。
+- 镜像链（新→旧）：AI 图片降级（本镜像）→ 拼单修复 `pingroup-fix-20260829-144558` → 浏览器扩展导入修复 `browser-ext-1.2.3-20260829-0745` → 发货提速+破自锁+对账 `ship-speedup-20260829-072150` → P0/P2 埋点 `p0p2-observability-20260828-2120` → 小刀两段式、白屏固化、404 no-store、Bundle A / L3 / Toast / 仪表盘等。
 - listener 注册隔离仍有效；`runtime_sessions` 只记录带 TTL 的临时操作，不代表 listener 数量。
 - 维护源是 `/Users/mac/Documents/咸鱼监控台`；Mac `/Users/mac/Library/Application Support/XianyuManager` 是冻结回滚备份。两棵树不得整树互相覆盖。工作树中的 `.cursor/` 与未提交 `browser_extension/*` 继续保留，不清理、不覆盖。
 
