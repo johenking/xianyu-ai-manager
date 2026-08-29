@@ -1,3 +1,18 @@
+# 代理多租户（2026-08-29 · 六任务全部完成，待领导确认部署）
+
+- 目标：分销代理经邀请码注册进监控台，只管自己的闲鱼账号（销量/商品/AI/自助扫码重登），互不可见；admin 独享全站汇总+分代理明细+账号总览；禁用代理即账号下线。开发+测试完成即止，不部署不 push（等领导确认）。
+- 顺序：任务 0 基线 → 1 邀请码注册 → 2 全站汇总+admin 明细 → 3 admin 账号总览 → 4 告警按归属路由+自助重登走查 → 5 禁用处置 → 6 越权渗透固化。
+- 最大风险：与并行登录会话共享 4 文件（reply_server/db_manager/schema_migrations/XianyuAutoAsync）——只加不改其未提交 diff，git add 永远点名文件；其在制品已致 12 个测试红（见 BLOCKED 首条），完成口径按快照调整。
+- 任务 0 完成（15:5x）：基线快照 12 failed + 1101 passed（归因并行在制品）；Ruff 全绿；并行在制品 12 文件清单已录（git status 快照 /tmp/tenant-task0-gitstatus.txt）；迁移号 2026082901 已被并行占用，本任务用 2026082902。
+- 现状底账：registration_invites 表已在迁移存在（列全）、register_user 有 invite_code 参数但无校验实现、registration-config 硬编码 invite_required=False、前端有 invite_required 类型无输入框、cookies.user_id 归属/仪表盘按用户隔离/扫码会话归属校验均已在。
+- 任务 1 完成（16:2x）：邀请码注册复活（v1.7.0 移除的功能）——auth_registration_service.py 服务层（创建/列表/吊销/开关，HMAC digest 存储明文只回一次，事务内唯一消费）+ 三个 410 路由复活 + PUT /api/admin/registration/invite-required + 前端注册输入框与管理区块。开关默认关=存量语义零破坏。新测试 8（test_registration_invites.py）+ 端到端改写；反向验证 7 红 1 绿（绿者恰为 legacy 用例）。
+- 任务 2 完成（16:3x）：GET /api/dashboard/global-summary（任何登录用户见全站合计，无分用户泄漏）+ GET /api/admin/dashboard/agents（admin 独享分代理明细）；db_manager 两聚合方法（口径与 dashboard-summary 一致）；前端 SiteOverview 组件。新测试后端 2 + 前端 3。
+- 任务 3 完成（16:4x）：GET /api/admin/accounts/overview（cookies JOIN users 单 SQL，掉线判定/归属/登录方式，绝不出 cookie value）；前端 AdminAccountsPanel 挂 Settings 管理区。新测试后端 1 + 前端 2。
+- 任务 4 完成（16:5x）：走查结论=告警归属路由/绑定双校验/自助重登链路均已就位无需改产品代码；补回归锁 4 测试（test_account_ownership_routing.py）。
+- 任务 5 完成（17:1x）：禁用处置——get_inactive_user_ids + cookie_manager 加载/启用护栏（停用属主账号标 disabled、enable 被拒）+ update_registration_user 启停后 reconcile_from_db 同步运行态（listener 下线/恢复），失败 503。新测试 4（handoff 2 + hardening 1 + registration 1），62 passed。
+- 任务 6 完成（17:4x，18:1x 收全量门禁）：tests/test_privilege_escalation.py（7 用例 + 69 subtests）——纵向 41 条 admin 路由普通用户全 403 + 未认证 401 + admin 正控制；横向 24 条 cookie-scoped 路由跨租户全 403 + QR 会话 403/404 + 自有资源正控制。反向验证非空洞（关守卫即变红）。全量 `pytest tests/` 最终 2 failed + 1183 passed + 276 subtests——2 失败均为并行登录会话在制品地界（迁移号断言 2026082901≠2026082502），其余全绿含全部新增；test_application_architecture 路由数断言已随新增 6 路由更新 244→250。
+- 部署清单备忘（等领导确认后）：生产开邀请码需管理页开关或 `registration_invite_required=1`；无新迁移（registration_invites 表 v1.6 起已在，迁移号 2026082902 未用上）。
+
 # 发货链路提速 + 平台状态自锁修复（2026-08-29 开工回执）
 
 - 目标：①同买家多单即时发现（fan-out）＋付款核验 order_not_observed 短退避重试（2/4/8s），消除 30 秒兜底轮询造成的 p90 61-96 秒尾巴；②mark-fulfilled 幂等护栏回查平台真实状态破自锁；③对账重发器自动补「本地已发×平台待发货」并告警（默认 600s 一轮、每账号 ≤5 笔）。
