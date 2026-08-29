@@ -8205,6 +8205,42 @@ def get_account_session_status(cookie_id: str, current_user: Dict[str, Any] = De
     return {'success': True, 'data': status_data}
 
 
+async def _start_l3_passwordless_refresh(cookie_id: str) -> Dict[str, Any]:
+    """账号有浏览器登录记忆时，用 L3 免密续签替代插件设备代续签。
+
+    前端把「立即刷新 Cookie」点亮的依据就是 has_l3_memory（见
+    db_manager.get_cookie_refresh_settings），后端却一度只认插件设备绑定，
+    于是健康号一点就被打成人工重登。这里把两者接上。
+    """
+    result = await cookie_manager.trigger_manual_l3_refresh(cookie_id)
+    if result.get('ok'):
+        db_manager.update_account_session_refresh(
+            cookie_id, state='success', trigger='manual_l3',
+            message=result.get('message') or '免密续签成功',
+            error_code='',
+        )
+        return {
+            'success': True,
+            'status': 'l3_renewed',
+            'message': result.get('message') or '免密续签成功',
+            'data': _current_session_refresh_status(cookie_id),
+        }
+    # 免密续签没成不代表会话死了：只记一次可重试的失败，绝不写
+    # manual_reauth_required——那是全系统的人工重登闸门，会把仍然活着的
+    # 账号冻结、停掉监听与订单同步（2026-08-29 事故正是如此）。
+    db_manager.update_account_session_refresh(
+        cookie_id, state='failed', trigger='manual_l3',
+        message=result.get('message') or '免密续签未成功',
+        error_code=str(result.get('code') or 'l3_refresh_failed'),
+    )
+    return {
+        'success': False,
+        'status': str(result.get('code') or 'l3_refresh_failed'),
+        'message': result.get('message') or '免密续签未成功，现有会话未受影响',
+        'data': _current_session_refresh_status(cookie_id),
+    }
+
+
 @accounts_router.post("/api/accounts/{cookie_id}/session-refresh")
 async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     _require_owned_cookie(cookie_id, current_user['user_id'])
@@ -8223,17 +8259,15 @@ async def refresh_account_session(cookie_id: str, current_user: Dict[str, Any] =
                 'data': _current_session_refresh_status(cookie_id),
             }
         if exc.error_code == 'client_device_binding_required':
-            db_manager.update_account_session_refresh(
-                cookie_id, state='manual_reauth_required', trigger='manual',
-                message='绑定当前设备后可恢复自动续期',
-                error_code='client_device_binding_required',
-            )
+            if bool((db_manager.get_cookie_details(cookie_id) or {}).get('has_l3_memory')):
+                return await _start_l3_passwordless_refresh(cookie_id)
+            # 缺续期设备绑定 ≠ 会话过期，绝不能改写账号会话状态。
             return {
                 'success': False,
                 'status': 'client_device_binding_required',
-                'message': '请先绑定当前 Chrome 或 Edge 作为此账号的续期设备',
+                'message': '该账号既没有浏览器登录记忆，也没有绑定续期设备，请重新扫码登录',
                 'reauth_action': 'bind_client_device',
-                'data': db_manager.get_account_session_refresh(cookie_id),
+                'data': _current_session_refresh_status(cookie_id),
             }
         _raise_client_browser_error(exc)
     db_manager.update_account_session_refresh(

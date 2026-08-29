@@ -786,6 +786,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         manager = object.__new__(CookieManager)
         manager.task_status = {}
+        manager.live_instances = {}
 
         with patch("XianyuAutoAsync.XianyuLive", FakeLive):
             await manager._run_xianyu(
