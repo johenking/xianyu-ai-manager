@@ -50,7 +50,7 @@ The public registration status is deliberately narrow and fail-closed:
 curl -sS "$BASE_URL/api/auth/registration-config"
 ```
 
-It returns `enabled`, `ready`, `invite_required: false`, `terms_version`, local terms/privacy links, a public support email, and a user-facing message. It never returns SMTP configuration, verification fingerprints, user counts, or capacity. Treat `enabled: false` as authoritative even when the service itself is healthy.
+It returns `enabled`, `ready`, `invite_required`, `terms_version`, local terms/privacy links, a public support email, and a user-facing message. `invite_required` reflects the administrator's live setting; when it is `true`, `POST /register` must include a valid `invite_code` or it fails with `INVITE_CODE_REQUIRED`. The endpoint never returns SMTP configuration, verification fingerprints, user counts, or capacity. Treat `enabled: false` as authoritative even when the service itself is healthy.
 
 Request a one-time image CAPTCHA, then submit it when requesting a registration email code:
 

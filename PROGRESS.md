@@ -1,4 +1,12 @@
-# 代理多租户（2026-08-29 · 六任务全部完成，待领导确认部署）
+# 代理主站共享两连发（2026-08-29 · 已上云，当前运行 delivery-site-share-20260829-2132）
+
+- 需求拍板（用户原话口径）：代理是“我的代理，消耗我的无所谓”——AI 平台与卡密自动发货全部同步主站；决策卡答复=AI 共享立即提交+部署、卡密发货完全同步主站。
+- AI 平台站级共享（commit `1fb114f`）：db 层 `get_site_default_ai_provider_profile` + 双读路径（`get_ai_reply_settings` / `get_ai_reply_settings_for_user`）回退；顺序=账号绑定平台 > 账号自有 Key > 管理员站级默认已验证配置 > 系统全局 Key；回退时 `provider_profile_id` 恒 None、`api_key_source='site'`，前端 AccountList 显示「主站共享配置」，明文 Key 不下发、admin 未验证配置不外借；模型经 `resolve_ai_model_and_base_url` 与站级平台对齐。新测试 `test_ai_providers.py` +5。
+- 卡密发货主站回退（commit `d7d5641`）：`XianyuAutoAsync._match_rules_with_site_fallback`（普通与多规格两分支同语义）——代理无自有命中规则时回退 admin 规则并消耗主站卡密；自有规则永远优先、商品显式发货方式（resource/off/invite）不回退、admin 自身不重复查询、发货计数落真实命中的主站规则行；db 层 `get_site_admin_user_id`，租户隔离 SQL 未动（fail-closed 保持）。新测试 `test_delivery_site_fallback.py` 8 条。
+- 发布链（当日三连）：`multitenant-loginbase-20260829-2000` → `ai-site-share-20260829-2113` → `delivery-site-share-20260829-2132`（当前运行）；迁移 `2026082901` 三次不变；每次均容器 healthy、双公网 ready 200、Traceback=0、监听 9 任务恢复；回滚脚本三份就绪（见云 PROGRESS 顶部条目）。
+- 注册现状：注册开+强制邀请码已上线（SMTP 经用户真实收件码验证后手动开启）；管理员已自行生成 1 个未使用邀请码（30 天有效）；普通用户 4 个全为历史停用态，尚无真实代理注册。
+
+# 代理多租户（2026-08-29 · 六任务全部完成，已上云 multitenant-loginbase-20260829-2000）
 
 - 目标：分销代理经邀请码注册进监控台，只管自己的闲鱼账号（销量/商品/AI/自助扫码重登），互不可见；admin 独享全站汇总+分代理明细+账号总览；禁用代理即账号下线。开发+测试完成即止，不部署不 push（等领导确认）。
 - 顺序：任务 0 基线 → 1 邀请码注册 → 2 全站汇总+admin 明细 → 3 admin 账号总览 → 4 告警按归属路由+自助重登走查 → 5 禁用处置 → 6 越权渗透固化。
@@ -11,7 +19,7 @@
 - 任务 4 完成（16:5x）：走查结论=告警归属路由/绑定双校验/自助重登链路均已就位无需改产品代码；补回归锁 4 测试（test_account_ownership_routing.py）。
 - 任务 5 完成（17:1x）：禁用处置——get_inactive_user_ids + cookie_manager 加载/启用护栏（停用属主账号标 disabled、enable 被拒）+ update_registration_user 启停后 reconcile_from_db 同步运行态（listener 下线/恢复），失败 503。新测试 4（handoff 2 + hardening 1 + registration 1），62 passed。
 - 任务 6 完成（17:4x，18:1x 收全量门禁）：tests/test_privilege_escalation.py（7 用例 + 69 subtests）——纵向 41 条 admin 路由普通用户全 403 + 未认证 401 + admin 正控制；横向 24 条 cookie-scoped 路由跨租户全 403 + QR 会话 403/404 + 自有资源正控制。反向验证非空洞（关守卫即变红）。全量 `pytest tests/` 最终 2 failed + 1183 passed + 276 subtests——2 失败均为并行登录会话在制品地界（迁移号断言 2026082901≠2026082502），其余全绿含全部新增；test_application_architecture 路由数断言已随新增 6 路由更新 244→250。
-- 部署清单备忘（等领导确认后）：生产开邀请码需管理页开关或 `registration_invite_required=1`；无新迁移（registration_invites 表 v1.6 起已在，迁移号 2026082902 未用上）。
+- 部署清单备忘（等领导确认后）：生产开邀请码需管理页开关或 `registration_invite_required=1`；无新迁移（registration_invites 表 v1.6 起已在，迁移号 2026082902 未用上）。→ 已执行：2026-08-29 20:02 与登录地基合并上云（镜像 `multitenant-loginbase-20260829-2000`，迁移 2026082901——登录地基的 cookies 代理列所致）；注册开+强制邀请码同晚由用户验证 SMTP 后开启。
 
 # 发货链路提速 + 平台状态自锁修复（2026-08-29 开工回执）
 
