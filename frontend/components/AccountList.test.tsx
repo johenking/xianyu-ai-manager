@@ -33,6 +33,8 @@ import {
   showOfficialLoginBrowser,
   updateAccountAutoRate,
   updateAccountCookieRefreshSettings,
+  updateAccountProxy,
+  testAccountProxy,
   getAccountAISettings,
   getAIProviders,
   getAiReplyStrategies,
@@ -72,6 +74,8 @@ vi.mock('../services/api', () => ({
   updateAccountCookie: vi.fn(),
   updateAccountLoginInfo: vi.fn(),
   updateAccountCookieRefreshSettings: vi.fn(),
+  updateAccountProxy: vi.fn(),
+  testAccountProxy: vi.fn(),
   updateAccountAISettings: vi.fn(),
   getAllAISettings: vi.fn(),
   getAccountAISettings: vi.fn(),
@@ -420,6 +424,77 @@ describe('AccountList session verification UI', () => {
         cookie_refresh_interval_minutes: 360,
       });
     });
+  });
+
+  it('saves a per-account residential proxy from the edit modal', async () => {
+    vi.mocked(updateAccountProxy).mockResolvedValue({
+      success: true,
+      message: '代理配置已保存',
+      data: {
+        proxy_enabled: true,
+        proxy_server: 'http://gw:1000',
+        proxy_username: 'u1',
+        proxy_password_set: true,
+        proxy_region: '上海',
+        proxy_last_ip: '',
+        proxy_last_status: '',
+        proxy_last_check_at: null,
+      },
+    });
+
+    render(<AccountList />);
+    const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('编辑账号'));
+
+    fireEvent.click(await screen.findByLabelText('启用住宅代理'));
+    fireEvent.change(screen.getByLabelText('代理服务器'), { target: { value: 'http://gw:1000' } });
+    fireEvent.change(screen.getByLabelText('账号'), { target: { value: 'u1' } });
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(updateAccountProxy).toHaveBeenCalledWith('account-1', {
+        proxy_enabled: true,
+        proxy_server: 'http://gw:1000',
+        proxy_username: 'u1',
+        proxy_password: 'secret',
+        proxy_region: '',
+      });
+    });
+  });
+
+  it('tests proxy connectivity and shows the egress IP', async () => {
+    vi.mocked(updateAccountProxy).mockResolvedValue({
+      success: true,
+      message: '代理配置已保存',
+      data: {
+        proxy_enabled: true,
+        proxy_server: 'http://gw:1000',
+        proxy_username: '',
+        proxy_password_set: false,
+        proxy_region: '',
+        proxy_last_ip: '',
+        proxy_last_status: '',
+        proxy_last_check_at: null,
+      },
+    });
+    vi.mocked(testAccountProxy).mockResolvedValue({
+      success: true,
+      data: { ok: true, ip: '203.0.113.9', status: 'ok', error: '' },
+    });
+
+    render(<AccountList />);
+    const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
+    expect(accountCard).not.toBeNull();
+    fireEvent.click(within(accountCard as HTMLElement).getByTitle('编辑账号'));
+
+    fireEvent.click(await screen.findByLabelText('启用住宅代理'));
+    fireEvent.change(screen.getByLabelText('代理服务器'), { target: { value: 'http://gw:1000' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存并测试连通性' }));
+
+    await waitFor(() => expect(testAccountProxy).toHaveBeenCalledWith('account-1'));
+    expect(await screen.findByText(/出口 IP：203\.0\.113\.9/)).toBeInTheDocument();
   });
 
   it('lets a QR account with browser memory enable scheduled refresh', async () => {

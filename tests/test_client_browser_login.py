@@ -171,7 +171,7 @@ class ClientRenewalDatabaseTests(unittest.TestCase):
         self.assertEqual(encrypted, "")
         self.assertEqual(enabled, 0)
         self.assertEqual(count, 0)
-        self.assertEqual(MIGRATIONS[-1].version, "2026082502")
+        self.assertEqual(MIGRATIONS[-1].version, "2026082901")
 
     def test_registered_device_keys_are_immutable(self):
         replacement = ec.generate_private_key(ec.SECP256R1())

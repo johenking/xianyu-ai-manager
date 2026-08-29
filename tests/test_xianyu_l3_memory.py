@@ -103,6 +103,10 @@ class _FakeContext:
         self.collect_count = 0
         self.seeded = ""
         self.closed = False
+        self.init_scripts = []
+
+    def add_init_script(self, script):
+        self.init_scripts.append(script)
 
     def add_cookies(self, _cookies):
         return None
@@ -120,6 +124,30 @@ class _FakeContext:
 
     def close(self):
         self.closed = True
+
+
+class _VerifiableContext(_FakeContext):
+    """支持建档就地验证的上下文：可按名删 Cookie，删除后登录框才会弹出。"""
+
+    def __init__(self, page, cookies, *, login_iframe=None, baseline=None):
+        super().__init__(page, cookies, baseline=baseline)
+        self._page = page
+        self._login_iframe = login_iframe
+        self.cleared_names = []
+        self.restored = False
+
+    def clear_cookies(self, *, name=None, domain=None, path=None):
+        del domain, path
+        if name:
+            self.cleared_names.append(name)
+        # 会话 Cookie 被删后，下次访问首页登录框（若有）就会出现
+        self._page.iframe = self._login_iframe
+
+    def add_cookies(self, cookies):
+        # 建档验证失败/无法验证时会用备份还原会话
+        if cookies:
+            self.restored = True
+        return None
 
 
 class _FakeChromium:
@@ -251,6 +279,140 @@ class L3MemoryServiceTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertIsNone(chromium.launch_kwargs[0]["channel"])
         self.assertFalse(chromium.launch_kwargs[0]["chromium_sandbox"])
+
+    def test_no_proxy_keeps_launch_options_proxy_free(self):
+        # 未配代理时启动选项不得出现 proxy 键（与接入前一致）。
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context)
+        service = self._service(context, chromium=chromium)
+        service.seed_profile_from_cookies("9988", FRESH_COOKIES, settle_seconds=0)
+        self.assertNotIn("proxy", chromium.launch_kwargs[0])
+
+    def test_proxy_config_reaches_launch_options(self):
+        # 配了代理时，账号浏览器启动必须带上归一化后的 proxy（账密拆分、内联被丢弃）。
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context)
+        service = L3MemoryService(
+            profile_root=self.root,
+            playwright_factory=lambda: _FakePlaywright(chromium),
+            official_login=_FakeOfficial(self.root),
+            settle_seconds=0,
+            proxy="http://u:p@1.2.3.4:8000",
+        )
+        result = service.seed_profile_from_cookies("9988", FRESH_COOKIES, settle_seconds=0)
+        self.assertTrue(result.succeeded)
+        self.assertEqual(
+            chromium.launch_kwargs[0]["proxy"],
+            {"server": "http://1.2.3.4:8000", "username": "u", "password": "p"},
+        )
+
+    def test_fingerprint_disabled_keeps_launch_options_unchanged(self):
+        # 指纹关闭（默认）时：启动选项不含 screen/color_scheme，viewport 维持原值，
+        # 且不注入任何 init 脚本——与接入指纹前字节级一致。
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context)
+        service = self._service(context, chromium=chromium)
+        with patch.dict(os.environ, {"XIANYU_ACCOUNT_FINGERPRINT": "0"}):
+            service.seed_profile_from_cookies("9988", FRESH_COOKIES, settle_seconds=0)
+        kwargs = chromium.launch_kwargs[0]
+        self.assertEqual(kwargs["viewport"], {"width": 1440, "height": 960})
+        self.assertNotIn("screen", kwargs)
+        self.assertNotIn("color_scheme", kwargs)
+        self.assertNotIn("timezone_id", kwargs)
+        self.assertEqual(context.init_scripts, [])
+
+    def test_fingerprint_enabled_injects_context_options_and_script(self):
+        # 指纹开启时：账号稳定指纹进入 launch 选项（screen/timezone/色彩），并注入 init 脚本。
+        from utils.account_fingerprint import derive_fingerprint
+
+        page = _FakePage()
+        context = _FakeContext(page, FRESH_COOKIES)
+        chromium = _FakeChromium(context)
+        service = self._service(context, chromium=chromium)
+        with patch.dict(os.environ, {"XIANYU_ACCOUNT_FINGERPRINT": "1"}):
+            service.seed_profile_from_cookies("9988", FRESH_COOKIES, settle_seconds=0)
+        kwargs = chromium.launch_kwargs[0]
+        expected = derive_fingerprint("9988", os_family="linux")
+        self.assertIn("screen", kwargs)
+        self.assertEqual(kwargs["screen"]["width"], expected.screen_width)
+        self.assertEqual(kwargs["timezone_id"], expected.timezone_id)
+        self.assertIn("color_scheme", kwargs)
+        self.assertEqual(kwargs["viewport"]["width"], expected.viewport_width)
+        self.assertNotIn("user_agent", kwargs)  # 真实浏览器路径保留真实 UA
+        self.assertEqual(len(context.init_scripts), 1)
+        self.assertIn(expected.webgl_renderer, context.init_scripts[0])
+
+    def test_seed_verification_confirms_quick_entry(self):
+        """建档就地验证：删会话后登录框给出「快速进入」→ 记忆实测可用。"""
+        frame = _FakeFrame(clickable=True)
+        page = _FakePage()
+        context = _VerifiableContext(
+            page,
+            FRESH_COOKIES,
+            login_iframe=_FakeIframe(frame),
+            baseline=STALE_COOKIES,
+        )
+        service = self._service(context)
+
+        result = service.seed_profile_from_cookies("9988", STALE_COOKIES, settle_seconds=0)
+
+        self.assertTrue(result.succeeded)
+        self.assertIs(result.quick_entry_verified, True)
+        self.assertTrue(frame.clicked)
+        self.assertIn("cookie2", context.cleared_names)
+        # 快速进入换发的新会话必须成为结果（旧 cookie2 可能已被轮换）
+        self.assertEqual(result.cookies["cookie2"], "session")
+        self.assertTrue((self.root / "user_9988" / ".l3_ready").exists())
+
+    def test_seed_verification_detects_dead_memory(self):
+        """登录框弹出但没有「快速进入」→ 如实标记无记忆，还原备份会话。"""
+        frame = _FakeFrame(clickable=True, button_present=False)
+        page = _FakePage()
+        context = _VerifiableContext(
+            page, STALE_COOKIES, login_iframe=_FakeIframe(frame)
+        )
+        service = self._service(context)
+
+        result = service.seed_profile_from_cookies("9988", STALE_COOKIES, settle_seconds=0)
+
+        self.assertEqual(result.status, "success")
+        self.assertFalse(result.has_l3_memory)
+        self.assertFalse(result.succeeded)
+        self.assertIs(result.quick_entry_verified, False)
+        self.assertEqual(result.error_code, "quick_entry_unverified")
+        # 会话本身仍有效：验证前的备份必须被还原
+        self.assertTrue(context.restored)
+        self.assertFalse((self.root / "user_9988" / ".l3_ready").exists())
+
+    def test_seed_verification_inconclusive_stays_optimistic(self):
+        """删了会话但登录框根本没弹出来 → 无法下结论，保持乐观语义并还原。"""
+        page = _FakePage()
+        context = _VerifiableContext(page, STALE_COOKIES, login_iframe=None)
+        service = self._service(context)
+
+        result = service.seed_profile_from_cookies("9988", STALE_COOKIES, settle_seconds=0)
+
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(result.quick_entry_verified)
+        self.assertTrue(context.restored)
+        self.assertTrue((self.root / "user_9988" / ".l3_ready").exists())
+
+    def test_seed_without_verification_keeps_legacy_behavior(self):
+        """verify_quick_entry=False（CDP 来源）不得动会话 Cookie。"""
+        page = _FakePage()
+        context = _VerifiableContext(page, FRESH_COOKIES, login_iframe=None)
+        service = self._service(context)
+
+        result = service.seed_profile_from_cookies(
+            "9988", FRESH_COOKIES, settle_seconds=0, verify_quick_entry=False
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertIsNone(result.quick_entry_verified)
+        self.assertEqual(context.cleared_names, [])
 
     def test_passwordless_refresh_clicks_quick_enter_and_requires_cookie2(self):
         frame = _FakeFrame(clickable=True)

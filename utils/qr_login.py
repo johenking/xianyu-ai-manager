@@ -17,6 +17,7 @@ import qrcode.constants
 from loguru import logger
 import hashlib
 from utils.browser_interaction import BrowserInteractionChannel
+from utils.browser_runtime import httpx_proxy_url
 from utils.qr_verification_browser import (
     QRVerificationBrowser,
     remove_verification_screenshot,
@@ -123,6 +124,7 @@ class QRLoginManager:
         session_validator=None,
         terminal_retention_seconds: float = 300.0,
         l3_seeder=None,
+        proxy: Any = None,
     ):
         self.sessions: Dict[str, QRLoginSession] = {}
         self.headers = generate_headers()
@@ -132,13 +134,13 @@ class QRLoginManager:
         self.api_scan_status = f"{self.host}/newlogin/qrcode/query.do"
         self.api_h5_tk = "https://h5api.m.goofish.com/h5/mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/"
 
-        # 配置代理（如果需要的话，取消注释并修改代理地址）
-        # self.proxy = "http://127.0.0.1:7890"
-        self.proxy = None
+        # 每账号住宅代理：配置了就让扫码登录/风控接口都从该出口 IP 发出，规避机房 IP 风控；
+        # 未配置（proxy=None）时 httpx_proxy_url 返回 None，等价于直连（保持原行为）。
+        self.proxy = httpx_proxy_url(proxy)
 
         # 配置超时时间
         self.timeout = httpx.Timeout(connect=30.0, read=60.0, write=30.0, pool=60.0)
-        self.verification_browser = verification_browser or QRVerificationBrowser()
+        self.verification_browser = verification_browser or QRVerificationBrowser(proxy=proxy)
         self.session_validator = session_validator or probe_message_session_async
         self.terminal_retention_seconds = max(300.0, float(terminal_retention_seconds))
         self.l3_seeder = l3_seeder
@@ -554,6 +556,11 @@ class QRLoginManager:
                 type(exc).__name__,
             )
             return False
+        fresh = dict(getattr(result, "cookies", None) or {})
+        if fresh:
+            # 建档验证可能点「快速进入」换发了新会话（旧 cookie2 或已被服务端
+            # 轮换），必须把最新集合合并回扫码会话，后续落库才是活的。
+            session.cookies.update(fresh)
         succeeded = bool(getattr(result, "succeeded", result))
         if succeeded:
             logger.info("扫码登录已写入浏览器记忆: session={}", session.session_id)

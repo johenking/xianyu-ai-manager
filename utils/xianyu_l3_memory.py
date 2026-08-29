@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from loguru import logger
 
+from utils.account_fingerprint import build_browser_fingerprint
 from utils.browser_runtime import (
     chromium_runtime_options,
     classify_browser_launch_error,
@@ -50,6 +51,9 @@ PASSWORDLESS_RETRYABLE_ERROR_CODES = {
 # 未换新判定只看这两个字段：cookie2 是 L2 会话身份，_m_h5_tk 随访问刷新；
 # 二者同时与进入浏览器前的基线完全一致，说明本次会话没有发生任何真实续签。
 SESSION_RENEWAL_COOKIE_NAMES = ("cookie2", "_m_h5_tk")
+# 建档就地验证时删掉的会话 Cookie：只删鉴权态（模拟 cookie2 过期），保留
+# unb/cnaui/tracknick 等身份提示，让首页像真实过期那样弹出登录框。
+VERIFY_EXPIRE_COOKIE_NAMES = ("cookie2", "_m_h5_tk", "_m_h5_tk_enc", "sgcookie", "t")
 PASSWORDLESS_MANUAL_REAUTH_ERROR_CODES = {
     "fast_entry_unavailable",
     "account_mismatch",
@@ -71,6 +75,9 @@ class L3MemoryResult:
     message: str = ""
     browser_user_agent: str = ""
     has_l3_memory: bool = False
+    # 建档验证结论：True=删会话后「快速进入」实测可用；False=登录框弹出但没有
+    # 快速进入（记忆未建立）；None=未验证/无法验证（保持旧的乐观语义）。
+    quick_entry_verified: Optional[bool] = None
 
     @property
     def succeeded(self) -> bool:
@@ -125,6 +132,7 @@ class L3MemoryService:
         playwright_factory: Optional[Callable[[], Any]] = None,
         official_login: Optional[XianyuOfficialLoginService] = None,
         settle_seconds: Optional[float] = None,
+        proxy: Any = None,
     ) -> None:
         self.profile_root = Path(profile_root)
         self.playwright_factory = (
@@ -133,6 +141,7 @@ class L3MemoryService:
         )
         self._official = official_login
         self.settle_seconds = settle_seconds
+        self._proxy = proxy
 
     @property
     def official(self) -> XianyuOfficialLoginService:
@@ -140,6 +149,7 @@ class L3MemoryService:
             self._official = XianyuOfficialLoginService(
                 profile_root=self.profile_root,
                 playwright_factory=self.playwright_factory,
+                proxy=self._proxy,
             )
         return self._official
 
@@ -175,8 +185,14 @@ class L3MemoryService:
         cookies: Mapping[str, str] | str,
         *,
         settle_seconds: Optional[float] = None,
+        verify_quick_entry: bool = True,
     ) -> L3MemoryResult:
-        """Inject a validated QR session into `browser_data/user_<unb>`."""
+        """Inject a validated QR session into `browser_data/user_<unb>`.
+
+        verify_quick_entry=True 时在同一浏览器会话内做建档验证：删掉会话
+        Cookie 模拟过期，确认登录框真的给出「快速进入」才标记记忆可用——
+        杜绝「建档即虚标、续签时才发现记忆无效」（2026-08-29 线上根因）。
+        """
         expected_unb = str(unb or "").strip()
         cookie_map = normalize_cookie_map(cookies)
         cookie_unb = str(cookie_map.get("unb") or expected_unb).strip()
@@ -202,12 +218,13 @@ class L3MemoryService:
         profile_path = self.profile_path(expected_unb)
         with XianyuOfficialLoginService._lock_for(f"profile:{expected_unb}"):
             try:
-                _baseline, collected, user_agent = self._run_browser_session(
+                _baseline, collected, user_agent, verified = self._run_browser_session(
                     profile_path=profile_path,
                     cookies=cookie_map,
                     expected_unb=expected_unb,
                     require_quick_enter=False,
                     settle_seconds=settle_seconds,
+                    verify_quick_enter=verify_quick_entry,
                 )
             except Exception as exc:
                 return self._launch_failure(exc)
@@ -218,6 +235,7 @@ class L3MemoryService:
             browser_user_agent=user_agent,
             missing_code="login_state_unknown",
             missing_message="浏览器记忆已写入，但未拿到完整会话 Cookie",
+            quick_entry_verified=verified,
         )
 
     def passwordless_refresh(
@@ -245,7 +263,7 @@ class L3MemoryService:
         cookie_map = normalize_cookie_map(current_cookie)
         with XianyuOfficialLoginService._lock_for(f"profile:{expected_unb}"):
             try:
-                baseline, collected, user_agent = self._run_browser_session(
+                baseline, collected, user_agent, _verified = self._run_browser_session(
                     profile_path=profile_path,
                     cookies=cookie_map,
                     expected_unb=expected_unb,
@@ -337,10 +355,13 @@ class L3MemoryService:
             )
 
         if persist_profile:
+            # CDP 来源的会话与用户本机 Chrome 同源：建档验证会点「快速进入」
+            # 换发新 cookie2，可能把用户本机的登录顶掉，因此这里不做就地验证。
             seeded = self.seed_profile_from_cookies(
                 cookie_unb,
                 cookies,
                 settle_seconds=0,
+                verify_quick_entry=False,
             )
             if seeded.succeeded:
                 return seeded
@@ -367,7 +388,8 @@ class L3MemoryService:
         expected_unb: str,
         require_quick_enter: bool,
         settle_seconds: Optional[float],
-    ) -> tuple[dict[str, str], dict[str, str], str]:
+        verify_quick_enter: bool = False,
+    ) -> tuple[dict[str, str], dict[str, str], str, Optional[bool]]:
         profile_path.mkdir(parents=True, exist_ok=True)
         wait_seconds = l3_settle_seconds(
             settle_seconds if settle_seconds is not None else self.settle_seconds
@@ -377,20 +399,28 @@ class L3MemoryService:
         try:
             playwright = self.playwright_factory()
             started = playwright.start() if hasattr(playwright, "start") else playwright
+            context_kwargs: dict[str, Any] = {
+                "viewport": {"width": 1440, "height": 960},
+                "locale": "zh-CN",
+                "accept_downloads": False,
+            }
+            fingerprint = build_browser_fingerprint(expected_unb or profile_path.name)
+            if fingerprint:
+                context_kwargs.update(fingerprint.context_options())
             context = started.chromium.launch_persistent_context(
                 str(profile_path),
                 headless=False,
-                **chromium_runtime_options(),
+                **chromium_runtime_options(self._proxy),
                 args=[
                     "--lang=zh-CN",
                     "--password-store=basic",
                     "--window-position=-32000,-32000",
                     "--window-size=1440,960",
                 ],
-                viewport={"width": 1440, "height": 960},
-                locale="zh-CN",
-                accept_downloads=False,
+                **context_kwargs,
             )
+            if fingerprint:
+                self._add_fingerprint_script(context, fingerprint.init_script())
             if cookies:
                 self.official._seed_cookie_if_needed(
                     context,
@@ -407,10 +437,73 @@ class L3MemoryService:
             self._wait(page, wait_seconds)
             collected = self.official._collect_relevant_cookies(context)
             user_agent = self.official._browser_user_agent(page)
-            return baseline, collected, user_agent or detect_default_browser_user_agent()
+            verified: Optional[bool] = None
+            if verify_quick_enter:
+                verified, renewed = self._verify_quick_entry(context, page)
+                if renewed:
+                    # 验证点击「快速进入」换发了新会话：以新集合为准（旧 cookie2
+                    # 可能已被服务端轮换，还回旧值只会交出一个死会话）。
+                    collected = renewed
+            return (
+                baseline,
+                collected,
+                user_agent or detect_default_browser_user_agent(),
+                verified,
+            )
         finally:
             self._close_quietly(context)
             self._stop_quietly(playwright)
+
+    def _verify_quick_entry(
+        self,
+        context: Any,
+        page: Any,
+    ) -> tuple[Optional[bool], Optional[dict[str, str]]]:
+        """建档就地验证：删会话 Cookie 模拟过期，实测「快速进入」是否可用。
+
+        返回 (结论, 换发的新会话)：
+        - (True, 新Cookie)：登录框弹出且快速进入点击成功，记忆实测可用；
+        - (False, None)：登录框弹出但没有快速进入——记忆未建立，还原备份；
+        - (None, None)：无法验证（无 clear_cookies / 登录框未弹出 / 中途异常），
+          还原备份并保持乐观语义，不因验证机制本身的问题误伤建档。
+        """
+        clear = getattr(context, "clear_cookies", None)
+        if not callable(clear):
+            return None, None
+        try:
+            backup = list(context.cookies() or [])
+        except Exception:
+            return None, None
+        if not backup:
+            return None, None
+        try:
+            for name in VERIFY_EXPIRE_COOKIE_NAMES:
+                clear(name=name)
+            self._safe_goto(page, GOOFISH_HOME_URL)
+            self._wait(page, 1.5)
+            entered = self.try_quick_enter(page)
+        except Exception:
+            self._restore_cookies(context, backup)
+            return None, None
+        if entered is True:
+            renewed = dict(self.official._collect_relevant_cookies(context) or {})
+            if all(renewed.get(name) for name in REQUIRED_FRESH_COOKIE_NAMES):
+                logger.info("L3 建档验证通过：快速进入实测可用")
+                return True, renewed
+            # 点进去了但没回收到完整会话：无法下结论，还原备份按未验证处理
+            self._restore_cookies(context, backup)
+            return None, None
+        self._restore_cookies(context, backup)
+        if entered is False:
+            logger.warning("L3 建档验证不通过：登录框无「快速进入」，按无记忆处理")
+            return False, None
+        return None, None
+
+    def _restore_cookies(self, context: Any, backup: list) -> None:
+        try:
+            context.add_cookies(backup)
+        except Exception:
+            logger.warning("L3 建档验证：还原备份 Cookie 失败（档案内仍保留原会话文件）")
 
     @staticmethod
     def _session_not_renewed(
@@ -503,6 +596,7 @@ class L3MemoryService:
         browser_user_agent: str,
         missing_code: str,
         missing_message: str,
+        quick_entry_verified: Optional[bool] = None,
     ) -> L3MemoryResult:
         cookies = dict(collected or {})
         cookie_unb = str(cookies.get("unb") or "").strip()
@@ -516,6 +610,19 @@ class L3MemoryService:
         if missing:
             logger.warning("L3 会话缺少关键 Cookie: {}", ",".join(missing))
             return self._failed(missing_code, missing_message, manual=True)
+        if quick_entry_verified is False:
+            # 会话本身有效（登录没问题），但实测无「快速进入」：如实报告
+            # 记忆未建立，绝不写 .l3_ready、不虚标 has_l3_memory。
+            return L3MemoryResult(
+                status="success",
+                cookies=cookies,
+                unb=expected_unb,
+                browser_user_agent=browser_user_agent,
+                has_l3_memory=False,
+                quick_entry_verified=False,
+                error_code="quick_entry_unverified",
+                message="浏览器档案已写入，但免密快速进入未生效，按无记忆处理",
+            )
         self.mark_profile_ready(expected_unb)
         return L3MemoryResult(
             status="success",
@@ -523,6 +630,7 @@ class L3MemoryService:
             unb=expected_unb,
             browser_user_agent=browser_user_agent,
             has_l3_memory=True,
+            quick_entry_verified=quick_entry_verified,
         )
 
     def _launch_failure(self, exc: Exception) -> L3MemoryResult:
@@ -624,6 +732,17 @@ class L3MemoryService:
         return detect_default_browser_user_agent()
 
     @staticmethod
+    def _add_fingerprint_script(context: Any, script: str) -> None:
+        """Best-effort context-level init script; never break login on injection failure."""
+        adder = getattr(context, "add_init_script", None)
+        if not callable(adder):
+            return
+        try:
+            adder(script)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("注入账号指纹脚本失败（不影响登录）: {}", type(exc).__name__)
+
+    @staticmethod
     def _close_quietly(resource: Any) -> None:
         if resource is None:
             return
@@ -662,16 +781,26 @@ class _QuickEnterTimeout(RuntimeError):
 l3_memory_service = L3MemoryService()
 
 
+def _service_for(proxy: Any = None) -> "L3MemoryService":
+    """配了代理就用带该出口 IP 的独立实例；否则复用无代理单例（原行为）。"""
+    if proxy:
+        return L3MemoryService(proxy=proxy)
+    return l3_memory_service
+
+
 def seed_profile_from_cookies(
     unb: str,
     cookies: Mapping[str, str] | str,
     *,
     settle_seconds: Optional[float] = None,
+    proxy: Any = None,
+    verify_quick_entry: bool = True,
 ) -> L3MemoryResult:
-    return l3_memory_service.seed_profile_from_cookies(
+    return _service_for(proxy).seed_profile_from_cookies(
         unb,
         cookies,
         settle_seconds=settle_seconds,
+        verify_quick_entry=verify_quick_entry,
     )
 
 
@@ -680,8 +809,9 @@ def passwordless_refresh(
     current_cookie: Mapping[str, str] | str = "",
     *,
     settle_seconds: Optional[float] = None,
+    proxy: Any = None,
 ) -> L3MemoryResult:
-    return l3_memory_service.passwordless_refresh(
+    return _service_for(proxy).passwordless_refresh(
         unb,
         current_cookie,
         settle_seconds=settle_seconds,

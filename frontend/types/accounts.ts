@@ -26,6 +26,15 @@ export interface AccountDetail {
   login_method_label?: string;
   auto_refresh_supported?: boolean;
   has_l3_memory?: boolean;
+  // 账号级住宅代理（密码只回传 proxy_password_set，不含明文）
+  proxy_enabled?: boolean;
+  proxy_server?: string;
+  proxy_username?: string;
+  proxy_password_set?: boolean;
+  proxy_region?: string;
+  proxy_last_ip?: string;
+  proxy_last_status?: string;
+  proxy_last_check_at?: number | null;
   reauth_required?: boolean;
   reauth_action?: 'qr_login' | 'password_login' | 'sms_login' | 'chrome_extension_import' | 'manual_cookie' | 'choose_login';
   last_login_at?: number | null;

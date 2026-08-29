@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from loguru import logger
+from utils.account_fingerprint import build_browser_fingerprint
 from utils.browser_interaction import BrowserInteractionChannel
 from utils.browser_runtime import (
     chromium_runtime_options,
@@ -230,6 +231,7 @@ class XianyuOfficialLoginService:
         session_validator: Optional[
             Callable[[str, str], SessionProbeResult]
         ] = probe_message_session_sync,
+        proxy: Any = None,
     ) -> None:
         self.profile_root = Path(profile_root)
         self.verification_root = ensure_private_verification_root(verification_root)
@@ -239,6 +241,7 @@ class XianyuOfficialLoginService:
         self.poll_interval = poll_interval
         self.probe_interval = max(self.poll_interval, float(probe_interval))
         self.session_validator = session_validator
+        self._proxy = proxy
         self._cleanup_stale_profiles()
 
     @staticmethod
@@ -548,6 +551,14 @@ class XianyuOfficialLoginService:
                         "--window-size=1440,960",
                     ])
                 playwright = self.playwright_factory().start()
+                context_kwargs: dict[str, Any] = {
+                    "viewport": {"width": 1440, "height": 960},
+                    "locale": "zh-CN",
+                    "accept_downloads": False,
+                }
+                fingerprint = build_browser_fingerprint(expected_unb or profile_path.name)
+                if fingerprint:
+                    context_kwargs.update(fingerprint.context_options())
                 context = playwright.chromium.launch_persistent_context(
                     str(profile_path),
                     # Goofish currently rejects Chromium headless mode as an
@@ -557,12 +568,12 @@ class XianyuOfficialLoginService:
                     # 未显式配置 XIANYU_BROWSER_CHANNEL 时回退到 Playwright 自带的
                     # Chromium（channel=None），实现零安装：本机无需另装系统 Chrome。
                     # 配置了该变量（如 chrome/msedge）则沿用系统浏览器渠道。
-                    **chromium_runtime_options(),
+                    **chromium_runtime_options(self._proxy),
                     args=browser_args,
-                    viewport={"width": 1440, "height": 960},
-                    locale="zh-CN",
-                    accept_downloads=False,
+                    **context_kwargs,
                 )
+                if fingerprint:
+                    self._add_fingerprint_script(context, fingerprint.init_script())
                 worker.attach(context, playwright)
                 self._seed_cookie_if_needed(context, current_cookie)
 
@@ -1410,6 +1421,17 @@ class XianyuOfficialLoginService:
     @staticmethod
     def _safe_screenshot_key(value: str) -> str:
         return verification_identity_key(value)
+
+    @staticmethod
+    def _add_fingerprint_script(context: Any, script: str) -> None:
+        """Best-effort context-level fingerprint init script; never break login."""
+        adder = getattr(context, "add_init_script", None)
+        if not callable(adder):
+            return
+        try:
+            adder(script)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("注入账号指纹脚本失败（不影响登录）: {}", type(exc).__name__)
 
     @staticmethod
     def _install_official_message_listener(page: Any) -> None:

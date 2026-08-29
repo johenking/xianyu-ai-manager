@@ -36,6 +36,8 @@ import {
   updateAccountPauseDuration,
   updateAccountCookie,
   updateAccountCookieRefreshSettings,
+  updateAccountProxy,
+  testAccountProxy,
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
@@ -50,7 +52,7 @@ import {
   getAiReplyStrategies,
   updateAiReplyStrategies
 } from '../services/api';
-import type { BrowserInteractionAction, ReplyStrategy } from '../services/api';
+import type { BrowserInteractionAction, ReplyStrategy, ProxyProbeResult } from '../services/api';
 import type {
   ClientBrowserDevicePublic,
   ClientBrowserLoginSession,
@@ -60,7 +62,7 @@ import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
   Upload, Key, Bot, Settings, ExternalLink, Chrome, Copy,
-  Smartphone, ChevronDown, ChevronUp, AlertTriangle, ShieldCheck
+  Smartphone, ChevronDown, ChevronUp, AlertTriangle, ShieldCheck, Globe
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -302,7 +304,16 @@ const AccountList: React.FC<AccountListProps> = () => {
     pause_duration: 0,
     cookie_refresh_enabled: false,
     cookie_refresh_interval_minutes: DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
+    proxy_enabled: false,
+    proxy_server: '',
+    proxy_username: '',
+    proxy_password: '',
+    proxy_region: '',
   });
+  // 代理密码是否已保存过（已保存时占位符提示"留空不修改"）
+  const [proxyPasswordSaved, setProxyPasswordSaved] = useState(false);
+  const [proxyTesting, setProxyTesting] = useState(false);
+  const [proxyTestResult, setProxyTestResult] = useState<ProxyProbeResult | null>(null);
 
   // AI设置表单状态
   const [aiSettings, setAiSettings] = useState<AIReplySettings>({
@@ -1045,7 +1056,14 @@ const AccountList: React.FC<AccountListProps> = () => {
       pause_duration: account.pause_duration || 0,
       cookie_refresh_enabled: account.cookie_refresh_enabled || false,
       cookie_refresh_interval_minutes: account.cookie_refresh_interval_minutes || DEFAULT_COOKIE_REFRESH_INTERVAL_MINUTES,
+      proxy_enabled: Boolean(account.proxy_enabled),
+      proxy_server: account.proxy_server || '',
+      proxy_username: account.proxy_username || '',
+      proxy_password: '',
+      proxy_region: account.proxy_region || '',
     });
+    setProxyPasswordSaved(Boolean(account.proxy_password_set));
+    setProxyTestResult(null);
     setActiveModal('edit');
   };
 
@@ -1195,6 +1213,56 @@ const AccountList: React.FC<AccountListProps> = () => {
     }
   };
 
+  const proxyConfigDirty = () => {
+    if (!editingAccount) return false;
+    return (
+      editForm.proxy_enabled !== Boolean(editingAccount.proxy_enabled) ||
+      editForm.proxy_server.trim() !== (editingAccount.proxy_server || '') ||
+      editForm.proxy_username.trim() !== (editingAccount.proxy_username || '') ||
+      editForm.proxy_region.trim() !== (editingAccount.proxy_region || '') ||
+      editForm.proxy_password.length > 0
+    );
+  };
+
+  // 测试前先落库当前代理配置（后端测试端点读的是已存配置），再实测出口 IP
+  const handleTestProxy = async () => {
+    if (!editingAccount) return;
+    if (!editForm.proxy_server.trim()) {
+      setProxyTestResult({ ok: false, ip: '', status: 'not_configured', error: '请先填写代理服务器地址' });
+      return;
+    }
+    setProxyTesting(true);
+    setProxyTestResult(null);
+    try {
+      if (proxyConfigDirty()) {
+        await updateAccountProxy(editingAccount.id, {
+          proxy_enabled: true,
+          proxy_server: editForm.proxy_server.trim(),
+          proxy_username: editForm.proxy_username.trim(),
+          ...(editForm.proxy_password || !proxyPasswordSaved
+            ? { proxy_password: editForm.proxy_password }
+            : {}),
+          proxy_region: editForm.proxy_region.trim(),
+        });
+        // 已落库：密码视为已保存，清空输入框避免重复提交明文
+        setProxyPasswordSaved(true);
+        setEditForm((prev) => ({ ...prev, proxy_password: '', proxy_enabled: true }));
+      }
+      const result = await testAccountProxy(editingAccount.id);
+      setProxyTestResult(result.data);
+      await loadAccounts();
+    } catch (error) {
+      setProxyTestResult({
+        ok: false,
+        ip: '',
+        status: 'error',
+        error: error instanceof Error ? error.message : '连通性测试失败',
+      });
+    } finally {
+      setProxyTesting(false);
+    }
+  };
+
   const handleSaveEdit = async () => {
     if (!editingAccount) return;
     setSaving(true);
@@ -1235,6 +1303,19 @@ const AccountList: React.FC<AccountListProps> = () => {
         promises.push(updateAccountCookieRefreshSettings(editingAccount.id, {
           cookie_refresh_enabled: editForm.cookie_refresh_enabled,
           cookie_refresh_interval_minutes: editForm.cookie_refresh_interval_minutes,
+        }));
+      }
+
+      if (proxyConfigDirty()) {
+        promises.push(updateAccountProxy(editingAccount.id, {
+          proxy_enabled: editForm.proxy_enabled,
+          proxy_server: editForm.proxy_server.trim(),
+          proxy_username: editForm.proxy_username.trim(),
+          // 留空且已存过密码 => 不传，保留原密码
+          ...(editForm.proxy_password || !proxyPasswordSaved
+            ? { proxy_password: editForm.proxy_password }
+            : {}),
+          proxy_region: editForm.proxy_region.trim(),
         }));
       }
 
@@ -3264,6 +3345,114 @@ const AccountList: React.FC<AccountListProps> = () => {
                       <p className="text-xs text-gray-500 mt-1">建议使用 24 小时或更长间隔，减少账号风控压力。</p>
                     </div>
                   )}
+
+                  <div className="border-t border-gray-100 pt-4 space-y-3">
+                    <div className="flex items-center justify-between p-4 bg-indigo-50 rounded-xl">
+                      <div className="pr-3">
+                        <div className="font-bold text-gray-900 flex items-center gap-2">
+                          <Globe className="w-4 h-4 text-indigo-600" />
+                          住宅代理（专属出口 IP）
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          为该账号绑定独立住宅 IP，可显著降低云端机房 IP 触发滑块的概率。每个账号建议用不同的出口 IP。
+                        </div>
+                      </div>
+                      <ToggleControl
+                        checked={editForm.proxy_enabled}
+                        onChange={(checked) => setEditForm({ ...editForm, proxy_enabled: checked })}
+                        label="启用住宅代理"
+                      />
+                    </div>
+
+                    {editForm.proxy_enabled && (
+                      <div className="space-y-3">
+                        <div>
+                          <label htmlFor="proxy-server" className="block text-sm font-bold text-gray-700 mb-2">
+                            代理服务器
+                          </label>
+                          <input
+                            id="proxy-server"
+                            type="text"
+                            value={editForm.proxy_server}
+                            onChange={(e) => setEditForm({ ...editForm, proxy_server: e.target.value })}
+                            placeholder="http://host:port（支持 http/https，不支持 socks5）"
+                            className="w-full ios-input px-4 py-3 rounded-xl"
+                          />
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <label htmlFor="proxy-username" className="block text-sm font-bold text-gray-700 mb-2">
+                              账号
+                            </label>
+                            <input
+                              id="proxy-username"
+                              type="text"
+                              autoComplete="off"
+                              value={editForm.proxy_username}
+                              onChange={(e) => setEditForm({ ...editForm, proxy_username: e.target.value })}
+                              placeholder="代理用户名（可选）"
+                              className="w-full ios-input px-4 py-3 rounded-xl"
+                            />
+                          </div>
+                          <div>
+                            <label htmlFor="proxy-password" className="block text-sm font-bold text-gray-700 mb-2">
+                              密码
+                            </label>
+                            <input
+                              id="proxy-password"
+                              type="password"
+                              autoComplete="new-password"
+                              value={editForm.proxy_password}
+                              onChange={(e) => setEditForm({ ...editForm, proxy_password: e.target.value })}
+                              placeholder={proxyPasswordSaved ? '已保存（留空不修改）' : '代理密码（可选）'}
+                              className="w-full ios-input px-4 py-3 rounded-xl"
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <label htmlFor="proxy-region" className="block text-sm font-bold text-gray-700 mb-2">
+                            归属地备注
+                          </label>
+                          <input
+                            id="proxy-region"
+                            type="text"
+                            value={editForm.proxy_region}
+                            onChange={(e) => setEditForm({ ...editForm, proxy_region: e.target.value })}
+                            placeholder="如：上海·电信（仅用于自查，便于让指纹与归属地对齐）"
+                            className="w-full ios-input px-4 py-3 rounded-xl"
+                          />
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={handleTestProxy}
+                            disabled={proxyTesting || !editForm.proxy_server.trim()}
+                            className="min-h-11 rounded-xl bg-indigo-600 px-4 text-sm font-bold text-white flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {proxyTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                            {proxyTesting ? '测试中...' : '保存并测试连通性'}
+                          </button>
+                          {editingAccount.proxy_last_ip && (
+                            <span className="text-xs text-gray-500">
+                              上次出口 IP：{editingAccount.proxy_last_ip}（{editingAccount.proxy_last_status || '未知'}）
+                            </span>
+                          )}
+                        </div>
+                        {proxyTestResult && (
+                          <div
+                            className={`rounded-xl px-4 py-3 text-sm ${proxyTestResult.ok ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-700'}`}
+                          >
+                            {proxyTestResult.ok
+                              ? `连通正常，出口 IP：${proxyTestResult.ip}`
+                              : `连通失败：${proxyTestResult.error || proxyTestResult.status}`}
+                          </div>
+                        )}
+                        <p className="text-xs text-gray-400">
+                          代理密码加密存储，仅在登录/续期时于服务端解密使用；此处永不回显明文。
+                        </p>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from loguru import logger
+from utils.account_fingerprint import build_browser_fingerprint
 from utils.browser_interaction import BrowserInteractionChannel
 from utils.browser_runtime import (
     chromium_runtime_options,
@@ -53,17 +54,30 @@ class QRVerificationBrowser:
         session_validator: Optional[
             Callable[[str, str], SessionProbeResult]
         ] = probe_message_session_sync,
+        proxy: Any = None,
     ):
         self.profile_root = Path(profile_root)
         self.verification_root = ensure_private_verification_root(verification_root)
         self.playwright_factory = playwright_factory or self._default_playwright_factory
         self.session_validator = session_validator
+        self._proxy = proxy
 
     @staticmethod
     def _default_playwright_factory():
         from playwright.sync_api import sync_playwright
 
         return sync_playwright()
+
+    @staticmethod
+    def _add_fingerprint_script(context: Any, script: str) -> None:
+        """Best-effort context-level fingerprint init script; never break verification."""
+        adder = getattr(context, "add_init_script", None)
+        if not callable(adder):
+            return
+        try:
+            adder(script)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("注入账号指纹脚本失败（不影响验证）: {}", type(exc).__name__)
 
     @staticmethod
     def _safe_key(value: str) -> str:
@@ -129,14 +143,23 @@ class QRVerificationBrowser:
             )
 
             with self.playwright_factory() as playwright:
+                context_kwargs: dict[str, Any] = {
+                    "viewport": {"width": 1280, "height": 860},
+                    "locale": "zh-CN",
+                }
+                fp_key = str((initial_cookies or {}).get("unb") or "").strip() or session_id
+                fingerprint = build_browser_fingerprint(fp_key)
+                if fingerprint:
+                    context_kwargs.update(fingerprint.context_options())
                 context = playwright.chromium.launch_persistent_context(
                     str(user_data_dir),
                     headless=False,
-                    **chromium_runtime_options(),
+                    **chromium_runtime_options(self._proxy),
                     args=self._browser_args(),
-                    viewport={"width": 1280, "height": 860},
-                    locale="zh-CN",
+                    **context_kwargs,
                 )
+                if fingerprint:
+                    self._add_fingerprint_script(context, fingerprint.init_script())
                 page = self._active_page(context)
 
                 self._add_initial_cookies(context, initial_cookies or {})

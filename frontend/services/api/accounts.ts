@@ -37,6 +37,14 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     login_method_label: item.login_method_label,
     auto_refresh_supported: Boolean(item.auto_refresh_supported),
     has_l3_memory: Boolean(item.has_l3_memory),
+    proxy_enabled: Boolean(item.proxy_enabled),
+    proxy_server: item.proxy_server || '',
+    proxy_username: item.proxy_username || '',
+    proxy_password_set: Boolean(item.proxy_password_set),
+    proxy_region: item.proxy_region || '',
+    proxy_last_ip: item.proxy_last_ip || '',
+    proxy_last_status: item.proxy_last_status || '',
+    proxy_last_check_at: item.proxy_last_check_at ?? null,
     reauth_required: Boolean(item.reauth_required),
     reauth_action: item.reauth_action,
     last_login_at: item.last_login_at ?? null,
@@ -412,6 +420,41 @@ export const updateAccountCookieRefreshSettings = async (id: string, data: {
   cookie_refresh_interval_minutes: number;
 }): Promise<any> => {
   return put(`/cookies/${id}/cookie-refresh-settings`, data);
+};
+
+export interface AccountProxyView {
+  proxy_enabled: boolean;
+  proxy_server: string;
+  proxy_username: string;
+  proxy_password_set: boolean;
+  proxy_bypass?: string;
+  proxy_region: string;
+  proxy_last_ip: string;
+  proxy_last_status: string;
+  proxy_last_check_at: number | null;
+}
+
+export interface ProxyProbeResult {
+  ok: boolean;
+  ip: string;
+  status: string;
+  error: string;
+}
+
+// proxy_password: 省略/undefined 表示保留原密码，空串表示清空
+export const updateAccountProxy = async (id: string, data: {
+  proxy_enabled: boolean;
+  proxy_server: string;
+  proxy_username?: string;
+  proxy_password?: string;
+  proxy_region?: string;
+  proxy_bypass?: string;
+}): Promise<{ success: boolean; message: string; data: AccountProxyView }> => {
+  return put(`/cookies/${id}/proxy`, data);
+};
+
+export const testAccountProxy = async (id: string): Promise<{ success: boolean; data: ProxyProbeResult }> => {
+  return post(`/cookies/${id}/proxy/test`, {});
 };
 
 export const getAllAISettings = async (): Promise<Record<string, AIReplySettings>> => {

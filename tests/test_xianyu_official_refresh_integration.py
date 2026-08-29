@@ -56,6 +56,10 @@ class FakeRefreshDatabase:
         del cookie_id
         return dict(self.details)
 
+    def get_account_proxy_config(self, cookie_id):
+        del cookie_id
+        return None
+
     def mark_cookie_expired(self, cookie_id):
         del cookie_id
         self.expired_calls += 1
@@ -85,6 +89,16 @@ class FakeRefreshDatabase:
 
 class FakeOfficialRefreshService:
     calls = []
+
+    def __init__(self, **kwargs):
+        # 生产代码会以 proxy= 等关键字实例化官方登录服务；fake 一律忽略。
+        del kwargs
+
+    # 模块首次导入若发生在本 fake 的 patch 生效期间，L3MemoryService 单例
+    # 构造会引用这个类属性；给个空工厂避免 AttributeError。
+    @staticmethod
+    def _default_playwright_factory():
+        return None
 
     def refresh_session(self, **kwargs):
         self.calls.append(kwargs)
@@ -410,7 +424,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
             token = await live.refresh_token()
 
         self.assertIsNone(token)
-        probe.assert_awaited_once_with(live.cookies_str, live.browser_user_agent)
+        probe.assert_awaited_once_with(live.cookies_str, live.browser_user_agent, proxy=None)
         self.assertEqual(database.status["state"], "manual_reauth_required")
         self.assertFalse(getattr(live, "pending_verification_url", ""))
         self.assertEqual(FakeOfficialRefreshService.calls, [])
@@ -491,7 +505,7 @@ class XianyuOfficialRefreshIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.await_count, 1)
         self.assertEqual(
             probe.await_args.kwargs,
-            {"device_id": "listener-device-9988"},
+            {"device_id": "listener-device-9988", "proxy": None},
         )
 
     async def test_transient_message_token_probe_failure_is_retryable_and_does_not_require_human_action(self):

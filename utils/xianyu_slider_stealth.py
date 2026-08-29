@@ -701,20 +701,33 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】保存cookie到文件失败: {str(e)}")
     
     def _get_random_browser_features(self):
-        """获取随机浏览器特征"""
-        # 随机选择窗口大小（使用更大的尺寸以适应最大化）
+        """获取该账号**稳定**的浏览器特征（同号每次一致、不同号互异、跨维度自洽）。
+
+        原实现每次 random.choice——同一账号每次"换设备"本身就是可疑信号，且会把 Mac UA
+        随机配上脚本里钉死的 Win32 platform（一眼假）。改为按账号身份确定性派生（Windows
+        UA + Win32 + Windows 屏幕/WebGL，全程自洽），取值池不变、范围不变，只把"随机"换成
+        "账号稳定"。未知账号（default / 空）时回退到原随机行为，保持兼容。
+        """
+        pure_id = getattr(self, "pure_user_id", "") or ""
+        if pure_id and pure_id != "default":
+            try:
+                from utils.account_fingerprint import slider_fingerprint
+
+                return slider_fingerprint(pure_id).slider_features()
+            except Exception as exc:  # noqa: BLE001 - 派生失败绝不阻断登录，退回随机
+                logger.warning(
+                    f"【{self.pure_user_id}】账号稳定指纹派生失败，回退随机特征: {type(exc).__name__}"
+                )
+
+        # 兜底：无账号身份时沿用原随机行为。
         window_sizes = [
             "1920,1080", "1920,1200", "2560,1440", "1680,1050", "1600,900"
         ]
-        
-        # 随机选择语言
         languages = [
             ("zh-CN", "zh-CN,zh;q=0.9,en;q=0.8"),
             ("zh-CN", "zh-CN,zh;q=0.9"),
             ("zh-CN", "zh-CN,zh;q=0.8,en;q=0.6")
         ]
-        
-        # 随机选择用户代理
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -722,14 +735,12 @@ class XianyuSliderStealth:
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         ]
-        
+
         window_size = random.choice(window_sizes)
         lang, accept_lang = random.choice(languages)
         user_agent = random.choice(user_agents)
-        
-        # 解析窗口大小
         width, height = map(int, window_size.split(','))
-        
+
         return {
             'window_size': window_size,
             'lang': lang,

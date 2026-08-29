@@ -1986,6 +1986,37 @@ def _account_l3_memory_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
     _add_column(cursor, "cookies", "l3_memory_at REAL")
 
 
+def _account_proxy_v1(cursor: sqlite3.Cursor, _db_path: str) -> None:
+    """Per-account residential-proxy binding for cloud login stability.
+
+    每账号绑定一条独立住宅代理，浏览器与 mtop 请求都从该出口 IP 发出，
+    以规避机房 IP 触发的滑块风控。未配置的账号所有字段留空 → 直连（原行为）。
+    """
+    cookies_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cookies'"
+    ).fetchone()
+    if not cookies_exists:
+        return
+    _add_column(
+        cursor,
+        "cookies",
+        "proxy_enabled INTEGER NOT NULL DEFAULT 0 CHECK (proxy_enabled IN (0, 1))",
+    )
+    _add_column(cursor, "cookies", "proxy_server TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_username TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_password_encrypted TEXT NOT NULL DEFAULT ''")
+    _add_column(
+        cursor,
+        "cookies",
+        "proxy_password_encryption_version INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column(cursor, "cookies", "proxy_bypass TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_region TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_last_ip TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_last_status TEXT NOT NULL DEFAULT ''")
+    _add_column(cursor, "cookies", "proxy_last_check_at REAL")
+
+
 MIGRATIONS: Sequence[Migration] = (
     Migration("2026070501", "security_credentials_v1", _security_credentials_v1),
     Migration("2026070502", "runtime_sessions_v1", _runtime_sessions_v1),
@@ -2127,6 +2158,11 @@ MIGRATIONS: Sequence[Migration] = (
         "2026082502",
         "account_l3_memory_v1",
         _account_l3_memory_v1,
+    ),
+    Migration(
+        "2026082901",
+        "account_proxy_v1",
+        _account_proxy_v1,
     ),
 )
 

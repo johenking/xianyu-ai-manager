@@ -96,6 +96,10 @@ HEARTBEAT_INTERVAL = config.get('HEARTBEAT_INTERVAL', 15)
 HEARTBEAT_TIMEOUT = config.get('HEARTBEAT_TIMEOUT', 30)
 TOKEN_REFRESH_INTERVAL = config.get('TOKEN_REFRESH_INTERVAL', 1800)
 TOKEN_RETRY_INTERVAL = config.get('TOKEN_RETRY_INTERVAL', 7200)
+# L3 主动保活：趁 cookie2 仍有效时用「快速进入」免密续签，让会话常青、不走"死后才续必失败"的老路。
+# 默认关闭（需 1 账号 + 住宅代理云端灰度验证真实闭环后再开）；间隔默认 8h，须 < L2(~12h) 过期点。
+L3_KEEPALIVE_ENABLED = config.get('L3_KEEPALIVE_ENABLED', False)
+L3_KEEPALIVE_INTERVAL = config.get('L3_KEEPALIVE_INTERVAL', 28800)
 MESSAGE_EXPIRE_TIME = config.get('MESSAGE_EXPIRE_TIME', 300000)
 SLIDER_VERIFICATION = config.get('SLIDER_VERIFICATION', {
     'max_concurrent': 3,

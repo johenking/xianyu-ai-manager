@@ -23,6 +23,7 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 
 from config import API_ENDPOINTS
+from utils.browser_runtime import httpx_proxy_url
 from utils.xianyu_utils import generate_device_id, generate_sign
 
 
@@ -474,6 +475,7 @@ def probe_message_session_sync(
     device_id: Optional[str] = None,
     timeout: float = 25.0,
     client_factory: Optional[Callable[[], Any]] = None,
+    proxy: Any = None,
 ) -> SessionProbeResult:
     preflight = _preflight_cookies(cookie_string)
     if preflight:
@@ -482,9 +484,12 @@ def probe_message_session_sync(
     probe_device_id = str(device_id or "").strip() or generate_device_id(
         str(cookies.get("unb") or "").strip()
     )
+    proxy_url = httpx_proxy_url(proxy)
     try:
         if client_factory is None:
-            with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            with httpx.Client(
+                timeout=timeout, follow_redirects=False, proxy=proxy_url
+            ) as client:
                 return _probe_message_session_with_sync_client(
                     client,
                     cookie_string,
@@ -513,6 +518,7 @@ async def probe_message_session_async(
     device_id: Optional[str] = None,
     timeout: float = 25.0,
     client_factory: Optional[Callable[[], Any]] = None,
+    proxy: Any = None,
 ) -> SessionProbeResult:
     preflight = _preflight_cookies(cookie_string)
     if preflight:
@@ -521,9 +527,12 @@ async def probe_message_session_async(
     probe_device_id = str(device_id or "").strip() or generate_device_id(
         str(cookies.get("unb") or "").strip()
     )
+    proxy_url = httpx_proxy_url(proxy)
     try:
         if client_factory is None:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False, proxy=proxy_url
+            ) as client:
                 return await _probe_message_session_with_async_client(
                     client,
                     cookie_string,
