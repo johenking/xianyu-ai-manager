@@ -185,6 +185,17 @@ const reauthActionLabel = (account: AccountDetail) => {
   return '重新登录';
 };
 
+// 刷新按钮做的是哪件事，取决于后端会走哪条续签路径：有浏览器记忆走免密续签
+// （自动经该账号的住宅代理），否则通知绑定的插件设备代续期。以前一律显示
+// 「立即刷新 Cookie」，用户无从判断点下去会发生什么。
+const refreshActionLabel = (account: AccountDetail) => {
+  if (!account.auto_refresh_supported) return reauthActionLabel(account);
+  if (account.has_l3_memory) {
+    return account.proxy_enabled ? '免密续签（走该账号代理）' : '免密续签';
+  }
+  return '通知绑定设备续期';
+};
+
 const RETRYABLE_SESSION_ERROR_CODES = new Set([
   'token_probe_exception',
   'token_probe_failed',
@@ -2345,7 +2356,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                       ? account.cookie_refresh_enabled
                         ? `每 ${formatCookieRefreshInterval(account.cookie_refresh_interval_minutes)}自动续期`
                         : '可自动续期 · 定时关闭'
-                      : '到期需人工登录'}
+                      : '到期需人工重新登录'}
                    />
                    {diagnosis && (
                     <span className={`text-xs px-3 py-1.5 rounded-lg font-bold ${diagnosis.ready ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
@@ -2374,7 +2385,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                     onClick={() => void handleRefreshSession(account)}
                     disabled={refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' || sessionStatus?.state === 'verification_required'}
                     className={`p-3 rounded-xl transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${account.auto_refresh_supported ? 'text-cyan-700 hover:bg-cyan-100' : 'text-amber-700 hover:bg-amber-100'}`}
-                    title={account.auto_refresh_supported ? '立即刷新 Cookie' : reauthActionLabel(account)}
+                    title={refreshActionLabel(account)}
                 >
                     {account.auto_refresh_supported
                       ? <RefreshCw className={`w-5 h-5 ${refreshingSessionId === account.id || sessionStatus?.state === 'refreshing' ? 'animate-spin' : ''}`} />
