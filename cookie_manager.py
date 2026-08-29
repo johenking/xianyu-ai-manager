@@ -33,6 +33,7 @@ class CookieManager:
         self._runtime_action_locks: Dict[str, asyncio.Lock] = {}
         self._runtime_reconcile_lock = asyncio.Lock()
         self._task_generations: Dict[str, int] = {}
+        self.live_instances: Dict[str, Any] = {}  # 运行中的 XianyuLive，供 API 手动触发续签
         self._load_from_db()
 
     @staticmethod
@@ -266,6 +267,7 @@ class CookieManager:
             "last_error": "",
             "last_exit_reason": "",
         }
+        live = None
 
         try:
             logger.info(f"【{account_ref}】正在导入XianyuLive...")
@@ -280,6 +282,7 @@ class CookieManager:
                 user_id=user_id,
                 runtime_state=runtime_state,
             )
+            self.live_instances[cookie_id] = live
             logger.info(f"【{account_ref}】XianyuLive实例创建成功，开始调用main()...")
 
             # 强制刷新日志，确保日志被写入
@@ -325,6 +328,8 @@ class CookieManager:
                 pass
         finally:
             logger.info(f"【{account_ref}】_run_xianyu方法执行结束")
+            if live is not None and self.live_instances.get(cookie_id) is live:
+                self.live_instances.pop(cookie_id, None)
             self.task_status.setdefault(cookie_id, {}).update({
                 "running": False,
                 "last_end_time": time.time(),
@@ -335,6 +340,34 @@ class CookieManager:
                 sys.stdout.flush()
             except:
                 pass
+
+    async def trigger_manual_l3_refresh(self, cookie_id: str) -> Dict[str, Any]:
+        """由「立即刷新 Cookie」按钮触发一次 L3 免密续签（自动经该账号的住宅代理）。
+
+        只对监听在跑的账号可用——续签成功后要把新会话交接给监听，
+        没有在跑的实例就无处交接。
+        """
+        live = self.live_instances.get(cookie_id)
+        if live is None:
+            return {
+                "ok": False,
+                "code": "listener_not_running",
+                "message": "账号监听未在运行，请先启用该账号",
+            }
+        return await live._execute_l3_keepalive(manual=True)
+
+    def request_manual_l3_refresh(self, cookie_id: str) -> Dict[str, Any]:
+        """线程安全入口：供不在本管理器事件循环内的调用方使用。"""
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is not None and current_loop is self.loop:
+            raise RuntimeError("同一事件循环内请直接 await trigger_manual_l3_refresh")
+        fut = asyncio.run_coroutine_threadsafe(
+            self.trigger_manual_l3_refresh(cookie_id), self.loop
+        )
+        return fut.result(timeout=300)
 
     async def _add_cookie_async(
         self,
