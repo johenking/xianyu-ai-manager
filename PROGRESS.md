@@ -14,7 +14,29 @@
 - 3b 对账重发器（invite_bridge_poller.py）：平台发现顺带登记「本地已发×平台 pending_ship」漂移单（零额外列表请求）+ logger.warning 告警；每 600s（env XIANYU_SHIP_RECONCILE_INTERVAL_SECONDS）一轮，逐笔回查平台详情双确认后补免拼+虚拟发货，每轮每账号 ≤5 笔，查询失败保留候选下轮再试（fail-closed）。
 - 3c 测试：旧缺陷用例 test_mark_fulfilled_already_shipped_without_platform_call 按新契约重写为 3 条（平台已推进直接成功 / 平台待发货补发货 / 回查失败 fail-closed）；任务 1 新增 4 条、任务 2 新增 3 条、3b 新增 4 条（含反向验证：制造本地已发×平台待发样本，证明重发器补发货并告警，见 test_ship_reconciler_repairs_local_shipped_platform_pending_drift）。
 - 验收结果（均亲测）：三文件 88 passed + 2 subtests（基线 75，重写 1、新增 14）；全量 `pytest tests/ -q` = 1096 passed + 205 subtests，exit 0（基线 1083，1096 = 1083 − 1 重写 + 14 新增），skipped 无新增。反向验证输出：`test_ship_reconciler_repairs_local_shipped_platform_pending_drift PASSED`——样本为本地 shipped/system_shipped=1 + 平台发现 pending_ship，重发器回查双确认后补免拼+虚拟发货一次（is_bargain/buyer 透传正确）、本地收敛 shipped、漂移队列清空，且捕获到「平台状态漂移」与「对账补发货成功」两条 WARNING 告警。
-- 未动文件说明：order_sync_service.py / delivery_stage_metrics.py 在白名单内但本次无需改动（回查复用既有 fetch_xianyu_order_detail + parse_order_detail_payload，埋点复用既有阶段常量）。按任务铁律未部署、未动生产数据、未修存量卡单。
+- 未动文件说明：order_sync_service.py / delivery_stage_metrics.py 在白名单内但本次无需改动（回查复用既有 fetch_xianyu_order_detail + parse_order_detail_payload，埋点复用既有阶段常量）。
+
+## 发货提速（已上云 · 2026-08-29）
+
+- 生产镜像 `xianyu-ai-manager:ship-speedup-20260829-072150`（覆盖 `XianyuAutoAsync.py` / `invite_bridge.py` / `invite_bridge_poller.py`，sha256 与维护源 HEAD `b0d6f4c` 一致）。基线 `p0p2-observability-20260828-2120`。
+- 风控闸保持失败关闭：同买家 fan-out 15s 冷却、单次最多 5 笔、待发货只扫前 2 页；核验重试仅 `order_not_observed` 的 2/4/8s；对账默认 600s 一轮、每账号 ≤5 笔，只补免拼+虚拟发货，不重发码。
+- 按用户拍板未修存量卡单（活跃号 10 笔、历史号遗留、代点未打开链接的 2 笔）。
+- 健康检查：云端 18091 与公网 `xianyu.cxywjx.top` `/health/ready` = ready，迁移仍 `2026082502`。
+- 回滚：`outputs/ship-speedup-20260829T072150+0800/rollback/rollback.sh --check|--execute`。证据：`outputs/ship-speedup-20260829T072150+0800/evidence/verification-record.md`。
+- 下一笔真实新单才是现网速度金丝雀；代码门禁不能代替墙钟。
+
+## 拼单发货修复（已上云 · 2026-08-29 14:48）
+
+- 根因（当日调查实证）：拼团/两人小刀订单平台编码 `idleBizCode="6000"`、`xGlobalBizCode="idleShop|pinGroup|c2c"`，而 08-25 bundle-a 的 `classify_order_business_type` 只认 bizCode=="6" 或 LOGISTICS_SEND 按钮 → 拼团单判 unknown → 热路径拒发（order_business_type_unconfirmed 不重试）+ 30s 轮询永久跳过；仅买家再发一条消息触发二次核验才自愈。08-27 上云起生效，非 08-28/29 两笔提交引入。生产影响：1 笔卡 10h 已被申请退款、1 笔被买家取消、平台仍挂 ~10 笔拼团待发货存量。
+- 改动 1（order_sync_service.py）：新增 `ORDINARY_BIZ_CODES = {"6","6000"}` 与 `ORDINARY_BIZ_CODE_KEYWORDS = ("pingroup",)`，分类循环命中即 ordinary；lead 分支与「lead∧ordinary→unknown」失败关闭语义一字未改。一处改动同时修热路径门禁、send-message 门禁、30s 轮询、对账重发器四条链路。
+- 改动 2（XianyuAutoAsync.py）：`INVITE_VERIFY_RETRYABLE_ERROR_CODES = {order_not_observed, order_business_type_unconfirmed}`，2/4/8s 退避循环按集合判可重试；确定性失败仍首查即弃，重试上限/请求预算不变。
+- 测试：新增 3 条（拼团分类三形态+冲突仍 unknown / 热路径 unconfirmed→重试→投递 / 真实 normalize_order_record 归一化拼团平台行→轮询 stage+发事件），均反向验证（stash 源码后变红）。定向 226 passed + 53 subtests；全量 **1101 passed + 205 subtests, exit 0**（HEAD 基线 1098 + 3，对账吻合）；Ruff/py_compile 过。
+- 用户拍板（14:16 决策卡）：现在改码+补测试，部署等确认；存量 ~10 笔随修复自动收敛（不加豁免，幂等不重码）。14:44 用户确认部署。
+- 发布（14:48）：镜像 `xianyu-ai-manager:pingroup-fix-20260829-144558`（基底=部署时刻运行镜像 `browser-ext-1.2.3-20260829-0745`，仅 COPY 两文件）。`DEPLOY_APP_A=PASS`；容器内两文件 sha256 与维护源工作树一致；本地 18091 + 公网双域名 `/health/ready`=ready；迁移 `2026082502` 不变；`rollback.sh --check`=PASS；启动切片 Traceback/ERROR=0；心跳恢复（295 次/3 分钟）。
+- 生效证据：修复前每轮必打的「邀请桥订单跳过非普通业务类型」发布后 **0 次**。当前轮询跳过均为正当理由：2 笔 refunding（含用户要人工处理的退款单）、1 笔 cancelled、5 账号 skipped_reauth（登录过期，既有状态）。
+- 存量收敛路径（多路）：①从没收到链接的存量单→轮询 stage+补链接；②已发过链接的→幂等跳过等买家点（日志见「已有下游消息操作」×4 笔）；③本地已发×平台待发货漂移→对账重发器 600s 首轮补免拼+真发货；④挂在过期账号上的→等用户扫码重登。
+- 退款单（尾号 005037，ref_8e58c959c5）系统正确拒发（status=refunding），留用户人工处理。
+- 证据：`outputs/pingroup-fix-20260829T144558+0800/evidence/verification-record.md`；回滚 `outputs/pingroup-fix-20260829T144558+0800/rollback/rollback.sh --check|--execute`（回 browser-ext-1.2.3）。
 
 # 扫码账号免密自动续签（五阶段）：已发布上线
 
@@ -25,11 +47,10 @@
 
 # 当前生产状态
 
-- 最终复核时间：2026-08-26 01:52（Asia/Shanghai）。`com.cxywjx.xianyu-manager` 正在运行，PID `6309`（00:59:02 随性能优化发布的受控重载启动）；`8091` 只有一个 listener，本地与公网 `/health/ready` 均为 `ready`，迁移 `2026082502`。
-- 当前生产已包含 Bundle A、滑块隐身账密自愈、扫码免密续签、Toast、UI 一致性、仪表盘图表重组、运营概览精修、前端关键路径性能优化（00:57 发布，含 `reply_server.py` 订单图片单飞/负缓存/四并发背压），以及营收趋势图恢复早上版本（01:43 纯静态发布）。公网前端入口为 `assets/index-B3QLJzmi.js` / `assets/index-Dt1bU_Op.css`，与生产 `static/index.html` 一致。
-- 维护源 `main@b329c44` 已推送 origin/main 并与生产对齐：生产静态构建自 `b329c44` 对应工作树，生产后端与 `fcd1182` 一致（本次恢复为纯前端）。
+- 最终复核时间：2026-08-29 14:50。唯一活跃生产是云 HOST `app-suite-candidate` 容器 `app-a-cloud-app-a-1`，镜像 `xianyu-ai-manager:pingroup-fix-20260829-144558`。公网 `/health/ready` = ready，迁移 `2026082502`。Mac LaunchAgent / `8091` 已冻结，不得再据其推导线上状态。
+- 镜像链（新→旧）：拼单修复（本镜像）→ 浏览器扩展导入修复 `browser-ext-1.2.3-20260829-0745` → 发货提速+破自锁+对账 `ship-speedup-20260829-072150` → P0/P2 埋点 `p0p2-observability-20260828-2120` → 小刀两段式、白屏固化、404 no-store、Bundle A / L3 / Toast / 仪表盘等。
 - listener 注册隔离仍有效；`runtime_sessions` 只记录带 TTL 的临时操作，不代表 listener 数量。
-- 维护源是 `/Users/mac/Documents/咸鱼监控台`，运行目录是 `/Users/mac/Library/Application Support/XianyuManager`；两棵树不得整树互相覆盖。工作树中的 `.cursor/` 用户资产继续保留，不清理、不覆盖。
+- 维护源是 `/Users/mac/Documents/咸鱼监控台`；Mac `/Users/mac/Library/Application Support/XianyuManager` 是冻结回滚备份。两棵树不得整树互相覆盖。工作树中的 `.cursor/` 与未提交 `browser_extension/*` 继续保留，不清理、不覆盖。
 
 ## 部署后观察（替代真人 canary）
 
@@ -39,6 +60,7 @@
 
 ## 证据路由
 
+- 发货提速云端发布（08-29）：`outputs/ship-speedup-20260829T072150+0800/`（evidence/verification-record.md；回滚 `rollback/rollback.sh`）。
 - 营收趋势图恢复早上版本发布（08-26 01:43）：`outputs/trend-restore-20260826T014313+0800/`（verification-record.md、post-deploy-verify.txt；回滚在生产 `_rollback/trend-restore-20260826T014313+0800/`）。
 - 前端关键路径性能优化发布（08-26 00:57）：`outputs/frontend-critical-20260826T005740+0800/`（verification-record.md、source-head.txt；回滚在生产 `_rollback/` 同名目录）。
 - 运营概览精修发布（22:28，含过载事故记录）：`outputs/hero-refine-20260825T222457+0800/`（evidence/verification-record.md、original/、rollback/rollback.sh + static-original）。

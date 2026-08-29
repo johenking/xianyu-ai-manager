@@ -1,5 +1,15 @@
 # Handoff
 
+## 2026-08-29 拼单发货修复发布（14:48）
+
+云生产 APP_A 切到 `xianyu-ai-manager:pingroup-fix-20260829-144558`（基底=部署时刻运行镜像 `browser-ext-1.2.3-20260829-0745`，仅 COPY `order_sync_service.py` / `XianyuAutoAsync.py`，容器内 sha256 与维护源工作树一致）。修复：`classify_order_business_type` 认识拼团单（bizCode=="6000" 或含 "pinGroup" → ordinary，失败关闭语义未放宽），一处改动同时修热路径门禁 / send-message 门禁 / 30s 轮询 / 对账重发器四条链路；热路径 2/4/8s 退避重试扩展到 `order_business_type_unconfirmed`。门禁：全量 1101 passed + 205 subtests、3 条新测试反向验证、Ruff/py_compile 过。发布后：`DEPLOY_APP_A=PASS`、双公网域名 ready、迁移 `2026082502` 不变、启动切片零错误、心跳恢复、「跳过非普通业务类型」拦截日志归零。存量 ~10 笔按用户拍板随修复自动收敛（幂等不重码；已发过链接的等买家点击，本地已发×平台待发货走 600s 对账重发器，过期账号上的等重登）。退款单（尾号 005037）系统正确拒发，留用户人工处理。回滚 `outputs/pingroup-fix-20260829T144558+0800/rollback/rollback.sh`。
+
+## 2026-08-29 发货链路提速 + 破自锁发布
+
+云生产 APP_A 切到 `xianyu-ai-manager:ship-speedup-20260829-072150`（基线 `p0p2-observability-20260828-2120`，仅 COPY `XianyuAutoAsync.py` / `invite_bridge.py` / `invite_bridge_poller.py`，sha256 与维护源 HEAD `b0d6f4c` 一致）。同买家待发货 fan-out（≤5 / 15s 冷却 / 前 2 页）、仅 `order_not_observed` 的 2/4/8s 核验重试、每 600s 每账号 ≤5 笔对账补发货（只补免拼+虚拟发货，不重发码）；mark-fulfilled 本地已发时先回查平台再决定补发。门禁未放宽。按用户拍板未修存量卡单、未代点确认。公网 `/health/ready` = ready，迁移 `2026082502`。回滚 `outputs/ship-speedup-20260829T072150+0800/rollback/rollback.sh`。下一笔真实新单才是现网速度金丝雀。
+
+并行会话把邀请服务发货聊天改成只发兑换码+使用地址（Web `invite-fulfillment-web:fulfillment-copy-20260829`，迁移 015），不在本仓库。
+
 ## 2026-08-26 运营概览营收趋势图恢复早上版本发布
 
 依据用户反馈（早上版本观感优于晚间改版）把营收趋势图恢复到 2026-08-25 早上基线 `91bf92a`，其余晚间改版全部保留（hero 左列 flex 布局与 4 指标含客单价、商品成交榜合并、客单价分布、买家构成、账号贡献、BusinessInsights 静默跟刷不动）。恢复内容与 `91bf92a` 字节级一致：折线 linear→monotone（线宽 2.5、去 activeDot）、撤销 `ReferenceDot` 峰谷图上标注（连带 TrendMarkerLabel/anchorFor）、渐变 0.32、网格恢复虚线、柱 fillOpacity 0.28 圆角 [3,3]、图高 192→174px（Dashboard 的 Suspense 占位同步）；`getTrendHighlights` 移除 `peakAmount/lowAmount` 扩展，两个测试文件同步回退（峰谷标注用例删除、ResponsiveContainer mock 恢复简单版）。维护源提交 `b329c44` 已推送 `origin/main`。
