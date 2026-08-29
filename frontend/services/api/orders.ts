@@ -1,9 +1,12 @@
 import { del, get, post, put } from '../request';
 import type {
+  AdminAccountOverview,
+  AdminAgentSummary,
   AdminStats,
   ApiResponse,
   BuyerBehaviorAnalytics,
   DashboardSummary,
+  GlobalDashboardSummary,
   ItemMetricStatus,
   ItemPerformanceAnalytics,
   ItemTrafficAnalytics,
@@ -150,6 +153,26 @@ export const getDashboardSummary = async (params: {
   end_date?: string;
 }, signal?: AbortSignal): Promise<DashboardSummary> => {
   return get('/api/dashboard/summary', params, signal);
+};
+
+export const getGlobalDashboardSummary = async (params: {
+  range: 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
+  start_date?: string;
+  end_date?: string;
+}, signal?: AbortSignal): Promise<GlobalDashboardSummary> => {
+  return get('/api/dashboard/global-summary', params, signal);
+};
+
+export const getAdminAgentSummary = async (params: {
+  range: 'today' | 'yesterday' | '3days' | '7days' | '30days' | 'custom';
+  start_date?: string;
+  end_date?: string;
+}, signal?: AbortSignal): Promise<AdminAgentSummary> => {
+  return get('/api/admin/dashboard/agents', params, signal);
+};
+
+export const getAdminAccountsOverview = async (signal?: AbortSignal): Promise<AdminAccountOverview> => {
+  return get('/api/admin/accounts/overview', undefined, signal);
 };
 
 export const getOrderAnalytics = async (daysOrParams: number | {start_date: string; end_date: string} = 7): Promise<OrderAnalytics> => {

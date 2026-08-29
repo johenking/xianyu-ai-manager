@@ -31,6 +31,9 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
                 state.get("auto_confirm", {}).get(cookie_id, True)
             ),
         }
+        database.get_inactive_user_ids.side_effect = lambda: set(
+            state.get("inactive_users", set())
+        )
         return database
 
     async def test_runtime_reconcile_stops_listener_removed_from_database(self):
@@ -70,6 +73,59 @@ class CookieManagerHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(listener_stopped.is_set())
         self.assertNotIn("account-removed", manager.tasks)
         self.assertNotIn("account-removed", manager.cookies)
+
+    async def test_runtime_reconcile_stops_listener_when_owner_deactivated(self):
+        """归属用户被停用后，reconcile 必须把其账号 listener 停掉且不再重启。"""
+        loop = asyncio.get_running_loop()
+        state = {
+            "cookies": {"account-owned": "unb=owned; cookie2=live"},
+            "statuses": {"account-owned": True},
+            "owners": {"account-owned": 7},
+        }
+        database = self._runtime_database(state)
+
+        with patch("cookie_manager.db_manager", database):
+            manager = CookieManager(loop)
+            listener_stopped = asyncio.Event()
+
+            async def old_listener():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    listener_stopped.set()
+                    raise
+
+            manager.tasks["account-owned"] = loop.create_task(old_listener())
+            await asyncio.sleep(0)
+            state["inactive_users"] = {7}
+
+            result = await manager.reconcile_from_db(shutdown_timeout=0.2)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["stopped"], 1)
+        self.assertTrue(listener_stopped.is_set())
+        self.assertNotIn("account-owned", manager.tasks)
+        # 账号记录保留（数据不删），仅监听下线、状态判定为禁用
+        self.assertIn("account-owned", manager.cookies)
+        self.assertFalse(manager.cookie_status["account-owned"])
+
+    async def test_enable_account_rejected_when_owner_deactivated(self):
+        """归属用户停用期间，任何人不得重新启用其账号监听。"""
+        loop = asyncio.get_running_loop()
+        state = {
+            "cookies": {"account-owned": "unb=owned; cookie2=live"},
+            "statuses": {"account-owned": False},
+            "owners": {"account-owned": 7},
+            "inactive_users": {7},
+        }
+        database = self._runtime_database(state)
+
+        with patch("cookie_manager.db_manager", database):
+            manager = CookieManager(loop)
+            with self.assertRaises(ValueError):
+                manager.update_cookie_status("account-owned", True)
+            self.assertFalse(manager.cookie_status["account-owned"])
+            database.save_cookie_status.assert_not_called()
 
     async def test_runtime_reconcile_restarts_changed_listener_and_starts_new_one(self):
         loop = asyncio.get_running_loop()

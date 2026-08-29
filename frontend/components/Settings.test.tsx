@@ -6,9 +6,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getAIProviders,
+  getAdminAccountsOverview,
   getRegistrationAdminStatus,
   getSettingsSummary,
   getUserSettingsSummary,
+  listRegistrationInvites,
   listRegistrationUsers,
   saveUserBasicSettings,
   saveSettingsSection,
@@ -23,9 +25,14 @@ vi.mock('../services/api', () => ({
   getUserSettingsSummary: vi.fn(),
   getRegistrationAdminStatus: vi.fn(),
   listRegistrationUsers: vi.fn(),
+  listRegistrationInvites: vi.fn(),
+  createRegistrationInvites: vi.fn(),
+  revokeRegistrationInvite: vi.fn(),
+  setInviteRequired: vi.fn(),
   setRegistrationEnabled: vi.fn(),
   setRegistrationLimit: vi.fn(),
   setRegistrationUserActive: vi.fn(),
+  getAdminAccountsOverview: vi.fn(),
   getAIProviders: vi.fn(),
   discoverAIProviderModels: vi.fn(),
   createAIProvider: vi.fn(),
@@ -78,6 +85,17 @@ describe('Settings configuration sections', () => {
       remaining_slots: 20,
     });
     vi.mocked(listRegistrationUsers).mockResolvedValue({ success: true, users: [] });
+    vi.mocked(listRegistrationInvites).mockResolvedValue({
+      success: true,
+      invite_required: false,
+      invites: [],
+    });
+    vi.mocked(getAdminAccountsOverview).mockResolvedValue({
+      success: true,
+      total: 0,
+      expired_count: 0,
+      accounts: [],
+    });
     vi.mocked(saveSettingsSection).mockReset();
     vi.mocked(verifySettingsSection).mockReset();
     vi.mocked(confirmSmtpVerification).mockReset();

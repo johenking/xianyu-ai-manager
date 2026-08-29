@@ -24,6 +24,7 @@ import {
 
 const DashboardCharts = lazy(() => import('./DashboardCharts'));
 const BusinessInsights = lazy(() => import('./BusinessInsights'));
+const SiteOverview = lazy(() => import('./SiteOverview'));
 // hero 内嵌趋势图与其余图表同 chunk，保持 recharts 只进懒加载分包
 const HeroTrend = lazy(() => import('./DashboardCharts').then((module) => ({ default: module.HeroTrend })));
 
@@ -122,7 +123,7 @@ const CompareBadge: React.FC<{ current: number; previous: number; periodLabel: s
   );
 };
 
-const Dashboard: React.FC = () => {
+const Dashboard: React.FC<{ isAdmin?: boolean }> = ({ isAdmin = false }) => {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [timeRange, setTimeRange] = useState<TimeRange>('today');
   const [customStartDate, setCustomStartDate] = useState('');
@@ -509,6 +510,14 @@ const Dashboard: React.FC = () => {
           <p className="mt-1 text-sm text-gray-500">添加闲鱼账号后，订单和营收会显示在这里。</p>
         </div>
       )}
+
+      <Suspense fallback={<div className={`${PANEL_CLASS} flex h-24 items-center justify-center text-sm text-gray-400`}>全站经营加载中...</div>}>
+        <SiteOverview
+          isAdmin={isAdmin}
+          startDate={summary.range.start_date}
+          endDate={summary.range.end_date}
+        />
+      </Suspense>
 
       <Suspense fallback={<div className={`${PANEL_CLASS} flex h-[420px] items-center justify-center text-sm text-gray-400`}>图表加载中...</div>}>
         <DashboardCharts

@@ -59,6 +59,10 @@ CHALLENGE_CLEANUP_BATCH_SIZE = 100
 RATE_IP_DIGEST_PURPOSE = "auth-rate-ip"
 RATE_EMAIL_DIGEST_PURPOSE = "auth-rate-email"
 RATE_ACCOUNT_DIGEST_PURPOSE = "auth-rate-account"
+# 邀请码明文只在创建时返回一次；库中仅存 HMAC digest 与展示用 hint。
+INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+INVITE_DIGEST_PURPOSE = "registration-invite-code"
+MAX_INVITE_NOTE_LENGTH = 200
 RATE_EVENT_RETENTION_SECONDS = 7 * 86_400
 RATE_CLEANUP_INTERVAL_SECONDS = 3600
 
@@ -820,6 +824,211 @@ class RegistrationService:
             ("true" if enabled else "false",),
         )
 
+    def invite_required(self) -> bool:
+        with self.lock:
+            return self._invite_required_locked()
+
+    def _invite_required_locked(self) -> bool:
+        row = self.connection.execute(
+            "SELECT value FROM system_settings"
+            " WHERE key = 'registration_invite_required'"
+        ).fetchone()
+        return row is not None and str(row[0]).strip().lower() in {"1", "true"}
+
+    def set_invite_required(self, enabled: bool) -> bool:
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    """
+                    INSERT INTO system_settings (key, value, description)
+                    VALUES (
+                        'registration_invite_required', ?,
+                        'Whether registration requires an invite code'
+                    )
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    ("1" if enabled else "0",),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return bool(enabled)
+
+    def create_invites(
+        self,
+        *,
+        count: int = 1,
+        valid_days: int = 30,
+        note: str = "",
+        created_by_user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 20:
+            raise RegistrationError(
+                "INVITE_COUNT_INVALID",
+                "每次只能创建 1 至 20 个邀请码",
+            )
+        if (
+            isinstance(valid_days, bool)
+            or not isinstance(valid_days, int)
+            or not 1 <= valid_days <= 365
+        ):
+            raise RegistrationError(
+                "INVITE_VALID_DAYS_INVALID",
+                "邀请码有效天数必须为 1 至 365 天",
+            )
+        normalized_note = str(note or "")
+        if len(normalized_note) > MAX_INVITE_NOTE_LENGTH:
+            raise RegistrationError(
+                "INVITE_NOTE_TOO_LONG",
+                f"邀请码备注不能超过 {MAX_INVITE_NOTE_LENGTH} 个字符",
+            )
+
+        now = self.clock()
+        expires_at = now + valid_days * 86_400
+        created: list[dict[str, Any]] = []
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                for _ in range(count):
+                    code = self._generate_invite_code()
+                    cursor = self.connection.execute(
+                        """
+                        INSERT INTO registration_invites (
+                            code_digest, code_hint, note, expires_at,
+                            created_by_user_id, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self._invite_digest(code),
+                            self._invite_hint(code),
+                            normalized_note,
+                            expires_at,
+                            created_by_user_id,
+                            int(now),
+                        ),
+                    )
+                    created.append(
+                        {
+                            "id": int(cursor.lastrowid),
+                            "code": code,
+                            "hint": self._invite_hint(code),
+                            "note": normalized_note,
+                            "created_at": int(now),
+                            "expires_at": expires_at,
+                            "used_at": None,
+                            "used_by_user_id": None,
+                            "revoked_at": None,
+                            "created_by_user_id": created_by_user_id,
+                            "status": "active",
+                        }
+                    )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        return created
+
+    def list_invites(self) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = self.connection.execute(
+                """
+                SELECT id, code_hint, note, expires_at, used_at,
+                       used_by_user_id, revoked_at, created_by_user_id, created_at
+                FROM registration_invites
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        now = self.clock()
+        return [self._invite_from_row(row, now) for row in rows]
+
+    def revoke_invite(self, invite_id: int) -> dict[str, Any]:
+        now = self.clock()
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.connection.execute(
+                    """
+                    SELECT id, code_hint, note, expires_at, used_at,
+                           used_by_user_id, revoked_at, created_by_user_id, created_at
+                    FROM registration_invites WHERE id = ?
+                    """,
+                    (invite_id,),
+                ).fetchone()
+                if row is None:
+                    raise RegistrationError("INVITE_NOT_FOUND", "邀请码不存在", http_status=404)
+                if row[4] is not None:
+                    raise RegistrationError("INVITE_ALREADY_USED", "已使用的邀请码不能吊销")
+                if row[6] is not None:
+                    raise RegistrationError("INVITE_REVOKED", "邀请码已被吊销")
+                self.connection.execute(
+                    "UPDATE registration_invites SET revoked_at = ? WHERE id = ?",
+                    (now, invite_id),
+                )
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
+        updated = list(row)
+        updated[6] = now
+        return self._invite_from_row(updated, now)
+
+    def _get_invite_for_use(self, digest: str) -> Any:
+        row = self.connection.execute(
+            """
+            SELECT id, expires_at, used_at, revoked_at
+            FROM registration_invites WHERE code_digest = ?
+            """,
+            (digest,),
+        ).fetchone()
+        if row is None:
+            raise RegistrationError("INVITE_INVALID", "邀请码无效或不可用")
+        return row
+
+    @staticmethod
+    def _validate_invite_for_use(row: Any, now: float) -> None:
+        if row[2] is not None:
+            raise RegistrationError("INVITE_ALREADY_USED", "邀请码已被使用")
+        if row[3] is not None:
+            raise RegistrationError("INVITE_REVOKED", "邀请码已被吊销")
+        if float(row[1]) <= now:
+            raise RegistrationError("INVITE_EXPIRED", "邀请码已过期")
+
+    def _generate_invite_code(self) -> str:
+        body = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(24))
+        return f"REG-{body}"
+
+    def _invite_digest(self, code: str) -> str:
+        return self.cipher.digest(str(code).strip(), purpose=INVITE_DIGEST_PURPOSE)
+
+    @staticmethod
+    def _invite_hint(code: str) -> str:
+        return f"{code[:7]}...{code[-4:]}"
+
+    @staticmethod
+    def _invite_from_row(row: Any, now: float) -> dict[str, Any]:
+        if row[4] is not None:
+            status = "used"
+        elif row[6] is not None:
+            status = "revoked"
+        elif float(row[3]) <= now:
+            status = "expired"
+        else:
+            status = "active"
+        return {
+            "id": int(row[0]),
+            "hint": row[1],
+            "note": row[2],
+            "expires_at": row[3],
+            "used_at": row[4],
+            "used_by_user_id": row[5],
+            "revoked_at": row[6],
+            "created_by_user_id": row[7],
+            "created_at": row[8],
+            "status": status,
+        }
+
     def create_challenge(
         self,
         *,
@@ -1161,6 +1370,20 @@ class RegistrationService:
                         "注册暂未开放",
                         http_status=403,
                     )
+                # 开关关闭时 invite_code 维持 v1.7 legacy 语义：忽略不校验。
+                invite_row = None
+                if self._invite_required_locked():
+                    invite_value = str(invite_code or "").strip()
+                    if not invite_value:
+                        raise RegistrationError(
+                            "INVITE_CODE_REQUIRED",
+                            "注册需要邀请码",
+                            http_status=403,
+                        )
+                    invite_row = self._get_invite_for_use(
+                        self._invite_digest(invite_value)
+                    )
+                    self._validate_invite_for_use(invite_row, now)
                 username_identity = normalize_username(username)
                 email_identity = normalize_email(email)
                 challenge = self._get_challenge(challenge_id)
@@ -1204,6 +1427,21 @@ class RegistrationService:
                     terms_accepted_at=now,
                     is_active=True,
                 )
+                if invite_row is not None:
+                    invite_cursor = self.connection.execute(
+                        """
+                        UPDATE registration_invites
+                        SET used_at = ?, used_by_user_id = ?
+                        WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL
+                          AND expires_at > ?
+                        """,
+                        (now, user_id, invite_row[0], now),
+                    )
+                    if invite_cursor.rowcount != 1:
+                        raise RegistrationError(
+                            "INVITE_UNAVAILABLE",
+                            "邀请码已不可用",
+                        )
                 challenge_cursor = self.connection.execute(
                     """
                     UPDATE auth_challenges SET consumed_at = ?

@@ -2272,7 +2272,9 @@ class DBManager:
                     "cookie_refresh_enabled, cookie_refresh_interval_minutes, browser_user_agent, "
                     "cookie_revision, login_method, last_login_at, last_validated_at, "
                     "last_expired_at, avatar_url, xianyu_nick, "
-                    "auto_rate_enabled, auto_rate_enabled_at, has_l3_memory, l3_memory_at "
+                    "auto_rate_enabled, auto_rate_enabled_at, has_l3_memory, l3_memory_at, "
+                    "proxy_enabled, proxy_server, proxy_username, proxy_password_encrypted, "
+                    "proxy_bypass, proxy_region, proxy_last_ip, proxy_last_status, proxy_last_check_at "
                     "FROM cookies WHERE id = ?",
                     (cookie_id,),
                 )
@@ -2311,6 +2313,15 @@ class DBManager:
                         'auto_rate_enabled_at': result[23],
                         'has_l3_memory': bool(result[24]),
                         'l3_memory_at': result[25],
+                        'proxy_enabled': bool(result[26]),
+                        'proxy_server': result[27] or '',
+                        'proxy_username': result[28] or '',
+                        'proxy_password_set': bool(result[29]),
+                        'proxy_bypass': result[30] or '',
+                        'proxy_region': result[31] or '',
+                        'proxy_last_ip': result[32] or '',
+                        'proxy_last_status': result[33] or '',
+                        'proxy_last_check_at': result[34],
                     }
                 return None
             except Exception as e:
@@ -2693,6 +2704,135 @@ class DBManager:
                 return True
             except Exception as exc:
                 logger.error("更新账号 L3 记忆标记失败: {}", type(exc).__name__)
+                self.conn.rollback()
+                return False
+
+    def get_account_proxy_config(self, cookie_id: str) -> Optional[Dict[str, str]]:
+        """返回登录路径直接可用的代理配置（含解密后的密码）。
+
+        仅当账号 proxy_enabled=1 且填了 proxy_server 时返回；否则返回 None
+        表示直连（保持未接入前的原行为）。密码字段为明文，仅供进程内使用。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT proxy_enabled, proxy_server, proxy_username, "
+                    "proxy_password_encrypted, proxy_bypass, proxy_region "
+                    "FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                row = cursor.fetchone()
+            except Exception as exc:
+                logger.error("读取账号代理配置失败: {}", type(exc).__name__)
+                return None
+        if not row:
+            return None
+        enabled = bool(row[0])
+        server = str(row[1] or "").strip()
+        if not enabled or not server:
+            return None
+        password = ""
+        if row[3]:
+            try:
+                password = AccountCredentialCipher(self.db_path).decrypt(row[3])
+            except ValueError:
+                logger.error("账号 {} 代理密码解密失败，按无密码处理", cookie_id)
+                password = ""
+        config = {
+            "server": server,
+            "username": str(row[2] or ""),
+            "password": password,
+            "bypass": str(row[4] or ""),
+            "region": str(row[5] or ""),
+        }
+        return config
+
+    def set_account_proxy(
+        self,
+        cookie_id: str,
+        *,
+        server: str,
+        username: str = "",
+        password: Optional[str] = None,
+        bypass: str = "",
+        region: str = "",
+        enabled: Optional[bool] = None,
+    ) -> bool:
+        """保存/更新账号代理配置。
+
+        password=None 表示保留原密码不变；password='' 表示清空密码。
+        enabled=None 时按是否填了 server 自动推断（填了即启用）。
+        """
+        server = str(server or "").strip()
+        if enabled is None:
+            enabled = bool(server)
+        fields = [
+            "proxy_enabled = ?",
+            "proxy_server = ?",
+            "proxy_username = ?",
+            "proxy_bypass = ?",
+            "proxy_region = ?",
+        ]
+        values: list[Any] = [
+            1 if enabled else 0,
+            server,
+            str(username or ""),
+            str(bypass or ""),
+            str(region or ""),
+        ]
+        if password is not None:
+            encrypted = (
+                AccountCredentialCipher(self.db_path).encrypt(password) if password else ""
+            )
+            fields.append("proxy_password_encrypted = ?")
+            values.append(encrypted)
+            fields.append("proxy_password_encryption_version = ?")
+            values.append(ACCOUNT_PASSWORD_ENCRYPTION_VERSION if password else 0)
+        values.append(cookie_id)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    f"UPDATE cookies SET {', '.join(fields)} WHERE id = ?",
+                    tuple(values),
+                )
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("保存账号代理配置失败: {}", type(exc).__name__)
+                self.conn.rollback()
+                return False
+
+    def record_proxy_probe(
+        self,
+        cookie_id: str,
+        *,
+        ip: str = "",
+        status: str = "",
+    ) -> bool:
+        """记录一次代理出口自检结果（出口 IP + 状态 + 时间）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET proxy_last_ip = ?, proxy_last_status = ?, "
+                    "proxy_last_check_at = ? WHERE id = ?",
+                    (str(ip or ""), str(status or ""), time.time(), cookie_id),
+                )
+                if cursor.rowcount <= 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.commit()
+                return True
+            except Exception as exc:
+                logger.error("记录代理自检结果失败: {}", type(exc).__name__)
                 self.conn.rollback()
                 return False
 
@@ -10636,6 +10776,20 @@ class DBManager:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
 
+    def get_inactive_user_ids(self) -> set:
+        """被停用用户的 id 集合（供运行态把其账号从监听中摘除）。
+
+        读失败时返回空集合（宁可多监听，也不能因一次读失败把所有账号误判停用）。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT id FROM users WHERE is_active != 1")
+                return {int(row[0]) for row in cursor.fetchall()}
+            except Exception as e:
+                logger.error(f"查询停用用户失败: {e}")
+                return set()
+
     def delete_user_and_data(self, user_id: int):
         """删除用户及其所有相关数据"""
         with self.lock:
@@ -12349,6 +12503,170 @@ class DBManager:
             return {'error': str(e)}
 
     # ==================== BI报表统计函数 ====================
+
+    def _order_period_conditions(self, start_date, end_date, include_statuses):
+        """全站/分代理汇总共用的订单期间过滤条件（不含 user 过滤）。"""
+        where_conditions = []
+        params = []
+        if start_date:
+            start = datetime.strptime(start_date, "%Y-%m-%d")
+            where_conditions.append("o.created_at >= ?")
+            params.append(start.strftime("%Y-%m-%d 00:00:00"))
+        if end_date:
+            end = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+            where_conditions.append("o.created_at < ?")
+            params.append(end.strftime("%Y-%m-%d 00:00:00"))
+        if include_statuses:
+            placeholders = ','.join(['?' for _ in include_statuses])
+            where_conditions.append(f"o.order_status IN ({placeholders})")
+            params.extend(include_statuses)
+        return where_conditions, params
+
+    def get_global_order_summary(self, start_date: str = None, end_date: str = None, include_statuses: list = None):
+        """全站订单合计（所有登录用户可见的"总经营情况"口径）。
+
+        只返回站级聚合数字，绝不包含任何按用户/账号/买家细分的字段，
+        普通代理由此看到大盘却看不到彼此。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where_conditions, params = self._order_period_conditions(
+                    start_date, end_date, include_statuses
+                )
+                where_clause = (
+                    f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+                )
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COUNT(DISTINCT o.order_id) AS total_orders,
+                        COALESCE(SUM(o.paid_amount_fen), 0) / 100.0 AS total_amount
+                    FROM orders AS o
+                    {where_clause}
+                    """,
+                    params,
+                )
+                row = cursor.fetchone()
+                return {
+                    'total_orders': int(row[0] or 0),
+                    'total_amount': round(float(row[1] or 0), 2),
+                }
+            except Exception as e:
+                logger.error(f"全站订单汇总失败: {e}")
+                return {'error': str(e)}
+
+    def get_per_user_order_summary(self, start_date: str = None, end_date: str = None, include_statuses: list = None):
+        """按归属用户分组的订单汇总（admin 独享的分代理明细）。
+
+        含全部用户（包括没有订单/没有账号的），便于 admin 看清每个代理现状。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where_conditions, params = self._order_period_conditions(
+                    start_date, end_date, include_statuses
+                )
+                order_filter = (
+                    f"AND {' AND '.join(where_conditions)}" if where_conditions else ""
+                )
+                cursor.execute(
+                    f"""
+                    SELECT
+                        u.id AS user_id,
+                        u.username,
+                        u.is_active,
+                        COUNT(DISTINCT c.id) AS account_count,
+                        COUNT(DISTINCT o.order_id) AS total_orders,
+                        COALESCE(SUM(o.paid_amount_fen), 0) / 100.0 AS total_amount
+                    FROM users AS u
+                    LEFT JOIN cookies AS c ON c.user_id = u.id
+                    LEFT JOIN orders AS o
+                        ON o.cookie_id = c.id {order_filter}
+                    GROUP BY u.id, u.username, u.is_active
+                    ORDER BY total_amount DESC, u.id ASC
+                    """,
+                    params,
+                )
+                return [
+                    {
+                        'user_id': int(row[0]),
+                        'username': row[1],
+                        'is_active': bool(row[2]),
+                        'account_count': int(row[3] or 0),
+                        'total_orders': int(row[4] or 0),
+                        'total_amount': round(float(row[5] or 0), 2),
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"分代理订单汇总失败: {e}")
+                return {'error': str(e)}
+
+    def get_admin_account_overview(self):
+        """admin 账号总览：全部闲鱼账号 + 归属用户 + 登录健康状态（一条 SQL，避免 N+1）。
+
+        只返回运营可见性字段，绝不返回 cookie 值/密码等登录物料。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT
+                        c.id AS cookie_id,
+                        u.id AS user_id,
+                        u.username,
+                        u.is_active AS user_is_active,
+                        c.xianyu_nick,
+                        c.remark,
+                        c.login_method,
+                        c.has_l3_memory,
+                        c.last_login_at,
+                        c.last_validated_at,
+                        c.last_expired_at,
+                        COALESCE(cs.enabled, 1) AS enabled,
+                        COALESCE(r.state, 'idle') AS refresh_state
+                    FROM cookies AS c
+                    JOIN users AS u ON u.id = c.user_id
+                    LEFT JOIN cookie_status AS cs ON cs.cookie_id = c.id
+                    LEFT JOIN account_session_refresh_status AS r ON r.cookie_id = c.id
+                    ORDER BY u.username COLLATE NOCASE ASC, c.id ASC
+                    """
+                )
+                accounts = []
+                for row in cursor.fetchall():
+                    last_login_at = float(row[8]) if row[8] is not None else None
+                    last_validated_at = float(row[9]) if row[9] is not None else None
+                    last_expired_at = float(row[10]) if row[10] is not None else None
+                    # 掉线判定：最近一次过期时间晚于最近一次登录/校验成功时间。
+                    freshest_ok = max(
+                        value for value in (last_login_at, last_validated_at, 0.0)
+                        if value is not None
+                    )
+                    session_expired = bool(
+                        last_expired_at is not None and last_expired_at > freshest_ok
+                    )
+                    accounts.append({
+                        'cookie_id': row[0],
+                        'user_id': int(row[1]),
+                        'username': row[2],
+                        'user_is_active': bool(row[3]),
+                        'xianyu_nick': row[4] or '',
+                        'remark': row[5] or '',
+                        'login_method': row[6] or 'unknown',
+                        'has_l3_memory': bool(row[7]),
+                        'last_login_at': last_login_at,
+                        'last_validated_at': last_validated_at,
+                        'last_expired_at': last_expired_at,
+                        'enabled': bool(row[11]),
+                        'refresh_state': row[12] or 'idle',
+                        'session_expired': session_expired,
+                    })
+                return accounts
+            except Exception as e:
+                logger.error(f"admin 账号总览查询失败: {e}")
+                return {'error': str(e)}
 
     def get_order_analytics(self, start_date: str = None, end_date: str = None, user_id: int = None, include_statuses: list = None):
         """

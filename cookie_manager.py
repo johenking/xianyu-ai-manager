@@ -50,6 +50,7 @@ class CookieManager:
         }
         auto_confirm: Dict[str, bool] = {}
         owners: Dict[str, Optional[int]] = {}
+        inactive_users = db_manager.get_inactive_user_ids()
         for cookie_id in cookies:
             details = db_manager.get_cookie_details(cookie_id) or {}
             statuses.setdefault(cookie_id, True)
@@ -57,6 +58,10 @@ class CookieManager:
                 details.get("auto_confirm", db_manager.get_auto_confirm(cookie_id))
             )
             owners[cookie_id] = details.get("user_id")
+            # 归属用户被停用的账号一律按禁用对待：启动不注册 listener，
+            # reconcile 会把在跑的任务停掉（用户被禁用 → 其账号立刻下线）。
+            if owners[cookie_id] in inactive_users:
+                statuses[cookie_id] = False
         return {
             "cookies": cookies,
             "keywords": keywords,
@@ -598,6 +603,11 @@ class CookieManager:
         """更新Cookie的启用/禁用状态"""
         if cookie_id not in self.cookies:
             raise ValueError(f"Cookie ID {cookie_id} 不存在")
+
+        if enabled:
+            owner_id = self.cookie_user_ids.get(cookie_id)
+            if owner_id is not None and owner_id in db_manager.get_inactive_user_ids():
+                raise ValueError("归属用户已停用，无法启用该账号")
 
         old_status = self.cookie_status.get(cookie_id, True)
         self.cookie_status[cookie_id] = enabled

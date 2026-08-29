@@ -1,4 +1,4 @@
-import { get, post, put } from '../request';
+import { del, get, post, put } from '../request';
 import type {
   ApiResponse,
   AuthCaptchaResponse,
@@ -11,6 +11,7 @@ import type {
   PasswordResetVerifyResponse,
   RegistrationAdminStatus,
   RegistrationConfig,
+  RegistrationInvite,
   RegistrationRequest,
   RegistrationUser,
   VerifyResponse,
@@ -87,4 +88,36 @@ export const setRegistrationLimit = async (
   limit: number,
 ): Promise<ApiResponse> => {
   return put('/api/admin/registration/limit', { limit });
+};
+
+export const listRegistrationInvites = async (): Promise<{
+  success: boolean;
+  invite_required: boolean;
+  invites: RegistrationInvite[];
+}> => {
+  return get('/api/admin/registration/invites');
+};
+
+export const createRegistrationInvites = async (
+  count: number,
+  validDays: number,
+  note: string,
+): Promise<{ success: boolean; invites: RegistrationInvite[] }> => {
+  return post('/api/admin/registration/invites', {
+    count,
+    valid_days: validDays,
+    note,
+  });
+};
+
+export const revokeRegistrationInvite = async (
+  inviteId: number,
+): Promise<{ success: boolean; invite: RegistrationInvite }> => {
+  return del(`/api/admin/registration/invites/${inviteId}`);
+};
+
+export const setInviteRequired = async (
+  enabled: boolean,
+): Promise<{ success: boolean; invite_required: boolean }> => {
+  return put('/api/admin/registration/invite-required', { enabled });
 };

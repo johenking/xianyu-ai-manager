@@ -4,8 +4,12 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  createRegistrationInvites,
   getRegistrationAdminStatus,
+  listRegistrationInvites,
   listRegistrationUsers,
+  revokeRegistrationInvite,
+  setInviteRequired,
   setRegistrationEnabled,
   setRegistrationLimit,
   setRegistrationUserActive,
@@ -13,8 +17,12 @@ import {
 import RegistrationManagement from './RegistrationManagement';
 
 vi.mock('../services/api', () => ({
+  createRegistrationInvites: vi.fn(),
   getRegistrationAdminStatus: vi.fn(),
+  listRegistrationInvites: vi.fn(),
   listRegistrationUsers: vi.fn(),
+  revokeRegistrationInvite: vi.fn(),
+  setInviteRequired: vi.fn(),
   setRegistrationEnabled: vi.fn(),
   setRegistrationLimit: vi.fn(),
   setRegistrationUserActive: vi.fn(),
@@ -39,13 +47,40 @@ const users = [{
   terms_accepted_at: '2026-07-11 10:30:00',
 }];
 
+const activeInvite = {
+  id: 7,
+  hint: 'REG-ABC...WXYZ',
+  note: '代理小王',
+  status: 'active' as const,
+  expires_at: 1_800_400_000,
+  used_at: null,
+  used_by_user_id: null,
+  revoked_at: null,
+  created_by_user_id: 1,
+  created_at: 1_800_300_000,
+};
+
 describe('RegistrationManagement', () => {
   beforeEach(() => {
     vi.mocked(getRegistrationAdminStatus).mockResolvedValue(status);
     vi.mocked(listRegistrationUsers).mockResolvedValue({ success: true, users });
+    vi.mocked(listRegistrationInvites).mockResolvedValue({
+      success: true,
+      invite_required: false,
+      invites: [activeInvite],
+    });
     vi.mocked(setRegistrationUserActive).mockResolvedValue({ success: true, user: { ...users[0], is_active: false } });
     vi.mocked(setRegistrationEnabled).mockResolvedValue({ success: true, enabled: true, message: '注册功能已开启' });
     vi.mocked(setRegistrationLimit).mockResolvedValue({ success: true, message: '用户容量已更新' });
+    vi.mocked(setInviteRequired).mockResolvedValue({ success: true, invite_required: true });
+    vi.mocked(createRegistrationInvites).mockResolvedValue({
+      success: true,
+      invites: [{ ...activeInvite, id: 8, code: 'REG-NEWCODENEWCODENEWCODE23', hint: 'REG-NEW...DE23', note: '' }],
+    });
+    vi.mocked(revokeRegistrationInvite).mockResolvedValue({
+      success: true,
+      invite: { ...activeInvite, status: 'revoked', revoked_at: 1_800_350_000 },
+    });
   });
 
   afterEach(() => {
@@ -53,14 +88,16 @@ describe('RegistrationManagement', () => {
     vi.clearAllMocks();
   });
 
-  it('shows receipt-confirmed SMTP status and registration capacity without invitation controls', async () => {
+  it('shows receipt-confirmed SMTP status, capacity, and the invite management block', async () => {
     render(<RegistrationManagement />);
     await screen.findByText('su***@example.com');
 
     expect(screen.getByText('已实收验证')).toBeInTheDocument();
     expect(screen.getByText('3 / 20')).toBeInTheDocument();
     expect(screen.getByText('剩余 17 个名额')).toBeInTheDocument();
-    expect(screen.queryByText(/邀请码/)).not.toBeInTheDocument();
+    expect(screen.getByText('邀请码准入')).toBeInTheDocument();
+    expect(screen.getByText('REG-ABC...WXYZ')).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: '注册需要邀请码' })).not.toBeChecked();
   });
 
   it('adjusts capacity, disables users, and opens registration when ready', async () => {
@@ -94,5 +131,26 @@ describe('RegistrationManagement', () => {
 
     expect(await screen.findByText(/用户容量已满/)).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: '开放注册' })).toBeDisabled();
+  });
+
+  it('toggles invite requirement, generates one-time plaintext codes, and revokes invites', async () => {
+    render(<RegistrationManagement />);
+    await screen.findByText('邀请码准入');
+
+    fireEvent.click(screen.getByRole('switch', { name: '注册需要邀请码' }));
+    await waitFor(() => expect(setInviteRequired).toHaveBeenCalledWith(true));
+    expect(await screen.findByText('注册已改为邀请码准入')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('邀请码数量'), { target: { value: '1' } });
+    fireEvent.change(screen.getByLabelText('邀请码有效天数'), { target: { value: '7' } });
+    fireEvent.change(screen.getByLabelText('邀请码备注'), { target: { value: '代理直邀' } });
+    fireEvent.click(screen.getByRole('button', { name: /生成邀请码/ }));
+    await waitFor(() => expect(createRegistrationInvites).toHaveBeenCalledWith(1, 7, '代理直邀'));
+    expect(await screen.findByText('REG-NEWCODENEWCODENEWCODE23')).toBeInTheDocument();
+    expect(screen.getByText(/明文仅显示这一次/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '吊销' }));
+    await waitFor(() => expect(revokeRegistrationInvite).toHaveBeenCalledWith(7));
+    expect(await screen.findByText('已吊销')).toBeInTheDocument();
   });
 });

@@ -155,14 +155,14 @@ const App: React.FC = () => {
   // Main App Layout
   const renderContent = () => {
     switch (activeTab) {
-      case 'dashboard': return <Dashboard />;
+      case 'dashboard': return <Dashboard isAdmin={isAdmin} />;
       case 'accounts': return <AccountList isAdmin={isAdmin} />;
       case 'orders': return <OrderList onNavigateAccounts={() => setActiveTab('accounts')} />;
       case 'delivery': return <AutoDelivery />;
       case 'items': return <ItemList />;
       case 'keywords': return <Keywords />;
       case 'settings': return <Settings isAdmin={isAdmin} />;
-      default: return <Dashboard />;
+      default: return <Dashboard isAdmin={isAdmin} />;
     }
   };
 

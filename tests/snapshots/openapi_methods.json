@@ -126,7 +126,16 @@
   "/api/accounts/{cookie_id}/session-status": [
     "GET"
   ],
+  "/api/admin/accounts/overview": [
+    "GET"
+  ],
+  "/api/admin/dashboard/agents": [
+    "GET"
+  ],
   "/api/admin/registration/enabled": [
+    "PUT"
+  ],
+  "/api/admin/registration/invite-required": [
     "PUT"
   ],
   "/api/admin/registration/invites": [
@@ -235,6 +244,9 @@
   ],
   "/api/client-browser/sessions/{session_id}/confirm": [
     "POST"
+  ],
+  "/api/dashboard/global-summary": [
+    "GET"
   ],
   "/api/dashboard/summary": [
     "GET"
@@ -378,6 +390,12 @@
   "/cookies/{cid}/pause-duration": [
     "GET",
     "PUT"
+  ],
+  "/cookies/{cid}/proxy": [
+    "PUT"
+  ],
+  "/cookies/{cid}/proxy/test": [
+    "POST"
   ],
   "/cookies/{cid}/remark": [
     "GET",

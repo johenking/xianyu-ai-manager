@@ -220,6 +220,37 @@ class RuntimeDestructiveOperationTests(unittest.IsolatedAsyncioTestCase):
         database.delete_user_and_data.assert_called_once_with(8)
         manager.reconcile_from_db.assert_awaited_once()
 
+    async def test_user_disable_does_not_report_success_when_reconcile_fails(self):
+        database = Mock()
+        database.get_user_by_id.return_value = {
+            "id": 9,
+            "username": "agent-nine",
+        }
+        database.auth_service.set_user_active.return_value = {
+            "id": 9,
+            "username": "agent-nine",
+            "is_active": False,
+        }
+        manager = Mock()
+        manager.reconcile_from_db = AsyncMock(
+            return_value={"success": False, "failed": 1}
+        )
+
+        with (
+            patch.object(reply_server, "db_manager", database),
+            patch("cookie_manager.manager", manager),
+        ):
+            with self.assertRaises(reply_server.HTTPException) as raised:
+                await reply_server.update_registration_user(
+                    9,
+                    reply_server.UserActiveUpdate(is_active=False),
+                    {"user_id": 1, "username": "admin"},
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        database.auth_service.set_user_active.assert_called_once_with(9, False)
+        manager.reconcile_from_db.assert_awaited_once()
+
     async def test_online_raw_database_restore_is_permanently_disabled(self):
         signature = inspect.signature(reply_server.upload_database_backup)
         self.assertNotIn(

@@ -212,6 +212,59 @@ export interface DashboardSummary {
   item_names: Record<string, string>;
 }
 
+export interface SiteTotals {
+  total_orders: number;
+  total_amount: number;
+}
+
+export interface GlobalDashboardSummary {
+  success: boolean;
+  scope: 'site';
+  range: DashboardSummary['range'];
+  current: SiteTotals;
+  previous: SiteTotals;
+}
+
+export interface AgentSummaryRow {
+  user_id: number;
+  username: string;
+  is_active: boolean;
+  account_count: number;
+  total_orders: number;
+  total_amount: number;
+}
+
+export interface AdminAgentSummary {
+  success: boolean;
+  range: DashboardSummary['range'];
+  agents: AgentSummaryRow[];
+}
+
+export interface AdminAccountRow {
+  cookie_id: string;
+  user_id: number;
+  username: string;
+  user_is_active: boolean;
+  xianyu_nick: string;
+  remark: string;
+  login_method: string;
+  login_method_label: string;
+  has_l3_memory: boolean;
+  last_login_at: number | null;
+  last_validated_at: number | null;
+  last_expired_at: number | null;
+  enabled: boolean;
+  refresh_state: string;
+  session_expired: boolean;
+}
+
+export interface AdminAccountOverview {
+  success: boolean;
+  total: number;
+  expired_count: number;
+  accounts: AdminAccountRow[];
+}
+
 export interface AnalyticsCoverage {
   total_orders: number;
   coverage_rate: number;

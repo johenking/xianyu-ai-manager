@@ -68,6 +68,22 @@ export interface RegistrationRequest {
   password: string;
   terms_version: string;
   terms_accepted: boolean;
+  invite_code?: string;
+}
+
+export interface RegistrationInvite {
+  id: number;
+  /** 明文邀请码只在创建响应中出现一次。 */
+  code?: string;
+  hint: string;
+  note: string;
+  status: 'active' | 'used' | 'expired' | 'revoked';
+  expires_at: number;
+  used_at: number | null;
+  used_by_user_id: number | null;
+  revoked_at: number | null;
+  created_by_user_id: number | null;
+  created_at: number;
 }
 
 export interface PasswordResetGrantRequest {

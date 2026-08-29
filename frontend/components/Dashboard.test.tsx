@@ -4,7 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getDashboardSummary, getValidOrders, getTrafficAnalytics, getBuyerBehaviorAnalytics, getItemPerformanceAnalytics, getItemTrafficAnalytics, getItemMetricStatus } from '../services/api';
+import { getDashboardSummary, getValidOrders, getTrafficAnalytics, getBuyerBehaviorAnalytics, getItemPerformanceAnalytics, getItemTrafficAnalytics, getItemMetricStatus, getGlobalDashboardSummary } from '../services/api';
 import Dashboard, { DASHBOARD_REFRESH_MS } from './Dashboard';
 
 vi.mock('../services/api', () => ({
@@ -15,6 +15,8 @@ vi.mock('../services/api', () => ({
   getItemPerformanceAnalytics: vi.fn(),
   getItemTrafficAnalytics: vi.fn(),
   getItemMetricStatus: vi.fn(),
+  getGlobalDashboardSummary: vi.fn(),
+  getAdminAgentSummary: vi.fn(),
 }));
 
 vi.mock('@number-flow/react', () => ({
@@ -75,6 +77,13 @@ describe('Dashboard summary loading', () => {
     Object.defineProperty(navigator, 'onLine', { configurable: true, value: true });
     vi.mocked(getDashboardSummary).mockResolvedValue(summary);
     vi.mocked(getValidOrders).mockResolvedValue([]);
+    vi.mocked(getGlobalDashboardSummary).mockResolvedValue({
+      success: true,
+      scope: 'site',
+      range: summary.range,
+      current: { total_orders: 2, total_amount: 88.5 },
+      previous: { total_orders: 1, total_amount: 40 },
+    });
     vi.mocked(getTrafficAnalytics).mockResolvedValue({
       coverage: { total_orders: 0, with_ordered_at: 0, coverage_rate: 0 },
       time_coverage: { total_orders: 0, with_ordered_at: 0, coverage_rate: 0 },

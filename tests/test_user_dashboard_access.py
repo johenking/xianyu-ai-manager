@@ -287,6 +287,115 @@ class UserDashboardAccessTests(unittest.TestCase):
         self.assertNotIn("item-one", response.text)
         self.assertNotIn("item-two", response.text)
 
+    def test_global_summary_shows_site_totals_without_per_user_detail(self):
+        # 全站合计对任何登录用户可见，但绝不下发分用户/分账号明细
+        for user in (self.user_one, self.user_two):
+            response = self.client.get(
+                "/api/dashboard/global-summary",
+                params={"range": "7days", "end_date": "2026-07-11"},
+                headers=self.headers_for(user),
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["scope"], "site")
+            self.assertEqual(payload["current"]["total_orders"], 2)
+            self.assertEqual(payload["current"]["total_amount"], 111.5)
+            self.assertEqual(
+                set(payload["current"].keys()),
+                {"total_orders", "total_amount"},
+            )
+            for leaked in ("per_user", "agents", "username", "ordinary-one", "ordinary-two"):
+                self.assertNotIn(leaked, response.text)
+
+    def test_admin_agent_summary_groups_by_owner_and_requires_admin(self):
+        admin = self.db.get_user_by_username("admin")
+        response = self.client.get(
+            "/api/admin/dashboard/agents",
+            params={"range": "7days", "end_date": "2026-07-11"},
+            headers=self.headers_for(admin),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        agents = {item["username"]: item for item in response.json()["agents"]}
+        self.assertEqual(agents["ordinary-one"]["total_orders"], 1)
+        self.assertEqual(agents["ordinary-one"]["total_amount"], 12.5)
+        self.assertEqual(agents["ordinary-one"]["account_count"], 2)
+        self.assertEqual(agents["ordinary-two"]["total_orders"], 1)
+        self.assertEqual(agents["ordinary-two"]["total_amount"], 99.0)
+        self.assertEqual(agents["ordinary-two"]["account_count"], 1)
+        self.assertEqual(agents["admin"]["total_orders"], 0)
+        self.assertEqual(agents["admin"]["account_count"], 0)
+        # 金额降序：ordinary-two 在最前
+        self.assertEqual(response.json()["agents"][0]["username"], "ordinary-two")
+
+        forbidden = self.client.get(
+            "/api/admin/dashboard/agents",
+            params={"range": "7days", "end_date": "2026-07-11"},
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
+    def test_admin_account_overview_reports_ownership_and_health(self):
+        with self.db.lock:
+            cursor = self.db.conn.cursor()
+            # one-active 掉线（过期时间晚于校验时间）；two-active 健康（校验时间更新）
+            cursor.execute(
+                "UPDATE cookies SET xianyu_nick = '鱼铺一号', login_method = 'qr_code', "
+                "last_validated_at = 1000.0, last_expired_at = 2000.0 WHERE id = 'one-active'"
+            )
+            cursor.execute(
+                "UPDATE cookies SET xianyu_nick = '鱼铺二号', login_method = 'browser_extension', "
+                "last_validated_at = 3000.0, last_expired_at = 1000.0, has_l3_memory = 1 "
+                "WHERE id = 'two-active'"
+            )
+            cursor.execute(
+                "INSERT INTO account_session_refresh_status (cookie_id, state, updated_at) "
+                "VALUES ('one-active', 'manual_reauth_required', 2100.0)"
+            )
+            self.db.conn.commit()
+
+        admin = self.db.get_user_by_username("admin")
+        response = self.client.get(
+            "/api/admin/accounts/overview",
+            headers=self.headers_for(admin),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["total"], 3)
+        self.assertEqual(payload["expired_count"], 1)
+
+        accounts = {item["cookie_id"]: item for item in payload["accounts"]}
+        self.assertEqual(
+            set(accounts.keys()), {"one-active", "one-paused", "two-active"}
+        )
+        expired = accounts["one-active"]
+        self.assertEqual(expired["username"], "ordinary-one")
+        self.assertTrue(expired["session_expired"])
+        self.assertEqual(expired["refresh_state"], "manual_reauth_required")
+        self.assertEqual(expired["xianyu_nick"], "鱼铺一号")
+        self.assertTrue(expired["enabled"])
+
+        healthy = accounts["two-active"]
+        self.assertEqual(healthy["username"], "ordinary-two")
+        self.assertFalse(healthy["session_expired"])
+        self.assertTrue(healthy["has_l3_memory"])
+        self.assertEqual(healthy["refresh_state"], "idle")
+
+        paused = accounts["one-paused"]
+        self.assertFalse(paused["enabled"])
+        self.assertFalse(paused["session_expired"])
+
+        # 绝不下发登录物料
+        self.assertNotIn("cookie2=session", response.text)
+        for leaked_key in ("value", "password"):
+            for account in payload["accounts"]:
+                self.assertNotIn(leaked_key, account)
+
+        forbidden = self.client.get(
+            "/api/admin/accounts/overview",
+            headers=self.headers_for(self.user_one),
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.text)
+
     def test_analytics_helpers_reject_missing_user_id(self):
         # 仪表盘/分析查询必须显式携带 user_id，禁止 None 静默退化为全表
         with self.assertRaises(ValueError):

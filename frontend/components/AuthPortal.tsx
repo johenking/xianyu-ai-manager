@@ -543,6 +543,7 @@ const RegistrationForm: React.FC<{
   onAuthenticated: (token: string) => void;
 }> = ({ config, loadingConfig, onAuthenticated }) => {
   const [verificationCode, setVerificationCode] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -555,6 +556,7 @@ const RegistrationForm: React.FC<{
     event.preventDefault();
     setError('');
     if (!config.enabled) return setError(config.message || '注册暂未开放');
+    if (config.invite_required && !inviteCode.trim()) return setError('请输入邀请码');
     if (!verification.emailChallengeId || !OTP_PATTERN.test(verificationCode)) return setError('请先完成邮箱验证');
     if (!USERNAME_PATTERN.test(username)) return setError('用户名需为 3–24 位字母、数字、下划线或短横线');
     const passwordError = validatePassword(password, username);
@@ -572,6 +574,7 @@ const RegistrationForm: React.FC<{
         password,
         terms_version: config.terms_version,
         terms_accepted: true,
+        ...(inviteCode.trim() ? { invite_code: inviteCode.trim() } : {}),
       });
       if (!response.success || !response.token) throw new Error(response.message || '注册失败');
       onAuthenticated(response.token);
@@ -586,6 +589,18 @@ const RegistrationForm: React.FC<{
     <form onSubmit={submit} className="space-y-6">
       <FormHeading title="创建账号" description="通过邮箱验证码确认身份" />
       {loadingConfig ? <Notice>正在检查注册状态...</Notice> : !config.enabled ? <Notice tone="error">{config.message}</Notice> : <Notice tone="success">注册已开放，请完成邮箱验证。</Notice>}
+      {config.invite_required ? (
+        <InputField
+          label="邀请码"
+          value={inviteCode}
+          onChange={(value) => setInviteCode(value.toUpperCase())}
+          autoComplete="off"
+          placeholder="REG- 开头的邀请码"
+          icon={ShieldCheck}
+          maxLength={32}
+          disabled={!config.enabled}
+        />
+      ) : null}
       <VerificationFields state={verification} verificationCode={verificationCode} onVerificationCodeChange={setVerificationCode} disabled={!config.enabled} />
       <InputField label="用户名" value={username} onChange={setUsername} autoComplete="username" placeholder="3–24 位字母、数字、_ 或 -" icon={User} maxLength={24} />
       <div className="grid gap-4 sm:grid-cols-2">

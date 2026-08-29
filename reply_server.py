@@ -371,6 +371,16 @@ class RegisterRequest(BaseModel):
     terms_accepted: bool
 
 
+class InviteCreateRequest(BaseModel):
+    count: int = 1
+    valid_days: int = 30
+    note: str = ""
+
+
+class InviteRequiredUpdate(BaseModel):
+    enabled: bool
+
+
 class RegisterResponse(BaseModel):
     success: bool
     message: str
@@ -1453,7 +1463,7 @@ def get_registration_config():
         return {
             "enabled": state['enabled'],
             "ready": state['ready'],
-            "invite_required": False,
+            "invite_required": db_manager.registration_service.invite_required(),
             "terms_version": state['terms_version'] or 'v2',
             "terms_url": "/terms",
             "privacy_url": "/privacy",
@@ -2173,6 +2183,15 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'last_validated_at': cookie_details.get('last_validated_at') if cookie_details else None,
             'last_expired_at': cookie_details.get('last_expired_at') if cookie_details else None,
             'reauth_updated_at': refresh_status.get('updated_at') if reauth_required else None,
+            # 账号级住宅代理（密码只报"是否已设置"）
+            'proxy_enabled': bool(cookie_details.get('proxy_enabled')) if cookie_details else False,
+            'proxy_server': (cookie_details.get('proxy_server') or '') if cookie_details else '',
+            'proxy_username': (cookie_details.get('proxy_username') or '') if cookie_details else '',
+            'proxy_password_set': bool(cookie_details.get('proxy_password_set')) if cookie_details else False,
+            'proxy_region': (cookie_details.get('proxy_region') or '') if cookie_details else '',
+            'proxy_last_ip': (cookie_details.get('proxy_last_ip') or '') if cookie_details else '',
+            'proxy_last_status': (cookie_details.get('proxy_last_status') or '') if cookie_details else '',
+            'proxy_last_check_at': cookie_details.get('proxy_last_check_at') if cookie_details else None,
             'search_readiness': {
                 'ready': search_state == 'ready',
                 'state': search_state,
@@ -2756,6 +2775,17 @@ class CookieRefreshSettingsUpdate(BaseModel):
     cookie_refresh_interval_minutes: int
 
 
+class AccountProxyUpdate(BaseModel):
+    """账号级住宅代理配置。password=None 表示保留原密码，空串表示清空。"""
+
+    proxy_enabled: Optional[bool] = None
+    proxy_server: str = Field("", max_length=300)
+    proxy_username: str = Field("", max_length=200)
+    proxy_password: Optional[str] = Field(None, max_length=500)
+    proxy_bypass: str = Field("", max_length=500)
+    proxy_region: str = Field("", max_length=100)
+
+
 class AccountRenewalBindingIn(BaseModel):
     login_session_id: str = Field(..., min_length=8, max_length=80)
     device_id: str = Field(..., min_length=16, max_length=80)
@@ -3037,8 +3067,9 @@ async def complete_client_renewal_task(
         imported = normalize_structured_cookies([cookie.model_dump() for cookie in payload.cookies])
         expected_unb = str((db_manager.get_cookie_details(task["account_id"]) or {}).get("xianyu_unb") or "").strip()
         imported_unb = str(imported.get("unb") or "").strip()
+        account_proxy = db_manager.get_account_proxy_config(task["account_id"])
         probe = await probe_message_session_async(
-            session_cookies_to_string(imported), payload.user_agent
+            session_cookies_to_string(imported), payload.user_agent, proxy=account_proxy
         )
         platform_unb = str((probe.cookies or {}).get("unb") or "").strip()
         if not probe.succeeded or not expected_unb or {expected_unb, imported_unb, platform_unb} != {expected_unb}:
@@ -3116,6 +3147,98 @@ def update_cookie_refresh_settings(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _account_proxy_public_view(cookie_id: str) -> Dict[str, Any]:
+    """账号代理配置的对外视图：只报密码是否已设置，绝不回传明文。"""
+    from db_manager import db_manager
+
+    details = db_manager.get_cookie_details(cookie_id) or {}
+    return {
+        'proxy_enabled': bool(details.get('proxy_enabled')),
+        'proxy_server': details.get('proxy_server') or '',
+        'proxy_username': details.get('proxy_username') or '',
+        'proxy_password_set': bool(details.get('proxy_password_set')),
+        'proxy_bypass': details.get('proxy_bypass') or '',
+        'proxy_region': details.get('proxy_region') or '',
+        'proxy_last_ip': details.get('proxy_last_ip') or '',
+        'proxy_last_status': details.get('proxy_last_status') or '',
+        'proxy_last_check_at': details.get('proxy_last_check_at'),
+    }
+
+
+@accounts_router.put("/cookies/{cid}/proxy")
+def update_account_proxy(
+    cid: str,
+    update_data: AccountProxyUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """保存账号住宅代理配置（按账号独立出口 IP）。"""
+    try:
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        server = str(update_data.proxy_server or "").strip()
+        if update_data.proxy_enabled and not server:
+            raise HTTPException(status_code=400, detail="启用代理必须填写服务器地址")
+
+        success = db_manager.set_account_proxy(
+            cid,
+            server=server,
+            username=update_data.proxy_username,
+            password=update_data.proxy_password,
+            bypass=update_data.proxy_bypass,
+            region=update_data.proxy_region,
+            enabled=update_data.proxy_enabled,
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="保存代理配置失败")
+        return {
+            "success": True,
+            "message": "代理配置已保存",
+            "data": _account_proxy_public_view(cid),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"保存账号代理配置失败: {e}")
+        raise HTTPException(status_code=500, detail="保存代理配置失败")
+
+
+@accounts_router.post("/cookies/{cid}/proxy/test")
+def test_account_proxy(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """用已保存的代理实测连通性并回显出口 IP（结果落库供列表展示）。"""
+    try:
+        user_id = current_user['user_id']
+        from db_manager import db_manager
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cid not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        proxy_config = db_manager.get_account_proxy_config(cid)
+        if not proxy_config:
+            return {
+                "success": False,
+                "data": {"ok": False, "ip": "", "status": "not_configured", "error": "未配置或未启用代理"},
+            }
+
+        from utils.browser_runtime import probe_proxy_egress
+
+        probe = probe_proxy_egress(proxy_config)
+        db_manager.record_proxy_probe(
+            cid,
+            ip=str(probe.get("ip") or ""),
+            status=str(probe.get("status") or ""),
+        )
+        return {"success": bool(probe.get("ok")), "data": probe}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"账号代理连通性测试失败: {e}")
+        raise HTTPException(status_code=500, detail="代理连通性测试失败")
 
 
 # ============ 通用的 /cookies/{cid} 路由 ============
@@ -4858,25 +4981,29 @@ def get_registration_admin_status(
 
 @admin_router.post('/api/admin/registration/invites')
 def create_registration_invites(
-    _request: Dict[str, Any] = Body(default_factory=dict),
-    _: Dict[str, Any] = Depends(require_admin),
+    request: InviteCreateRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
 ):
-    raise RegistrationError(
-        "INVITATION_REGISTRATION_REMOVED",
-        "邀请注册已移除，请使用直接注册配置",
-        http_status=410,
+    # 明文 code 仅本次响应返回一次，库中只存 digest。
+    invites = db_manager.registration_service.create_invites(
+        count=request.count,
+        valid_days=request.valid_days,
+        note=request.note,
+        created_by_user_id=current_user.get('user_id'),
     )
+    return {'success': True, 'invites': invites}
 
 
 @admin_router.get('/api/admin/registration/invites')
 def list_registration_invites(
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    raise RegistrationError(
-        "INVITATION_REGISTRATION_REMOVED",
-        "邀请注册已移除，请使用直接注册配置",
-        http_status=410,
-    )
+    service = db_manager.registration_service
+    return {
+        'success': True,
+        'invite_required': service.invite_required(),
+        'invites': service.list_invites(),
+    }
 
 
 @admin_router.delete('/api/admin/registration/invites/{invite_id}')
@@ -4884,12 +5011,17 @@ def revoke_registration_invite(
     invite_id: int,
     _: Dict[str, Any] = Depends(require_admin),
 ):
-    del invite_id
-    raise RegistrationError(
-        "INVITATION_REGISTRATION_REMOVED",
-        "邀请注册已移除，请使用直接注册配置",
-        http_status=410,
-    )
+    invite = db_manager.registration_service.revoke_invite(invite_id)
+    return {'success': True, 'invite': invite}
+
+
+@admin_router.put('/api/admin/registration/invite-required')
+def update_invite_required(
+    request: InviteRequiredUpdate,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    enabled = db_manager.registration_service.set_invite_required(request.enabled)
+    return {'success': True, 'invite_required': enabled}
 
 
 @admin_router.put('/api/admin/registration/limit')
@@ -4944,7 +5076,7 @@ def list_registration_users(
 
 
 @admin_router.put('/api/admin/registration/users/{user_id}')
-def update_registration_user(
+async def update_registration_user(
     user_id: int,
     request: UserActiveUpdate,
     _: Dict[str, Any] = Depends(require_admin),
@@ -4958,7 +5090,27 @@ def update_registration_user(
     user = db_manager.auth_service.set_user_active(user_id, request.is_active)
     if not request.is_active:
         _drop_user_sessions_from_memory(user_id)
-    return {'success': True, 'user': user}
+
+    # 用户启停立即同步运行态：禁用 → 其账号 listener 全部下线；启用 → 恢复监听
+    runtime = {'reconciled': False, 'stopped': 0, 'started': 0}
+    manager = cookie_manager.manager
+    if manager is not None:
+        reconcile = await manager.reconcile_from_db()
+        runtime = {
+            'reconciled': bool(reconcile.get('success')),
+            'stopped': int(reconcile.get('stopped', 0)),
+            'started': int(reconcile.get('started', 0) or 0) + int(reconcile.get('restarted', 0) or 0),
+        }
+        if not reconcile.get('success'):
+            logger.error(
+                "用户启停后运行态对账未完成: "
+                f"user_id={user_id}, failed={reconcile.get('failed', 0)}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="用户状态已更新，但账号监听对账未完成，请人工检查",
+            )
+    return {'success': True, 'user': user, 'runtime': runtime}
 
 
 @admin_router.put('/api/admin/registration/enabled')
@@ -9086,6 +9238,83 @@ def get_dashboard_summary(
             [item.get("item_id") for item in current["item_stats"]],
         ),
     }
+
+
+@orders_router.get('/api/dashboard/global-summary')
+def get_dashboard_global_summary(
+    range_key: Literal['today', 'yesterday', '3days', '7days', '30days', 'custom'] = Query('7days', alias='range'),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_user),
+):
+    """全站经营合计：任何登录用户可见，只给站级总数，绝不下发分用户明细。"""
+    period = _dashboard_period(range_key, start_date, end_date)
+    valid_statuses = list(DASHBOARD_ANALYTICS_STATUSES)
+    current = db_manager.get_global_order_summary(
+        start_date=period['start_date'],
+        end_date=period['end_date'],
+        include_statuses=valid_statuses,
+    )
+    previous = db_manager.get_global_order_summary(
+        start_date=period['previous_start_date'],
+        end_date=period['previous_end_date'],
+        include_statuses=valid_statuses,
+    )
+    if 'error' in current or 'error' in previous:
+        raise HTTPException(
+            status_code=500,
+            detail=current.get('error') or previous.get('error') or '全站汇总统计失败',
+        )
+    return {
+        "success": True,
+        "scope": "site",
+        "range": period,
+        "current": current,
+        "previous": previous,
+    }
+
+
+@admin_router.get('/api/admin/dashboard/agents')
+def get_admin_agent_summary(
+    range_key: Literal['today', 'yesterday', '3days', '7days', '30days', 'custom'] = Query('7days', alias='range'),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(require_admin),
+):
+    """admin 独享：按归属用户分组的销量/销售额明细（代理经营看板）。"""
+    period = _dashboard_period(range_key, start_date, end_date)
+    agents = db_manager.get_per_user_order_summary(
+        start_date=period['start_date'],
+        end_date=period['end_date'],
+        include_statuses=list(DASHBOARD_ANALYTICS_STATUSES),
+    )
+    if isinstance(agents, dict) and 'error' in agents:
+        raise HTTPException(status_code=500, detail=agents['error'] or '分代理统计失败')
+    return {
+        "success": True,
+        "range": period,
+        "agents": agents,
+    }
+
+
+@admin_router.get('/api/admin/accounts/overview')
+def get_admin_accounts_overview(_: Dict[str, Any] = Depends(require_admin)):
+    """admin 独享：全部闲鱼账号 + 归属代理 + 登录健康状态（不含任何登录物料）。"""
+    accounts = db_manager.get_admin_account_overview()
+    if isinstance(accounts, dict) and 'error' in accounts:
+        raise HTTPException(status_code=500, detail=accounts['error'] or '账号总览查询失败')
+    for account in accounts:
+        method = normalize_login_method(account.get('login_method'))
+        account['login_method'] = method
+        account['login_method_label'] = login_method_label(method)
+    expired_count = sum(1 for account in accounts if account['session_expired'])
+    return {
+        "success": True,
+        "total": len(accounts),
+        "expired_count": expired_count,
+        "accounts": accounts,
+    }
+
 
 @orders_router.get('/analytics/orders')
 def get_order_analytics(

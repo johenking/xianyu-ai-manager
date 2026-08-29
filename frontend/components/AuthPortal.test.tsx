@@ -147,6 +147,43 @@ describe('AuthPortal', () => {
     await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith('register-token'));
   });
 
+  it('requires and submits an invite code when the config demands it', async () => {
+    window.history.replaceState({}, '', '/register');
+    vi.mocked(getRegistrationConfig).mockResolvedValue({
+      ...readyConfig,
+      invite_required: true,
+    });
+    const onAuthenticated = vi.fn();
+    render(<AuthPortal onAuthenticated={onAuthenticated} />);
+
+    await screen.findByAltText('图形验证码');
+    const inviteInput = screen.getByLabelText('邀请码');
+    expect(inviteInput).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'agent@example.com' } });
+    fireEvent.change(screen.getByLabelText('图形验证码'), { target: { value: 'AB12' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送邮件验证码' }));
+    await screen.findByText('图形验证已通过，邮件已发送');
+    fireEvent.change(screen.getByLabelText('邮件验证码'), { target: { value: '482615' } });
+    fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'agent-user' } });
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'Agent-pass-2026!' } });
+    fireEvent.change(screen.getByLabelText('确认密码'), { target: { value: 'Agent-pass-2026!' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /服务条款和隐私说明/ }));
+
+    fireEvent.click(screen.getByRole('button', { name: '完成注册' }));
+    expect(await screen.findByText('请输入邀请码')).toBeInTheDocument();
+    expect(registerAccount).not.toHaveBeenCalled();
+
+    fireEvent.change(inviteInput, { target: { value: 'reg-agentcode23456789abcdefg' } });
+    fireEvent.click(screen.getByRole('button', { name: '完成注册' }));
+
+    await waitFor(() => expect(registerAccount).toHaveBeenCalledWith(expect.objectContaining({
+      invite_code: 'REG-AGENTCODE23456789ABCDEFG',
+      username: 'agent-user',
+    })));
+    await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith('register-token'));
+  });
+
   it('keeps the current CAPTCHA after a wrong answer and clears only its input', async () => {
     window.history.replaceState({}, '', '/register');
     vi.mocked(sendAuthEmailCode).mockRejectedValueOnce(new ApiRequestError('图形验证码错误', {

@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 from loguru import logger
@@ -241,13 +241,102 @@ class PublicRegistrationAPITests(RegistrationAPIFixture):
                 "challenge_id": email_result["challenge_id"],
                 "verification_code": email_code,
                 "username": "second-user",
+                "password": "Safe-pass-2026!!",
+                "terms_version": "v2",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(reused.status_code, 400, reused.text)
+        self.assertEqual(reused.json()["code"], "CHALLENGE_CONSUMED")
+
+    def test_invite_required_registration_end_to_end(self):
+        self.make_registration_ready()
+        headers = self.admin_headers()
+        self.assertTrue(
+            self.client.put(
+                "/api/admin/registration/invite-required",
+                headers=headers,
+                json={"enabled": True},
+            ).json()["invite_required"]
+        )
+        invite = self.client.post(
+            "/api/admin/registration/invites",
+            headers=headers,
+            json={"count": 1, "valid_days": 7, "note": "代理直邀"},
+        ).json()["invites"][0]
+
+        config = self.client.get("/api/auth/registration-config").json()
+        self.assertTrue(config["invite_required"])
+
+        captcha = self.captcha()
+        email_result, email_code = self.email_code(
+            purpose="register",
+            email="invited@example.com",
+            captcha=captcha,
+        )
+        rejected = self.client.post(
+            "/register",
+            json={
+                "email": "invited@example.com",
+                "challenge_id": email_result["challenge_id"],
+                "verification_code": email_code,
+                "username": "invited-agent",
+                "password": "Invited-pass-2026!",
+                "terms_version": "v2",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(rejected.status_code, 403, rejected.text)
+        self.assertEqual(rejected.json()["code"], "INVITE_CODE_REQUIRED")
+
+        registered = self.client.post(
+            "/register",
+            json={
+                "invite_code": invite["code"],
+                "email": "invited@example.com",
+                "challenge_id": email_result["challenge_id"],
+                "verification_code": email_code,
+                "username": "invited-agent",
+                "password": "Invited-pass-2026!",
+                "terms_version": "v2",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(registered.status_code, 200, registered.text)
+        self.assertTrue(registered.json()["success"])
+
+        listing = self.client.get(
+            "/api/admin/registration/invites",
+            headers=headers,
+        ).json()
+        used = next(
+            item for item in listing["invites"] if item["id"] == invite["id"]
+        )
+        self.assertEqual(used["status"], "used")
+        self.assertIsNotNone(used["used_by_user_id"])
+
+        second_captcha = self.captcha(code="EF56")
+        second_email, second_code = self.email_code(
+            purpose="register",
+            email="second-invited@example.com",
+            captcha=second_captcha,
+            captcha_code="EF56",
+        )
+        replayed = self.client.post(
+            "/register",
+            json={
+                "invite_code": invite["code"],
+                "email": "second-invited@example.com",
+                "challenge_id": second_email["challenge_id"],
+                "verification_code": second_code,
+                "username": "second-agent",
                 "password": "Second-pass-2026!",
                 "terms_version": "v2",
                 "terms_accepted": True,
             },
         )
-        self.assertEqual(reused.status_code, 400)
-        self.assertEqual(reused.json()["code"], "CHALLENGE_CONSUMED")
+        self.assertEqual(replayed.status_code, 400, replayed.text)
+        self.assertEqual(replayed.json()["code"], "INVITE_ALREADY_USED")
 
     def test_smtp_failure_does_not_create_a_usable_email_challenge(self):
         self.make_registration_ready()
@@ -1143,29 +1232,57 @@ class RegistrationAdminAPITests(RegistrationAPIFixture):
         self.assertNotIn(fingerprint, response.text)
         self.assertTrue(response.json()["sections"]["smtp"]["verified"])
 
-    def test_legacy_invite_routes_return_gone_and_user_management_remains(self):
+    def test_invite_admin_routes_manage_lifecycle_and_user_management_remains(self):
         headers = self.admin_headers()
         created = self.client.post(
             "/api/admin/registration/invites",
             headers=headers,
             json={"count": 2, "valid_days": 7, "note": "pilot"},
         )
-        self.assertEqual(created.status_code, 410, created.text)
-        self.assertEqual(
-            created.json()["code"],
-            "INVITATION_REGISTRATION_REMOVED",
-        )
+        self.assertEqual(created.status_code, 200, created.text)
+        invites = created.json()["invites"]
+        self.assertEqual(len(invites), 2)
+        for invite in invites:
+            self.assertTrue(invite["code"].startswith("REG-"))
+            self.assertEqual(invite["status"], "active")
+            self.assertEqual(invite["note"], "pilot")
 
         listed = self.client.get(
             "/api/admin/registration/invites",
             headers=headers,
         )
-        self.assertEqual(listed.status_code, 410)
+        self.assertEqual(listed.status_code, 200, listed.text)
+        listing = listed.json()
+        self.assertFalse(listing["invite_required"])
+        self.assertEqual(len(listing["invites"]), 2)
+        self.assertNotIn(invites[0]["code"], listed.text)
+
         revoked = self.client.delete(
-            "/api/admin/registration/invites/1",
+            f"/api/admin/registration/invites/{invites[0]['id']}",
             headers=headers,
         )
-        self.assertEqual(revoked.status_code, 410, revoked.text)
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertEqual(revoked.json()["invite"]["status"], "revoked")
+
+        switched = self.client.put(
+            "/api/admin/registration/invite-required",
+            headers=headers,
+            json={"enabled": True},
+        )
+        self.assertEqual(switched.status_code, 200, switched.text)
+        self.assertTrue(switched.json()["invite_required"])
+        config = self.client.get("/api/auth/registration-config")
+        self.assertTrue(config.json()["invite_required"])
+        self.assertTrue(
+            self.client.put(
+                "/api/admin/registration/invite-required",
+                headers=headers,
+                json={"enabled": False},
+            ).json()["success"]
+        )
+
+        anonymous = self.client.get("/api/admin/registration/invites")
+        self.assertIn(anonymous.status_code, (401, 403))
 
         self.assertTrue(
             self.db.create_user(
@@ -1192,6 +1309,53 @@ class RegistrationAdminAPITests(RegistrationAPIFixture):
         )
         self.assertEqual(disabled.status_code, 200, disabled.text)
         self.assertFalse(disabled.json()["user"]["is_active"])
+
+    def test_user_disable_and_enable_reconcile_runtime_listeners(self):
+        """禁用代理 → 立即对账下线其账号监听；重新启用 → 恢复监听。"""
+        headers = self.admin_headers()
+        self.assertTrue(
+            self.db.create_user(
+                "agent-user",
+                "agent-user@example.com",
+                "Agent-pass-2026!",
+            )
+        )
+        user = self.db.get_user_by_username("agent-user")
+
+        manager = Mock()
+        manager.reconcile_from_db = AsyncMock(
+            return_value={"success": True, "stopped": 2, "started": 0, "restarted": 0}
+        )
+        with patch("cookie_manager.manager", manager):
+            disabled = self.client.put(
+                f"/api/admin/registration/users/{user['id']}",
+                headers=headers,
+                json={"is_active": False},
+            )
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+        self.assertFalse(disabled.json()["user"]["is_active"])
+        self.assertEqual(
+            disabled.json()["runtime"],
+            {"reconciled": True, "stopped": 2, "started": 0},
+        )
+        manager.reconcile_from_db.assert_awaited_once()
+
+        manager.reconcile_from_db = AsyncMock(
+            return_value={"success": True, "stopped": 0, "started": 0, "restarted": 1}
+        )
+        with patch("cookie_manager.manager", manager):
+            enabled = self.client.put(
+                f"/api/admin/registration/users/{user['id']}",
+                headers=headers,
+                json={"is_active": True},
+            )
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertTrue(enabled.json()["user"]["is_active"])
+        self.assertEqual(
+            enabled.json()["runtime"],
+            {"reconciled": True, "stopped": 0, "started": 1},
+        )
+        manager.reconcile_from_db.assert_awaited_once()
 
     def test_registration_can_be_enabled_after_smtp_confirmation_without_invites(self):
         headers = self.admin_headers()

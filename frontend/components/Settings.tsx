@@ -21,6 +21,7 @@ import { getInitialOpenSection, isSectionDirty } from '../utils/settingsState';
 import { InlineNotice, StatusBadge, ToggleControl } from './ui/StatusControls';
 import { IconAction, PageHeader, SegmentedNav, WorkSurface } from './ui/ProtectedPage';
 import AIProviderManager from './AIProviderManager';
+import AdminAccountsPanel from './AdminAccountsPanel';
 import RegistrationManagement from './RegistrationManagement';
 
 const sectionFields: Record<SettingsSectionKey, string[]> = {
@@ -363,6 +364,8 @@ const AdminSettings: React.FC = () => {
       </WorkSurface>}
 
       <RegistrationManagement refreshKey={registrationRefreshKey} />
+
+      <AdminAccountsPanel />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3"><Metric label="账号管理器" value={summary.runtime.cookie_manager ? '运行中' : '未就绪'} /><Metric label="账号数量" value={`${summary.runtime.account_count}`} /><Metric label="监听任务" value={`${summary.runtime.active_tasks}`} /></div>
     </div>
