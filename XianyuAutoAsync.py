@@ -74,11 +74,18 @@ WS_SEND_TIMEOUT = 10      # 单次业务帧发送上限，避免 await send 永�
 DELIVERY_VERIFY_MAX_PAGES = 5
 FULFILLMENT_API_MAX_ATTEMPTS = 4
 
-# 付款核验 order_not_observed 的短退避重试间隔（秒）。平台订单详情/列表
-# 相对付款消息有秒级同步延迟：实测正常单 2~10 秒可见，但个别单在核验段
-# 空耗 23~49 秒才被 30 秒兜底轮询捞回。仅对「平台暂未返回该订单」这一种
-# 结果重试；登录失效、身份不符、业务类型不符等其它失败一律立即放弃。
+# 付款核验的短退避重试间隔（秒）。平台订单详情/列表相对付款消息有秒级同步
+# 延迟：实测正常单 2~10 秒可见，但个别单在核验段空耗 23~49 秒才被 30 秒兜底
+# 轮询捞回。
 INVITE_VERIFY_RETRY_DELAYS_SECONDS = (2.0, 4.0, 8.0)
+
+# 只有「平台数据尚未就绪」的两种结果值得重试：订单还没出现在平台列表/详情里，
+# 或者出现了但业务类型标记还没传播完（此时分类器只能失败关闭判 unknown）。
+# 登录失效、身份不符、lead 单等确定性失败一律立即放弃，不拖住热路径。
+INVITE_VERIFY_RETRYABLE_ERROR_CODES = frozenset({
+    "order_not_observed",
+    "order_business_type_unconfirmed",
+})
 
 # Shadow 默认开启，仍可通过环境变量立即关闭。
 AI_REPLY_SHADOW_ENABLED = os.getenv("AI_REPLY_SHADOW_ENABLED", "true").strip().lower() in {
@@ -2022,13 +2029,13 @@ class XianyuLive:
                     item_id=item_id,
                     buyer_id=send_user_id,
                 )
-                # 平台订单接口相对付款消息有秒级同步延迟：仅当结果是
-                # order_not_observed（平台暂未返回该订单）时短退避重试，
-                # 吃掉大部分延迟；其它失败保持立即放弃，不放宽任何门禁。
+                # 平台订单接口相对付款消息有秒级同步延迟：仅当结果属于
+                # INVITE_VERIFY_RETRYABLE_ERROR_CODES（平台数据尚未就绪）时短
+                # 退避重试，吃掉大部分延迟；其它失败保持立即放弃，不放宽门禁。
                 for retry_delay in INVITE_VERIFY_RETRY_DELAYS_SECONDS:
                     if payment_check.get("allowed") or str(
                         payment_check.get("error_code") or ""
-                    ) != "order_not_observed":
+                    ) not in INVITE_VERIFY_RETRYABLE_ERROR_CODES:
                         break
                     await asyncio.sleep(retry_delay)
                     payment_check = await self._verify_paid_order_for_delivery(

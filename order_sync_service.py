@@ -403,6 +403,13 @@ ORDER_BUSINESS_ORDINARY = "ordinary"
 ORDER_BUSINESS_LEAD = "lead"
 ORDER_BUSINESS_UNKNOWN = "unknown"
 
+# 平台自有的「普通可发货订单」业务编码。拼团（两人小刀）单的编码是
+# idleBizCode="6000" + xGlobalBizCode="idleShop|pinGroup|c2c"，履约方式与普通
+# 实物单一致（只多一步免拼成团），必须与 "6" 同等视为正向标记；否则它会落进
+# unknown 并被自动发货门禁永久拦死。
+ORDINARY_BIZ_CODES = frozenset({"6", "6000"})
+ORDINARY_BIZ_CODE_KEYWORDS = ("pingroup",)
+
 
 def classify_order_business_type(raw: Dict[str, Any]) -> str:
     """Classify the platform order kind using positive, platform-owned markers."""
@@ -438,7 +445,9 @@ def classify_order_business_type(raw: Dict[str, Any]) -> str:
             lead = True
         elif normalized == "7000":
             lead = True
-        elif normalized == "6":
+        elif normalized in ORDINARY_BIZ_CODES or any(
+            keyword in normalized for keyword in ORDINARY_BIZ_CODE_KEYWORDS
+        ):
             ordinary = True
 
     components = raw.get("components") if isinstance(raw.get("components"), list) else []

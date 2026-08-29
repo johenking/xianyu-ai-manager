@@ -341,6 +341,67 @@ class OrderStatusNormalizationTests(unittest.TestCase):
             "lead",
         )
 
+    def test_pin_group_orders_are_ordinary_shippable(self):
+        # 拼团（两人小刀）单在平台上的真实编码，履约方式与普通实物单一致。
+        pin_group_detail = {
+            "ret": ["SUCCESS::调用成功"],
+            "data": {
+                "orderId": "order-pingroup",
+                "itemId": "item-pingroup",
+                "peerUserId": "buyer-pingroup",
+                "status": "2",
+                "utArgs": {
+                    "xGlobalBizCode": "idleShop|pinGroup|c2c",
+                    "idleBizCode": "6000",
+                    "orderStatusName": "买家已付款，请尽快发货",
+                },
+                "components": [{
+                    "data": {
+                        "orderStatusInfo": {"title": "买家已付款，请尽快发货"},
+                        "itemInfo": {"buyAmount": "1", "title": "Fixture"},
+                        "priceInfo": {"amount": {"value": "3.88"}},
+                    },
+                }],
+            },
+        }
+        parsed = parse_order_detail_payload(pin_group_detail, "account-1")
+        self.assertTrue(parsed["success"])
+        self.assertEqual(parsed["orders"][0]["order_business_type"], "ordinary")
+
+        # 待发货列表行（兜底轮询与同买家 fan-out 走这条归一化）。
+        self.assertEqual(
+            normalize_pending_order_record({
+                "bizOrderId": "order-pingroup-list",
+                "auctionId": "item-pingroup",
+                "buyerId": "buyer-pingroup",
+                "totalFee": "3.88",
+                "buyAmount": 1,
+                "orderStatus": "2",
+                "idleBizCode": "6000",
+                "xGlobalBizCode": "idleShop|pinGroup|c2c",
+            }, "account-1")["order_business_type"],
+            "ordinary",
+        )
+
+        # 只有 pinGroup 关键字（无 6000 编码）同样是正向标记。
+        self.assertEqual(
+            classify_order_business_type({
+                "commonData": {"orderStatus": "待发货"},
+                "xGlobalBizCode": "idleShop|pinGroup|c2c",
+            }),
+            "ordinary",
+        )
+
+        # 正向标记冲突时仍然失败关闭，拼团标记不覆盖 lead 标记。
+        self.assertEqual(
+            classify_order_business_type({
+                "commonData": {"orderStatus": "待发货"},
+                "xGlobalBizCode": "idleShop|pinGroup|c2c",
+                "idleBizCode": "7000",
+            }),
+            "unknown",
+        )
+
     def test_order_list_does_not_infer_unverified_buyer_identity_fields(self):
         order = normalize_order_record({
             "commonData": {"orderId": "order-private"},

@@ -2100,6 +2100,113 @@ def test_poller_lead_discovery_never_stages_or_emits_event(monkeypatch):
     assert poller._seen == set()
 
 
+def test_poller_stages_pin_group_order_discovered_from_platform_row(monkeypatch):
+    """拼团（两人小刀）单未成团时平台不给「发货」按钮，只能靠 6000/pinGroup 编码放行。"""
+    import XianyuAutoAsync
+    import invite_bridge_poller as poller_module
+    from order_sync_service import normalize_order_record
+
+    pin_group_row = {
+        "commonData": {
+            "orderId": "order-pingroup",
+            "itemId": "item-1",
+            "itemTitle": "拼团商品",
+            "orderStatusCode": "2",
+            "orderStatus": "等待卖家发货",
+            "createTime": "2026-08-29 03:21:00",
+            "idleBizCode": "6000",
+            "xGlobalBizCode": "idleShop|pinGroup|c2c",
+        },
+        "buyerInfoVO": {"buyerId": "buyer-1"},
+        "priceVO": {"totalPrice": "3.88", "buyNum": "1"},
+        "rightVO": {"btnList": [{"tradeAction": "MODIFY_PRICE"}]},
+    }
+
+    class _Database:
+        def __init__(self):
+            self.orders = {}
+            self.writes = []
+
+        def get_all_cookies(self):
+            return {"account-1": "fixture-cookie"}
+
+        def get_cookie_details(self, _cookie_id):
+            return {"browser_user_agent": "fixture-agent"}
+
+        def get_order_by_id(self, order_id):
+            return self.orders.get(order_id)
+
+        def find_chat_id_by_buyer(self, _cookie_id, _buyer_id):
+            return None
+
+        def insert_or_update_order(self, **values):
+            self.writes.append(("insert", values["order_id"]))
+            self.orders[values["order_id"]] = {**values, "system_shipped": 0}
+            return True
+
+        def apply_order_sync_update(self, **values):
+            self.writes.append(("sync", values["order_id"]))
+            self.orders[values["order_id"]]["order_status"] = values["incoming_status"]
+            return {"updated": True}
+
+        def get_orders_by_cookie(self, cookie_id, limit=200):
+            del limit
+            return [
+                order
+                for order in self.orders.values()
+                if order.get("cookie_id") == cookie_id
+            ]
+
+    class _Lock:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _OrderClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def discover(self, **_kwargs):
+            return {
+                "success": True,
+                "orders": [normalize_order_record(pin_group_row, "account-1")],
+            }
+
+    class _Socket:
+        closed = False
+
+    class _Live:
+        ws = _Socket()
+
+        async def _verify_paid_order_for_delivery(self, **_kwargs):
+            return {"allowed": True}
+
+    database = _Database()
+    events = []
+    poller = poller_module.InviteBridgePoller()
+
+    async def record_event(payload):
+        events.append(payload)
+
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(poller_module, "_allowed_item_ids", lambda _id: {"item-1"})
+    monkeypatch.setattr(poller_module, "XianyuOrderListClient", _OrderClient)
+    monkeypatch.setattr(poller_module, "get_order_sync_lock", lambda _id: _Lock())
+    monkeypatch.setattr(poller_module, "_message_operation_exists", lambda *_args: False)
+    monkeypatch.setattr(poller_module, "_send_order_event_to_invite", record_event)
+    monkeypatch.setattr(
+        XianyuAutoAsync.XianyuLive,
+        "get_instance",
+        staticmethod(lambda _cookie_id: _Live()),
+    )
+
+    assert asyncio.run(poller.scan_once()) == 1
+    assert database.orders["order-pingroup"]["order_status"] == "pending_ship"
+    assert [payload["orderId"] for payload in events] == ["order-pingroup"]
+
+
 def test_poller_preserves_verified_chat_id_on_platform_rediscovery(monkeypatch):
     import invite_bridge_poller as poller_module
 
@@ -3035,6 +3142,31 @@ def test_paid_invite_notice_gives_up_after_bounded_unobserved_retries(monkeypatc
     assert poller.fanout == []
 
 
+def test_paid_invite_notice_retries_unconfirmed_business_type_then_delivers(monkeypatch):
+    """业务类型标记的平台传播延迟同样值得等：重试一次翻成 ordinary 就照常发货。"""
+    unconfirmed = {
+        "allowed": False,
+        "status": "pending_ship",
+        "business_type": "unknown",
+        "error_code": "order_business_type_unconfirmed",
+    }
+    allowed = {
+        "allowed": True,
+        "status": "pending_ship",
+        "business_type": "ordinary",
+        "amount": "3.88",
+        "quantity": 1,
+    }
+    live, poller, sleeps = _hot_path_retry_setup(monkeypatch, [unconfirmed, allowed])
+
+    _run_hot_path(live)
+
+    assert live.verify_calls == 2
+    assert sleeps == [2.0]
+    assert [call["order_id"] for call in poller.staged] == ["order-1"]
+    assert [call["order_id"] for call in poller.direct] == ["order-1"]
+
+
 def test_paid_invite_notice_does_not_retry_terminal_verification_failures(monkeypatch):
     for error_code in ("lead_order_not_fulfillable", "requires_login", "not_paid"):
         terminal = {
@@ -3046,7 +3178,7 @@ def test_paid_invite_notice_does_not_retry_terminal_verification_failures(monkey
 
         _run_hot_path(live)
 
-        # 只有 order_not_observed 值得重试；其它失败立即放弃，不拖热路径。
+        # 只有平台数据尚未就绪的两种结果值得重试；确定性失败立即放弃，不拖热路径。
         assert live.verify_calls == 1, error_code
         assert sleeps == [], error_code
         assert poller.staged == []
