@@ -1137,6 +1137,10 @@ class XianyuLive:
         self.last_l3_keepalive_time = float(
             (runtime_state or {}).get('last_l3_keepalive_time') or 0
         )
+        try:
+            self.l3_keepalive_enabled = db_manager.get_l3_keepalive_enabled(self.cookie_id)
+        except Exception:
+            self.l3_keepalive_enabled = False
         self.l3_keepalive_lock = asyncio.Lock()
 
         # 商品同步定时任务
