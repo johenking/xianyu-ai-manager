@@ -1782,7 +1782,14 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                     logger.info(f"【{account_ref}】当前消息为最新消息，开始处理")
 
                 settings = db_manager.get_ai_reply_settings(cookie_id)
-                image_parts = self._prepare_image_parts(settings, image_refs)
+                try:
+                    image_parts = self._prepare_image_parts(settings, image_refs)
+                except ValueError as exc:
+                    # 与订单感知主路径同约定：图片校验失败降级为无图回复，不放弃本次回复。
+                    logger.warning(
+                        f"【{account_ref}】入站图片处理失败，降级为无图回复: reason={exc}"
+                    )
+                    image_parts = []
                 context = self.get_conversation_context(
                     chat_id, cookie_id, item_id, order_scope='legacy'
                 )
@@ -1967,7 +1974,15 @@ overview是包含text的对象；pricing是包含label、amount、text的数组�
                         return None
 
                 settings = db_manager.get_ai_reply_settings(cookie_id)
-                image_parts = self._prepare_image_parts(settings, image_refs)
+                try:
+                    image_parts = self._prepare_image_parts(settings, image_refs)
+                except ValueError as exc:
+                    # 图片校验失败不放弃整次回复：降级为无图路径（纯图片消息由下方
+                    # 非文本引导接管）。exc 文案是本仓库固定字符串，不含敏感数据。
+                    logger.warning(
+                        f"【{account_ref}】入站图片处理失败，降级为无图回复: reason={exc}"
+                    )
+                    image_parts = []
 
                 # 非文本占位输入（卡片/语音/视频/无视觉图片）不走生成，直接固定引导。
                 guidance_reply = self._non_text_guidance_reply(message, bool(image_parts))

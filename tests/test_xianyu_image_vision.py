@@ -124,6 +124,86 @@ class AIImageRequestTests(unittest.TestCase):
             )
         request_mock.assert_not_called()
 
+    def test_image_failure_degrades_to_guidance_reply_on_order_aware_path(self):
+        """图片校验失败时主路径降级为无图：纯图片消息返回固定引导而非静默失败。"""
+        checked_reply = Mock(return_value={'reply': '不应走到模型', 'regenerated': False})
+        save_record = Mock(return_value={'id': 1, 'created_at': '2026-08-29 10:00:00'})
+        with (
+            patch.object(self.engine, 'order_aware_enabled', return_value=True),
+            patch.object(self.engine, 'is_ai_enabled', return_value=True),
+            patch.object(
+                self.engine, 'resolve_order_scope',
+                return_value={'scope': 'legacy', 'order_id': None},
+            ),
+            patch.object(self.engine, 'detect_intent', return_value='default'),
+            patch.object(self.engine, '_save_conversation_record', save_record),
+            patch.object(self.engine, '_get_recent_user_messages', return_value=[]),
+            patch.object(
+                self.engine, '_prepare_image_parts',
+                side_effect=ValueError('入站图片下载失败: status=403'),
+            ),
+            patch.object(self.engine, 'generate_rule_checked_reply', checked_reply),
+            patch.object(self.engine, '_record_shadow_metric'),
+            patch('ai_reply_engine.db_manager.get_ai_reply_settings', return_value=self.settings),
+        ):
+            result = self.engine.generate_reply(
+                message=IMAGE_PLACEHOLDER,
+                item_info={'title': 'item', 'price': 1, 'desc': 'desc'},
+                chat_id='chat-1',
+                cookie_id='account-1',
+                user_id='buyer-1',
+                item_id='item-1',
+                skip_wait=True,
+                image_refs=[ImageReference('https://gw.alicdn.com/test/broken.png')],
+            )
+
+        self.assertEqual(result, self.engine.NON_TEXT_GUIDANCE_REPLY)
+        checked_reply.assert_not_called()
+        saved_replies = [
+            call.args for call in save_record.call_args_list
+            if len(call.args) >= 6 and call.args[4] == 'assistant'
+        ]
+        self.assertEqual(len(saved_replies), 1)
+        self.assertEqual(saved_replies[0][5], self.engine.NON_TEXT_GUIDANCE_REPLY)
+
+    def test_image_failure_degrades_to_text_only_generation_on_legacy_path(self):
+        """图片校验失败时 legacy 路径同样降级为无图生成，不再让整次回复失败。"""
+        checked_reply = Mock(return_value={'reply': '还在的哦', 'regenerated': False})
+        with (
+            patch.object(self.engine, 'order_aware_enabled', return_value=False),
+            patch.object(self.engine, 'is_ai_enabled', return_value=True),
+            patch.object(self.engine, 'detect_intent', return_value='default'),
+            patch.object(self.engine, 'save_conversation', return_value='created'),
+            patch.object(self.engine, '_get_recent_user_messages', return_value=[]),
+            patch.object(self.engine, 'get_conversation_context', return_value=[]),
+            patch.object(self.engine, 'get_bargain_count', return_value=0),
+            patch.object(
+                self.engine, '_prepare_image_parts',
+                side_effect=ValueError('入站图片超出尺寸限制'),
+            ),
+            patch.object(self.engine, 'build_product_reply_context', return_value={
+                'system_prompt': 'system',
+                'rule_context': {'applied_rules': []},
+                'knowledge_text': '',
+            }),
+            patch.object(self.engine, 'generate_rule_checked_reply', checked_reply),
+            patch('ai_reply_engine.db_manager.get_ai_reply_settings', return_value=self.settings),
+        ):
+            result = self.engine.generate_reply(
+                message=f'这个还在吗{IMAGE_PLACEHOLDER}',
+                item_info={'title': 'item', 'price': 1, 'desc': 'desc'},
+                chat_id='chat-1',
+                cookie_id='account-1',
+                user_id='buyer-1',
+                item_id='item-1',
+                skip_wait=True,
+                image_refs=[ImageReference('https://gw.alicdn.com/test/broken.png')],
+            )
+
+        self.assertEqual(result, '还在的哦')
+        user_content = checked_reply.call_args.kwargs['messages'][1]['content']
+        self.assertIsInstance(user_content, str)
+
     def test_generate_reply_builds_multimodal_user_content(self):
         image_part = {
             'type': 'image_url',
