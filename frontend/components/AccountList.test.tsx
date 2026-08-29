@@ -407,7 +407,7 @@ describe('AccountList session verification UI', () => {
     render(<AccountList />);
 
     await screen.findByText('可自动续期 · 定时关闭');
-    expect(screen.getAllByTitle('立即刷新 Cookie').length).toBeGreaterThan(0);
+    expect(screen.getAllByTitle('通知绑定设备续期').length).toBeGreaterThan(0);
 
     const accountCard = screen.getByRole('heading', { name: '验证账号' }).closest('.ios-card');
     expect(accountCard).not.toBeNull();
@@ -584,7 +584,7 @@ describe('AccountList session verification UI', () => {
 
     const accountCard = (await screen.findByRole('heading', { name: '验证账号' })).closest('.ios-card');
     expect(accountCard).not.toBeNull();
-    const refreshButton = within(accountCard as HTMLElement).getByTitle('立即刷新 Cookie');
+    const refreshButton = within(accountCard as HTMLElement).getByTitle('通知绑定设备续期');
     act(() => {
       fireEvent.click(refreshButton);
       fireEvent.click(refreshButton);
