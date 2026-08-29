@@ -19,6 +19,7 @@ from invite_bridge import (
     _allowed_item_ids,
     _execute_platform_ship,
     _fetch_platform_order_status,
+    _has_succeeded_fulfillment_message,
     _is_provisional_chat,
     _send_order_event_to_invite,
     bridge_enabled,
@@ -450,12 +451,17 @@ class InviteBridgePoller:
         item_id: str,
         buyer_id: str,
     ) -> bool:
-        """平台报待发货但本地已发时登记漂移单，返回是否属于漂移。
+        """平台报待发货时登记漂移单，返回是否属于漂移。仅在调用点已确认
+        平台状态为 pending_ship 时进入，覆盖两类需补发货的单：
 
-        这类单多因平台侧确认发货只完成一半（如拼团只点了免拼没发货）而
-        滞留，历史上被 mark-fulfilled 的本地幂等护栏假成功吞掉后永久无人
-        补救（2026-08 全量对账实测 10 笔活跃账号卡单、零告警）。登记后由
-        对账重发器限流补发。
+        1. 本地已发 × 平台待发货：平台侧确认发货只完成一半（如拼团只点了
+           免拼没发货）而滞留，历史上被 mark-fulfilled 的本地幂等护栏假成功
+           吞掉后永久无人补救（2026-08 全量对账实测 10 笔活跃账号卡单）。
+        2. 兑换码已送达 × 两边都待发货：发码消息已 succeeded 但「平台确认发货」
+           那一步当时失败（如撞令牌过期），本地仍 pending_ship，不在旧对账
+           覆盖面内、只能人工补点。
+
+        两类都只补一次平台发货、绝不重发兑换码，登记后由对账重发器限流补发。
         """
         local = db_manager.get_order_by_id(order_id)
         if not local or str(local.get("cookie_id") or "") != cookie_id:
@@ -466,7 +472,27 @@ class InviteBridgePoller:
             or bool(local.get("system_shipped"))
         )
         if not locally_shipped:
-            return False
+            # 本地未标已发：仅当兑换码确已送达买家（fulfillment-message 已
+            # succeeded）却平台仍待发货，才是「已履约未发货」漂移，补一次平台
+            # 发货即可；否则不介入（可能只是尚未履约的正常待发单）。
+            if not _has_succeeded_fulfillment_message(cookie_id, order_id):
+                return False
+            key = (cookie_id, order_id)
+            if key not in self._ship_drift:
+                logger.warning(
+                    "邀请桥发现已履约未发货订单（兑换码已送达×平台待发货），"
+                    "已列入对账补发: order_ref={} account_ref={}",
+                    _opaque_ref(order_id),
+                    _opaque_ref(cookie_id),
+                )
+            self._ship_drift[key] = {
+                "cookie_id": cookie_id,
+                "order_id": order_id,
+                "item_id": item_id,
+                "buyer_id": buyer_id,
+                "observed_at": time.time(),
+            }
+            return True
         key = (cookie_id, order_id)
         if key not in self._ship_drift:
             logger.warning(
@@ -485,7 +511,9 @@ class InviteBridgePoller:
         return True
 
     async def _reconcile_shipped_drift(self) -> int:
-        """对账重发器：把「本地已发 × 平台待发货」的漂移单补到真正已发货。
+        """对账重发器：把待发货漂移单补到真正已发货，收敛两类来源——
+        「本地已发 × 平台待发货」与「兑换码已送达 × 两边待发货」（见
+        _note_ship_drift）。
 
         候选完全来自平台发现的顺带观测（零额外列表请求）。补发前逐笔用
         订单详情回查双确认——列表观测可能滞后于真实状态；平台已推进的
