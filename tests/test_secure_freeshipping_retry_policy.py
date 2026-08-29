@@ -28,14 +28,35 @@ from secure_freeshipping_decrypted import (
 COOKIES = "_m_h5_tk=faketoken123_1234567890; unb=42"
 
 
+class _FakeHeaders(dict):
+    """支持 `'set-cookie' in headers` 与 `headers.getall('set-cookie', [])`，
+    大小写不敏感，贴合 `_post_freeshipping` 合并响应 Cookie 的取值方式。"""
+
+    def getall(self, key, default=None):
+        target = str(key).lower()
+        values = [v for k, v in self.items() if str(k).lower() == target]
+        return values if values else (default or [])
+
+    def __contains__(self, key):
+        return any(str(k).lower() == str(key).lower() for k in self.keys())
+
+
 class _FakeResponse:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, headers=None):
         self._payload = payload
         self.status = status
-        self.headers = {}
+        self.headers = _FakeHeaders(headers or {})
 
     async def json(self):
         return self._payload
+
+
+def _token_expired_with_fresh_cookie(fresh_token):
+    """一条令牌过期响应，并在 Set-Cookie 里回带平台新签发的 _m_h5_tk。"""
+    return _FakeResponse(
+        {"ret": ["FAIL_SYS_TOKEN_EXPIRED::令牌过期"]},
+        headers={"set-cookie": f"_m_h5_tk={fresh_token}_1756500000000; Path=/"},
+    )
 
 
 class _FakePostContext:
@@ -87,15 +108,26 @@ class ClassifyFreeshippingRetTests(unittest.TestCase):
                     classify_freeshipping_ret([ret])[0], "already_shipped"
                 )
 
-    def test_session_and_token_expired(self):
+    def test_session_expired_is_session_invalid(self):
         for ret in (
             "FAIL_SYS_SESSION_EXPIRED::Session过期",
-            "FAIL_SYS_TOKEN_EXOIRED::令牌过期",
-            "FAIL_SYS_TOKEN_EXPIRED::令牌过期",
+            "FAIL_SYS_MINI_LOGIN::请登录",
         ):
             with self.subTest(ret=ret):
                 self.assertEqual(
                     classify_freeshipping_ret([ret])[0], "session_invalid"
+                )
+
+    def test_token_expired_is_its_own_category(self):
+        # 令牌过期单列一类，便于就地重试（与确认发货对称）
+        for ret in (
+            "FAIL_SYS_TOKEN_EXPIRED::令牌过期",
+            "FAIL_SYS_TOKEN_EXOIRED::令牌过期",
+            "FAIL_SYS_TOKEN_EMPTY::令牌为空",
+        ):
+            with self.subTest(ret=ret):
+                self.assertEqual(
+                    classify_freeshipping_ret([ret])[0], "token_expired"
                 )
 
     def test_risk_control(self):
@@ -175,6 +207,57 @@ class AutoFreeshippingRetryPolicyTests(unittest.TestCase):
                 freeship.auto_freeshipping(order_id, item_id, buyer_id, **kwargs)
             )
         return result, session, sleep_mock
+
+    def _call_capture(self, outcomes, order_id="order-1", item_id="100", buyer_id="200", **kwargs):
+        """同 _call，但额外拿到 freeship 实例并屏蔽 Cookie 落库（不碰真实 DB）。"""
+        session = _FakeSession(outcomes)
+        freeship = SecureFreeshipping(
+            session=session, cookies_str=COOKIES, cookie_id="acct-test"
+        )
+        freeship.update_config_cookies = AsyncMock()
+        sleep_mock = AsyncMock()
+        with patch.object(
+            secure_freeshipping_decrypted.asyncio, "sleep", sleep_mock
+        ), patch.object(
+            secure_freeshipping_decrypted.random, "uniform", return_value=1.0
+        ):
+            result = asyncio.run(
+                freeship.auto_freeshipping(order_id, item_id, buyer_id, **kwargs)
+            )
+        return result, session, sleep_mock, freeship
+
+    def test_token_expired_retries_once_with_fresh_token(self):
+        result, session, sleep_mock, freeship = self._call_capture(
+            [
+                _token_expired_with_fresh_cookie("newtoken123"),
+                _ret_response("SUCCESS::调用成功"),
+            ]
+        )
+        self.assertIs(result.get("success"), True)
+        self.assertEqual(session.post_calls, 2)
+        sleep_mock.assert_not_awaited()
+        self.assertIn("newtoken123", freeship.cookies_str)
+
+    def test_token_expired_without_fresh_token_fails_closed(self):
+        result, session, sleep_mock, _ = self._call_capture(
+            [_ret_response("FAIL_SYS_TOKEN_EXPIRED::令牌过期")]
+        )
+        self.assertNotIn("success", result)
+        self.assertEqual(result.get("category"), "session_invalid")
+        self.assertEqual(session.post_calls, 1)
+        sleep_mock.assert_not_awaited()
+
+    def test_token_expired_twice_fails_closed(self):
+        result, session, sleep_mock, _ = self._call_capture(
+            [
+                _token_expired_with_fresh_cookie("newtoken1"),
+                _token_expired_with_fresh_cookie("newtoken2"),
+            ]
+        )
+        self.assertNotIn("success", result)
+        self.assertEqual(result.get("category"), "session_invalid")
+        self.assertEqual(session.post_calls, 2)
+        sleep_mock.assert_not_awaited()
 
     def test_success_returns_without_retry_or_sleep(self):
         result, session, sleep_mock = self._call(
