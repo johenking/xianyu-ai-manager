@@ -7638,6 +7638,10 @@ def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends
         if profile:
             api_key_source = 'provider'
             api_key_masked = profile.get('api_key_masked', '')
+        elif settings.get('api_key_source') == 'site':
+            # 站级共享配置（admin 默认平台）回退，见 db_manager.get_site_default_ai_provider_profile
+            api_key_source = 'site'
+            api_key_masked = _mask_secret(effective_key)
         elif account_api_key:
             api_key_source = 'account'
             api_key_masked = _mask_secret(effective_key)

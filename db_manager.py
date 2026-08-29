@@ -4560,6 +4560,34 @@ class DBManager:
                     account_api_key = result[2]
                     account_base_url = result[3]
 
+                    # 账号无自有 Key 时优先回退站级共享配置（admin 默认平台），
+                    # 让代理账号直接消耗主站的 Key；仍无则走系统全局设置。
+                    if not account_api_key:
+                        site_profile = self.get_site_default_ai_provider_profile(include_secret=True)
+                        if site_profile and site_profile.get('api_key'):
+                            # 账号残留的历史默认模型名不可信，Key/URL/模型必须整体来自站级配置。
+                            site_model, site_base_url = resolve_ai_model_and_base_url(
+                                account_model, '',
+                                site_profile['default_model'], site_profile['base_url']
+                            )
+                            # provider_profile_id 恒为 None：站级 profile 不属于该用户，
+                            # 透出真实 id 会被 PUT 接口的属主校验拒绝、并污染前端绑定下拉。
+                            return {
+                                'ai_enabled': bool(result[0]),
+                                'provider_profile_id': None,
+                                'provider_name': site_profile['name'],
+                                'provider_type': site_profile['provider_type'],
+                                'provider_status': site_profile['verification_status'],
+                                'model_name': site_model,
+                                'api_key': site_profile['api_key'],
+                                'base_url': site_base_url,
+                                'api_key_source': 'site',
+                                'max_discount_percent': result[4],
+                                'max_discount_amount': result[5],
+                                'max_bargain_rounds': result[6],
+                                'custom_prompts': result[7]
+                            }
+
                     # 如果账号值为空或等于硬编码默认值，则使用系统设置
                     use_model, use_base_url = resolve_ai_model_and_base_url(
                         account_model, account_base_url, system_model, system_base_url
@@ -4579,7 +4607,24 @@ class DBManager:
                         'custom_prompts': result[7]
                     }
                 else:
-                    # 账号没有设置，使用系统设置作为默认值
+                    # 账号没有设置：优先站级共享配置（admin 默认平台），再退系统全局设置
+                    site_profile = self.get_site_default_ai_provider_profile(include_secret=True)
+                    if site_profile and site_profile.get('api_key'):
+                        return {
+                            'ai_enabled': False,
+                            'provider_profile_id': None,
+                            'provider_name': site_profile['name'],
+                            'provider_type': site_profile['provider_type'],
+                            'provider_status': site_profile['verification_status'],
+                            'model_name': site_profile['default_model'],
+                            'api_key': site_profile['api_key'],
+                            'base_url': site_profile['base_url'],
+                            'api_key_source': 'site',
+                            'max_discount_percent': 10,
+                            'max_discount_amount': 100,
+                            'max_bargain_rounds': 3,
+                            'custom_prompts': ''
+                        }
                     return {
                         'ai_enabled': False,
                         'provider_profile_id': None,
@@ -4668,6 +4713,8 @@ class DBManager:
             profile['id']: profile
             for profile in self.list_ai_provider_profiles(user_id)
         }
+        # 站级共享配置（admin 默认平台）查一次供全部账号复用，保持查询数固定。
+        site_profile = self.get_site_default_ai_provider_profile()
 
         resolved: Dict[str, dict] = {}
         for cookie_id, row in rows.items():
@@ -4690,6 +4737,25 @@ class DBManager:
                     'api_key_source': 'provider',
                     'api_key_masked': profile.get('api_key_masked', ''),
                     'has_effective_api_key': bool(profile.get('api_key_configured')),
+                })
+            elif not row['api_key_configured'] and site_profile and site_profile.get('api_key_configured'):
+                # 无自有 Key → 站级共享配置（与 get_ai_reply_settings 的运行时回退一致）。
+                # provider_profile_id 必须为 None：站级 profile 不属于该用户，
+                # 返回真实 id 会污染前端绑定下拉与"测试连接"按钮（按属主校验会 404）。
+                site_model, site_base_url = resolve_ai_model_and_base_url(
+                    row['model_name'], '',
+                    site_profile['default_model'], site_profile['base_url']
+                )
+                settings.update({
+                    'provider_profile_id': None,
+                    'provider_name': site_profile['name'],
+                    'provider_type': site_profile['provider_type'],
+                    'provider_status': site_profile['verification_status'],
+                    'model_name': site_model,
+                    'base_url': site_base_url,
+                    'api_key_source': 'site',
+                    'api_key_masked': site_profile.get('api_key_masked', ''),
+                    'has_effective_api_key': True,
                 })
             else:
                 use_model, use_base_url = resolve_ai_model_and_base_url(
@@ -4806,6 +4872,29 @@ class DBManager:
                        verification_message, last_verified_at, is_default, created_at, updated_at
                 FROM ai_provider_profiles WHERE id = ? AND user_id = ?
             ''', (profile_id, user_id)).fetchone()
+            return self._serialize_ai_provider_profile(row, include_secret) if row else None
+
+    def get_site_default_ai_provider_profile(self, include_secret: bool = False) -> Optional[dict]:
+        """站级共享 AI 平台配置：admin 账号的默认且已验证的平台配置。
+
+        代理（子账号）未绑定平台配置、也没有自有 Key 时回退到这份配置，
+        让代理开箱即用主站的 AI 能力（消耗主站 Key，产品决策见 2026-08-29 会话）。
+        管理员判定与 reply_server.ADMIN_USERNAME 一致：username == 'admin'。
+        """
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT p.id, p.user_id, p.name, p.provider_type, p.preset, p.base_url,
+                       p.api_key_encrypted, p.default_model, p.models_cache, p.models_cached_at,
+                       p.verification_status, p.verification_message, p.last_verified_at,
+                       p.is_default, p.created_at, p.updated_at
+                FROM ai_provider_profiles p
+                JOIN users u ON u.id = p.user_id
+                WHERE lower(u.username) = 'admin'
+                  AND p.is_default = 1
+                  AND p.verification_status = 'verified'
+                ORDER BY p.id
+                LIMIT 1
+            ''').fetchone()
             return self._serialize_ai_provider_profile(row, include_secret) if row else None
 
     def count_ai_provider_references(self, profile_id: int) -> int:

@@ -3561,7 +3561,7 @@ const AccountList: React.FC<AccountListProps> = () => {
                     <p className="text-xs text-gray-500 mt-1">选择后必须点击“测试并应用”；测试失败不会改变当前生效模型。</p>
                   </div>
                   <div className="grid grid-cols-1 gap-2 rounded-xl bg-gray-50 px-3 py-3 text-xs text-gray-600 sm:grid-cols-2">
-                    <div><span className="font-bold text-gray-800">Key 来源：</span>{aiSettings.api_key_source === 'provider' ? '平台配置库' : aiSettings.api_key_source === 'account' ? '旧版账号专属' : aiSettings.api_key_source === 'global' ? '旧版系统全局' : '未配置'} {aiSettings.api_key_masked || ''}</div>
+                    <div><span className="font-bold text-gray-800">Key 来源：</span>{aiSettings.api_key_source === 'provider' ? '平台配置库' : aiSettings.api_key_source === 'site' ? '主站共享配置' : aiSettings.api_key_source === 'account' ? '旧版账号专属' : aiSettings.api_key_source === 'global' ? '旧版系统全局' : '未配置'} {aiSettings.api_key_masked || ''}</div>
                     <div><span className="font-bold text-gray-800">连接状态：</span>{aiProviders.find((item) => item.id === aiSettings.provider_profile_id)?.verification_status === 'verified' ? '已验证' : '待测试'}</div>
                   </div>
                 </div>

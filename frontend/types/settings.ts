@@ -79,7 +79,7 @@ export interface AIReplySettings {
   model_name: string;
   api_key: string;
   base_url: string;
-  api_key_source?: 'provider' | 'account' | 'global' | 'missing';
+  api_key_source?: 'provider' | 'site' | 'account' | 'global' | 'missing';
   api_key_masked?: string;
   has_effective_api_key?: boolean;
   max_discount_percent: number;

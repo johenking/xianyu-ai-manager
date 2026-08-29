@@ -140,6 +140,122 @@ class AIProviderDatabaseTests(unittest.TestCase):
         self.assertEqual(after["model_name"], before["model_name"])
 
 
+class SiteDefaultProviderFallbackTests(unittest.TestCase):
+    """代理（子账号）未配置 AI 时回退主站（admin）默认平台配置。
+
+    产品决策（2026-08-29）：代理开箱即用主站的 AI Key，消耗主站配置。
+    优先级：账号绑定平台 > 账号自有 Key > 站级共享（admin 默认已验证平台）> 系统全局。
+    """
+
+    def setUp(self):
+        handle, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(handle)
+        self.db = DBManager(self.db_path)
+        with self.db.lock:
+            # user 1 是 DBManager 初始化自动创建的 admin；user 7 模拟代理
+            self.db.conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, email, password_hash) VALUES (7, 'agent', 'agent@example.com', 'x')"
+            )
+            self.db.conn.execute(
+                "INSERT INTO cookies (id, value, user_id, remark) VALUES ('agent-acc', 'cookie-value', 7, '代理账号')"
+            )
+            self.db.conn.commit()
+
+    def tearDown(self):
+        self.db.conn.close()
+        os.unlink(self.db_path)
+
+    def _create_admin_default_profile(self, **overrides):
+        data = {
+            "name": "主站 DeepSeek",
+            "provider_type": "openai_compatible",
+            "preset": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "api_key": "sk-admin-shared",
+            "default_model": "deepseek-chat",
+            "is_default": True,
+            "verification_status": "verified",
+        }
+        data.update(overrides)
+        return self.db.create_ai_provider_profile(1, data)
+
+    def test_agent_without_key_falls_back_to_site_default(self):
+        self._create_admin_default_profile()
+        self.db.save_ai_reply_settings("agent-acc", {"ai_enabled": True})
+
+        got = self.db.get_ai_reply_settings("agent-acc")
+
+        self.assertEqual(got["api_key"], "sk-admin-shared")
+        self.assertEqual(got["base_url"], "https://api.deepseek.com")
+        self.assertEqual(got["model_name"], "deepseek-chat")
+        self.assertEqual(got["api_key_source"], "site")
+        # 站级 profile 不属于代理，id 不能透出，否则 PUT 属主校验会拒绝保存
+        self.assertIsNone(got["provider_profile_id"])
+        self.assertTrue(got["ai_enabled"])
+
+    def test_agent_own_key_wins_over_site_default(self):
+        self._create_admin_default_profile()
+        self.db.save_ai_reply_settings("agent-acc", {
+            "ai_enabled": True,
+            "api_key": "sk-agent-own",
+            "model_name": "agent-model",
+            "base_url": "https://agent.example.com",
+        })
+
+        got = self.db.get_ai_reply_settings("agent-acc")
+
+        self.assertEqual(got["api_key"], "sk-agent-own")
+        self.assertEqual(got["base_url"], "https://agent.example.com")
+        self.assertNotEqual(got.get("api_key_source"), "site")
+
+    def test_unverified_admin_default_is_not_shared(self):
+        self._create_admin_default_profile(verification_status="unverified")
+        self.db.set_system_setting("ai_api_key", "sk-global")
+        self.db.save_ai_reply_settings("agent-acc", {"ai_enabled": True})
+
+        got = self.db.get_ai_reply_settings("agent-acc")
+
+        self.assertEqual(got["api_key"], "sk-global")
+        self.assertNotEqual(got.get("api_key_source"), "site")
+
+    def test_account_without_settings_row_previews_site_default(self):
+        self._create_admin_default_profile()
+
+        got = self.db.get_ai_reply_settings("agent-acc")
+
+        self.assertFalse(got["ai_enabled"])
+        self.assertEqual(got["api_key"], "sk-admin-shared")
+        self.assertEqual(got["api_key_source"], "site")
+
+    def test_bulk_view_marks_site_source_without_leaking_secret(self):
+        self._create_admin_default_profile()
+        self.db.save_ai_reply_settings("agent-acc", {"ai_enabled": True})
+
+        resolved = self.db.get_ai_reply_settings_for_user(7)
+        view = resolved["agent-acc"]
+
+        self.assertEqual(view["api_key_source"], "site")
+        self.assertEqual(view["provider_name"], "主站 DeepSeek")
+        self.assertIsNone(view["provider_profile_id"])
+        self.assertTrue(view["has_effective_api_key"])
+        self.assertEqual(view["api_key"], "")
+        self.assertNotIn("sk-admin-shared", json.dumps(view, ensure_ascii=False))
+        self.assertTrue(view["api_key_masked"])
+
+    def test_stale_default_model_name_is_replaced_by_site_model(self):
+        self._create_admin_default_profile(default_model="deepseek-reasoner")
+        # save 的历史默认填充值不可信，应替换为站级模型
+        self.db.save_ai_reply_settings("agent-acc", {
+            "ai_enabled": True,
+            "model_name": "deepseek-v4-flash",
+        })
+
+        got = self.db.get_ai_reply_settings("agent-acc")
+
+        self.assertEqual(got["model_name"], "deepseek-reasoner")
+        self.assertEqual(got["base_url"], "https://api.deepseek.com")
+
+
 class AIProviderServiceTests(unittest.TestCase):
     def test_openai_model_list_is_normalized_and_sorted(self):
         result = extract_openai_models({"data": [{"id": "z-model"}, {"id": "a-model"}, {"id": "a-model"}]})
