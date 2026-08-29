@@ -1107,6 +1107,13 @@ class DBManager:
                 )
                 logger.info("数据库迁移完成：添加cookie_refresh_interval_minutes列")
 
+            if 'l3_keepalive_enabled' not in cookie_columns:
+                logger.info("添加cookies表的l3_keepalive_enabled列...")
+                cursor.execute(
+                    "ALTER TABLE cookies ADD COLUMN l3_keepalive_enabled INTEGER DEFAULT 0"
+                )
+                logger.info("数据库迁移完成：添加l3_keepalive_enabled列")
+
             cursor.execute('''
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_cookies_user_unb
                 ON cookies(user_id, xianyu_unb)
@@ -2705,6 +2712,41 @@ class DBManager:
             except Exception as exc:
                 logger.error("更新账号 L3 记忆标记失败: {}", type(exc).__name__)
                 self.conn.rollback()
+                return False
+
+    def get_l3_keepalive_enabled(self, cookie_id: str) -> bool:
+        """该账号是否单独开启 L3 主动保活（按号灰度，与全局开关取或）。
+
+        存在的意义是灰度：保活会用浏览器打 passport，只有配了住宅代理的号
+        才适合先开，全局一刀切会让没配代理的号从机房 IP 出去。
+        """
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT COALESCE(l3_keepalive_enabled, 0) FROM cookies WHERE id = ?",
+                    (cookie_id,),
+                )
+                row = cursor.fetchone()
+                return bool(row[0]) if row else False
+            except Exception as exc:
+                logger.error("读取账号L3保活开关失败: {}", type(exc).__name__)
+                return False
+
+    def set_l3_keepalive_enabled(self, cookie_id: str, enabled: bool) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "UPDATE cookies SET l3_keepalive_enabled = ? WHERE id = ?",
+                    (1 if enabled else 0, cookie_id),
+                )
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as exc:
+                logger.error("写入账号L3保活开关失败: {}", type(exc).__name__)
                 return False
 
     def get_account_proxy_config(self, cookie_id: str) -> Optional[Dict[str, str]]:
