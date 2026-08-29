@@ -172,6 +172,33 @@ def _operation_response(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _has_succeeded_fulfillment_message(cookie_id: str, order_id: str) -> bool:
+    """兑换码是否已确认送达买家。
+
+    判据：存在一条 operation_type='message'、operation_key 以
+    'fulfillment-message-' 开头、status='succeeded' 的记录（这正是发码消息
+    成功送达时的落库形态，见 send_invite_message 成功分支）。确认消息
+    （confirmation-message-）成功不计入，ambiguous/failed 也不计入。
+
+    这是「已履约」的权威判据——对账兜底据此只补平台发货、绝不重发码。
+    查询异常一律返回 False：宁可漏一次兜底，也不可误判成已发码而漏发。
+    """
+    try:
+        with db_manager.lock:
+            row = db_manager.conn.execute(
+                "SELECT 1 FROM invite_bridge_operations "
+                "WHERE cookie_id = ? AND order_id = ? "
+                "AND operation_type = 'message' "
+                "AND operation_key LIKE 'fulfillment-message-%' "
+                "AND status = 'succeeded' LIMIT 1",
+                (cookie_id, order_id),
+            ).fetchone()
+        return row is not None
+    except Exception as exc:
+        logger.warning("查询履约消息状态失败: {}", type(exc).__name__)
+        return False
+
+
 def _load_operation(operation_key: str) -> Optional[Dict[str, Any]]:
     with db_manager.lock:
         row = db_manager.conn.execute(

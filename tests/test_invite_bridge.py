@@ -3599,3 +3599,112 @@ def test_ship_reconciler_respects_per_account_budget_and_interval(monkeypatch):
     assert len(ship_calls) == poller_module.SHIP_RECONCILE_MAX_PER_ACCOUNT
     assert repaired_second == 0
     assert len(poller._ship_drift) == 7 - poller_module.SHIP_RECONCILE_MAX_PER_ACCOUNT
+
+
+# ---------------------------------------------------------------------------
+# 已履约未发货兜底：兑换码已送达买家 × 平台仍待发货 也纳入对账补发
+# ---------------------------------------------------------------------------
+
+
+def test_has_succeeded_fulfillment_message_true_only_for_succeeded_fulfillment(bridge_database):
+    bridge_database.execute(
+        "INSERT INTO invite_bridge_operations "
+        "(operation_key, operation_type, order_id, cookie_id, request_hash, status, created_at, updated_at) "
+        "VALUES ('fulfillment-message-A', 'message', 'order-1', 'account-1', 'hash', 'succeeded', 0, 0)"
+    )
+    bridge_database.commit()
+    assert invite_bridge._has_succeeded_fulfillment_message("account-1", "order-1") is True
+
+
+def test_has_succeeded_fulfillment_message_false_for_failed_missing_or_other(bridge_database):
+    bridge_database.executemany(
+        "INSERT INTO invite_bridge_operations "
+        "(operation_key, operation_type, order_id, cookie_id, request_hash, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, 'hash', ?, 0, 0)",
+        [
+            # 履约消息但结果未确定/失败：都不算已送达（宁漏勿误）
+            ("fulfillment-message-B", "message", "order-2", "account-1", "ambiguous"),
+            ("fulfillment-message-C", "message", "order-3", "account-1", "failed"),
+            # 确认消息成功 ≠ 兑换码已送达
+            ("confirmation-message-D", "message", "order-4", "account-1", "succeeded"),
+            # 成功记录属于另一个账号
+            ("fulfillment-message-E", "message", "order-5", "account-2", "succeeded"),
+        ],
+    )
+    bridge_database.commit()
+    for order_id in ("order-2", "order-3", "order-4", "order-6"):
+        assert (
+            invite_bridge._has_succeeded_fulfillment_message("account-1", order_id)
+            is False
+        )
+    # 成功记录严格按 account+order 作用域，不跨账号命中
+    assert invite_bridge._has_succeeded_fulfillment_message("account-1", "order-5") is False
+    assert invite_bridge._has_succeeded_fulfillment_message("account-2", "order-5") is True
+
+
+def _fulfilled_unshipped_order():
+    return {
+        "order_id": "order-fx",
+        "cookie_id": "account-1",
+        "item_id": "item-1",
+        "buyer_id": "buyer-1",
+        "order_status": "pending_ship",
+        "system_shipped": 0,
+    }
+
+
+def test_note_ship_drift_registers_fulfilled_unshipped(monkeypatch):
+    """兑换码已送达 × 平台待发货 × 本地待发货 → 入对账队列补发货（不重发码）。"""
+    import invite_bridge_poller as poller_module
+    from loguru import logger as loguru_logger
+
+    database = _ReconcileDatabase([_fulfilled_unshipped_order()])
+    poller = poller_module.InviteBridgePoller()
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(
+        poller_module,
+        "_has_succeeded_fulfillment_message",
+        lambda cookie_id, order_id: True,
+    )
+
+    warnings = []
+    sink_id = loguru_logger.add(
+        lambda message: warnings.append(str(message)), level="WARNING"
+    )
+    try:
+        noted = poller._note_ship_drift(
+            cookie_id="account-1",
+            order_id="order-fx",
+            item_id="item-1",
+            buyer_id="buyer-1",
+        )
+    finally:
+        loguru_logger.remove(sink_id)
+
+    assert noted is True
+    assert ("account-1", "order-fx") in poller._ship_drift
+    assert any("已履约未发货" in message for message in warnings)
+
+
+def test_note_ship_drift_skips_unfulfilled_pending(monkeypatch):
+    """没有 succeeded 的履约消息 → 不入队（行为与现状一致，绝不盲发）。"""
+    import invite_bridge_poller as poller_module
+
+    database = _ReconcileDatabase([_fulfilled_unshipped_order()])
+    poller = poller_module.InviteBridgePoller()
+    monkeypatch.setattr(poller_module, "db_manager", database)
+    monkeypatch.setattr(
+        poller_module,
+        "_has_succeeded_fulfillment_message",
+        lambda cookie_id, order_id: False,
+    )
+
+    noted = poller._note_ship_drift(
+        cookie_id="account-1",
+        order_id="order-fx",
+        item_id="item-1",
+        buyer_id="buyer-1",
+    )
+
+    assert noted is False
+    assert poller._ship_drift == {}
