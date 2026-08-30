@@ -5496,45 +5496,66 @@ class DBManager:
             self.conn.commit()
         return self.get_ai_item_knowledge_profile(cookie_id, item_id)
 
-    def copy_ai_item_knowledge_draft(self, cookie_id: str, source_item_id: str,
-                                     target_item_ids: List[str], overwrite: bool = True) -> Dict[str, Any]:
-        """复制源商品当前档案并覆盖目标草稿，不自动发布。"""
-        normalized_targets = []
-        for value in target_item_ids or []:
-            target_id = str(value or '').strip()
-            if target_id and target_id != source_item_id and target_id not in normalized_targets:
-                normalized_targets.append(target_id)
+    def _read_ai_item_knowledge_source(self, cursor, cookie_id: str, item_id: str) -> Tuple[Dict[str, Any], str]:
+        """读取源商品可搬运的档案：草稿优先，没有草稿才取已发布版本。"""
+        cursor.execute('''
+        SELECT draft_json, published_json
+        FROM ai_item_knowledge_profiles
+        WHERE cookie_id = ? AND item_id = ?
+        ''', (cookie_id, item_id))
+        source_row = cursor.fetchone()
+        if not source_row:
+            raise ValueError('源商品还没有知识档案')
+        source_draft = json.loads(source_row[0] or '{}')
+        source_published = json.loads(source_row[1] or '{}')
+        source_profile = source_draft or source_published
+        if not source_profile:
+            raise ValueError('源商品知识档案为空')
+        return source_profile, ('draft' if source_draft else 'published')
+
+    def get_ai_item_knowledge_source_kind(self, cookie_id: str, item_id: str) -> str:
+        """搬运前预告这次会取哪一份：'draft' / 'published' / ''（没有可搬运内容）。"""
         with self.lock:
             cursor = self.conn.cursor()
-            cursor.execute('''
-            SELECT draft_json, published_json
-            FROM ai_item_knowledge_profiles
-            WHERE cookie_id = ? AND item_id = ?
-            ''', (cookie_id, source_item_id))
-            source_row = cursor.fetchone()
-            if not source_row:
-                raise ValueError('源商品还没有知识档案')
-            source_draft = json.loads(source_row[0] or '{}')
-            source_published = json.loads(source_row[1] or '{}')
-            source_profile = source_draft or source_published
-            source_kind = 'draft' if source_draft else 'published'
-            if not source_profile:
-                raise ValueError('源商品知识档案为空')
+            try:
+                _, source_kind = self._read_ai_item_knowledge_source(cursor, cookie_id, item_id)
+            except ValueError:
+                return ''
+        return source_kind
+
+    def copy_ai_item_knowledge_draft_to_targets(self, source_cookie_id: str, source_item_id: str,
+                                                targets: Sequence[Tuple[str, str]]) -> Dict[str, Any]:
+        """把源商品档案覆盖到任意账号下的目标商品草稿，不自动发布。
+
+        目标以 (cookie_id, item_id) 二元组寻址，因此支持跨账号；账号归属由路由层校验。
+        """
+        normalized_targets: List[Tuple[str, str]] = []
+        for pair in targets or []:
+            target_cookie = str((pair[0] if pair else '') or '').strip()
+            target_item = str((pair[1] if pair and len(pair) > 1 else '') or '').strip()
+            if not target_cookie or not target_item:
+                continue
+            if (target_cookie, target_item) == (source_cookie_id, source_item_id):
+                continue
+            if (target_cookie, target_item) not in normalized_targets:
+                normalized_targets.append((target_cookie, target_item))
+        with self.lock:
+            cursor = self.conn.cursor()
+            source_profile, source_kind = self._read_ai_item_knowledge_source(
+                cursor, source_cookie_id, source_item_id
+            )
             profile_json = json.dumps(source_profile, ensure_ascii=False)
 
-            copied = []
-            skipped = []
-            missing = []
-            skipped_reasons = {}
+            copied: List[Dict[str, str]] = []
+            missing: List[Dict[str, str]] = []
             try:
-                for target_id in normalized_targets:
+                for target_cookie, target_item in normalized_targets:
                     cursor.execute(
                         'SELECT 1 FROM item_info WHERE cookie_id = ? AND item_id = ?',
-                        (cookie_id, target_id),
+                        (target_cookie, target_item),
                     )
                     if not cursor.fetchone():
-                        missing.append(target_id)
-                        skipped_reasons[target_id] = '目标商品不存在或不属于当前账号'
+                        missing.append({'cookie_id': target_cookie, 'item_id': target_item})
                         continue
                     cursor.execute('''
                     INSERT INTO ai_item_knowledge_profiles
@@ -5544,22 +5565,45 @@ class DBManager:
                         draft_json = excluded.draft_json,
                         source_detail_hash = '',
                         draft_updated_at = CURRENT_TIMESTAMP
-                    ''', (cookie_id, target_id, profile_json))
-                    copied.append(target_id)
+                    ''', (target_cookie, target_item, profile_json))
+                    copied.append({'cookie_id': target_cookie, 'item_id': target_item})
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
             return {
-                'copied_item_ids': copied,
-                'skipped_item_ids': skipped,
-                'missing_item_ids': missing,
+                'copied_targets': copied,
+                'missing_targets': missing,
+                'copied_item_ids': [target['item_id'] for target in copied],
+                'skipped_item_ids': [],
+                'missing_item_ids': [target['item_id'] for target in missing],
                 'source_kind': source_kind,
                 'copied_count': len(copied),
-                'skipped_count': len(skipped),
+                'skipped_count': 0,
                 'missing_count': len(missing),
-                'skipped_reasons': skipped_reasons,
+                'skipped_reasons': {
+                    target['item_id']: '目标商品不存在或不属于该账号' for target in missing
+                },
             }
+
+    def copy_ai_item_knowledge_draft(self, cookie_id: str, source_item_id: str,
+                                     target_item_ids: List[str], overwrite: bool = True) -> Dict[str, Any]:
+        """复制源商品当前档案并覆盖同账号目标草稿，不自动发布。"""
+        return self.copy_ai_item_knowledge_draft_to_targets(
+            cookie_id,
+            source_item_id,
+            [(cookie_id, str(value or '').strip()) for value in (target_item_ids or [])],
+        )
+
+    def import_ai_item_knowledge_draft(self, target_cookie_id: str, target_item_id: str,
+                                       source_cookie_id: str, source_item_id: str) -> Dict[str, Any]:
+        """把源商品（可跨账号）的档案拉进目标商品草稿，不自动发布。"""
+        result = self.copy_ai_item_knowledge_draft_to_targets(
+            source_cookie_id, source_item_id, [(target_cookie_id, target_item_id)]
+        )
+        if result['copied_count'] != 1:
+            raise ValueError('目标商品不存在或不属于该账号')
+        return {'source_kind': result['source_kind']}
 
     def publish_ai_item_knowledge(self, cookie_id: str, item_id: str) -> Dict[str, Any]:
         with self.lock:

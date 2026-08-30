@@ -6,25 +6,24 @@ import {
   AIItemKnowledgeProfile,
   AIItemKnowledgeVersion,
   AIKnowledgeEntry,
-  copyAIItemKnowledge,
   generateAIItemKnowledge,
   getAIItemKnowledge,
   getAIItemKnowledgeVersions,
-  getItemsByCookie,
   publishAIItemKnowledge,
   rollbackAIItemKnowledge,
   saveAIItemKnowledgeDraft,
 } from '../services/api';
 import {
-  AlertTriangle, Bot, Check, ChevronDown, ChevronUp, Copy,
+  AlertTriangle, ArrowLeftRight, Bot, Check, ChevronDown, ChevronRight, ChevronUp,
   History, Loader2, Plus, RotateCcw, Save, Send, Trash2, X,
 } from 'lucide-react';
 import {
   countPendingKnowledge, emptyItemKnowledge, hasKnowledgeContent,
-  knowledgeStateOf, newKnowledgeEntry, normalizeItemKnowledge,
+  newKnowledgeEntry, normalizeItemKnowledge,
 } from '../utils/itemKnowledge';
 import { pushToast } from './ui/Toast';
 import { confirmDialog } from './ui/ConfirmDialog';
+import ItemKnowledgeTransferModal, { TransferTab } from './ItemKnowledgeTransferModal';
 
 type ListSection = 'pricing' | 'process' | 'after_sales' | 'forbidden' | 'faqs' | 'notes';
 
@@ -52,31 +51,12 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [publishing, setPublishing] = useState(false);
-  const [copying, setCopying] = useState(false);
-  const [copyOpen, setCopyOpen] = useState(false);
-  const [availableItems, setAvailableItems] = useState<Item[]>([]);
-  const [copyTargetIds, setCopyTargetIds] = useState<string[]>([]);
-  const [copySearch, setCopySearch] = useState('');
+  const [transferOpen, setTransferOpen] = useState<false | TransferTab>(false);
   const [dirty, setDirty] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
   const pendingCount = useMemo(() => countPendingKnowledge(knowledge), [knowledge]);
-  const copyCandidates = useMemo(
-    () => availableItems.filter((candidate) => candidate.item_id !== item.item_id),
-    [availableItems, item.item_id]
-  );
-  const visibleCopyCandidates = useMemo(() => {
-    const keyword = copySearch.trim().toLowerCase();
-    if (!keyword) return copyCandidates;
-    return copyCandidates.filter((candidate) => (
-      (candidate.item_title || '').toLowerCase().includes(keyword) ||
-      candidate.item_id.toLowerCase().includes(keyword)
-    ));
-  }, [copyCandidates, copySearch]);
-  const selectedWithKnowledgeCount = useMemo(() => copyCandidates.filter((candidate) => (
-    copyTargetIds.includes(candidate.item_id) && knowledgeStateOf(candidate) !== 'none'
-  )).length, [copyCandidates, copyTargetIds]);
 
   const loadProfile = async () => {
     setLoading(true);
@@ -96,24 +76,6 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
   };
 
   useEffect(() => { void loadProfile(); }, [item.cookie_id, item.item_id]);
-
-  useEffect(() => {
-    let mounted = true;
-    getItemsByCookie(item.cookie_id)
-      .then((items) => { if (mounted) setAvailableItems(items); })
-      .catch(() => { if (mounted) setAvailableItems([]); });
-    return () => { mounted = false; };
-  }, [item.cookie_id]);
-
-  // 复制成功后重新拉取同账号商品，让复制面板里目标行的档案标识立即更新
-  const refreshCopyCandidates = async () => {
-    try {
-      const items = await getItemsByCookie(item.cookie_id);
-      setAvailableItems(items);
-    } catch {
-      // 静默失败：下次打开弹窗或手动刷新时会重新拉取
-    }
-  };
 
   const updateKnowledge = (updater: (current: AIItemKnowledge) => AIItemKnowledge) => {
     setKnowledge((current) => updater(current));
@@ -199,73 +161,6 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
       pushToast('error', text);
     } finally {
       setGenerating(false);
-    }
-  };
-
-  const toggleCopyTarget = (targetId: string) => {
-    setCopyTargetIds((current) => current.includes(targetId)
-      ? current.filter((value) => value !== targetId)
-      : [...current, targetId]);
-  };
-
-  const selectAllCopyTargets = () => {
-    setCopyTargetIds(visibleCopyCandidates.map((candidate) => candidate.item_id));
-  };
-
-  const selectCopyTargetsWithoutKnowledge = () => {
-    setCopyTargetIds(visibleCopyCandidates
-      .filter((candidate) => knowledgeStateOf(candidate) === 'none')
-      .map((candidate) => candidate.item_id));
-  };
-
-  const clearCopyTargets = () => {
-    setCopyTargetIds([]);
-  };
-
-  const copyKnowledge = async () => {
-    if (!hasKnowledgeContent(knowledge)) {
-      setError('当前商品还没有可复制的知识档案');
-      pushToast('error', '当前商品还没有可复制的知识档案');
-      return;
-    }
-    if (copyTargetIds.length === 0) {
-      setError('请选择至少一个目标商品');
-      pushToast('error', '请选择至少一个目标商品');
-      return;
-    }
-    setCopying(true);
-    setError('');
-    setMessage('');
-    try {
-      if (dirty) {
-        const saved = await saveAIItemKnowledgeDraft(item.cookie_id, item.item_id, knowledge);
-        setProfile(saved);
-        setKnowledge(normalizeItemKnowledge(saved.draft));
-        setDirty(false);
-      }
-      const result = await copyAIItemKnowledge(
-        item.cookie_id, item.item_id, copyTargetIds
-      );
-      const copiedCount = result.copied_count ?? result.copied_item_ids.length;
-      const missingCount = result.missing_count ?? result.missing_item_ids.length;
-      const sourceLabel = result.source_kind === 'published' ? '已发布版本' : '草稿';
-      const details = [
-        `来源：${sourceLabel}`,
-        `已覆盖 ${copiedCount}`,
-        missingCount > 0 ? `不存在 ${missingCount}` : '',
-      ].filter(Boolean).join('，');
-      const text = `${result.message}（${details}）`;
-      setMessage(text);
-      pushToast('success', text);
-      setCopyTargetIds([]);
-      setCopyOpen(false);
-      await refreshCopyCandidates();
-    } catch (err) {
-      const text = err instanceof Error ? err.message : '复制知识档案失败';
-      setError(text);
-      pushToast('error', text);
-    } finally {
-      setCopying(false);
     }
   };
 
@@ -412,77 +307,15 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
                 </div>
                 {profile?.source_changed && <div className="border border-orange-200 bg-orange-50 rounded-lg px-3 py-3 text-xs text-orange-800 flex gap-2"><AlertTriangle className="w-4 h-4 shrink-0" />商品详情同步后发生变化，建议复核知识档案。</div>}
                 <button
-                  onClick={() => setCopyOpen((current) => !current)}
-                  disabled={!hasKnowledgeContent(knowledge)}
-                  className="w-full px-4 py-3 rounded-lg bg-gray-100 text-gray-700 font-bold flex items-center justify-between disabled:opacity-50"
+                  onClick={() => setTransferOpen('import')}
+                  className="w-full px-4 py-3 rounded-lg bg-gray-900 text-white font-bold flex items-center justify-between"
                 >
-                  <span className="flex items-center gap-2"><Copy className="w-4 h-4" />复制到其他商品</span>
-                  {copyOpen ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  <span className="flex items-center gap-2"><ArrowLeftRight className="w-4 h-4" />档案搬运</span>
+                  <ChevronRight className="w-4 h-4" />
                 </button>
-                {copyOpen && (
-                  <div className="border-l-4 border-yellow-400 pl-3 space-y-3">
-                    <div className="text-xs text-gray-600 leading-5">
-                      复制当前完整知识档案并覆盖目标商品草稿；不会自动发布，也不影响目标已发布版本和历史版本。
-                      {dirty && <span className="block mt-1 font-bold text-orange-700">当前草稿有未保存修改，执行复制时会先保存当前草稿。</span>}
-                    </div>
-                    <input
-                      value={copySearch}
-                      onChange={(event) => setCopySearch(event.target.value)}
-                      className="ios-input w-full px-3 py-2 rounded-lg text-xs"
-                      placeholder="搜索商品标题或ID"
-                      aria-label="搜索复制目标商品"
-                    />
-                    <div className="flex items-center justify-between gap-2 text-xs">
-                      <span className="text-gray-500">可选目标 {visibleCopyCandidates.length} 个，已选 {copyTargetIds.length} 个</span>
-                      <div className="flex gap-2">
-                        <button type="button" onClick={selectAllCopyTargets} className="font-bold text-blue-700 disabled:text-gray-400" disabled={visibleCopyCandidates.length === 0}>全选</button>
-                        <button type="button" onClick={selectCopyTargetsWithoutKnowledge} className="font-bold text-green-700 disabled:text-gray-400" disabled={visibleCopyCandidates.length === 0}>只选无档案</button>
-                        <button type="button" onClick={clearCopyTargets} className="font-bold text-gray-600 disabled:text-gray-400" disabled={copyTargetIds.length === 0}>清空</button>
-                      </div>
-                    </div>
-                    <div className="max-h-48 overflow-y-auto space-y-2 pr-1">
-                      {visibleCopyCandidates.map((candidate) => {
-                        const candidateState = knowledgeStateOf(candidate);
-                        return (
-                          <label key={candidate.item_id} className="flex items-start gap-2 text-xs text-gray-700 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={copyTargetIds.includes(candidate.item_id)}
-                              onChange={() => toggleCopyTarget(candidate.item_id)}
-                              aria-label={`${candidate.item_title || candidate.item_id} ${candidate.item_price || ''} ${candidate.item_id.slice(-6)}`}
-                              className="mt-0.5"
-                            />
-                            <span className="min-w-0 flex-1">
-                              <b className="block truncate">{candidate.item_title || candidate.item_id}</b>
-                              <span className="text-gray-400">{candidate.item_price || '-'} · …{candidate.item_id.slice(-6)}</span>
-                            </span>
-                            {candidateState === 'published' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-green-100 text-green-700 font-bold">已发布 v{candidate.knowledge_published_version}</span>}
-                            {candidateState === 'draft' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-800 font-bold">已有草稿</span>}
-                            {candidateState === 'none' && <span className="shrink-0 px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 font-bold">无档案</span>}
-                          </label>
-                        );
-                      })}
-                      {visibleCopyCandidates.length === 0 && (
-                        <div className="text-xs text-gray-400 py-2">
-                          {copyCandidates.length === 0 ? '当前账号没有其他可复制的商品。' : '没有匹配搜索条件的商品。'}
-                        </div>
-                      )}
-                    </div>
-                    <div className="sticky bottom-0 bg-white pt-2 pb-1 border-t border-gray-100 space-y-2">
-                      <div className="text-xs text-gray-500">
-                        将覆盖 {copyTargetIds.length} 个目标商品草稿，已发布版本保持不变
-                        {selectedWithKnowledgeCount > 0 && (
-                          <span className="block mt-1 font-bold text-orange-700">
-                            其中 {selectedWithKnowledgeCount} 个目标已有档案，其草稿将被本档案覆盖
-                          </span>
-                        )}
-                      </div>
-                      <button onClick={() => void copyKnowledge()} disabled={copying || copyTargetIds.length === 0 || !hasKnowledgeContent(knowledge)} className="w-full px-3 py-2 rounded-lg bg-black text-white text-xs font-bold disabled:opacity-50">
-                        {copying ? '覆盖中...' : dirty ? '保存当前草稿并覆盖所选草稿' : '覆盖所选商品草稿'}
-                      </button>
-                    </div>
-                  </div>
-                )}
+                <p className="text-xs text-gray-500 leading-5">
+                  从其他商品（含其他账号）导入一份现成档案，或把当前档案复制给其他商品。
+                </p>
                 <button onClick={() => void toggleVersions()} className="w-full px-4 py-3 rounded-lg bg-gray-100 text-gray-700 font-bold flex items-center justify-between">
                   <span className="flex items-center gap-2"><History className="w-4 h-4" />版本记录</span>{showVersions ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                 </button>
@@ -527,6 +360,28 @@ const ItemKnowledgeModal: React.FC<ItemKnowledgeModalProps> = ({ item, onClose, 
           </div>
         </div>
       </div>
+      {transferOpen && (
+        <ItemKnowledgeTransferModal
+          item={item}
+          canDistribute={hasKnowledgeContent(knowledge)}
+          initialTab={transferOpen}
+          dirty={dirty}
+          onBeforeDistribute={async () => {
+            const saved = await saveAIItemKnowledgeDraft(item.cookie_id, item.item_id, knowledge);
+            setProfile(saved);
+            setKnowledge(normalizeItemKnowledge(saved.draft));
+            setDirty(false);
+          }}
+          onImported={(imported) => {
+            setProfile(imported);
+            setKnowledge(normalizeItemKnowledge(imported.draft));
+            setDirty(false);
+            setError('');
+            setMessage('已导入档案为当前草稿，确认内容后再发布');
+          }}
+          onClose={() => setTransferOpen(false)}
+        />
+      )}
     </div>,
     document.body
   );

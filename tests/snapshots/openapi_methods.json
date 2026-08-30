@@ -54,6 +54,9 @@
   "/ai-item-knowledge/{cookie_id}/{item_id}/generate": [
     "POST"
   ],
+  "/ai-item-knowledge/{cookie_id}/{item_id}/import": [
+    "POST"
+  ],
   "/ai-item-knowledge/{cookie_id}/{item_id}/publish": [
     "POST"
   ],

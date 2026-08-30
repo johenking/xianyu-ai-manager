@@ -338,10 +338,15 @@ export const generateAIItemKnowledge = async (
   return post(`/ai-item-knowledge/${cookieId}/${itemId}/generate`, data);
 }
 
+export interface AIItemKnowledgeTargetRef {
+  cookie_id: string;
+  item_id: string;
+}
+
 export const copyAIItemKnowledge = async (
   cookieId: string,
   sourceItemId: string,
-  targetItemIds: string[]
+  targets: AIItemKnowledgeTargetRef[]
 ): Promise<{
   message: string;
   copied_item_ids: string[];
@@ -352,9 +357,16 @@ export const copyAIItemKnowledge = async (
   skipped_count?: number;
   missing_count?: number;
   skipped_reasons?: Record<string, string>;
-}> => post(`/ai-item-knowledge/${cookieId}/${sourceItemId}/copy`, {
-  target_item_ids: targetItemIds,
-});
+}> => post(`/ai-item-knowledge/${cookieId}/${sourceItemId}/copy`, { targets });
+
+export const importAIItemKnowledge = async (
+  cookieId: string,
+  itemId: string,
+  source: AIItemKnowledgeTargetRef
+): Promise<ApiResponse & AIItemKnowledgeProfile & { source_kind: 'draft' | 'published' }> => post(
+  `/ai-item-knowledge/${cookieId}/${itemId}/import`,
+  { source_cookie_id: source.cookie_id, source_item_id: source.item_id },
+);
 
 export const saveAIItemKnowledgeDraft = async (cookieId: string, itemId: string, profile: AIItemKnowledge): Promise<ApiResponse & AIItemKnowledgeProfile> => {
   return put(`/ai-item-knowledge/${cookieId}/${itemId}/draft`, { profile });
