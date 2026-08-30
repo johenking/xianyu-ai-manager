@@ -8272,7 +8272,17 @@ async def _start_l3_passwordless_refresh(cookie_id: str) -> Dict[str, Any]:
     db_manager.get_cookie_refresh_settings），后端却一度只认插件设备绑定，
     于是健康号一点就被打成人工重登。这里把两者接上。
     """
-    result = await cookie_manager.trigger_manual_l3_refresh(cookie_id)
+    manager = cookie_manager.manager
+    if manager is None:
+        # 仅进程启动早期可能出现：如实报不可用即可，不写会话状态——
+        # 这不是账号本身的问题，写 failed 会污染刷新状态记录。
+        return {
+            'success': False,
+            'status': 'cookie_manager_unavailable',
+            'message': '账号运行时尚未就绪，请稍后重试',
+            'data': _current_session_refresh_status(cookie_id),
+        }
+    result = await manager.trigger_manual_l3_refresh(cookie_id)
     if result.get('ok'):
         db_manager.update_account_session_refresh(
             cookie_id, state='success', trigger='manual_l3',

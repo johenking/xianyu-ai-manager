@@ -74,5 +74,57 @@ class SessionRefreshBindingTests(unittest.TestCase):
         self.assertTrue(result["success"])
 
 
+class L3PasswordlessRefreshSingletonTests(unittest.TestCase):
+    """_start_l3_passwordless_refresh 必须经 cookie_manager.manager 单例调用。
+
+    2026-08-30 线上 500：该函数把 cookie_manager 模块当 CookieManager 实例
+    调用（漏写 .manager），点「免密续签」直接 AttributeError。上面的端点测试
+    把本函数整体 Mock 掉了，模块级笔误从未被执行到；这里用只暴露 manager
+    属性的严格桩跑真函数，笔误会当场炸红。
+    """
+
+    class _StrictModuleStub:
+        """只有 manager 属性；对模块本身调实例方法立即 AttributeError。"""
+
+        __slots__ = ("manager",)
+
+        def __init__(self, manager):
+            self.manager = manager
+
+    def _run(self, manager):
+        db = Mock()
+        db.update_account_session_refresh = Mock(return_value=True)
+        with patch.object(
+            reply_server, "cookie_manager", self._StrictModuleStub(manager)
+        ), patch.object(reply_server, "db_manager", db), patch.object(
+            reply_server,
+            "_current_session_refresh_status",
+            Mock(return_value={"state": "success"}),
+        ):
+            result = asyncio.run(
+                reply_server._start_l3_passwordless_refresh("acct-1")
+            )
+        return result, db
+
+    def test_refresh_goes_through_manager_singleton(self):
+        manager = Mock()
+        manager.trigger_manual_l3_refresh = AsyncMock(
+            return_value={"ok": True, "message": "免密续签成功"}
+        )
+
+        result, _ = self._run(manager)
+
+        manager.trigger_manual_l3_refresh.assert_awaited_once_with("acct-1")
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], "l3_renewed")
+
+    def test_manager_not_ready_fails_without_touching_session_state(self):
+        result, db = self._run(None)
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "cookie_manager_unavailable")
+        db.update_account_session_refresh.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
