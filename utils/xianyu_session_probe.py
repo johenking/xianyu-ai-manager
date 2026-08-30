@@ -64,6 +64,15 @@ _TOKEN_EXPIRED_MARKERS = (
 _ALLOWED_VERIFICATION_HOSTS = ("goofish.com", "taobao.com")
 _H5_API_HOST_OK_CACHE: dict[str, bool] = {}
 
+# 隧道代理空闲一段时间后会掐掉下一个 CONNECT，换新连接立刻重试即通；
+# 超时不在此列——它已经烧掉整个 timeout 预算，重试只会让探测翻倍卡住。
+_TRANSPORT_RETRYABLE_ERRORS = (
+    httpx.NetworkError,
+    httpx.ProxyError,
+    httpx.RemoteProtocolError,
+)
+_TRANSPORT_ATTEMPTS = 2
+
 
 @dataclass
 class SessionProbeResult:
@@ -485,30 +494,35 @@ def probe_message_session_sync(
         str(cookies.get("unb") or "").strip()
     )
     proxy_url = httpx_proxy_url(proxy)
-    try:
-        if client_factory is None:
-            with httpx.Client(
-                timeout=timeout, follow_redirects=False, proxy=proxy_url
-            ) as client:
-                return _probe_message_session_with_sync_client(
-                    client,
-                    cookie_string,
-                    browser_user_agent,
-                    probe_device_id,
-                )
-        return _probe_message_session_with_sync_client(
-            client_factory(),
-            cookie_string,
-            browser_user_agent,
-            probe_device_id,
-        )
-    except Exception:
-        return SessionProbeResult(
-            status=PROBE_RETRYABLE_ERROR,
-            cookies=cookies,
-            error_code="token_probe_exception",
-            message="消息 Token 探测出现临时异常",
-        )
+    for attempt in range(_TRANSPORT_ATTEMPTS):
+        try:
+            if client_factory is None:
+                with httpx.Client(
+                    timeout=timeout, follow_redirects=False, proxy=proxy_url
+                ) as client:
+                    return _probe_message_session_with_sync_client(
+                        client,
+                        cookie_string,
+                        browser_user_agent,
+                        probe_device_id,
+                    )
+            return _probe_message_session_with_sync_client(
+                client_factory(),
+                cookie_string,
+                browser_user_agent,
+                probe_device_id,
+            )
+        except _TRANSPORT_RETRYABLE_ERRORS:
+            if attempt + 1 >= _TRANSPORT_ATTEMPTS:
+                break
+        except Exception:
+            break
+    return SessionProbeResult(
+        status=PROBE_RETRYABLE_ERROR,
+        cookies=cookies,
+        error_code="token_probe_exception",
+        message="消息 Token 探测出现临时异常",
+    )
 
 
 async def probe_message_session_async(
@@ -528,30 +542,35 @@ async def probe_message_session_async(
         str(cookies.get("unb") or "").strip()
     )
     proxy_url = httpx_proxy_url(proxy)
-    try:
-        if client_factory is None:
-            async with httpx.AsyncClient(
-                timeout=timeout, follow_redirects=False, proxy=proxy_url
-            ) as client:
-                return await _probe_message_session_with_async_client(
-                    client,
-                    cookie_string,
-                    browser_user_agent,
-                    probe_device_id,
-                )
-        return await _probe_message_session_with_async_client(
-            client_factory(),
-            cookie_string,
-            browser_user_agent,
-            probe_device_id,
-        )
-    except Exception:
-        return SessionProbeResult(
-            status=PROBE_RETRYABLE_ERROR,
-            cookies=cookies,
-            error_code="token_probe_exception",
-            message="消息 Token 探测出现临时异常",
-        )
+    for attempt in range(_TRANSPORT_ATTEMPTS):
+        try:
+            if client_factory is None:
+                async with httpx.AsyncClient(
+                    timeout=timeout, follow_redirects=False, proxy=proxy_url
+                ) as client:
+                    return await _probe_message_session_with_async_client(
+                        client,
+                        cookie_string,
+                        browser_user_agent,
+                        probe_device_id,
+                    )
+            return await _probe_message_session_with_async_client(
+                client_factory(),
+                cookie_string,
+                browser_user_agent,
+                probe_device_id,
+            )
+        except _TRANSPORT_RETRYABLE_ERRORS:
+            if attempt + 1 >= _TRANSPORT_ATTEMPTS:
+                break
+        except Exception:
+            break
+    return SessionProbeResult(
+        status=PROBE_RETRYABLE_ERROR,
+        cookies=cookies,
+        error_code="token_probe_exception",
+        message="消息 Token 探测出现临时异常",
+    )
 
 
 __all__ = [
