@@ -47,6 +47,26 @@ class ScriptedAsyncClient(ScriptedSyncClient):
         return super().post(url, params=params, data=data, headers=headers)
 
 
+class ScriptedClientFactory:
+    """每次调用交出一个全新的脚本化 client，用来观察换连接重试。"""
+
+    def __init__(self, client_cls, scripts):
+        self.client_cls = client_cls
+        self.scripts = list(scripts)
+        self.clients = []
+
+    def __call__(self):
+        client = self.client_cls(self.scripts.pop(0))
+        self.clients.append(client)
+        return client
+
+
+def success_response():
+    return probe_response(
+        {"ret": ["SUCCESS::调用成功"], "data": {"accessToken": "message-token"}},
+    )
+
+
 class XianyuSessionProbeTests(unittest.TestCase):
     def test_success_requires_a_real_access_token_and_merges_response_cookies(self):
         result = classify_probe_response(
@@ -318,6 +338,67 @@ class XianyuSessionProbeTests(unittest.TestCase):
         self.assertEqual(result.cookies["_m_h5_tk"], "fresh-token_2000000000000")
         self.assertEqual(result.cookies["x5sec"], "verification-cookie")
 
+    def test_sync_probe_retries_a_dropped_connection_on_a_fresh_client(self):
+        # 隧道代理空闲后会掐掉首个 CONNECT，重试必须换新连接而不是复用死连接。
+        factory = ScriptedClientFactory(
+            ScriptedSyncClient,
+            [
+                [httpx.ReadError("synthetic idle tunnel drop")],
+                [success_response()],
+            ],
+        )
+
+        result = probe_message_session_sync(
+            "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+            "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+            client_factory=factory,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(factory.clients), 2)
+        self.assertEqual(len(factory.clients[0].calls), 1)
+        self.assertEqual(len(factory.clients[1].calls), 1)
+
+    def test_sync_probe_retries_transport_errors_at_most_once(self):
+        for first, second in (
+            (httpx.ReadError("synthetic drop"), httpx.ConnectError("synthetic refuse")),
+            (httpx.ProxyError("synthetic proxy"), httpx.RemoteProtocolError("synthetic eof")),
+        ):
+            with self.subTest(first=type(first).__name__):
+                factory = ScriptedClientFactory(
+                    ScriptedSyncClient, [[first], [second]]
+                )
+
+                result = probe_message_session_sync(
+                    "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+                    "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+                    client_factory=factory,
+                )
+
+                self.assertEqual(result.status, PROBE_RETRYABLE_ERROR)
+                self.assertEqual(result.error_code, "token_probe_exception")
+                self.assertEqual(len(factory.clients), 2)
+
+    def test_sync_probe_does_not_retry_timeouts_or_unexpected_errors(self):
+        # 超时已经烧掉整个预算，再来一次只会把 25s 变成 50s。
+        for error in (
+            httpx.ReadTimeout("synthetic timeout"),
+            httpx.ConnectTimeout("synthetic connect timeout"),
+            ValueError("unexpected token response"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                factory = ScriptedClientFactory(ScriptedSyncClient, [[error]])
+
+                result = probe_message_session_sync(
+                    "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+                    "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+                    client_factory=factory,
+                )
+
+                self.assertEqual(result.status, PROBE_RETRYABLE_ERROR)
+                self.assertEqual(result.error_code, "token_probe_exception")
+                self.assertEqual(len(factory.clients), 1)
+
 
 class XianyuSessionProbeAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_probe_resigns_once_with_fresh_h5_token(self):
@@ -368,6 +449,60 @@ class XianyuSessionProbeAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(result.cookies["_m_h5_tk"], "fresh-token_2000000000000")
         self.assertEqual(result.cookies["x5sec"], "verification-cookie")
+
+    async def test_async_probe_retries_a_dropped_connection_on_a_fresh_client(self):
+        factory = ScriptedClientFactory(
+            ScriptedAsyncClient,
+            [
+                [httpx.ReadError("synthetic idle tunnel drop")],
+                [success_response()],
+            ],
+        )
+
+        result = await probe_message_session_async(
+            "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+            "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+            client_factory=factory,
+        )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(len(factory.clients), 2)
+        self.assertEqual(len(factory.clients[0].calls), 1)
+        self.assertEqual(len(factory.clients[1].calls), 1)
+
+    async def test_async_probe_retries_transport_errors_at_most_once(self):
+        factory = ScriptedClientFactory(
+            ScriptedAsyncClient,
+            [
+                [httpx.ReadError("synthetic drop")],
+                [httpx.ConnectError("synthetic refuse")],
+            ],
+        )
+
+        result = await probe_message_session_async(
+            "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+            "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+            client_factory=factory,
+        )
+
+        self.assertEqual(result.status, PROBE_RETRYABLE_ERROR)
+        self.assertEqual(result.error_code, "token_probe_exception")
+        self.assertEqual(len(factory.clients), 2)
+
+    async def test_async_probe_does_not_retry_timeouts(self):
+        factory = ScriptedClientFactory(
+            ScriptedAsyncClient, [[httpx.ReadTimeout("synthetic timeout")]]
+        )
+
+        result = await probe_message_session_async(
+            "unb=9988; cookie2=old; _m_h5_tk=stale-token_1000000000000",
+            "Mozilla/5.0 Synthetic Chrome/150.0.0.0 Safari/537.36",
+            client_factory=factory,
+        )
+
+        self.assertEqual(result.status, PROBE_RETRYABLE_ERROR)
+        self.assertEqual(result.error_code, "token_probe_exception")
+        self.assertEqual(len(factory.clients), 1)
 
 
 if __name__ == "__main__":
