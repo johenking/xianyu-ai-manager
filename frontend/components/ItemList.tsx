@@ -12,7 +12,7 @@ import {
   updateItemDeliveryBinding,
   updateItemInviteAutoFulfillment
 } from '../services/api';
-import { BookOpen, Box, Loader2, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
+import { BookOpen, Box, ChevronDown, Loader2, RefreshCw, ShoppingBag, Trash2 } from 'lucide-react';
 import ItemKnowledgeModal from './ItemKnowledgeModal';
 import AITrainingLab from './AITrainingLab';
 import RemoteImage from './ui/RemoteImage';
@@ -30,6 +30,14 @@ const toBool = (value: unknown) => value === true || value === 1 || value === '1
 const itemKey = (item: Item) => `${item.cookie_id}-${item.item_id}`;
 const ALL_ACCOUNTS_VALUE = '__all__';
 
+const formatRelativeTime = (timestamp: number) => {
+  const minutes = Math.floor((Date.now() - timestamp) / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时前`;
+  return new Date(timestamp).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+};
+
 type KnowledgeFilter = 'all' | 'has' | 'none';
 
 const ItemList: React.FC = () => {
@@ -37,6 +45,9 @@ const ItemList: React.FC = () => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [selectedAccount, setSelectedAccount] = useState<string>('');
   const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [actionKey, setActionKey] = useState<string>('');
   const [statusText, setStatusText] = useState('');
   const [knowledgeItem, setKnowledgeItem] = useState<Item | null>(null);
@@ -49,6 +60,18 @@ const ItemList: React.FC = () => {
   useEffect(() => {
     loadData();
   }, []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false); };
+    document.addEventListener('click', close);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('click', close);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [menuOpen]);
 
   const loadItemsForAccount = async (accountId: string) => {
     if (!accountId) {
@@ -90,9 +113,6 @@ const ItemList: React.FC = () => {
     setStatusText('');
     try {
       await loadItemsForAccount(accountId);
-      if (accountId === ALL_ACCOUNTS_VALUE) {
-        setStatusText('已显示全部账号商品；同步商品请先选择单个账号。');
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : '加载商品数据失败';
       setStatusText(message);
@@ -108,7 +128,7 @@ const ItemList: React.FC = () => {
       pushToast('error', '请先选择单个账号再同步商品');
       return;
     }
-    setLoading(true);
+    setSyncing(true);
     setStatusText('');
     try {
       const result = await syncItemsFromAccount(selectedAccount);
@@ -116,6 +136,7 @@ const ItemList: React.FC = () => {
         throw new Error(result.message || '同步商品失败');
       }
       await loadItemsForAccount(selectedAccount);
+      setLastSyncAt(Date.now());
       const message = result?.message || '商品同步完成';
       setStatusText(message);
       pushToast('success', message);
@@ -124,7 +145,44 @@ const ItemList: React.FC = () => {
       setStatusText(message);
       pushToast('error', message);
     } finally {
-      setLoading(false);
+      setSyncing(false);
+    }
+  };
+
+  // 逐个账号串行同步：单个失败不中断，跑完后汇总。串行本身即节流，不会并发打平台接口。
+  const handleSyncAllAccounts = async () => {
+    setMenuOpen(false);
+    if (accounts.length === 0) {
+      pushToast('error', '暂无可同步的账号');
+      return;
+    }
+    setSyncing(true);
+    setStatusText('');
+    const failed: string[] = [];
+    let succeeded = 0;
+    try {
+      for (const account of accounts) {
+        try {
+          const result = await syncItemsFromAccount(account.id);
+          if (result?.success === false) throw new Error(result.message || '同步失败');
+          succeeded += 1;
+        } catch {
+          failed.push(account.nickname || account.remark || account.id);
+        }
+      }
+      try {
+        await loadItemsForAccount(selectedAccount);
+      } catch {
+        // 列表刷新失败不掩盖同步汇总，可再用「仅刷新本地列表」重试
+      }
+      setLastSyncAt(Date.now());
+      const message = failed.length
+        ? `${succeeded} 个账号同步完成，${failed.length} 个失败：${failed.join('、')}`
+        : `${succeeded} 个账号全部同步完成`;
+      setStatusText(message);
+      pushToast(failed.length ? 'error' : 'success', message);
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -244,9 +302,6 @@ const ItemList: React.FC = () => {
     }
   };
 
-  const selectedAccountLabel = selectedAccount === ALL_ACCOUNTS_VALUE
-    ? null
-    : accounts.find(account => account.id === selectedAccount);
   const canSyncSelectedAccount = Boolean(selectedAccount && selectedAccount !== ALL_ACCOUNTS_VALUE);
 
   const knowledgeCount = items.filter(item => knowledgeStateOf(item) !== 'none').length;
@@ -264,14 +319,6 @@ const ItemList: React.FC = () => {
           <p className="text-gray-500 mt-2 text-sm">从闲鱼账号同步商品，并管理自动发货相关状态。</p>
         </div>
         <div className="flex flex-col sm:flex-row gap-3 w-full lg:w-auto">
-          <button
-            onClick={loadData}
-            disabled={loading}
-            className="p-3 rounded-xl bg-white border border-gray-100 text-gray-600 hover:bg-gray-50 hover:text-black transition-colors shadow-sm disabled:opacity-50 self-start"
-            title="刷新"
-          >
-            <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
-          </button>
           <select
             aria-label="商品账号"
             className="ios-input px-4 py-3 rounded-xl text-sm min-w-0 sm:min-w-[220px]"
@@ -284,14 +331,50 @@ const ItemList: React.FC = () => {
             ))}
             {accounts.length > 0 && <option value={ALL_ACCOUNTS_VALUE}>全部账号</option>}
           </select>
-          <button
-            onClick={handleSync}
-            disabled={loading || !canSyncSelectedAccount}
-            className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl font-bold shadow-lg shadow-yellow-200 disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            同步商品
-          </button>
+          {/* 分裂按钮：主按钮随所选账号切换身份，菜单收纳其余同步方式；转圈只绑 syncing */}
+          <div className="relative flex self-start" onClick={(event) => event.stopPropagation()}>
+            <button
+              onClick={() => void (canSyncSelectedAccount ? handleSync() : handleSyncAllAccounts())}
+              disabled={syncing}
+              title={canSyncSelectedAccount
+                ? '去闲鱼拉取该账号的在售商品，并刷新列表'
+                : '逐个账号串行同步，结束后汇总成功与失败'}
+              className="ios-btn-primary flex items-center gap-2 px-6 py-3 rounded-l-2xl font-bold shadow-lg shadow-yellow-200 disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
+              {syncing ? '同步中…' : canSyncSelectedAccount ? '同步商品' : '同步全部账号'}
+            </button>
+            <button
+              onClick={() => setMenuOpen((current) => !current)}
+              disabled={syncing}
+              aria-label="更多同步方式"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              className="ios-btn-primary rounded-r-2xl border-l border-black/10 px-3 shadow-lg shadow-yellow-200 disabled:opacity-50"
+            >
+              <ChevronDown className="w-4 h-4" />
+            </button>
+            {menuOpen && (
+              <div role="menu" className="absolute right-0 top-full z-30 mt-2 w-60 rounded-2xl border border-gray-100 bg-white p-1.5 shadow-xl">
+                <button
+                  role="menuitem"
+                  onClick={() => { setMenuOpen(false); void loadData(); }}
+                  className="w-full rounded-xl px-3 py-2.5 text-left text-sm text-gray-700 hover:bg-gray-100"
+                >
+                  仅刷新本地列表
+                  <span className="mt-0.5 block text-xs text-gray-400">不调用闲鱼接口，只重拉数据库里的商品</span>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => void handleSyncAllAccounts()}
+                  className="w-full rounded-xl px-3 py-2.5 text-left text-sm text-gray-700 hover:bg-gray-100"
+                >
+                  同步全部账号
+                  <span className="mt-0.5 block text-xs text-gray-400">逐个账号串行同步，结束后汇总成功与失败</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -301,14 +384,12 @@ const ItemList: React.FC = () => {
         </div>
       )}
 
-      {selectedAccountLabel && (
+      {selectedAccount && (
         <div className="text-xs text-gray-400">
-          当前查看账号：{selectedAccountLabel.nickname || selectedAccountLabel.remark || selectedAccountLabel.id}
-        </div>
-      )}
-      {selectedAccount === ALL_ACCOUNTS_VALUE && (
-        <div className="text-xs text-gray-400">
-          当前查看：全部账号商品
+          {lastSyncAt ? `上次同步：${formatRelativeTime(lastSyncAt)} · ` : ''}
+          {canSyncSelectedAccount
+            ? `当前账号共 ${items.length} 个商品`
+            : `全部账号共 ${items.length} 个商品`}
         </div>
       )}
 

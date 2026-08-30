@@ -19,7 +19,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
             for method in definition
             if method.lower() in {"get", "post", "put", "patch", "delete", "options", "head"}
         }
-        self.assertEqual(len(signatures), 250)
+        self.assertEqual(len(signatures), 251)
         self.assertEqual(
             set(app.state.domain_routers),
             {
@@ -38,6 +38,7 @@ class ApplicationFactoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("POST", "/login"), signatures)
         self.assertIn(("POST", "/api/orders/sync"), signatures)
         self.assertIn(("POST", "/ai-reply-lab/reply/{cookie_id}"), signatures)
+        self.assertIn(("POST", "/ai-item-knowledge/{cookie_id}/{item_id}/import"), signatures)
         self.assertIn(("GET", "/api/accounts/{cookie_id}/session-status"), signatures)
         self.assertIn(("GET", "/api/dashboard/summary"), signatures)
         self.assertIn(("GET", "/analytics/items/performance"), signatures)

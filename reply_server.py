@@ -7039,10 +7039,22 @@ class AIItemKnowledgeGenerateRequest(BaseModel):
     profile: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AIItemKnowledgeTargetRef(BaseModel):
+    cookie_id: str
+    item_id: str
+
+
 class AIItemKnowledgeCopyRequest(BaseModel):
     target_item_ids: List[str] = Field(default_factory=list)
+    # 跨账号目标；与 target_item_ids 二选一，同时给则以 targets 为准。
+    targets: List[AIItemKnowledgeTargetRef] = Field(default_factory=list)
     # Kept for older clients. Copying always replaces target drafts.
     overwrite: bool = True
+
+
+class AIItemKnowledgeImportRequest(BaseModel):
+    source_cookie_id: str
+    source_item_id: str
 
 
 def _mask_secret(value: str) -> str:
@@ -8065,15 +8077,47 @@ def generate_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnow
 def copy_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeCopyRequest,
                            current_user: Dict[str, Any] = Depends(get_current_user)):
     _get_ai_knowledge_item(cookie_id, item_id, current_user)
-    if not request.target_item_ids:
+    if request.targets:
+        target_pairs = [(target.cookie_id, target.item_id) for target in request.targets]
+    else:
+        target_pairs = [(cookie_id, target_id) for target_id in request.target_item_ids]
+    if not target_pairs:
         raise HTTPException(status_code=400, detail='请选择至少一个目标商品')
+    # 跨账号目标逐个校验归属，越权边界不放宽。
+    for target_cookie_id in {pair[0] for pair in target_pairs}:
+        if target_cookie_id != cookie_id:
+            _ensure_ai_cookie_access(target_cookie_id, current_user)
     try:
-        result = db_manager.copy_ai_item_knowledge_draft(
-            cookie_id, item_id, request.target_item_ids
+        result = db_manager.copy_ai_item_knowledge_draft_to_targets(
+            cookie_id, item_id, target_pairs
         )
         return {
             **result,
             'message': f"已覆盖 {len(result['copied_item_ids'])} 个商品草稿",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@ai_router.post("/ai-item-knowledge/{cookie_id}/{item_id}/import")
+def import_ai_item_knowledge(cookie_id: str, item_id: str, request: AIItemKnowledgeImportRequest,
+                             current_user: Dict[str, Any] = Depends(get_current_user)):
+    item = _get_ai_knowledge_item(cookie_id, item_id, current_user)
+    source_cookie_id = str(request.source_cookie_id or '').strip()
+    source_item_id = str(request.source_item_id or '').strip()
+    if not source_cookie_id or not source_item_id:
+        raise HTTPException(status_code=400, detail='请选择一个来源商品')
+    if (source_cookie_id, source_item_id) == (cookie_id, item_id):
+        raise HTTPException(status_code=400, detail='来源商品不能是当前商品')
+    _get_ai_knowledge_item(source_cookie_id, source_item_id, current_user)
+    try:
+        result = db_manager.import_ai_item_knowledge_draft(
+            cookie_id, item_id, source_cookie_id, source_item_id
+        )
+        return {
+            'message': '已导入为当前商品草稿，确认无误后再发布',
+            'source_kind': result['source_kind'],
+            **_item_knowledge_payload(cookie_id, item_id, item),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

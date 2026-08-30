@@ -146,7 +146,57 @@ describe('ItemList account filtering', () => {
     await waitFor(() => expect(getItems).toHaveBeenCalledTimes(1));
     expect(screen.getByText('账号一商品')).toBeInTheDocument();
     expect(screen.getByText('账号二商品')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /同步商品/ })).toBeDisabled();
+    // 1C：独立刷新小圈已删除；全部账号视图下主按钮变身「同步全部账号」且可点
+    expect(screen.queryByRole('button', { name: '刷新' })).toBeNull();
+    expect(screen.getByRole('button', { name: /同步全部账号/ })).not.toBeDisabled();
+  });
+
+  it('切换账号只重载列表，不让主同步按钮进入加载态', async () => {
+    render(<ItemList />);
+    await screen.findByText('账号一商品');
+
+    fireEvent.change(screen.getByLabelText('商品账号'), { target: { value: 'account-2' } });
+    // 列表在加载，但主按钮不转圈、不禁用（loading 与 syncing 已拆分）
+    expect(screen.getByRole('button', { name: /同步商品/ })).not.toBeDisabled();
+    await screen.findByText('账号二商品');
+    expect(syncItemsFromAccount).not.toHaveBeenCalled();
+  });
+
+  it('菜单里的「仅刷新本地列表」不调用平台同步', async () => {
+    render(<ItemList />);
+    await screen.findByText('账号一商品');
+
+    fireEvent.click(screen.getByRole('button', { name: '更多同步方式' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /仅刷新本地列表/ }));
+
+    await waitFor(() => expect(getItemsByCookie).toHaveBeenCalledTimes(2));
+    expect(syncItemsFromAccount).not.toHaveBeenCalled();
+  });
+
+  it('同步全部账号逐个跑完，单个失败不中断并在末尾汇总', async () => {
+    vi.mocked(syncItemsFromAccount).mockImplementation(async (cookieId: string) => (
+      cookieId === 'account-2'
+        ? { success: false, message: '账号登录态已过期' }
+        : { success: true, message: '商品同步完成' }
+    ) as any);
+
+    render(
+      <>
+        <ItemList />
+        <ToastViewport />
+      </>
+    );
+    await screen.findByText('账号一商品');
+
+    fireEvent.click(screen.getByRole('button', { name: '更多同步方式' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /同步全部账号/ }));
+
+    await waitFor(() => expect(syncItemsFromAccount).toHaveBeenCalledTimes(2));
+    expect(syncItemsFromAccount).toHaveBeenNthCalledWith(1, 'account-1');
+    expect(syncItemsFromAccount).toHaveBeenNthCalledWith(2, 'account-2');
+    await waitFor(() => expect(
+      within(screen.getByRole('status')).getByText(/1 个账号同步完成，1 个失败：账号二/)
+    ).toBeInTheDocument());
   });
 
   it('shows reconciliation statistics and retries the image when sync returns a new URL', async () => {

@@ -329,14 +329,14 @@ class AIProductScopingTests(unittest.TestCase):
         }
         with patch.object(reply_server, "_get_ai_knowledge_item", return_value={}), patch.object(
             reply_server.db_manager,
-            "copy_ai_item_knowledge_draft",
+            "copy_ai_item_knowledge_draft_to_targets",
             return_value=copy_result,
         ) as copy:
             result = reply_server.copy_ai_item_knowledge(
                 "account-1", "item-a", request, current_user={"user_id": 1}
             )
 
-        copy.assert_called_once_with("account-1", "item-a", ["item-b"])
+        copy.assert_called_once_with("account-1", "item-a", [("account-1", "item-b")])
         self.assertEqual(result["copied_item_ids"], ["item-b"])
 
     def test_generation_prompt_contains_seller_overview(self):
