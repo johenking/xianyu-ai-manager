@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import OrderItemImage, { clearOrderItemImageCache } from './OrderItemImage';
 
-const imageResponse = () => new Response(new Blob(['image-bytes'], { type: 'image/png' }), {
+const imageResponse = () => new Response('image-bytes', {
   status: 200,
   headers: { 'content-type': 'image/png' },
 });
