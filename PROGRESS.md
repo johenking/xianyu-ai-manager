@@ -1,4 +1,18 @@
-# 代理主站共享两连发（2026-08-29 · 已上云，当前运行 delivery-site-share-20260829-2132）
+# 登录代理全覆盖+发货双兜底（2026-08-30 · 已上云，当前运行 login-proxy-delivery-fallback-20260830-0054）
+
+- A 扫码登录按账号注入住宅代理（fix `0de658b`）：`QRLoginSession` 增 per-session proxy/proxy_config；`generate_qr_code(proxy=)` 归一化，4 处 httpx 与验证浏览器改读 session 级代理；`reply_server.generate_qr_code` 可带 cid（归属校验→按号取代理注入），无 cid 保持零参兼容；前端重登带 cid、新增账号不带。死号扫码重登自此走住宅 IP。
+- B 令牌过期就地重试（`8092e19`）：confirm/freeshipping 从 SESSION_INVALID_MARKERS 拆出 TOKEN_EXPIRED_MARKERS；撞令牌过期且响应已合并新令牌（fresh!=attempt）且本单未重试过 → 就地重试一次；对外 category 仍 session_invalid（上游零改动）。
+- C 对账兜底扩面（`c6a9091`）：`invite_bridge._has_succeeded_fulfillment_message`（宁漏勿误）+ `_note_ship_drift` 覆盖「码已发×平台发货失败」单入 `_ship_drift` 对账队列（不重发码）；对账器零改动（发货前二次复核 fail-closed）。
+- 门禁：后端 1256 passed + 280 subtests / ruff clean；前端 vitest 243 / tsc clean。部署：layered-patch 基底 `site-overview-collapse-20260829-2244`，首跑被 post_lock_count 假阳性回滚（Chromium 运行态锁属正常，该检查已改 informational），二跑 `-0054` PASS；回滚脚本就绪；app-b 零涉及。origin/main=`0ed67ae` 与云端一致。
+- 遗留（08-30 上午定位）：青果单通道隧道**空闲首连被掐**（CONNECT 阶段 httpx.ReadError，重试即通）→ 寻艺探测自 01:24 连败 9h（RETRYABLE 会话保留、业务未受损）；修复方向=探测传输层异常就地重试一次，待拍板。另：L3 保活试点号寻艺 l3mem=0 保活实际空转，需扫码重登建记忆或换试点号。详见 `会话-2026-08-30.md`。
+
+# 仪表盘全站经营折叠优化（2026-08-29 · 已上云，当前运行 site-overview-collapse-20260829-2244）
+
+- 需求（用户 22:11 拍板 + 22:27 决策卡）：全站经营与运营概览（订单数/客单价）、订单/商品页（账号贡献）重复 → **默认折叠、纯标题一行**；分代理明细**停用代理直接隐藏**。
+- 实现（main `698f73f`）：`SiteOverview.tsx` 默认折叠+localStorage 记展开偏好；折叠零接口请求、首次展开才拉全站合计/分代理明细；明细渲染前过滤 `is_active=false` 并移除恒定「状态」列；标题行 button + aria-expanded。权限语义与后端接口未动。`SiteOverview.test.tsx` 重写 5 例；全量 vitest 34 文件 241 例通过、tsc 0 错。
+- 发布：`site-overview-collapse-20260829-2244` = 登录线 `session-refresh-fix-20260829-2220`（22:20 上线）+ static 整代（入口 `index-C3tlQHZg.js`，顺带补齐登录线任务 8 按钮文案前端）；回滚脚本 `rollback-app-a-site-overview-collapse.sh`；迁移 2026082901 不变、双公网 ready 200、Traceback=0、4 账号监听恢复。详见云 PROGRESS 顶部条目。
+
+# 代理主站共享两连发（2026-08-29 · 已上云）
 
 - 需求拍板（用户原话口径）：代理是“我的代理，消耗我的无所谓”——AI 平台与卡密自动发货全部同步主站；决策卡答复=AI 共享立即提交+部署、卡密发货完全同步主站。
 - AI 平台站级共享（commit `1fb114f`）：db 层 `get_site_default_ai_provider_profile` + 双读路径（`get_ai_reply_settings` / `get_ai_reply_settings_for_user`）回退；顺序=账号绑定平台 > 账号自有 Key > 管理员站级默认已验证配置 > 系统全局 Key；回退时 `provider_profile_id` 恒 None、`api_key_source='site'`，前端 AccountList 显示「主站共享配置」，明文 Key 不下发、admin 未验证配置不外借；模型经 `resolve_ai_model_and_base_url` 与站级平台对齐。新测试 `test_ai_providers.py` +5。
