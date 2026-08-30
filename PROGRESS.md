@@ -1,3 +1,11 @@
+# 会话探测抗隧道冷启动（2026-08-30 · 已上云，当前运行 probe-coldstart-retry-20260830-1042）
+
+- 病因（08-30 上午实证）：青果单通道隧道空闲后会掐掉下一个 CONNECT——纯 CONNECT 6 连测「首次 ReadError 0.2s、后 5 次全通 0.47s」，而 `probe_message_session_*` 对首个 POST 无传输层重试，探测时隙最早的账号波波吃冷隧道第一枪（寻艺自 01:24 连败 9h，令牌续不上；chen 间歇中招；小梅骑暖隧道全过）。属 RETRYABLE、会话保留，业务未受损。
+- 修复（fix `489a5f0` / main `dca59dc`，用户拍板只修探测不扩 QR 登录）：`utils/xianyu_session_probe.py` 新增 `_TRANSPORT_RETRYABLE_ERRORS`(NetworkError/ProxyError/RemoteProtocolError) + `_TRANSPORT_ATTEMPTS=2`；sync/async 外层改两次尝试循环，**每次新建 client**（换连接才有意义），命中传输层异常重试一次。**超时不重试**（已烧满 25s 预算，重试会翻倍）；其它异常与二次失败照旧落 `token_probe_exception`，对外错误码与语义零变化。内层「令牌过期就地重签」未动。
+- 门禁：新增 6 用例（sync/async 各：冷连接换新 client 重试成功 / 传输层最多重试一次 / 超时与非传输异常不重试），红灯 5 failed → 绿灯；后端 tests 目录 **1271 passed + 285 subtests**、ruff clean。（`pytest` 不带路径会因 `outputs/` 归档快照同名 test 模块产生 35 个 collection error，属既有噪音，门禁跑 `pytest tests`。）
+- 部署：layered-patch 基底 `login-proxy-delivery-fallback-20260830-0054`，仅 COPY 1 个后端文件；staging 与本地 sha256 一致；含**行为门禁**（容器内注入 ReadError 证明部署态代码确实换新连接重试、注入 ReadTimeout 证明不重试）。一跑 PASS，容器 healthy、18091 /health 200、迁移 2026082901 不变、Traceback=0、心跳恢复、app-b 零涉及；回滚脚本 `rollback-app-a-probe-coldstart-retry.sh`；部署前 DB 快照留存。
+- 遗留：L3 保活试点号寻艺 `l3mem=0`，保活循环遇无记忆直接跳过＝试点空转；用户已拍板走「寻艺扫码重登建 L3 记忆」，**待用户手机扫码**（扫码登录已走住宅代理）。
+
 # 登录代理全覆盖+发货双兜底（2026-08-30 · 已上云，当前运行 login-proxy-delivery-fallback-20260830-0054）
 
 - A 扫码登录按账号注入住宅代理（fix `0de658b`）：`QRLoginSession` 增 per-session proxy/proxy_config；`generate_qr_code(proxy=)` 归一化，4 处 httpx 与验证浏览器改读 session 级代理；`reply_server.generate_qr_code` 可带 cid（归属校验→按号取代理注入），无 cid 保持零参兼容；前端重登带 cid、新增账号不带。死号扫码重登自此走住宅 IP。
